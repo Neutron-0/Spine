@@ -73,14 +73,14 @@ fn test_end_to_end_repository_lifecycle() {
 
     // 5. Commit
     let root_tree_id = write_index_to_tree(&index, &store).unwrap();
-    let commit = Commit {
-        root_tree: root_tree_id,
-        parents: vec![],
-        author_name: "Test Developer".into(),
-        author_email: "test@spine.org".into(),
-        timestamp_nanos: 1730000000000000000,
-        message: "feat: initial commit".into(),
-    };
+    let commit = Commit::new_simple(
+        root_tree_id,
+        vec![],
+        "Test Developer".into(),
+        "test@spine.org".into(),
+        1730000000000000000,
+        "feat: initial commit".into(),
+    );
     let commit_bytes = spine_format::serialize_commit(&commit);
     let commit_1_id = store
         .write_object(ObjectType::Commit, &commit_bytes)
@@ -109,14 +109,14 @@ fn test_end_to_end_repository_lifecycle() {
     index.save_to_file(spine_dir.join("index")).unwrap();
 
     let root_tree_2 = write_index_to_tree(&index, &store).unwrap();
-    let commit_2 = Commit {
-        root_tree: root_tree_2,
-        parents: vec![commit_1_id],
-        author_name: "Test Developer".into(),
-        author_email: "test@spine.org".into(),
-        timestamp_nanos: 1730000005000000000,
-        message: "docs: update README".into(),
-    };
+    let commit_2 = Commit::new_simple(
+        root_tree_2,
+        vec![commit_1_id],
+        "Test Developer".into(),
+        "test@spine.org".into(),
+        1730000005000000000,
+        "docs: update README".into(),
+    );
     let commit_2_bytes = spine_format::serialize_commit(&commit_2);
     let commit_2_id = store
         .write_object(ObjectType::Commit, &commit_2_bytes)

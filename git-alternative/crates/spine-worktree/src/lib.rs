@@ -21,6 +21,10 @@ pub enum WorktreeError {
     FileNotFound(String),
     #[error("Cannot add directory itself without files: {0}")]
     EmptyDirectory(String),
+    #[error("Your local changes to the following files would be overwritten by switch:\n  {0}")]
+    LocalChangesWouldBeOverwritten(String),
+    #[error("The following untracked working tree files would be overwritten by switch:\n  {0}")]
+    UntrackedWouldBeOverwritten(String),
     #[error("Object store error: {0}")]
     ObjectStore(#[from] ObjectStoreError),
     #[error("Index error: {0}")]
@@ -473,4 +477,160 @@ pub fn write_index_to_tree<S: ObjectStore>(
     });
 
     Ok(root_oid)
+}
+
+/// Preflight safety check before switching the working tree.
+/// Verifies that no uncommitted changes (staged or unstaged) or untracked files
+/// would be overwritten by the files that differ between the current tree and target tree.
+pub fn check_switch_safety<P: AsRef<Path>, S: ObjectStore>(
+    root: P,
+    index: &Index,
+    store: &S,
+    current_tree_id: Option<&ObjectId>,
+    target_tree_id: &ObjectId,
+    ignore: &IgnoreRules,
+) -> Result<(), WorktreeError> {
+    let root_path = root.as_ref();
+    let status = compute_status(root_path, index, store, current_tree_id, ignore)?;
+
+    let mut current_files = BTreeMap::new();
+    if let Some(cur_id) = current_tree_id {
+        flatten_tree(store, cur_id, "", &mut current_files)?;
+    }
+
+    let mut target_files = BTreeMap::new();
+    flatten_tree(store, target_tree_id, "", &mut target_files)?;
+
+    // Collect all paths that differ between current tree and target tree
+    let mut touched_by_switch = std::collections::BTreeSet::new();
+    for (path, (mode, oid)) in &target_files {
+        match current_files.get(path) {
+            Some((c_mode, c_oid)) => {
+                if mode != c_mode || oid != c_oid {
+                    touched_by_switch.insert(path.clone());
+                }
+            }
+            None => {
+                touched_by_switch.insert(path.clone());
+            }
+        }
+    }
+    for path in current_files.keys() {
+        if !target_files.contains_key(path) {
+            touched_by_switch.insert(path.clone());
+        }
+    }
+
+    // Check untracked files:
+    // If an untracked file would be overwritten by a file introduced or changed by target tree
+    for untracked in &status.untracked {
+        if target_files.contains_key(untracked) {
+            return Err(WorktreeError::UntrackedWouldBeOverwritten(
+                untracked.clone(),
+            ));
+        }
+    }
+
+    // Check uncommitted changes:
+    let mut dirty_paths = std::collections::BTreeSet::new();
+    dirty_paths.extend(status.staged_new);
+    dirty_paths.extend(status.staged_modified);
+    dirty_paths.extend(status.staged_deleted);
+    dirty_paths.extend(status.unstaged_modified);
+    dirty_paths.extend(status.unstaged_deleted);
+
+    for dirty in dirty_paths {
+        if touched_by_switch.contains(&dirty) {
+            return Err(WorktreeError::LocalChangesWouldBeOverwritten(dirty));
+        }
+    }
+
+    Ok(())
+}
+
+/// Executes the working tree switch: updates disk files, cleans deleted files & empty directories,
+/// and updates the staging index to match the target commit tree.
+pub fn execute_switch<P: AsRef<Path>, S: ObjectStore>(
+    root: P,
+    index: &mut Index,
+    store: &S,
+    current_tree_id: Option<&ObjectId>,
+    target_tree_id: &ObjectId,
+) -> Result<(), WorktreeError> {
+    let root_path = root.as_ref();
+
+    let mut current_files = BTreeMap::new();
+    if let Some(cur_id) = current_tree_id {
+        flatten_tree(store, cur_id, "", &mut current_files)?;
+    }
+
+    let mut target_files = BTreeMap::new();
+    flatten_tree(store, target_tree_id, "", &mut target_files)?;
+
+    // 1. Remove files in current that are not in target
+    for path in current_files.keys() {
+        if !target_files.contains_key(path) {
+            let file_path = root_path.join(path);
+            if file_path.exists() {
+                fs::remove_file(&file_path)?;
+                let _ = remove_empty_parent_dirs(root_path, path);
+            }
+            index.remove(path);
+        }
+    }
+
+    // 2. Add or update files from target
+    for (path, (mode, oid)) in &target_files {
+        let needs_update = match current_files.get(path) {
+            Some((c_mode, c_oid)) => c_mode != mode || c_oid != oid,
+            None => true,
+        };
+
+        let file_path = root_path.join(path);
+        if needs_update || !file_path.exists() {
+            if let Some(parent) = file_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let (_, content) = store.read_object(oid)?;
+            fs::write(&file_path, &content)?;
+        }
+
+        // Update index entry
+        let meta = fs::metadata(&file_path)?;
+        let (file_mode, size, mtime_secs, mtime_nanos) = metadata_to_stat(&meta);
+
+        index.add_or_update(IndexEntry {
+            path: path.clone(),
+            mode: file_mode,
+            file_size: size,
+            mtime_secs,
+            mtime_nanos,
+            inode: 0,
+            object_id: *oid,
+            stage_status: StageStatus::Clean,
+        });
+    }
+
+    Ok(())
+}
+
+fn remove_empty_parent_dirs(root: &Path, rel_file_path: &str) -> io::Result<()> {
+    let mut current = root.join(rel_file_path);
+    while let Some(parent) = current.parent() {
+        if parent == root || !parent.starts_with(root) {
+            break;
+        }
+        match fs::read_dir(parent) {
+            Ok(mut read) => {
+                if read.next().is_none() {
+                    let _ = fs::remove_dir(parent);
+                } else {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+        current = parent.to_path_buf();
+    }
+    Ok(())
 }

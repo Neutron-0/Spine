@@ -33,6 +33,9 @@ pub struct FsckReport {
     pub dangling_objects: Vec<ObjectId>,
     pub refs_checked: usize,
     pub invalid_refs: Vec<(String, String)>,
+    pub journal_records_checked: usize,
+    pub journal_errors: Vec<(String, String)>,
+    pub merge_state_errors: Vec<String>,
 }
 
 impl FsckReport {
@@ -40,6 +43,8 @@ impl FsckReport {
         self.corrupt_objects.is_empty()
             && self.missing_objects.is_empty()
             && self.invalid_refs.is_empty()
+            && self.journal_errors.is_empty()
+            && self.merge_state_errors.is_empty()
     }
 
     pub fn add_corrupt_object(&mut self, oid: ObjectId, err: String) {
@@ -180,6 +185,77 @@ pub fn run_fsck<S: ObjectStore, P: AsRef<Path>>(
     for oid in &all_objects {
         if !reachable_objects.contains(oid) {
             report.dangling_objects.push(*oid);
+        }
+    }
+
+    // 6. Check pending merge state if present
+    let merge_state_file = spine_path.join("MERGE_STATE");
+    if merge_state_file.exists() {
+        match spine_merge::MergeState::load_from_dir(spine_path) {
+            Ok(Some(ms)) => {
+                if !store.has_object(&ms.ours_commit) {
+                    report.merge_state_errors.push(format!(
+                        "Merge state references missing ours_commit: {}",
+                        ms.ours_commit.to_hex()
+                    ));
+                }
+                if !store.has_object(&ms.theirs_commit) {
+                    report.merge_state_errors.push(format!(
+                        "Merge state references missing theirs_commit: {}",
+                        ms.theirs_commit.to_hex()
+                    ));
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                report
+                    .merge_state_errors
+                    .push(format!("Corrupt MERGE_STATE: {}", e));
+            }
+        }
+    }
+
+    // 7. Check operation journal integrity
+    let journal_dir = spine_path.join("journal");
+    if journal_dir.exists() {
+        match spine_journal::Journal::new(&journal_dir) {
+            Ok(journal) => match journal.list_records() {
+                Ok(records) => {
+                    report.journal_records_checked = records.len();
+                    let mut prev_seq = 0;
+                    for r in records {
+                        if r.sequence <= prev_seq {
+                            report.journal_errors.push((
+                                r.id.clone(),
+                                format!(
+                                    "Non-monotonic sequence number: {} <= {}",
+                                    r.sequence, prev_seq
+                                ),
+                            ));
+                        }
+                        prev_seq = r.sequence;
+
+                        if let Some(tip) = r.before_state.branch_tip {
+                            if !store.has_object(&tip) {
+                                report.journal_errors.push((
+                                    r.id.clone(),
+                                    format!("Before state branch tip missing: {}", tip.to_hex()),
+                                ));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    report
+                        .journal_errors
+                        .push(("journal".into(), format!("Failed to read records: {}", e)));
+                }
+            },
+            Err(e) => {
+                report
+                    .journal_errors
+                    .push(("journal".into(), format!("Failed to load journal: {}", e)));
+            }
         }
     }
 

@@ -3,11 +3,137 @@
 //! Myers diff and longest common subsequence algorithms for line-level file comparison
 //! and unified diff generation.
 
+use spine_core::{FileMode, ObjectId};
+use std::collections::BTreeMap;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffOp {
     Context(String),
     Addition(String),
     Deletion(String),
+}
+
+/// Represents a change to a single tracked path between two tree snapshots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TreeChange {
+    Added {
+        path: String,
+        object_id: ObjectId,
+    },
+    Deleted {
+        path: String,
+        object_id: ObjectId,
+    },
+    Modified {
+        path: String,
+        old_id: ObjectId,
+        new_id: ObjectId,
+    },
+}
+
+impl TreeChange {
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Added { path, .. } => path,
+            Self::Deleted { path, .. } => path,
+            Self::Modified { path, .. } => path,
+        }
+    }
+}
+
+/// Computes differences between two flattened tree structures.
+pub fn compare_trees(
+    tree_a: &BTreeMap<String, (FileMode, ObjectId)>,
+    tree_b: &BTreeMap<String, (FileMode, ObjectId)>,
+) -> Vec<TreeChange> {
+    let mut changes = Vec::new();
+
+    // Check additions and modifications
+    for (path, (_mode_b, oid_b)) in tree_b {
+        match tree_a.get(path) {
+            Some((_mode_a, oid_a)) => {
+                if oid_a != oid_b {
+                    changes.push(TreeChange::Modified {
+                        path: path.clone(),
+                        old_id: *oid_a,
+                        new_id: *oid_b,
+                    });
+                }
+            }
+            None => {
+                changes.push(TreeChange::Added {
+                    path: path.clone(),
+                    object_id: *oid_b,
+                });
+            }
+        }
+    }
+
+    // Check deletions
+    for (path, (_mode_a, oid_a)) in tree_a {
+        if !tree_b.contains_key(path) {
+            changes.push(TreeChange::Deleted {
+                path: path.clone(),
+                object_id: *oid_a,
+            });
+        }
+    }
+
+    changes.sort_by(|a, b| a.path().cmp(b.path()));
+    changes
+}
+
+/// Statistics summary for a diff.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DiffSummary {
+    pub files_changed: usize,
+    pub insertions: usize,
+    pub deletions: usize,
+    pub file_stats: Vec<(String, usize, usize, bool)>, // (path, adds, dels, is_binary)
+}
+
+/// Formats diff summary into standard `--stat` display table.
+pub fn format_diff_stat(summary: &DiffSummary) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+
+    if summary.file_stats.is_empty() {
+        return out;
+    }
+
+    let max_path_len = summary
+        .file_stats
+        .iter()
+        .map(|(p, _, _, _)| p.len())
+        .max()
+        .unwrap_or(0);
+
+    for (path, adds, dels, is_bin) in &summary.file_stats {
+        if *is_bin {
+            let _ = writeln!(&mut out, " {:width$} | Bin", path, width = max_path_len);
+        } else {
+            let total = adds + dels;
+            let pluses = "+".repeat((*adds).min(30));
+            let minuses = "-".repeat((*dels).min(30));
+            let _ = writeln!(
+                &mut out,
+                " {:width$} | {:>3} {}{}",
+                path,
+                total,
+                pluses,
+                minuses,
+                width = max_path_len
+            );
+        }
+    }
+
+    let _ = writeln!(
+        &mut out,
+        " {} files changed, {} insertions(+), {} deletions(-)",
+        summary.files_changed, summary.insertions, summary.deletions
+    );
+
+    out
 }
 
 /// Computes line-by-line diff between two text documents using LCS algorithm.
@@ -107,5 +233,50 @@ mod tests {
         assert!(ops.contains(&DiffOp::Deletion("line 2".into())));
         assert!(ops.contains(&DiffOp::Addition("line 2 modified".into())));
         assert!(ops.contains(&DiffOp::Addition("line 4".into())));
+    }
+
+    #[test]
+    fn test_compare_trees_and_stats() {
+        let mut a = BTreeMap::new();
+        a.insert(
+            "file1.txt".into(),
+            (FileMode::Regular, ObjectId::from_bytes([1u8; 32])),
+        );
+        a.insert(
+            "file2.txt".into(),
+            (FileMode::Regular, ObjectId::from_bytes([2u8; 32])),
+        );
+
+        let mut b = BTreeMap::new();
+        b.insert(
+            "file1.txt".into(),
+            (FileMode::Regular, ObjectId::from_bytes([1u8; 32])),
+        ); // unchanged
+        b.insert(
+            "file2.txt".into(),
+            (FileMode::Regular, ObjectId::from_bytes([3u8; 32])),
+        ); // modified
+        b.insert(
+            "file3.txt".into(),
+            (FileMode::Regular, ObjectId::from_bytes([4u8; 32])),
+        ); // added
+
+        let changes = compare_trees(&a, &b);
+        assert_eq!(changes.len(), 2);
+        assert!(matches!(changes[0], TreeChange::Modified { .. }));
+        assert!(matches!(changes[1], TreeChange::Added { .. }));
+
+        let summary = DiffSummary {
+            files_changed: 2,
+            insertions: 5,
+            deletions: 1,
+            file_stats: vec![
+                ("file2.txt".into(), 2, 1, false),
+                ("file3.txt".into(), 3, 0, false),
+            ],
+        };
+        let stat_str = format_diff_stat(&summary);
+        assert!(stat_str.contains("file2.txt |   3 ++-"));
+        assert!(stat_str.contains("2 files changed, 5 insertions(+), 1 deletions(-)"));
     }
 }

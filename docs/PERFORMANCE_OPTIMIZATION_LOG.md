@@ -17,3 +17,13 @@
 ## Entry 04: Temporary File POSIX Semantics on Windows
 - **Problem:** Windows file locks can cause concurrent rename failures if a target object file already exists.
 - **Mitigation:** If `fs::rename` fails and the target object file exists on disk, Spine checks that the target exists and removes the temporary file, ensuring atomic idempotency.
+
+## Entry 05: Benchmark Runner Warm-Up Calibration on Windows NTFS
+- **Problem:** In Batch 01, `spine init` cold start was measured at 729 ms due to cold process initialization and Windows Defender DLL/file scanning on first run.
+- **Verification:** Adding 1 warm-up cycle and sampling median/p95 over 5 iterations revealed true warm `spine init` performance is **20.30 ms** (vs Git's 101.93 ms, achieving a **5.02x speedup**).
+- **Decision:** All future benchmark measurements must execute a mandatory warm-up cycle and report min, median, p95, and max.
+
+## Entry 06: Zero-Copy In-Memory Three-Way Merge Reconciliation
+- **Hypothesis:** Reconciling three trees in memory (`BTreeMap<String, (FileMode, ObjectId)>`) and checking for identity shortcuts before reading object payloads eliminates >80% of disk I/O on typical merges.
+- **Verification:** Benchmarking a 3-way divergent merge resulted in 65.51 ms median execution for Spine vs 159.62 ms for Git (a **2.44x speedup**).
+- **Decision:** Integrated in-memory path classification with 13 discrete reconciliation cases in `spine-merge`.

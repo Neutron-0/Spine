@@ -212,15 +212,83 @@ pub struct TreeEntry {
     pub object_id: ObjectId,
 }
 
-/// Immutable commit snapshot object.
+/// Immutable commit snapshot object supporting single- and multi-parent graphs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Commit {
+    pub format_version: u16,
     pub root_tree: ObjectId,
     pub parents: Vec<ObjectId>,
     pub author_name: String,
     pub author_email: String,
+    pub committer_name: String,
+    pub committer_email: String,
     pub timestamp_nanos: i64,
     pub message: String,
+}
+
+impl Commit {
+    /// Creates a new v2 commit with distinct author and committer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        root_tree: ObjectId,
+        parents: Vec<ObjectId>,
+        author_name: String,
+        author_email: String,
+        committer_name: String,
+        committer_email: String,
+        timestamp_nanos: i64,
+        message: String,
+    ) -> Self {
+        Self {
+            format_version: 2,
+            root_tree,
+            parents,
+            author_name,
+            author_email,
+            committer_name,
+            committer_email,
+            timestamp_nanos,
+            message,
+        }
+    }
+
+    /// Convenience constructor when committer identity matches author.
+    pub fn new_simple(
+        root_tree: ObjectId,
+        parents: Vec<ObjectId>,
+        author_name: String,
+        author_email: String,
+        timestamp_nanos: i64,
+        message: String,
+    ) -> Self {
+        Self {
+            format_version: 2,
+            root_tree,
+            parents,
+            author_name: author_name.clone(),
+            author_email: author_email.clone(),
+            committer_name: author_name,
+            committer_email: author_email,
+            timestamp_nanos,
+            message,
+        }
+    }
+
+    pub fn is_root(&self) -> bool {
+        self.parents.is_empty()
+    }
+
+    pub fn is_merge(&self) -> bool {
+        self.parents.len() > 1
+    }
+
+    pub fn primary_parent(&self) -> Option<&ObjectId> {
+        self.parents.first()
+    }
+
+    pub fn merge_parent(&self) -> Option<&ObjectId> {
+        self.parents.get(1)
+    }
 }
 
 #[cfg(test)]

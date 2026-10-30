@@ -36,7 +36,9 @@ spine/
 │       ├── spine-history/     # Commit graph traversal, topological log ordering
 │       ├── spine-diff/        # Myers line diff and change calculation
 │       ├── spine-config/      # User, repository, and global configuration
-│       └── spine-integrity/   # fsck, hash validation, dangling pointer checks
+│       ├── spine-integrity/   # fsck, hash validation, dangling pointer checks
+│       ├── spine-merge/       # 3-way tree & text merge engine, conflict markers
+│       └── spine-journal/     # Append-only transaction log, undo/redo, crash recovery
 ├── github-alternative/        # Spine Forge collaboration platform
 │   ├── backend/               # Rust Axum API services, distributed storage abstractions
 │   └── frontend/              # React + TypeScript + Vite web client
@@ -72,6 +74,27 @@ spine commit -m "feat: initial commit"
 # Inspect history and commits
 spine log
 spine show HEAD
+
+# Branch management and switching
+spine branch create feature-x
+spine switch feature-x
+spine branch
+
+# Review diffs
+spine diff
+spine diff --staged --stat
+
+# Three-way merge and conflict handling
+spine switch main
+spine merge feature-x
+# If conflicts occur:
+spine merge --abort      # or resolve files and:
+spine merge --continue
+
+# Transaction journal undo/redo
+spine undo
+spine redo
+spine undo --list
 
 # Verify repository integrity
 spine fsck

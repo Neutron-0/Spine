@@ -859,6 +859,8 @@ dependencies = [
  "spine-history",
  "spine-index",
  "spine-integrity",
+ "spine-journal",
+ "spine-merge",
  "spine-object-store",
  "spine-worktree",
  "tempfile",
@@ -888,6 +890,7 @@ dependencies = [
 name = "spine-diff"
 version = "0.1.0"
 dependencies = [
+ "spine-core",
  "thiserror",
 ]
 
@@ -928,8 +931,39 @@ dependencies = [
  "spine-format",
  "spine-history",
  "spine-index",
+ "spine-journal",
+ "spine-merge",
  "spine-object-store",
  "thiserror",
+]
+
+[[package]]
+name = "spine-journal"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "spine-core",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "spine-merge"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "spine-core",
+ "spine-diff",
+ "spine-format",
+ "spine-history",
+ "spine-index",
+ "spine-object-store",
+ "thiserror",
+ "toml",
 ]
 
 [[package]]

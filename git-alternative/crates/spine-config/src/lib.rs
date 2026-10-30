@@ -20,6 +20,8 @@ pub enum ConfigError {
     UnknownKey(String),
     #[error("Invalid configuration value for key '{key}': {value}")]
     InvalidValue { key: String, value: String },
+    #[error("Cannot modify immutable repository setting: {0}")]
+    ImmutableSetting(String),
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +68,15 @@ impl SpineConfig {
     }
 
     pub fn set_value(&mut self, key: &str, value: &str) -> Result<(), ConfigError> {
+        self.set_value_with_repo_check(key, value, false)
+    }
+
+    pub fn set_value_with_repo_check(
+        &mut self,
+        key: &str,
+        value: &str,
+        has_objects: bool,
+    ) -> Result<(), ConfigError> {
         match key {
             "user.name" => {
                 self.user.name = Some(value.to_string());
@@ -91,6 +102,12 @@ impl SpineConfig {
                         key: key.to_string(),
                         value: value.to_string(),
                     });
+                }
+                if has_objects && self.repository.hash_algorithm != value {
+                    return Err(ConfigError::ImmutableSetting(format!(
+                        "Cannot change repository hash algorithm from '{}' to '{}' once objects exist",
+                        self.repository.hash_algorithm, value
+                    )));
                 }
                 self.repository.hash_algorithm = value.to_string();
                 Ok(())
@@ -142,5 +159,20 @@ mod tests {
             Some("jane@example.com")
         );
         assert!(cfg.set_value("user.unknown", "val").is_err());
+    }
+
+    #[test]
+    fn test_immutable_hash_algorithm_protection() {
+        let mut cfg = SpineConfig::default();
+        assert_eq!(cfg.repository.hash_algorithm, "blake3");
+
+        // Allowed when no objects exist
+        assert!(cfg
+            .set_value_with_repo_check("repository.hash_algorithm", "sha256", false)
+            .is_ok());
+
+        // Prohibited once objects exist
+        let res = cfg.set_value_with_repo_check("repository.hash_algorithm", "blake3", true);
+        assert!(matches!(res, Err(ConfigError::ImmutableSetting(_))));
     }
 }

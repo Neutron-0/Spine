@@ -11,6 +11,9 @@ pub const LOOSE_OBJECT_MAGIC: &[u8; 8] = b"SPINEOBJ";
 pub const LOOSE_OBJECT_VERSION: u16 = 1;
 pub const LOOSE_HEADER_SIZE: usize = 16;
 
+pub const COMMIT_MAGIC: &[u8; 4] = b"SPCM";
+pub const COMMIT_VERSION_2: u16 = 2;
+
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum FormatError {
     #[error("Buffer too short: expected at least {expected} bytes, found {actual}")]
@@ -145,8 +148,45 @@ pub fn deserialize_tree(payload: &[u8]) -> Result<Vec<TreeEntry>, FormatError> {
     Ok(entries)
 }
 
-/// Serializes a `Commit` into canonical binary representation.
+/// Serializes a `Commit` into canonical v2 binary representation.
 pub fn serialize_commit(commit: &Commit) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(COMMIT_MAGIC);
+    buf.extend_from_slice(&COMMIT_VERSION_2.to_le_bytes());
+    buf.extend_from_slice(commit.root_tree.as_bytes());
+
+    buf.extend_from_slice(&(commit.parents.len() as u16).to_le_bytes());
+    for parent in &commit.parents {
+        buf.extend_from_slice(parent.as_bytes());
+    }
+
+    let author_name_bytes = commit.author_name.as_bytes();
+    buf.extend_from_slice(&(author_name_bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(author_name_bytes);
+
+    let author_email_bytes = commit.author_email.as_bytes();
+    buf.extend_from_slice(&(author_email_bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(author_email_bytes);
+
+    let committer_name_bytes = commit.committer_name.as_bytes();
+    buf.extend_from_slice(&(committer_name_bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(committer_name_bytes);
+
+    let committer_email_bytes = commit.committer_email.as_bytes();
+    buf.extend_from_slice(&(committer_email_bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(committer_email_bytes);
+
+    buf.extend_from_slice(&commit.timestamp_nanos.to_le_bytes());
+
+    let message_bytes = commit.message.as_bytes();
+    buf.extend_from_slice(&(message_bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(message_bytes);
+
+    buf
+}
+
+/// Serializes a `Commit` into legacy v1 binary format (used for testing backwards compatibility).
+pub fn serialize_commit_v1(commit: &Commit) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(commit.root_tree.as_bytes());
 
@@ -172,8 +212,159 @@ pub fn serialize_commit(commit: &Commit) -> Vec<u8> {
     buf
 }
 
-/// Deserializes a binary payload into a `Commit`.
+/// Deserializes a binary payload into a `Commit`, automatically detecting v2 or legacy v1 framing.
 pub fn deserialize_commit(payload: &[u8]) -> Result<Commit, FormatError> {
+    if payload.len() >= 6 && &payload[0..4] == COMMIT_MAGIC {
+        deserialize_commit_v2(payload)
+    } else {
+        deserialize_commit_v1(payload)
+    }
+}
+
+fn deserialize_commit_v2(payload: &[u8]) -> Result<Commit, FormatError> {
+    // 4 magic + 2 version + 32 root_tree + 2 parent_count = 40 min
+    if payload.len() < 40 {
+        return Err(FormatError::BufferTooShort {
+            expected: 40,
+            actual: payload.len(),
+        });
+    }
+
+    let version = u16::from_le_bytes(payload[4..6].try_into().unwrap());
+    if version != COMMIT_VERSION_2 {
+        return Err(FormatError::UnsupportedVersion(version));
+    }
+
+    let mut cursor = 6;
+    let mut root_tree_bytes = [0u8; 32];
+    root_tree_bytes.copy_from_slice(&payload[cursor..cursor + 32]);
+    let root_tree = ObjectId::from_bytes(root_tree_bytes);
+    cursor += 32;
+
+    let parent_count = u16::from_le_bytes(payload[cursor..cursor + 2].try_into().unwrap()) as usize;
+    cursor += 2;
+
+    let mut parents = Vec::with_capacity(parent_count);
+    for _ in 0..parent_count {
+        if cursor + 32 > payload.len() {
+            return Err(FormatError::BufferTooShort {
+                expected: cursor + 32,
+                actual: payload.len(),
+            });
+        }
+        let mut p_bytes = [0u8; 32];
+        p_bytes.copy_from_slice(&payload[cursor..cursor + 32]);
+        parents.push(ObjectId::from_bytes(p_bytes));
+        cursor += 32;
+    }
+
+    // Author name
+    if cursor + 2 > payload.len() {
+        return Err(FormatError::BufferTooShort {
+            expected: cursor + 2,
+            actual: payload.len(),
+        });
+    }
+    let a_name_len = u16::from_le_bytes(payload[cursor..cursor + 2].try_into().unwrap()) as usize;
+    cursor += 2;
+    if cursor + a_name_len > payload.len() {
+        return Err(FormatError::BufferTooShort {
+            expected: cursor + a_name_len,
+            actual: payload.len(),
+        });
+    }
+    let author_name = String::from_utf8(payload[cursor..cursor + a_name_len].to_vec())?;
+    cursor += a_name_len;
+
+    // Author email
+    if cursor + 2 > payload.len() {
+        return Err(FormatError::BufferTooShort {
+            expected: cursor + 2,
+            actual: payload.len(),
+        });
+    }
+    let a_email_len = u16::from_le_bytes(payload[cursor..cursor + 2].try_into().unwrap()) as usize;
+    cursor += 2;
+    if cursor + a_email_len > payload.len() {
+        return Err(FormatError::BufferTooShort {
+            expected: cursor + a_email_len,
+            actual: payload.len(),
+        });
+    }
+    let author_email = String::from_utf8(payload[cursor..cursor + a_email_len].to_vec())?;
+    cursor += a_email_len;
+
+    // Committer name
+    if cursor + 2 > payload.len() {
+        return Err(FormatError::BufferTooShort {
+            expected: cursor + 2,
+            actual: payload.len(),
+        });
+    }
+    let c_name_len = u16::from_le_bytes(payload[cursor..cursor + 2].try_into().unwrap()) as usize;
+    cursor += 2;
+    if cursor + c_name_len > payload.len() {
+        return Err(FormatError::BufferTooShort {
+            expected: cursor + c_name_len,
+            actual: payload.len(),
+        });
+    }
+    let committer_name = String::from_utf8(payload[cursor..cursor + c_name_len].to_vec())?;
+    cursor += c_name_len;
+
+    // Committer email
+    if cursor + 2 > payload.len() {
+        return Err(FormatError::BufferTooShort {
+            expected: cursor + 2,
+            actual: payload.len(),
+        });
+    }
+    let c_email_len = u16::from_le_bytes(payload[cursor..cursor + 2].try_into().unwrap()) as usize;
+    cursor += 2;
+    if cursor + c_email_len > payload.len() {
+        return Err(FormatError::BufferTooShort {
+            expected: cursor + c_email_len,
+            actual: payload.len(),
+        });
+    }
+    let committer_email = String::from_utf8(payload[cursor..cursor + c_email_len].to_vec())?;
+    cursor += c_email_len;
+
+    // Timestamp
+    if cursor + 8 + 4 > payload.len() {
+        return Err(FormatError::BufferTooShort {
+            expected: cursor + 12,
+            actual: payload.len(),
+        });
+    }
+    let timestamp_nanos = i64::from_le_bytes(payload[cursor..cursor + 8].try_into().unwrap());
+    cursor += 8;
+
+    // Message
+    let message_len = u32::from_le_bytes(payload[cursor..cursor + 4].try_into().unwrap()) as usize;
+    cursor += 4;
+    if cursor + message_len > payload.len() {
+        return Err(FormatError::BufferTooShort {
+            expected: cursor + message_len,
+            actual: payload.len(),
+        });
+    }
+    let message = String::from_utf8(payload[cursor..cursor + message_len].to_vec())?;
+
+    Ok(Commit {
+        format_version: 2,
+        root_tree,
+        parents,
+        author_name,
+        author_email,
+        committer_name,
+        committer_email,
+        timestamp_nanos,
+        message,
+    })
+}
+
+fn deserialize_commit_v1(payload: &[u8]) -> Result<Commit, FormatError> {
     if payload.len() < 32 + 1 {
         return Err(FormatError::BufferTooShort {
             expected: 33,
@@ -261,10 +452,13 @@ pub fn deserialize_commit(payload: &[u8]) -> Result<Commit, FormatError> {
     let message = String::from_utf8(payload[cursor..cursor + message_len].to_vec())?;
 
     Ok(Commit {
+        format_version: 1,
         root_tree,
         parents,
-        author_name,
-        author_email,
+        author_name: author_name.clone(),
+        author_email: author_email.clone(),
+        committer_name: author_name,
+        committer_email: author_email,
         timestamp_nanos,
         message,
     })
@@ -305,20 +499,77 @@ mod tests {
     }
 
     #[test]
-    fn test_commit_serialization_roundtrip() {
-        let commit = Commit {
-            root_tree: ObjectId::from_bytes([3u8; 32]),
-            parents: vec![
+    fn test_commit_serialization_roundtrip_v2() {
+        let commit = Commit::new(
+            ObjectId::from_bytes([3u8; 32]),
+            vec![
                 ObjectId::from_bytes([4u8; 32]),
                 ObjectId::from_bytes([5u8; 32]),
             ],
-            author_name: "Developer".into(),
-            author_email: "dev@spine.org".into(),
-            timestamp_nanos: 1730332800123456789,
-            message: "feat: initial commit\n\nwith body".into(),
-        };
+            "Alice Author".into(),
+            "alice@spine.org".into(),
+            "Bob Committer".into(),
+            "bob@spine.org".into(),
+            1730332800123456789,
+            "feat: merge feature branch into main\n\nFull details".into(),
+        );
         let bytes = serialize_commit(&commit);
         let decoded = deserialize_commit(&bytes).unwrap();
         assert_eq!(commit, decoded);
+        assert_eq!(decoded.format_version, 2);
+        assert!(decoded.is_merge());
+        assert_eq!(
+            decoded.primary_parent(),
+            Some(&ObjectId::from_bytes([4u8; 32]))
+        );
+        assert_eq!(
+            decoded.merge_parent(),
+            Some(&ObjectId::from_bytes([5u8; 32]))
+        );
+    }
+
+    #[test]
+    fn test_commit_v1_legacy_compatibility() {
+        let commit_v1 = Commit::new_simple(
+            ObjectId::from_bytes([10u8; 32]),
+            vec![ObjectId::from_bytes([11u8; 32])],
+            "Legacy Author".into(),
+            "legacy@spine.org".into(),
+            1730000000000000000,
+            "legacy batch 01 commit".into(),
+        );
+        // Serialize using v1 binary layout
+        let v1_bytes = serialize_commit_v1(&commit_v1);
+        // Deserializing with current engine must transparently decode as v1
+        let decoded = deserialize_commit(&v1_bytes).unwrap();
+        assert_eq!(decoded.format_version, 1);
+        assert_eq!(decoded.root_tree, commit_v1.root_tree);
+        assert_eq!(decoded.parents, commit_v1.parents);
+        assert_eq!(decoded.author_name, "Legacy Author");
+        assert_eq!(decoded.committer_name, "Legacy Author");
+        assert_eq!(decoded.message, "legacy batch 01 commit");
+    }
+
+    #[test]
+    fn test_commit_unsupported_version_rejection() {
+        let mut bytes = serialize_commit(&Commit::new_simple(
+            ObjectId::ZERO,
+            vec![],
+            "Author".into(),
+            "a@b.com".into(),
+            100,
+            "test".into(),
+        ));
+        // Overwrite version with 99
+        bytes[4..6].copy_from_slice(&99u16.to_le_bytes());
+        let result = deserialize_commit(&bytes);
+        assert!(matches!(result, Err(FormatError::UnsupportedVersion(99))));
+    }
+
+    #[test]
+    fn test_commit_corrupted_payload_rejection() {
+        let bytes = vec![0x53, 0x50, 0x43, 0x4D, 0x02, 0x00]; // truncated after header
+        let result = deserialize_commit(&bytes);
+        assert!(result.is_err());
     }
 }

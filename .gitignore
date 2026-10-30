@@ -10,6 +10,7 @@ dist/
 
 # Cloned third-party reference sources
 references/sources/
+*.zip
 
 # Environment / local configs
 .env

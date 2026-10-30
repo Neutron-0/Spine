@@ -64,23 +64,42 @@ Repeated for each entry (sorted lexicographically by name):
 +-----------------------------------------------------------------------+
 ```
 
-### 3.3 Commit Object Format (`0x03`)
+### 3.3 Commit Object Format
+
+#### Commit v2 Format (`0x0002` - Default for all new commits)
 ```
 +-----------------------------------------------------------------------+
 | Field            | Type     | Size     | Description                  |
 +------------------+----------+----------+------------------------------+
+| Magic Prefix     | [u8; 4]  | 4        | b"SPCM" (0x53,0x50,0x43,0x4d)|
+| Format Version   | u16 (LE) | 2        | 0x0002                       |
 | Root Tree Id     | [u8; 32] | 32       | ObjectId of snapshot Tree    |
-| Parent Count     | u8       | 1        | Number of parent commits     |
-| Parent ObjectIds | [u8; 32] | 32 * M   | Parent commit ObjectIds      |
+| Parent Count     | u16 (LE) | 2        | Number of parent commits     |
+| Parent ObjectIds | [u8; 32] | 32 * M   | Ordered parent commit ObjectIds|
 | Author Name Len  | u16 (LE) | 2        | Length of author name string |
 | Author Name      | [u8; N]  | N        | Author name (UTF-8)          |
 | Author Email Len | u16 (LE) | 2        | Length of author email string|
 | Author Email     | [u8; N]  | N        | Author email (UTF-8)         |
+| Committer Name L | u16 (LE) | 2        | Length of committer name     |
+| Committer Name   | [u8; N]  | N        | Committer name (UTF-8)       |
+| Committer Email L| u16 (LE) | 2        | Length of committer email    |
+| Committer Email  | [u8; N]  | N        | Committer email (UTF-8)      |
 | Timestamp Nanos  | i64 (LE) | 8        | UTC timestamp in nanoseconds |
 | Message Length   | u32 (LE) | 4        | Length of commit message     |
 | Message Bytes    | [u8; N]  | N        | Commit message body (UTF-8)  |
 +-----------------------------------------------------------------------+
 ```
+
+#### Commit v1 Format (Legacy Batch 01 Compatibility)
+If payload does not start with `b"SPCM"`, it is parsed as v1:
+- `root_tree: [u8; 32]`
+- `parent_count: u8`
+- `parents: [u8; 32] * parent_count`
+- `author_name_len: u16 (LE)` + string
+- `author_email_len: u16 (LE)` + string
+- `timestamp_nanos: i64 (LE)`
+- `message_len: u32 (LE)` + string
+Committer defaults to Author for all v1 records.
 
 ---
 

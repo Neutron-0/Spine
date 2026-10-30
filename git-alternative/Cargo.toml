@@ -11,6 +11,8 @@ members = [
     "crates/spine-diff",
     "crates/spine-config",
     "crates/spine-integrity",
+    "crates/spine-merge",
+    "crates/spine-journal",
 ]
 
 [workspace.package]
@@ -29,6 +31,8 @@ spine-history = { path = "crates/spine-history" }
 spine-diff = { path = "crates/spine-diff" }
 spine-config = { path = "crates/spine-config" }
 spine-integrity = { path = "crates/spine-integrity" }
+spine-merge = { path = "crates/spine-merge" }
+spine-journal = { path = "crates/spine-journal" }
 
 blake3 = "1.5"
 sha2 = "0.10"

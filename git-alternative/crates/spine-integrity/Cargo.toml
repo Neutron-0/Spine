@@ -11,4 +11,6 @@ spine-format.workspace = true
 spine-object-store.workspace = true
 spine-index.workspace = true
 spine-history.workspace = true
+spine-merge.workspace = true
+spine-journal.workspace = true
 thiserror.workspace = true

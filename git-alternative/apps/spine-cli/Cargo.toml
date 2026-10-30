@@ -27,6 +27,8 @@ spine-history.workspace = true
 spine-diff.workspace = true
 spine-config.workspace = true
 spine-integrity.workspace = true
+spine-merge.workspace = true
+spine-journal.workspace = true
 
 clap.workspace = true
 anyhow.workspace = true
