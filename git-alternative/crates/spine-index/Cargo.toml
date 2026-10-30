@@ -1,0 +1,13 @@
+[package]
+name = "spine-index"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+spine-core.workspace = true
+thiserror.workspace = true
+blake3.workspace = true
+uuid.workspace = true
+tempfile.workspace = true

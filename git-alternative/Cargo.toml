@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/spine-cli",
+    "crates/spine-core",
+    "crates/spine-format",
+    "crates/spine-object-store",
+    "crates/spine-index",
+    "crates/spine-worktree",
+    "crates/spine-history",
+    "crates/spine-diff",
+    "crates/spine-config",
+    "crates/spine-integrity",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Spine Project Engineers"]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+spine-core = { path = "crates/spine-core" }
+spine-format = { path = "crates/spine-format" }
+spine-object-store = { path = "crates/spine-object-store" }
+spine-index = { path = "crates/spine-index" }
+spine-worktree = { path = "crates/spine-worktree" }
+spine-history = { path = "crates/spine-history" }
+spine-diff = { path = "crates/spine-diff" }
+spine-config = { path = "crates/spine-config" }
+spine-integrity = { path = "crates/spine-integrity" }
+
+blake3 = "1.5"
+sha2 = "0.10"
+zstd = "0.13"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+thiserror = "1.0"
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+tempfile = "3.10"
+uuid = { version = "1.8", features = ["v4", "fast-rng"] }
+criterion = "0.5"

@@ -1,0 +1,12 @@
+[package]
+name = "spine-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3.workspace = true
+sha2.workspace = true
+serde.workspace = true
+thiserror.workspace = true

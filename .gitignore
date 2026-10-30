@@ -1,0 +1,17 @@
+# Rust targets
+target/
+**/target/
+
+# Node / Frontend
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+
+# Cloned third-party reference sources
+references/sources/
+
+# Environment / local configs
+.env
+.env.local
+*.log

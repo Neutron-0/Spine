@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/spine-api",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Spine Project Engineers"]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+spine-core = { path = "../../git-alternative/crates/spine-core" }
+spine-format = { path = "../../git-alternative/crates/spine-format" }
+spine-object-store = { path = "../../git-alternative/crates/spine-object-store" }
+spine-history = { path = "../../git-alternative/crates/spine-history" }
+
+tokio = { version = "1.38", features = ["full"] }
+axum = { version = "0.7", features = ["json"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

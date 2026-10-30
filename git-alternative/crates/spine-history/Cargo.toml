@@ -1,0 +1,12 @@
+[package]
+name = "spine-history"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+spine-core.workspace = true
+spine-format.workspace = true
+spine-object-store.workspace = true
+thiserror.workspace = true

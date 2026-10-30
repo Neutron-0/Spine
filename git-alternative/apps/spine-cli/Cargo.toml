@@ -1,0 +1,38 @@
+[package]
+name = "spine-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "spine"
+path = "src/main.rs"
+
+[[bin]]
+name = "benchmark_runner"
+path = "src/bin/benchmark_runner.rs"
+
+[[bench]]
+name = "engine_benchmarks"
+harness = false
+
+[dependencies]
+spine-core.workspace = true
+spine-format.workspace = true
+spine-object-store.workspace = true
+spine-index.workspace = true
+spine-worktree.workspace = true
+spine-history.workspace = true
+spine-diff.workspace = true
+spine-config.workspace = true
+spine-integrity.workspace = true
+
+clap.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true

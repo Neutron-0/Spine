@@ -1,0 +1,10 @@
+[package]
+name = "spine-format"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+spine-core.workspace = true
+thiserror.workspace = true
