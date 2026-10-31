@@ -1,0 +1,26 @@
+[package]
+name = "spine-daemon"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "spine-daemon"
+path = "src/main.rs"
+
+[dependencies]
+spine-core.workspace = true
+spine-protocol.workspace = true
+spine-net.workspace = true
+spine-format.workspace = true
+spine-object-store.workspace = true
+spine-history.workspace = true
+tokio = { workspace = true, features = ["full"] }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true

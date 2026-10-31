@@ -455,4 +455,19 @@ mod tests {
         let lock2 = RepoLock::acquire(temp.path(), "gc");
         assert!(lock2.is_ok());
     }
+
+    #[test]
+    fn test_stale_lock_recovery() {
+        let temp = tempdir().unwrap();
+        let lock_path = temp.path().join("LOCK");
+        // Simulate a stale lock from a dead PID
+        fs::write(&lock_path, "pid: 9999999, operation: crashed_repack\n").unwrap();
+        assert!(lock_path.exists());
+
+        // Acquire should recover from the stale lock
+        let lock = RepoLock::acquire(temp.path(), "auto_recover");
+        assert!(lock.is_ok());
+        drop(lock);
+        assert!(!lock_path.exists());
+    }
 }

@@ -29,7 +29,10 @@ spine-config.workspace = true
 spine-integrity.workspace = true
 spine-merge.workspace = true
 spine-journal.workspace = true
+spine-protocol.workspace = true
+spine-net.workspace = true
 
+tokio = { workspace = true, features = ["full"] }
 clap.workspace = true
 anyhow.workspace = true
 chrono.workspace = true

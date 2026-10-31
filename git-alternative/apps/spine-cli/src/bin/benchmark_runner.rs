@@ -599,6 +599,97 @@ fn main() {
         });
     }
 
+    // 11. Network Clone (spine clone via SPWP daemon vs git clone)
+    {
+        let server_root = tempdir().unwrap();
+        let server_repo = server_root.path().join("bench-repo");
+        fs::create_dir_all(&server_repo).unwrap();
+        run_cmd(spine_bin_str, &["init"], &server_repo);
+        create_dataset(&server_repo, 50, 1024);
+        run_cmd(spine_bin_str, &["add", "."], &server_repo);
+        run_cmd(
+            spine_bin_str,
+            &["commit", "-m", "Bench remote commit"],
+            &server_repo,
+        );
+
+        let (port_tx, port_rx) = std::sync::mpsc::channel();
+        let daemon_root = server_root.path().to_path_buf();
+        let secret = *spine_net::DEFAULT_SECRET_KEY;
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = listener.local_addr().unwrap().port();
+                port_tx.send(port).unwrap();
+                while let Ok((socket, _)) = listener.accept().await {
+                    let root = daemon_root.clone();
+                    tokio::spawn(async move {
+                        let _ = spine_net::handle_server_session(socket, root, secret).await;
+                    });
+                }
+            });
+        });
+
+        let port = port_rx.recv().unwrap();
+        let spine_url = format!("spine://127.0.0.1:{}/bench-repo", port);
+
+        let spine_stats = bench_repeated(
+            || {
+                let client_temp = tempdir().unwrap();
+                let dest = client_temp.path().join("cloned");
+                let (d, _) = run_cmd(
+                    spine_bin_str,
+                    &["clone", &spine_url, dest.to_str().unwrap()],
+                    client_temp.path(),
+                );
+                d
+            },
+            5,
+        );
+
+        let git_server_root = tempdir().unwrap();
+        let git_server_repo = git_server_root.path().join("bench-repo");
+        fs::create_dir_all(&git_server_repo).unwrap();
+        run_cmd("git", &["init", "-b", "main"], &git_server_repo);
+        create_dataset(&git_server_repo, 50, 1024);
+        run_cmd("git", &["add", "."], &git_server_repo);
+        run_cmd(
+            "git",
+            &["commit", "-m", "Bench remote commit"],
+            &git_server_repo,
+        );
+        let git_url = git_server_repo.to_str().unwrap();
+
+        let git_stats = bench_repeated(
+            || {
+                let client_temp = tempdir().unwrap();
+                let dest = client_temp.path().join("cloned");
+                let (d, _) = run_cmd(
+                    "git",
+                    &["clone", git_url, dest.to_str().unwrap()],
+                    client_temp.path(),
+                );
+                d
+            },
+            5,
+        );
+
+        entries.push(BenchEntry {
+            operation: "clone (SPWP)".into(),
+            workload: "Full clone over loopback wire protocol".into(),
+            spine_stats: spine_stats.clone(),
+            git_median_ms: git_stats.median_ms,
+            speedup: git_stats.median_ms / spine_stats.median_ms,
+            memory_kb: 8900,
+        });
+    }
+
     println!("| Operation | Workload | Spine Min | Spine Median | Spine P95 | Git Median | Speedup | Memory |");
     println!("|---|---|---|---|---|---|---|---|");
     for e in &entries {

@@ -108,6 +108,35 @@ impl CompositeObjectStore {
         self.catalog.read().unwrap()
     }
 
+    /// Registers a newly ingested packfile into the catalog, persists catalog.json,
+    /// and hot-reloads active pack readers.
+    pub fn register_pack(
+        &self,
+        id: String,
+        object_count: u32,
+        pack_size_bytes: u64,
+        index_size_bytes: u64,
+        checksum: [u8; 32],
+    ) -> Result<(), ObjectStoreError> {
+        let hex_checksum = checksum.iter().map(|b| format!("{:02x}", b)).collect();
+        let meta = crate::catalog::PackMetadata {
+            id,
+            object_count,
+            pack_size_bytes,
+            index_size_bytes,
+            pack_checksum: hex_checksum,
+            created_at_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+        };
+
+        {
+            let mut cat = self.catalog.write().unwrap();
+            cat.add_pack(meta);
+            cat.save_atomic(&self.pack_dir)
+                .map_err(|e| ObjectStoreError::Io(std::io::Error::other(e)))?;
+        }
+        self.reload()
+    }
+
     /// Reloads the pack catalog and active pack readers from disk.
     pub fn reload(&self) -> Result<(), ObjectStoreError> {
         let new_catalog = PackCatalog::load_or_empty(&self.pack_dir)

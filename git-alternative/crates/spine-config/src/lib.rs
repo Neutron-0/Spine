@@ -3,6 +3,7 @@
 //! Configuration parsing, management, and serialization for Spine repositories.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -31,6 +32,13 @@ pub struct UserConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteConfig {
+    pub url: String,
+    #[serde(default)]
+    pub fetch: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositoryConfig {
     pub format_version: u16,
     pub hash_algorithm: String,
@@ -53,9 +61,38 @@ pub struct SpineConfig {
     pub user: UserConfig,
     #[serde(default)]
     pub repository: RepositoryConfig,
+    #[serde(default)]
+    pub remote: BTreeMap<String, RemoteConfig>,
 }
 
 impl SpineConfig {
+    pub fn add_remote(&mut self, name: &str, url: &str) {
+        self.remote.insert(
+            name.to_string(),
+            RemoteConfig {
+                url: url.to_string(),
+                fetch: Some(format!("+refs/heads/*:refs/remotes/{}/*", name)),
+            },
+        );
+    }
+
+    pub fn remove_remote(&mut self, name: &str) -> bool {
+        self.remote.remove(name).is_some()
+    }
+
+    pub fn get_remote(&self, name: &str) -> Option<&RemoteConfig> {
+        self.remote.get(name)
+    }
+
+    pub fn set_remote_url(&mut self, name: &str, url: &str) -> bool {
+        if let Some(r) = self.remote.get_mut(name) {
+            r.url = url.to_string();
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn get_value(&self, key: &str) -> Option<String> {
         match key {
             "user.name" => self.user.name.clone(),

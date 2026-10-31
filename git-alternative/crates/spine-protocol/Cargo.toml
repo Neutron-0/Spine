@@ -1,0 +1,14 @@
+[package]
+name = "spine-protocol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+spine-core.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+thiserror.workspace = true

@@ -366,4 +366,33 @@ impl PackReader {
 
         Ok(verified_count)
     }
+
+    /// Scans the packfile and extracts metadata entries to construct a `.spidx` index.
+    pub fn scan_index_entries(&mut self) -> Result<Vec<crate::pack_index::IndexEntry>, PackError> {
+        let file_len = self.file.metadata()?.len();
+        let payload_len = file_len - (PACK_TRAILER_SIZE as u64);
+        let mut current_offset = PACK_HEADER_SIZE as u64;
+        let mut entries = Vec::with_capacity(self.object_count as usize);
+
+        while current_offset < payload_len && entries.len() < self.object_count as usize {
+            self.file.seek(SeekFrom::Start(current_offset))?;
+            let mut rec_hdr = [0u8; RECORD_HEADER_SIZE];
+            self.file.read_exact(&mut rec_hdr)?;
+
+            let orig_len = u64::from_le_bytes(rec_hdr[4..12].try_into().unwrap());
+            let stored_len = u64::from_le_bytes(rec_hdr[12..20].try_into().unwrap());
+            let oid = ObjectId::from_bytes(rec_hdr[20..52].try_into().unwrap());
+
+            entries.push(crate::pack_index::IndexEntry {
+                id: oid,
+                offset: current_offset,
+                stored_len: stored_len as u32,
+                orig_len: orig_len as u32,
+            });
+
+            current_offset += (RECORD_HEADER_SIZE as u64) + stored_len;
+        }
+
+        Ok(entries)
+    }
 }

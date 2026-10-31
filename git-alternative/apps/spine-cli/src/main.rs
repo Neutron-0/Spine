@@ -10,10 +10,12 @@ use spine_index::{Index, IndexEntry, StageStatus};
 use spine_integrity::run_fsck;
 use spine_journal::{Journal, OperationKind, RepoStateSnapshot};
 use spine_merge::{merge_3way_text, merge_3way_trees, MergeState, ResolvedPath, TextMergeResult};
+use spine_net::{SpineClient, SpineUrl};
 use spine_object_store::{
     collect_garbage, repack_loose_objects, CompositeObjectStore, ObjectStore, PackIndexReader,
     PackReader, RepoLock, DEFAULT_GRACE_PERIOD_SECS,
 };
+use spine_protocol::messages::RefUpdateProposal;
 use spine_worktree::{
     check_switch_safety, compute_status, execute_switch, flatten_tree, metadata_to_stat,
     stage_path, write_index_to_tree, IgnoreRules,
@@ -155,6 +157,79 @@ enum Commands {
     },
     /// Verify integrity of all packfiles, indexes, and storage catalog
     VerifyStorage,
+    /// Manage set of tracked remote repositories
+    Remote {
+        #[command(subcommand)]
+        action: Option<RemoteAction>,
+    },
+    /// Clone a remote repository into a new directory
+    Clone {
+        /// Remote repository URL (e.g. spine://127.0.0.1:4434/repo)
+        url: String,
+        /// Target directory to clone into
+        directory: Option<PathBuf>,
+    },
+    /// Download objects and refs from another repository
+    Fetch {
+        /// Remote repository name (default "origin")
+        #[arg(default_value = "origin")]
+        remote: String,
+        /// Fetch all remotes
+        #[arg(long)]
+        all: bool,
+    },
+    /// Update remote refs along with associated objects
+    Push {
+        /// Remote repository name (default "origin")
+        #[arg(default_value = "origin")]
+        remote: String,
+        /// Branch name to push
+        branch: Option<String>,
+        /// Force update remote references (bypass fast-forward check)
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Fetch from and integrate with another repository or branch
+    Pull {
+        /// Remote repository name (default "origin")
+        #[arg(default_value = "origin")]
+        remote: String,
+        /// Branch name to pull
+        branch: Option<String>,
+    },
+    /// Create, list, or delete tags
+    Tag {
+        #[command(subcommand)]
+        action: Option<TagAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RemoteAction {
+    /// Add a new remote repository
+    Add { name: String, url: String },
+    /// List all configured remotes
+    List,
+    /// Remove a remote
+    Remove { name: String },
+    /// Get URL for a named remote
+    GetUrl { name: String },
+    /// Change the URL for a named remote
+    SetUrl { name: String, url: String },
+}
+
+#[derive(Subcommand)]
+enum TagAction {
+    /// List all tags
+    List,
+    /// Create a new tag pointing to rev (default HEAD)
+    Create {
+        name: String,
+        #[arg(default_value = "HEAD")]
+        rev: String,
+    },
+    /// Delete a tag
+    Delete { name: String },
 }
 
 #[derive(Subcommand)]
@@ -284,6 +359,20 @@ fn resolve_commit_ref(
     if branch_ref.exists() {
         let content = fs::read_to_string(branch_ref)?.trim().to_string();
         return ObjectId::from_hex(&content).context("Invalid branch ref");
+    }
+
+    // Check tag
+    let tag_ref = spine_dir.join("refs").join("tags").join(rev);
+    if tag_ref.exists() {
+        let content = fs::read_to_string(tag_ref)?.trim().to_string();
+        return ObjectId::from_hex(&content).context("Invalid tag ref");
+    }
+
+    // Check remote tracking ref (e.g. origin/main)
+    let remote_ref = spine_dir.join("refs").join("remotes").join(rev);
+    if remote_ref.exists() {
+        let content = fs::read_to_string(remote_ref)?.trim().to_string();
+        return ObjectId::from_hex(&content).context("Invalid remote tracking ref");
     }
 
     // Direct hash
@@ -531,7 +620,8 @@ fn summarize_diff<S: ObjectStore>(
     summary
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -2089,6 +2179,539 @@ fn main() -> Result<()> {
                     eprintln!("Corrupted objects: {:?}", report.corrupted_objects);
                 }
                 bail!("Storage verification detected corruption!");
+            }
+        }
+
+        Commands::Remote { action } => {
+            let (_worktree_root, spine_dir) = find_repo_root()?;
+            let config_path = spine_dir.join("spine.toml");
+            let mut config = SpineConfig::load_from_file(&config_path)?;
+
+            match action.unwrap_or(RemoteAction::List) {
+                RemoteAction::Add { name, url } => {
+                    SpineUrl::parse(&url).context("Invalid remote URL")?;
+                    config.add_remote(&name, &url);
+                    config.save_to_file(&config_path)?;
+                    println!("Added remote '{}' with URL '{}'", name, url);
+                }
+                RemoteAction::List => {
+                    if config.remote.is_empty() {
+                        println!("No remotes configured.");
+                    } else {
+                        for (name, r) in &config.remote {
+                            println!("{}\t{}", name, r.url);
+                        }
+                    }
+                }
+                RemoteAction::Remove { name } => {
+                    if config.remove_remote(&name) {
+                        config.save_to_file(&config_path)?;
+                        let tracking_dir = spine_dir.join("refs").join("remotes").join(&name);
+                        let _ = fs::remove_dir_all(tracking_dir);
+                        println!("Removed remote '{}'", name);
+                    } else {
+                        bail!("error: No such remote: '{}'", name);
+                    }
+                }
+                RemoteAction::GetUrl { name } => {
+                    if let Some(r) = config.get_remote(&name) {
+                        println!("{}", r.url);
+                    } else {
+                        bail!("error: No such remote: '{}'", name);
+                    }
+                }
+                RemoteAction::SetUrl { name, url } => {
+                    SpineUrl::parse(&url).context("Invalid remote URL")?;
+                    if config.set_remote_url(&name, &url) {
+                        config.save_to_file(&config_path)?;
+                        println!("Updated remote '{}' URL to '{}'", name, url);
+                    } else {
+                        bail!("error: No such remote: '{}'", name);
+                    }
+                }
+            }
+        }
+
+        Commands::Clone { url, directory } => {
+            let parsed_url = SpineUrl::parse(&url).context("Invalid clone URL")?;
+            let target_dir = match directory {
+                Some(d) => {
+                    if d.is_absolute() {
+                        d
+                    } else {
+                        env::current_dir()?.join(d)
+                    }
+                }
+                None => {
+                    let name = parsed_url
+                        .path
+                        .split('/')
+                        .next_back()
+                        .unwrap_or("repository");
+                    env::current_dir()?.join(name)
+                }
+            };
+
+            if target_dir.exists() {
+                let is_empty = fs::read_dir(&target_dir)?.next().is_none();
+                if !is_empty {
+                    bail!(
+                        "fatal: destination path '{}' already exists and is not an empty directory.",
+                        target_dir.display()
+                    );
+                }
+            } else {
+                fs::create_dir_all(&target_dir)?;
+            }
+
+            println!("Cloning into '{}'...", target_dir.display());
+
+            // 1. Initialize repository structure
+            let spine_dir = target_dir.join(".spine");
+            fs::create_dir_all(spine_dir.join("objects").join("pack"))?;
+            fs::create_dir_all(spine_dir.join("refs").join("heads"))?;
+            fs::create_dir_all(spine_dir.join("refs").join("tags"))?;
+            fs::create_dir_all(spine_dir.join("refs").join("remotes").join("origin"))?;
+
+            // 2. Write initial config with origin
+            let config_path = spine_dir.join("spine.toml");
+            let mut config = SpineConfig::default();
+            config.add_remote("origin", &url);
+            config.save_to_file(&config_path)?;
+
+            let store = CompositeObjectStore::new(&spine_dir, HashAlgorithm::Blake3, 3)?;
+
+            // 3. Connect to remote
+            let mut client = SpineClient::connect(&url, None, None)
+                .await
+                .context("Failed to connect to Spine daemon")?;
+
+            let default_branch = client
+                .repo_info()
+                .map(|i| i.default_branch.clone())
+                .unwrap_or_else(|| "main".to_string());
+
+            let remote_ref_name = format!("refs/heads/{}", default_branch);
+            let advertised = client.advertised_refs().clone();
+
+            let target_oid = match advertised.get(&remote_ref_name) {
+                Some(oid) => *oid,
+                None => {
+                    println!("warning: You appear to have cloned an empty repository.");
+                    fs::write(
+                        spine_dir.join("HEAD"),
+                        format!("ref: refs/heads/{}\n", default_branch),
+                    )?;
+                    return Ok(());
+                }
+            };
+
+            // 4. Fetch missing objects
+            let _ = client
+                .fetch(&[target_oid], &[], &spine_dir, &store)
+                .await
+                .context("Failed to stream pack during clone")?;
+
+            // 5. Update local references
+            fs::write(
+                spine_dir.join("refs").join("heads").join(&default_branch),
+                format!("{}\n", target_oid.to_hex()),
+            )?;
+            fs::write(
+                spine_dir
+                    .join("refs")
+                    .join("remotes")
+                    .join("origin")
+                    .join(&default_branch),
+                format!("{}\n", target_oid.to_hex()),
+            )?;
+            fs::write(
+                spine_dir.join("HEAD"),
+                format!("ref: refs/heads/{}\n", default_branch),
+            )?;
+
+            // 6. Check out working tree
+            let commit_record = get_commit(&store, &target_oid)?;
+            let mut new_index = Index::new();
+
+            execute_switch(
+                &target_dir,
+                &mut new_index,
+                &store,
+                None,
+                &commit_record.root_tree,
+            )?;
+            new_index.save_to_file(spine_dir.join("index"))?;
+
+            println!("Checking out files: done.");
+            println!("Switched to a new branch '{}'", default_branch);
+        }
+
+        Commands::Fetch { remote, all } => {
+            let (_worktree_root, spine_dir) = find_repo_root()?;
+            let config_path = spine_dir.join("spine.toml");
+            let config = SpineConfig::load_from_file(&config_path)?;
+            let store = open_store(&spine_dir, &config)?;
+
+            let remotes_to_fetch: Vec<(&str, &str)> = if all {
+                config
+                    .remote
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.url.as_str()))
+                    .collect()
+            } else {
+                let r = config.get_remote(&remote).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "fatal: '{}' does not appear to be a spine repository",
+                        remote
+                    )
+                })?;
+                vec![(remote.as_str(), r.url.as_str())]
+            };
+
+            for (r_name, r_url) in remotes_to_fetch {
+                println!("Fetching from {} ({})", r_name, r_url);
+                let mut client = SpineClient::connect(r_url, None, None)
+                    .await
+                    .context(format!("Failed to connect to remote '{}'", r_name))?;
+
+                let advertised = client.advertised_refs().clone();
+
+                let mut have = Vec::new();
+                let heads_dir = spine_dir.join("refs").join("heads");
+                if heads_dir.exists() {
+                    for entry in fs::read_dir(&heads_dir)?.flatten() {
+                        if let Ok(c) = fs::read_to_string(entry.path()) {
+                            if let Ok(oid) = ObjectId::from_hex(c.trim()) {
+                                have.push(oid);
+                            }
+                        }
+                    }
+                }
+
+                let mut want = Vec::new();
+                let mut updates = Vec::new();
+
+                for (ref_name, remote_oid) in &advertised {
+                    if let Some(branch) = ref_name.strip_prefix("refs/heads/") {
+                        let tracking_file = spine_dir
+                            .join("refs")
+                            .join("remotes")
+                            .join(r_name)
+                            .join(branch);
+
+                        let current_tracking = if tracking_file.exists() {
+                            let c = fs::read_to_string(&tracking_file).unwrap_or_default();
+                            ObjectId::from_hex(c.trim()).ok()
+                        } else {
+                            None
+                        };
+
+                        if current_tracking != Some(*remote_oid) {
+                            want.push(*remote_oid);
+                            updates.push((branch.to_string(), current_tracking, *remote_oid));
+                        }
+                    }
+                }
+
+                if want.is_empty() {
+                    println!("From {}", r_url);
+                    println!(" = [up to date]      all branches match remote");
+                    continue;
+                }
+
+                let _ = client.fetch(&want, &have, &spine_dir, &store).await?;
+
+                println!("From {}", r_url);
+                for (branch, old_oid, new_oid) in updates {
+                    let tracking_file = spine_dir
+                        .join("refs")
+                        .join("remotes")
+                        .join(r_name)
+                        .join(&branch);
+                    if let Some(parent) = tracking_file.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(&tracking_file, format!("{}\n", new_oid.to_hex()))?;
+
+                    let old_short = old_oid
+                        .map(|o| o.to_hex()[..7].to_string())
+                        .unwrap_or_else(|| "[new]".to_string());
+                    let new_short = &new_oid.to_hex()[..7];
+                    println!(
+                        "   {}..{}  {} -> {}/{}",
+                        old_short, new_short, branch, r_name, branch
+                    );
+                }
+            }
+        }
+
+        Commands::Push {
+            remote,
+            branch,
+            force,
+        } => {
+            let (_worktree_root, spine_dir) = find_repo_root()?;
+            let config_path = spine_dir.join("spine.toml");
+            let config = SpineConfig::load_from_file(&config_path)?;
+            let store = open_store(&spine_dir, &config)?;
+
+            let r = config.get_remote(&remote).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "fatal: '{}' does not appear to be a spine repository",
+                    remote
+                )
+            })?;
+
+            let target_branch = match branch {
+                Some(b) => b,
+                None => {
+                    let head_content = fs::read_to_string(spine_dir.join("HEAD"))?;
+                    if let Some(rest) = head_content.strip_prefix("ref: refs/heads/") {
+                        rest.trim().to_string()
+                    } else {
+                        bail!("fatal: You are not currently on a branch. Please specify branch to push.");
+                    }
+                }
+            };
+
+            let local_ref_file = spine_dir.join("refs").join("heads").join(&target_branch);
+            if !local_ref_file.exists() {
+                bail!("fatal: Local branch '{}' does not exist.", target_branch);
+            }
+            let local_oid_str = fs::read_to_string(&local_ref_file)?;
+            let local_oid = ObjectId::from_hex(local_oid_str.trim())?;
+
+            println!("Pushing to {} ({})", remote, r.url);
+            let mut client = SpineClient::connect(&r.url, None, None)
+                .await
+                .context(format!("Failed to connect to remote '{}'", remote))?;
+
+            let remote_ref_name = format!("refs/heads/{}", target_branch);
+            let advertised = client.advertised_refs().clone();
+            let remote_oid = advertised.get(&remote_ref_name).copied();
+
+            if remote_oid == Some(local_oid) {
+                println!("Everything up-to-date");
+                return Ok(());
+            }
+
+            let proposal = RefUpdateProposal {
+                ref_name: remote_ref_name.clone(),
+                expected_old_oid: remote_oid,
+                new_oid: local_oid,
+                force,
+            };
+
+            let remote_tips: Vec<ObjectId> = advertised.values().copied().collect();
+            let res = client
+                .push(&[proposal], &store, &remote_tips)
+                .await
+                .context("Push operation failed")?;
+
+            for update_res in res.results {
+                if update_res.status == "ok" {
+                    let tracking_file = spine_dir
+                        .join("refs")
+                        .join("remotes")
+                        .join(&remote)
+                        .join(&target_branch);
+                    if let Some(parent) = tracking_file.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(&tracking_file, format!("{}\n", local_oid.to_hex()))?;
+
+                    let old_short = remote_oid
+                        .map(|o| o.to_hex()[..7].to_string())
+                        .unwrap_or_else(|| "[new branch]".to_string());
+                    let new_short = &local_oid.to_hex()[..7];
+                    println!("To {}", r.url);
+                    println!(
+                        "   {}..{}  {} -> {}",
+                        old_short, new_short, target_branch, target_branch
+                    );
+                } else if update_res.status == "non_fast_forward" {
+                    eprintln!("To {}", r.url);
+                    eprintln!(
+                        " ! [rejected]        {} -> {} (non-fast-forward)",
+                        target_branch, target_branch
+                    );
+                    eprintln!("error: failed to push some refs to '{}'", r.url);
+                    eprintln!("hint: Updates were rejected because the tip of your current branch is behind");
+                    eprintln!("hint: its remote counterpart. Integrate the remote changes (e.g.");
+                    eprintln!(
+                        "hint: 'spine pull {} {}') before pushing again.",
+                        remote, target_branch
+                    );
+                    eprintln!("hint: See 'spine push --help' for options like --force.");
+                    bail!("Push rejected: non-fast-forward");
+                } else if update_res.status == "stale_ref" {
+                    eprintln!("To {}", r.url);
+                    eprintln!(
+                        " ! [rejected]        {} -> {} (stale reference)",
+                        target_branch, target_branch
+                    );
+                    eprintln!("error: Remote reference changed concurrently by another user.");
+                    bail!("Push rejected: stale reference");
+                } else {
+                    bail!("Push failed: {}", update_res.status);
+                }
+            }
+        }
+
+        Commands::Pull { remote, branch } => {
+            let (worktree_root, spine_dir) = find_repo_root()?;
+            let config_path = spine_dir.join("spine.toml");
+            let config = SpineConfig::load_from_file(&config_path)?;
+            let store = open_store(&spine_dir, &config)?;
+
+            let target_branch = match branch {
+                Some(b) => b,
+                None => {
+                    let head_content = fs::read_to_string(spine_dir.join("HEAD"))?;
+                    if let Some(rest) = head_content.strip_prefix("ref: refs/heads/") {
+                        rest.trim().to_string()
+                    } else {
+                        bail!("fatal: You are not currently on a branch.");
+                    }
+                }
+            };
+
+            let r = config.get_remote(&remote).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "fatal: '{}' does not appear to be a spine repository",
+                    remote
+                )
+            })?;
+
+            let mut client = SpineClient::connect(&r.url, None, None)
+                .await
+                .context(format!("Failed to connect to remote '{}'", remote))?;
+
+            let remote_ref_name = format!("refs/heads/{}", target_branch);
+            let advertised = client.advertised_refs().clone();
+
+            let remote_oid = match advertised.get(&remote_ref_name) {
+                Some(oid) => *oid,
+                None => {
+                    println!(
+                        "Your branch is up to date (remote has no branch '{}').",
+                        target_branch
+                    );
+                    return Ok(());
+                }
+            };
+
+            let local_ref_file = spine_dir.join("refs").join("heads").join(&target_branch);
+            let local_oid = if local_ref_file.exists() {
+                let s = fs::read_to_string(&local_ref_file)?;
+                ObjectId::from_hex(s.trim())?
+            } else {
+                bail!("Local branch '{}' does not exist.", target_branch);
+            };
+
+            if local_oid == remote_oid {
+                println!("Already up to date.");
+                return Ok(());
+            }
+
+            let _ = client
+                .fetch(&[remote_oid], &[local_oid], &spine_dir, &store)
+                .await?;
+
+            let tracking_file = spine_dir
+                .join("refs")
+                .join("remotes")
+                .join(&remote)
+                .join(&target_branch);
+            if let Some(parent) = tracking_file.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&tracking_file, format!("{}\n", remote_oid.to_hex()))?;
+
+            let can_ff = is_ancestor(&store, &local_oid, &remote_oid)?;
+            if can_ff {
+                fs::write(&local_ref_file, format!("{}\n", remote_oid.to_hex()))?;
+
+                let commit_record = get_commit(&store, &remote_oid)?;
+                let mut index =
+                    Index::load_from_file(spine_dir.join("index")).unwrap_or_else(|_| Index::new());
+
+                execute_switch(
+                    &worktree_root,
+                    &mut index,
+                    &store,
+                    Some(&get_commit(&store, &local_oid)?.root_tree),
+                    &commit_record.root_tree,
+                )?;
+                index.save_to_file(spine_dir.join("index"))?;
+
+                println!(
+                    "Updating {}..{}",
+                    &local_oid.to_hex()[..7],
+                    &remote_oid.to_hex()[..7]
+                );
+                println!("Fast-forward complete.");
+            } else {
+                eprintln!("warning: Divergent branches detected!");
+                eprintln!(
+                    "Local tip {} and remote tip {} have diverged.",
+                    &local_oid.to_hex()[..7],
+                    &remote_oid.to_hex()[..7]
+                );
+                eprintln!(
+                    "Run 'spine merge {}/{}' to merge changes.",
+                    remote, target_branch
+                );
+                bail!("Automatic fast-forward not possible; manual merge required.");
+            }
+        }
+
+        Commands::Tag { action } => {
+            let (_worktree_root, spine_dir) = find_repo_root()?;
+            let config = SpineConfig::load_from_file(spine_dir.join("spine.toml"))?;
+            let store = open_store(&spine_dir, &config)?;
+
+            match action.unwrap_or(TagAction::List) {
+                TagAction::List => {
+                    let tags_dir = spine_dir.join("refs").join("tags");
+                    if tags_dir.exists() {
+                        let mut tag_names = Vec::new();
+                        for entry in fs::read_dir(tags_dir)?.flatten() {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            tag_names.push(name);
+                        }
+                        tag_names.sort();
+                        for name in tag_names {
+                            println!("{}", name);
+                        }
+                    }
+                }
+                TagAction::Create { name, rev } => {
+                    let target_oid = resolve_commit_ref(&spine_dir, &store, &rev)?;
+                    let tag_file = spine_dir.join("refs").join("tags").join(&name);
+                    if tag_file.exists() {
+                        bail!("fatal: tag '{}' already exists", name);
+                    }
+                    if let Some(parent) = tag_file.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(&tag_file, format!("{}\n", target_oid.to_hex()))?;
+                    println!(
+                        "Created tag '{}' pointing to {}",
+                        name,
+                        &target_oid.to_hex()[..7]
+                    );
+                }
+                TagAction::Delete { name } => {
+                    let tag_file = spine_dir.join("refs").join("tags").join(&name);
+                    if tag_file.exists() {
+                        fs::remove_file(&tag_file)?;
+                        println!("Deleted tag '{}'", name);
+                    } else {
+                        bail!("error: tag '{}' not found", name);
+                    }
+                }
             }
         }
     }
