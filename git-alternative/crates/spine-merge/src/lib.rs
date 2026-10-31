@@ -81,6 +81,8 @@ pub struct MergeState {
     pub ours_commit: ObjectId,
     pub theirs_commit: ObjectId,
     pub conflicts: Vec<PathConflict>,
+    #[serde(default)]
+    pub resolved_paths: BTreeSet<String>,
     pub timestamp_nanos: i64,
 }
 
@@ -116,6 +118,31 @@ impl MergeState {
             fs::remove_file(p)?;
         }
         Ok(())
+    }
+
+    /// Mark a conflicted path as explicitly resolved.
+    /// Returns true if the path was a recognized conflict and was newly marked resolved.
+    pub fn mark_resolved(&mut self, path: &str) -> bool {
+        if self.conflicts.iter().any(|c| c.path == path) {
+            self.resolved_paths.insert(path.to_string())
+        } else {
+            false
+        }
+    }
+
+    /// Check whether all recorded conflicts have been explicitly resolved.
+    pub fn is_fully_resolved(&self) -> bool {
+        self.conflicts
+            .iter()
+            .all(|c| self.resolved_paths.contains(&c.path))
+    }
+
+    /// Returns a list of conflicts that are not yet marked as resolved.
+    pub fn unresolved_conflicts(&self) -> Vec<&PathConflict> {
+        self.conflicts
+            .iter()
+            .filter(|c| !self.resolved_paths.contains(&c.path))
+            .collect()
     }
 }
 

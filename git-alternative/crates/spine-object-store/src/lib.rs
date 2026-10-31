@@ -49,12 +49,31 @@ pub trait ObjectStore: Send + Sync {
     fn list_objects(&self) -> Result<Vec<ObjectId>, ObjectStoreError>;
 }
 
+pub mod catalog;
+pub mod composite;
+pub mod gc;
+pub mod lock;
+pub mod pack;
+pub mod pack_index;
+pub mod repack;
+
+pub use catalog::{CatalogError, PackCatalog, PackMetadata};
+pub use composite::{ActivePack, CompositeObjectStore, StorageAuditReport, StorageCountSummary};
+pub use gc::{collect_garbage, compute_reachable_set, GcSummary, DEFAULT_GRACE_PERIOD_SECS};
+pub use lock::{LockError, RepoLock};
+pub use pack::{PackError, PackReader, PackWriter, PACK_MAGIC, PACK_VERSION};
+pub use pack_index::{
+    IndexEntry, IndexEntryMeta, PackIndexError, PackIndexReader, PackIndexWriter, INDEX_MAGIC,
+    INDEX_VERSION,
+};
+pub use repack::{repack_loose_objects, RepackSummary};
+
 /// On-disk filesystem object store located at `.spine/objects`.
 pub struct FileSystemObjectStore {
-    objects_dir: PathBuf,
-    tmp_dir: PathBuf,
-    algorithm: HashAlgorithm,
-    compression_level: i32,
+    pub(crate) objects_dir: PathBuf,
+    pub(crate) tmp_dir: PathBuf,
+    pub(crate) algorithm: HashAlgorithm,
+    pub(crate) compression_level: i32,
 }
 
 impl FileSystemObjectStore {
@@ -77,10 +96,14 @@ impl FileSystemObjectStore {
         })
     }
 
-    fn object_path(&self, id: &ObjectId) -> PathBuf {
+    pub fn object_path(&self, id: &ObjectId) -> PathBuf {
         let hex = id.to_hex();
         let (prefix, suffix) = hex.split_at(2);
         self.objects_dir.join(prefix).join(suffix)
+    }
+
+    pub fn algorithm(&self) -> HashAlgorithm {
+        self.algorithm
     }
 }
 
@@ -285,5 +308,151 @@ mod tests {
 
         // Read must fail with compression or hash mismatch error
         assert!(store.read_object(&oid).is_err());
+    }
+
+    #[test]
+    fn test_pack_and_index_roundtrip_with_fanout() {
+        let temp = tempdir().unwrap();
+        let spk_path = temp.path().join("test.spk");
+        let spidx_path = temp.path().join("test.spidx");
+
+        let algo = HashAlgorithm::Blake3;
+        let count = 50;
+        let mut writer = PackWriter::new(&spk_path, algo, count, 3).unwrap();
+        let mut index_entries = Vec::new();
+        let mut expected_objects = Vec::new();
+
+        for i in 0..count {
+            let payload = format!("Object payload test string iteration number {}", i).into_bytes();
+            let oid = ObjectId::compute(algo, ObjectType::Blob, &payload);
+            let (offset, stored_len, orig_len) = writer
+                .append_object(&oid, ObjectType::Blob, &payload)
+                .unwrap();
+            index_entries.push(IndexEntry {
+                id: oid,
+                offset,
+                stored_len,
+                orig_len,
+            });
+            expected_objects.push((oid, payload));
+        }
+
+        let cum_hash = writer.finish().unwrap();
+        let idx_hash = PackIndexWriter::write_index(&spidx_path, algo, index_entries).unwrap();
+        assert_ne!(cum_hash, [0u8; 28]);
+        assert_ne!(idx_hash, [0u8; 28]);
+
+        // Open reader and verify integrity
+        let mut reader = PackReader::open(&spk_path).unwrap();
+        assert_eq!(reader.object_count(), count);
+        assert_eq!(reader.verify_integrity().unwrap(), count);
+
+        // Open index reader and verify lookup via fanout
+        let idx_reader = PackIndexReader::open(&spidx_path).unwrap();
+        idx_reader.verify_integrity().unwrap();
+        assert_eq!(idx_reader.object_count(), count);
+
+        for (oid, expected_data) in &expected_objects {
+            let meta = idx_reader.lookup(oid).expect("Object must be in index");
+            let (read_oid, obj_type, data) = reader.read_object_at(meta.offset).unwrap();
+            assert_eq!(read_oid, *oid);
+            assert_eq!(obj_type, ObjectType::Blob);
+            assert_eq!(&data, expected_data);
+        }
+
+        // Looking up an unknown object must return None
+        let dummy = ObjectId::compute(algo, ObjectType::Blob, b"non-existent object");
+        assert!(idx_reader.lookup(&dummy).is_none());
+    }
+
+    #[test]
+    fn test_repack_loose_to_pack_and_composite_read() {
+        let temp = tempdir().unwrap();
+        let store = CompositeObjectStore::new(temp.path(), HashAlgorithm::Blake3, 3).unwrap();
+
+        // Write several loose objects
+        let mut oids = Vec::new();
+        for i in 0..10 {
+            let data = format!("Repack test data content {}", i).into_bytes();
+            let oid = store.write_object(ObjectType::Blob, &data).unwrap();
+            oids.push((oid, data));
+        }
+
+        let pre_summary = store.count_objects();
+        assert_eq!(pre_summary.loose_count, 10);
+        assert_eq!(pre_summary.pack_count, 0);
+
+        // Execute repack
+        let summary = repack_loose_objects(&store, 3, false).unwrap();
+        assert_eq!(summary.objects_repacked, 10);
+        assert_eq!(summary.loose_deleted, 10);
+        assert!(summary.pack_id.is_some());
+
+        let post_summary = store.count_objects();
+        assert_eq!(post_summary.loose_count, 0);
+        assert_eq!(post_summary.pack_count, 1);
+        assert_eq!(post_summary.packed_count, 10);
+
+        // Verify all objects can be read transparently through CompositeObjectStore
+        for (oid, data) in &oids {
+            assert!(store.has_object(oid));
+            let (t, payload) = store.read_object(oid).unwrap();
+            assert_eq!(t, ObjectType::Blob);
+            assert_eq!(&payload, data);
+        }
+
+        // Verify storage audit report
+        let report = store.verify_storage().unwrap();
+        assert_eq!(report.total_verified_objects, 10);
+        assert!(report.corrupted_objects.is_empty());
+        assert!(report.corrupted_packs.is_empty());
+    }
+
+    #[test]
+    fn test_gc_reachability_and_grace_period() {
+        let temp = tempdir().unwrap();
+        let store = CompositeObjectStore::new(temp.path(), HashAlgorithm::Blake3, 3).unwrap();
+
+        // Root object (reachable)
+        let root_oid = store
+            .write_object(ObjectType::Blob, b"root live object")
+            .unwrap();
+        // Orphan object (unreachable)
+        let orphan_oid = store
+            .write_object(ObjectType::Blob, b"orphan dead object")
+            .unwrap();
+
+        // 1. With a standard 14-day grace period, orphan is unreachable but preserved
+        let gc_res = collect_garbage(
+            &store,
+            &[root_oid],
+            std::time::Duration::from_secs(14 * 86400),
+            false,
+        )
+        .unwrap();
+        assert_eq!(gc_res.reachable_objects, 1);
+        assert_eq!(gc_res.unreachable_objects, 1);
+        assert_eq!(gc_res.grace_period_preserved, 1);
+        assert_eq!(gc_res.pruned_objects, 0);
+        assert!(store.has_object(&orphan_oid));
+
+        // 2. With zero grace period, orphan is immediately pruned
+        let gc_prune =
+            collect_garbage(&store, &[root_oid], std::time::Duration::ZERO, false).unwrap();
+        assert_eq!(gc_prune.pruned_objects, 1);
+        assert!(!store.has_object(&orphan_oid));
+        assert!(store.has_object(&root_oid));
+    }
+
+    #[test]
+    fn test_repo_lock_protection() {
+        let temp = tempdir().unwrap();
+        let lock1 = RepoLock::acquire(temp.path(), "repack").unwrap();
+        // Second lock attempt must fail with AlreadyLocked
+        assert!(RepoLock::acquire(temp.path(), "gc").is_err());
+        drop(lock1);
+        // After drop, lock can be acquired again
+        let lock2 = RepoLock::acquire(temp.path(), "gc");
+        assert!(lock2.is_ok());
     }
 }

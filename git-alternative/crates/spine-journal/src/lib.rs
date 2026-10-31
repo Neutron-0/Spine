@@ -2,7 +2,6 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use spine_core::ObjectId;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
@@ -41,8 +40,10 @@ pub enum OperationKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransactionStatus {
     Prepared,
+    Applying,
     Committed,
     Aborted,
+    RecoveryRequired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,22 +72,18 @@ pub struct TransactionRecord {
 pub struct Journal {
     base_dir: PathBuf,
     records_dir: PathBuf,
-    tmp_dir: PathBuf,
 }
 
 impl Journal {
     pub fn new(journal_dir: impl AsRef<Path>) -> Result<Self, JournalError> {
         let base_dir = journal_dir.as_ref().to_path_buf();
         let records_dir = base_dir.join("records");
-        let tmp_dir = base_dir.join("tmp");
 
         fs::create_dir_all(&records_dir)?;
-        fs::create_dir_all(&tmp_dir)?;
 
         Ok(Self {
             base_dir,
             records_dir,
-            tmp_dir,
         })
     }
 
@@ -131,13 +128,28 @@ impl Journal {
         Ok(record)
     }
 
+    pub fn mark_applying(&mut self, tx_id: &str) -> Result<(), JournalError> {
+        let mut record = self.find_record_by_id(tx_id)?;
+        if record.status != TransactionStatus::Prepared {
+            return Err(JournalError::InvalidState(format!(
+                "Cannot transition transaction {} to Applying from status {:?}",
+                tx_id, record.status
+            )));
+        }
+        record.status = TransactionStatus::Applying;
+        self.write_record_atomic(&record)?;
+        Ok(())
+    }
+
     pub fn commit_transaction(
         &mut self,
         tx_id: &str,
         after: RepoStateSnapshot,
     ) -> Result<(), JournalError> {
         let mut record = self.find_record_by_id(tx_id)?;
-        if record.status != TransactionStatus::Prepared {
+        if record.status != TransactionStatus::Prepared
+            && record.status != TransactionStatus::Applying
+        {
             return Err(JournalError::InvalidState(format!(
                 "Cannot commit transaction {} in status {:?}",
                 tx_id, record.status
@@ -160,27 +172,56 @@ impl Journal {
         Ok(())
     }
 
-    pub fn check_and_recover(&mut self) -> Result<Option<TransactionRecord>, JournalError> {
+    pub fn mark_recovery_required(
+        &mut self,
+        tx_id: &str,
+        reason: &str,
+    ) -> Result<(), JournalError> {
+        let mut record = self.find_record_by_id(tx_id)?;
+        record.status = TransactionStatus::RecoveryRequired;
+        record.abort_reason = Some(reason.to_string());
+        self.write_record_atomic(&record)?;
+        Ok(())
+    }
+
+    pub fn recover_with<F>(
+        &mut self,
+        mut rollback_fn: F,
+    ) -> Result<Vec<TransactionRecord>, JournalError>
+    where
+        F: FnMut(&TransactionRecord) -> Result<(), String>,
+    {
         let records = self.list_records()?;
+        let mut recovered = Vec::new();
         for mut r in records.into_iter().rev() {
-            if r.status == TransactionStatus::Prepared {
-                // Interrupted transaction found! Mark as aborted
-                r.status = TransactionStatus::Aborted;
-                r.abort_reason = Some("Interrupted by crash or abnormal termination".to_string());
+            if r.status == TransactionStatus::Prepared || r.status == TransactionStatus::Applying {
+                match rollback_fn(&r) {
+                    Ok(()) => {
+                        r.status = TransactionStatus::Aborted;
+                        r.abort_reason = Some(format!(
+                            "Interrupted by crash or abnormal termination; rolled back ({:?})",
+                            r.kind
+                        ));
+                    }
+                    Err(err) => {
+                        r.status = TransactionStatus::RecoveryRequired;
+                        r.abort_reason = Some(format!("Rollback failed: {}", err));
+                    }
+                }
                 self.write_record_atomic(&r)?;
-                return Ok(Some(r));
+                recovered.push(r);
             }
         }
-        Ok(None)
+        Ok(recovered)
+    }
+
+    pub fn check_and_recover(&mut self) -> Result<Option<TransactionRecord>, JournalError> {
+        let recovered = self.recover_with(|_| Ok(()))?;
+        Ok(recovered.into_iter().next())
     }
 
     pub fn set_head(&self, tx_id: &str) -> Result<(), JournalError> {
-        let temp_path = self.tmp_dir.join(format!("head-{}", Uuid::new_v4()));
-        let mut f = fs::File::create(&temp_path)?;
-        f.write_all(tx_id.as_bytes())?;
-        f.flush()?;
-        drop(f);
-        fs::rename(temp_path, self.head_file())?;
+        spine_core::atomic_write_file(&self.head_file(), tx_id.as_bytes())?;
         Ok(())
     }
 
@@ -243,14 +284,8 @@ impl Journal {
 
     fn write_record_atomic(&self, record: &TransactionRecord) -> Result<(), JournalError> {
         let json_bytes = serde_json::to_vec_pretty(record)?;
-        let temp_path = self.tmp_dir.join(format!("rec-{}", Uuid::new_v4()));
-        let mut f = fs::File::create(&temp_path)?;
-        f.write_all(&json_bytes)?;
-        f.flush()?;
-        drop(f);
-
         let final_path = self.record_path(record.sequence, &record.id);
-        fs::rename(temp_path, final_path)?;
+        spine_core::atomic_write_file(&final_path, &json_bytes)?;
         Ok(())
     }
 
@@ -397,5 +432,42 @@ mod tests {
         // Now plan redo
         let to_redo = journal.plan_redo().unwrap();
         assert_eq!(to_redo.id, rec1.id);
+    }
+
+    #[test]
+    fn test_journal_state_machine_applying_and_recovery_required() {
+        let dir = tempdir().unwrap();
+        let mut journal = Journal::new(dir.path()).unwrap();
+
+        let s1 = dummy_snapshot("main");
+        let rec = journal
+            .prepare_transaction(
+                OperationKind::Commit,
+                "Multi-step pack operation".to_string(),
+                s1.clone(),
+                None,
+            )
+            .unwrap();
+
+        // Transition Prepared -> Applying
+        journal.mark_applying(&rec.id).unwrap();
+        let loaded = journal.find_record_by_id(&rec.id).unwrap();
+        assert_eq!(loaded.status, TransactionStatus::Applying);
+
+        // Simulate failed rollback
+        let recovered = journal
+            .recover_with(|_tx| Err("I/O lock failure during rollback".to_string()))
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].status, TransactionStatus::RecoveryRequired);
+        assert!(recovered[0]
+            .abort_reason
+            .as_ref()
+            .unwrap()
+            .contains("I/O lock failure"));
+
+        // Idempotency: second recovery call does not find Applying/Prepared transactions
+        let second = journal.recover_with(|_tx| Ok(())).unwrap();
+        assert!(second.is_empty());
     }
 }

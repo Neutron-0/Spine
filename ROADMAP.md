@@ -36,11 +36,23 @@
 
 ---
 
-## Milestone 3: Object Compaction, Packfiles & Network Protocol
-- [ ] Multi-object packfile format with delta-compression (Rabin fingerprinting / content-defined chunking).
-- [ ] Packfile indexing with fanout tables for sub-millisecond object resolution.
+## Milestone 3: Storage Engine V2: Packfiles, Indexing, Compaction & GC (Batch 03 - Completed)
+- [x] Immutable binary packfile format (`.spk`) with Zstandard compression and BLAKE3 framing (`ADR-0004`).
+- [x] 256-bucket fanout binary search indexing (`.spidx`) for sub-millisecond object resolution.
+- [x] Multi-pack generational catalog (`catalog.json`) with atomic publication protocol.
+- [x] High-throughput loose-to-pack repacking engine (`spine repack`, `--dry-run`, `--verify`).
+- [x] Conservative reachability-based garbage collection (`spine gc`, `--dry-run`, `--prune-before`).
+- [x] Storage inspection and auditing commands (`spine count-objects`, `spine pack list`, `spine pack inspect`, `spine verify-storage`).
+- [x] Durability hardening: 5-state operation journal (`Prepared`, `Applying`, `Committed`, `Aborted`, `RecoveryRequired`) and idempotent rollback.
+- [x] Defect remediation: explicit conflict resolution staging tracking and multi-merge-base / criss-cross rejection (`AmbiguousMergeBases`).
+- [x] Release-mode benchmarks demonstrating 1.59x to 17.14x speedup over Git (repack 6.01x, packed log 2.87x, gc 17.14x).
+
+---
+
+## Milestone 4: Network Synchronization & Remote Protocol (Batch 04)
 - [ ] Native Spine wire protocol over SSH and TLS.
-- [ ] `spine remote`, `spine push`, `spine pull`, and `spine clone`.
+- [ ] Remote reference advertisement and negotiation.
+- [ ] Packfile streaming and bundle generation for `spine push`, `spine pull`, `spine clone`.
 - [ ] Cryptographic commit and tag signing (Ed25519 / SSH keys).
 
 ---

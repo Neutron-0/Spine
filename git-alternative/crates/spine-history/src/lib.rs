@@ -14,6 +14,8 @@ pub enum HistoryError {
     CommitNotFound(ObjectId),
     #[error("Object is not a commit: {0}")]
     NotACommit(ObjectId),
+    #[error("Ambiguous merge bases detected ({0} candidates: {1}); criss-cross history cannot be resolved automatically without virtual base synthesis")]
+    AmbiguousMergeBases(usize, String),
     #[error("Object store error: {0}")]
     ObjectStore(#[from] ObjectStoreError),
     #[error("Format error: {0}")]
@@ -183,9 +185,9 @@ pub fn find_merge_bases<S: ObjectStore>(
     Ok(lowest)
 }
 
-/// Finds the single best merge base between two commits.
-/// In case of criss-cross merges with multiple LCA candidates, selects the one with the latest timestamp.
-pub fn find_best_merge_base<S: ObjectStore>(
+/// Finds the single unambiguous merge base between two commits.
+/// Fails safely with `HistoryError::AmbiguousMergeBases` if criss-cross history presents multiple lowest common ancestors.
+pub fn find_unique_merge_base<S: ObjectStore>(
     store: &S,
     commit_a: &ObjectId,
     commit_b: &ObjectId,
@@ -198,19 +200,22 @@ pub fn find_best_merge_base<S: ObjectStore>(
         return Ok(Some(bases[0]));
     }
 
-    // For multiple candidates (criss-cross history), pick the candidate with highest timestamp
-    let mut best = bases[0];
-    let mut best_ts = get_commit(store, &best)?.timestamp_nanos;
+    let id_list = bases
+        .iter()
+        .map(|b| b.to_hex())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(HistoryError::AmbiguousMergeBases(bases.len(), id_list))
+}
 
-    for candidate in &bases[1..] {
-        let ts = get_commit(store, candidate)?.timestamp_nanos;
-        if ts > best_ts {
-            best = *candidate;
-            best_ts = ts;
-        }
-    }
-
-    Ok(Some(best))
+/// Backwards-compatible alias for `find_unique_merge_base`.
+/// Rejects ambiguous criss-cross histories rather than arbitrarily picking timestamps.
+pub fn find_best_merge_base<S: ObjectStore>(
+    store: &S,
+    commit_a: &ObjectId,
+    commit_b: &ObjectId,
+) -> Result<Option<ObjectId>, HistoryError> {
+    find_unique_merge_base(store, commit_a, commit_b)
 }
 
 #[cfg(test)]
@@ -382,11 +387,19 @@ mod tests {
             .unwrap();
 
         let bases = find_merge_bases(&store, &m1_id, &m2_id).unwrap();
+        assert_eq!(bases.len(), 2);
         assert!(bases.contains(&a1_id));
         assert!(bases.contains(&b1_id));
 
-        let best = find_best_merge_base(&store, &m1_id, &m2_id).unwrap();
-        // b1 timestamp (25) > a1 timestamp (20)
-        assert_eq!(best, Some(b1_id));
+        // Attempting to pick a single best base without virtual synthesis must fail safely with AmbiguousMergeBases
+        let res = find_best_merge_base(&store, &m1_id, &m2_id);
+        match res {
+            Err(HistoryError::AmbiguousMergeBases(count, ids)) => {
+                assert_eq!(count, 2);
+                assert!(ids.contains(&a1_id.to_hex()));
+                assert!(ids.contains(&b1_id.to_hex()));
+            }
+            other => panic!("Expected AmbiguousMergeBases, got {:?}", other),
+        }
     }
 }

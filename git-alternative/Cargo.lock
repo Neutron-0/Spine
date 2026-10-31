@@ -884,6 +884,7 @@ dependencies = [
  "serde",
  "sha2",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]
@@ -927,6 +928,7 @@ dependencies = [
 name = "spine-integrity"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "spine-core",
  "spine-format",
  "spine-history",
@@ -970,6 +972,10 @@ dependencies = [
 name = "spine-object-store"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "chrono",
+ "serde",
+ "serde_json",
  "spine-core",
  "spine-format",
  "tempfile",

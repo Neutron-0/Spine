@@ -9,6 +9,9 @@ use std::fmt;
 use std::str::FromStr;
 use thiserror::Error;
 
+pub mod fs_util;
+pub use fs_util::{atomic_replace_file, atomic_write_file, clean_empty_parent_dirs};
+
 /// The canonical domain separator prefix for all Spine content-addressed hashing.
 pub const DOMAIN_PREFIX: &[u8] = b"SPINE\0";
 

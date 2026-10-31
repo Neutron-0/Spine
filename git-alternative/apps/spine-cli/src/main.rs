@@ -10,7 +10,10 @@ use spine_index::{Index, IndexEntry, StageStatus};
 use spine_integrity::run_fsck;
 use spine_journal::{Journal, OperationKind, RepoStateSnapshot};
 use spine_merge::{merge_3way_text, merge_3way_trees, MergeState, ResolvedPath, TextMergeResult};
-use spine_object_store::{FileSystemObjectStore, ObjectStore};
+use spine_object_store::{
+    collect_garbage, repack_loose_objects, CompositeObjectStore, ObjectStore, PackIndexReader,
+    PackReader, RepoLock, DEFAULT_GRACE_PERIOD_SECS,
+};
 use spine_worktree::{
     check_switch_safety, compute_status, execute_switch, flatten_tree, metadata_to_stat,
     stage_path, write_index_to_tree, IgnoreRules,
@@ -20,6 +23,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -124,6 +128,44 @@ enum Commands {
     Redo,
     /// Verify repository integrity and detect corruption
     Fsck,
+    /// Count unpacked and packed objects and disk footprint
+    CountObjects,
+    /// Manage packfiles and indexes
+    Pack {
+        #[command(subcommand)]
+        action: PackAction,
+    },
+    /// Consolidate loose objects into packfiles
+    Repack {
+        /// Simulate repacking without writing new packs or deleting loose objects
+        #[arg(long)]
+        dry_run: bool,
+        /// Audit and verify every object in the newly created pack
+        #[arg(long)]
+        verify: bool,
+    },
+    /// Cleanup unreachable expired objects
+    Gc {
+        /// Simulate garbage collection without deleting any objects
+        #[arg(long)]
+        dry_run: bool,
+        /// Prune objects older than duration (e.g. 14d, 2h, 0s; default 14d)
+        #[arg(long, default_value = "14d")]
+        prune_before: String,
+    },
+    /// Verify integrity of all packfiles, indexes, and storage catalog
+    VerifyStorage,
+}
+
+#[derive(Subcommand)]
+enum PackAction {
+    /// List all active packfiles in catalog
+    List,
+    /// Inspect a packfile and show record statistics
+    Inspect {
+        /// Pack ID (e.g. pack-<uuid>)
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -167,13 +209,13 @@ fn find_repo_root() -> Result<(PathBuf, PathBuf)> {
     }
 }
 
-fn open_store(spine_dir: &Path, config: &SpineConfig) -> Result<FileSystemObjectStore> {
+fn open_store(spine_dir: &Path, config: &SpineConfig) -> Result<CompositeObjectStore> {
     let algo = match config.repository.hash_algorithm.as_str() {
         "sha256" => HashAlgorithm::Sha256,
         _ => HashAlgorithm::Blake3,
     };
     let store =
-        FileSystemObjectStore::new(spine_dir, algo, 3).context("Failed to open object store")?;
+        CompositeObjectStore::new(spine_dir, algo, 3).context("Failed to open object store")?;
     Ok(store)
 }
 
@@ -227,7 +269,7 @@ fn resolve_head(spine_dir: &Path) -> Result<RepoState> {
 
 fn resolve_commit_ref(
     spine_dir: &Path,
-    store: &FileSystemObjectStore,
+    store: &CompositeObjectStore,
     rev: &str,
 ) -> Result<ObjectId> {
     if rev == "HEAD" {
@@ -282,7 +324,7 @@ fn update_ref(spine_dir: &Path, target_ref: &str, new_oid: &ObjectId) -> Result<
 fn capture_snapshot(
     spine_dir: &Path,
     state: &RepoState,
-    store: &FileSystemObjectStore,
+    store: &CompositeObjectStore,
 ) -> Result<RepoStateSnapshot> {
     let index_path = spine_dir.join("index");
     let index_checksum = if index_path.exists() {
@@ -320,7 +362,7 @@ fn capture_snapshot(
 fn restore_snapshot(
     worktree_root: &Path,
     spine_dir: &Path,
-    store: &FileSystemObjectStore,
+    store: &CompositeObjectStore,
     snapshot: &RepoStateSnapshot,
 ) -> Result<()> {
     // 1. Determine current tree BEFORE changing refs
@@ -562,8 +604,35 @@ fn main() -> Result<()> {
             let ignore = IgnoreRules::load_from_dir(&worktree_root);
 
             let mut total_staged = 0;
-            for p in paths {
-                total_staged += stage_path(&worktree_root, &p, &mut index, &store, &ignore)?;
+            for p in &paths {
+                total_staged += stage_path(&worktree_root, p, &mut index, &store, &ignore)?;
+            }
+
+            // If a merge is in progress, mark resolved conflicts
+            if let Ok(Some(mut ms)) = MergeState::load_from_dir(&spine_dir) {
+                let mut to_resolve = Vec::new();
+                for p in &paths {
+                    let p_str = p.to_string_lossy();
+                    let p_norm = p_str.replace('\\', "/");
+                    for c in &ms.conflicts {
+                        if p_norm == "."
+                            || p_norm == c.path
+                            || c.path
+                                .starts_with(&format!("{}/", p_norm.trim_end_matches('/')))
+                        {
+                            to_resolve.push(c.path.clone());
+                        }
+                    }
+                }
+                let mut updated = false;
+                for path in to_resolve {
+                    if ms.mark_resolved(&path) {
+                        updated = true;
+                    }
+                }
+                if updated {
+                    ms.save_to_dir(&spine_dir)?;
+                }
             }
 
             index.save_to_file(&index_path)?;
@@ -594,10 +663,18 @@ fn main() -> Result<()> {
                     "  (fix conflicts and run \"spine commit\" or \"spine merge --continue\")"
                 );
                 println!("  (use \"spine merge --abort\" to abort the merge)\n");
-                if !ms.conflicts.is_empty() {
+                let unresolved = ms.unresolved_conflicts();
+                if !unresolved.is_empty() {
                     println!("Unmerged paths:");
-                    for c in &ms.conflicts {
+                    for c in unresolved {
                         println!("\tboth modified:   {}", c.path);
+                    }
+                    println!();
+                }
+                if !ms.resolved_paths.is_empty() {
+                    println!("Resolved conflicts staged for commit:");
+                    for path in &ms.resolved_paths {
+                        println!("\tresolved:        {}", path);
                     }
                     println!();
                 }
@@ -714,6 +791,17 @@ fn main() -> Result<()> {
             // Check if completing a merge
             let pending_merge = MergeState::load_from_dir(&spine_dir)?;
             if let Some(ref ms) = pending_merge {
+                if !ms.is_fully_resolved() {
+                    let unresolved = ms.unresolved_conflicts();
+                    let first = unresolved
+                        .first()
+                        .map(|c| c.path.as_str())
+                        .unwrap_or("unknown");
+                    bail!(
+                        "fatal: Exiting because of unresolved conflict in '{}'. Stage resolved files with 'spine add <file>' before committing.",
+                        first
+                    );
+                }
                 // Ensure second parent is added
                 if parents.len() == 1 && parents[0] == ms.ours_commit {
                     parents.push(ms.theirs_commit);
@@ -1245,31 +1333,18 @@ fn main() -> Result<()> {
                     anyhow::anyhow!("fatal: There is no merge in progress (MERGE_STATE missing).")
                 })?;
 
-                // Check for unresolved conflicts
-                for c in &ms.conflicts {
-                    let p = worktree_root.join(&c.path);
-                    if p.exists() {
-                        let content = fs::read_to_string(&p).unwrap_or_default();
-                        if content.contains("<<<<<<< OURS") || content.contains(">>>>>>> THEIRS") {
-                            bail!(
-                                "fatal: Exiting because of unresolved conflict in '{}'",
-                                c.path
-                            );
-                        }
-                    }
-                }
-
-                // Stage any remaining resolved files
-                for c in &ms.conflicts {
-                    let _ = stage_path(
-                        &worktree_root,
-                        &worktree_root.join(&c.path),
-                        &mut index,
-                        &store,
-                        &ignore,
+                // Check for unresolved conflicts via explicit state tracking
+                if !ms.is_fully_resolved() {
+                    let unresolved = ms.unresolved_conflicts();
+                    let first = unresolved
+                        .first()
+                        .map(|c| c.path.as_str())
+                        .unwrap_or("unknown");
+                    bail!(
+                        "fatal: Exiting because of unresolved conflict in '{}'. Use 'spine add <file>' after resolving.",
+                        first
                     );
                 }
-                index.save_to_file(&index_path)?;
 
                 let root_tree_id = write_index_to_tree(&index, &store)?;
                 let author_name = config
@@ -1513,6 +1588,7 @@ fn main() -> Result<()> {
                     ours_commit: ours_cid,
                     theirs_commit: theirs_cid,
                     conflicts,
+                    resolved_paths: std::collections::BTreeSet::new(),
                     timestamp_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
                 };
                 ms.save_to_dir(&spine_dir)?;
@@ -1734,7 +1810,324 @@ fn main() -> Result<()> {
                 bail!("Repository verification FAILED. Corruption or missing references detected.");
             }
         }
+
+        Commands::CountObjects => {
+            let (_worktree_root, spine_dir) = find_repo_root()?;
+            let config = SpineConfig::load_from_file(spine_dir.join("spine.toml"))?;
+            let store = open_store(&spine_dir, &config)?;
+            let summary = store.count_objects();
+
+            println!("Storage Engine V2 Object Count Summary:");
+            println!(
+                "  Loose objects:        {:>8} ({})",
+                summary.loose_count,
+                format_bytes(summary.loose_size_bytes)
+            );
+            println!("  Packfiles:            {:>8}", summary.pack_count);
+            println!(
+                "  Packed objects:       {:>8} ({})",
+                summary.packed_count,
+                format_bytes(summary.packed_size_bytes)
+            );
+            println!(
+                "  Total objects:        {:>8}",
+                summary.loose_count + summary.packed_count
+            );
+            println!(
+                "  Total disk footprint: {:>8}",
+                format_bytes(summary.loose_size_bytes + summary.packed_size_bytes)
+            );
+        }
+
+        Commands::Pack { action } => {
+            let (_worktree_root, spine_dir) = find_repo_root()?;
+            let config = SpineConfig::load_from_file(spine_dir.join("spine.toml"))?;
+            let store = open_store(&spine_dir, &config)?;
+
+            match action {
+                PackAction::List => {
+                    let catalog = store.catalog();
+                    if catalog.active_packs.is_empty() {
+                        println!("No active packfiles found in catalog.");
+                    } else {
+                        println!(
+                            "Catalog Generation: {}, Active Packs: {}",
+                            catalog.generation,
+                            catalog.active_packs.len()
+                        );
+                        println!(
+                            "{:<42} {:>10} {:>12} {:>12}  CHECKSUM",
+                            "PACK ID", "OBJECTS", "PACK SIZE", "INDEX SIZE"
+                        );
+                        for p in &catalog.active_packs {
+                            println!(
+                                "{:<42} {:>10} {:>12} {:>12}  {:.12}...",
+                                p.id,
+                                p.object_count,
+                                format_bytes(p.pack_size_bytes),
+                                format_bytes(p.index_size_bytes),
+                                p.pack_checksum
+                            );
+                        }
+                    }
+                }
+                PackAction::Inspect { id } => {
+                    let pack_dir = spine_dir.join("objects").join("pack");
+                    let spk_path = pack_dir.join(format!("{}.spk", id));
+                    let spidx_path = pack_dir.join(format!("{}.spidx", id));
+                    if !spk_path.exists() {
+                        bail!("Packfile not found: {}", spk_path.display());
+                    }
+                    let mut reader = PackReader::open(&spk_path)?;
+                    let idx_reader = PackIndexReader::open(&spidx_path)?;
+                    let mut blobs = 0;
+                    let mut trees = 0;
+                    let mut commits = 0;
+                    let mut tags = 0;
+                    let mut uncompressed_total = 0u64;
+
+                    for oid in idx_reader.object_ids() {
+                        if let Some(entry) = idx_reader.lookup(oid) {
+                            uncompressed_total += entry.orig_len as u64;
+                            let (_, obj_type, _) = reader.read_object_at(entry.offset)?;
+                            match obj_type {
+                                ObjectType::Blob => blobs += 1,
+                                ObjectType::Tree => trees += 1,
+                                ObjectType::Commit => commits += 1,
+                                ObjectType::Tag => tags += 1,
+                            }
+                        }
+                    }
+                    let pack_size = fs::metadata(&spk_path)?.len();
+                    let ratio = if uncompressed_total > 0 {
+                        (1.0 - (pack_size as f64 / uncompressed_total as f64)) * 100.0
+                    } else {
+                        0.0
+                    };
+                    println!("Packfile: {}", id);
+                    println!("  Total Objects:        {}", reader.object_count());
+                    println!("    Blobs:              {}", blobs);
+                    println!("    Trees:              {}", trees);
+                    println!("    Commits:            {}", commits);
+                    println!("    Tags:               {}", tags);
+                    println!(
+                        "  Pack Size:            {} ({} bytes)",
+                        format_bytes(pack_size),
+                        pack_size
+                    );
+                    println!(
+                        "  Uncompressed Size:    {} ({} bytes)",
+                        format_bytes(uncompressed_total),
+                        uncompressed_total
+                    );
+                    println!("  Compression Savings:  {:.1}%", ratio.max(0.0));
+                }
+            }
+        }
+
+        Commands::Repack { dry_run, verify } => {
+            let (_worktree_root, spine_dir) = find_repo_root()?;
+            let config = SpineConfig::load_from_file(spine_dir.join("spine.toml"))?;
+            let store = open_store(&spine_dir, &config)?;
+            let _lock = RepoLock::acquire(&spine_dir, "repack")?;
+
+            println!("Starting repository repack...");
+            let summary = repack_loose_objects(&store, 3, dry_run)?;
+            if dry_run {
+                println!(
+                    "Dry-run: {} loose objects would be consolidated into a new pack.",
+                    summary.objects_repacked
+                );
+                println!(
+                    "Total loose bytes to repack: {}",
+                    format_bytes(summary.original_bytes)
+                );
+            } else if summary.objects_repacked == 0 {
+                println!("Nothing to repack: 0 loose objects found.");
+            } else {
+                println!("Repack complete:");
+                println!(
+                    "  Packfile:          {}",
+                    summary.pack_id.as_deref().unwrap_or("none")
+                );
+                println!("  Objects repacked:  {}", summary.objects_repacked);
+                println!(
+                    "  Original size:     {}",
+                    format_bytes(summary.original_bytes)
+                );
+                println!(
+                    "  Packfile size:     {}",
+                    format_bytes(summary.packed_bytes)
+                );
+                println!("  Index size:        {}", format_bytes(summary.index_bytes));
+                println!("  Loose pruned:      {}", summary.loose_deleted);
+                if verify {
+                    println!("Verifying repacked storage integrity...");
+                    let audit = store.verify_storage()?;
+                    if audit.corrupted_objects.is_empty() && audit.corrupted_packs.is_empty() {
+                        println!(
+                            "Integrity check PASSED: {} objects verified across all packs.",
+                            audit.total_verified_objects
+                        );
+                    } else {
+                        bail!("Integrity check FAILED: corrupt objects or packs detected!");
+                    }
+                }
+            }
+        }
+
+        Commands::Gc {
+            dry_run,
+            prune_before,
+        } => {
+            let (_worktree_root, spine_dir) = find_repo_root()?;
+            let config = SpineConfig::load_from_file(spine_dir.join("spine.toml"))?;
+            let store = open_store(&spine_dir, &config)?;
+            let _lock = RepoLock::acquire(&spine_dir, "gc")?;
+
+            // Enumerate roots: branch tips, HEAD, tags, merge state, journal records, index
+            let mut roots = Vec::new();
+            for (_, oid_opt) in list_branches(&spine_dir)? {
+                if let Some(oid) = oid_opt {
+                    roots.push(oid);
+                }
+            }
+            let head_state = resolve_head(&spine_dir)?;
+            if let Some(cid) = head_state.head_commit_id {
+                roots.push(cid);
+            }
+            if let Ok(Some(ms)) = MergeState::load_from_dir(&spine_dir) {
+                roots.push(ms.ours_commit);
+                roots.push(ms.theirs_commit);
+                roots.push(ms.base_commit);
+            }
+            let index_path = spine_dir.join("index");
+            if let Ok(idx) = Index::load_from_file(&index_path) {
+                for entry in idx.iter() {
+                    roots.push(entry.object_id);
+                }
+            }
+            if let Ok(journal) = Journal::new(spine_dir.join("journal")) {
+                if let Ok(records) = journal.list_records() {
+                    for r in records {
+                        if let Some(tip) = r.before_state.branch_tip {
+                            roots.push(tip);
+                        }
+                        if let Some(tree) = r.before_state.tree_id {
+                            roots.push(tree);
+                        }
+                        if let Some(ref after) = r.after_state {
+                            if let Some(tip) = after.branch_tip {
+                                roots.push(tip);
+                            }
+                            if let Some(tree) = after.tree_id {
+                                roots.push(tree);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let duration = parse_duration(&prune_before)
+                .unwrap_or(Duration::from_secs(DEFAULT_GRACE_PERIOD_SECS));
+            println!(
+                "Executing garbage collection (grace period: {:?})...",
+                duration
+            );
+            let gc_summary = collect_garbage(&store, &roots, duration, dry_run)?;
+
+            if dry_run {
+                println!(
+                    "Dry-run: {} unreachable objects eligible for pruning ({}).",
+                    gc_summary.pruned_objects,
+                    format_bytes(gc_summary.bytes_reclaimed)
+                );
+                println!(
+                    "Preserved by grace period: {} objects.",
+                    gc_summary.grace_period_preserved
+                );
+            } else {
+                println!("Garbage collection complete:");
+                println!(
+                    "  Objects inspected:      {}",
+                    gc_summary.total_objects_inspected
+                );
+                println!("  Reachable objects:      {}", gc_summary.reachable_objects);
+                println!(
+                    "  Grace-period preserved: {}",
+                    gc_summary.grace_period_preserved
+                );
+                println!("  Pruned objects:         {}", gc_summary.pruned_objects);
+                println!(
+                    "  Reclaimed disk space:   {}",
+                    format_bytes(gc_summary.bytes_reclaimed)
+                );
+            }
+        }
+
+        Commands::VerifyStorage => {
+            let (_worktree_root, spine_dir) = find_repo_root()?;
+            let config = SpineConfig::load_from_file(spine_dir.join("spine.toml"))?;
+            let store = open_store(&spine_dir, &config)?;
+
+            println!("Verifying Storage Engine V2 repository integrity...");
+            let report = store.verify_storage()?;
+            println!("  Packs audited:          {}", report.total_packs_audited);
+            println!("  Loose objects audited:  {}", report.total_loose_audited);
+            println!(
+                "  Total verified objects: {}",
+                report.total_verified_objects
+            );
+
+            if report.corrupted_objects.is_empty() && report.corrupted_packs.is_empty() {
+                println!("All storage objects and packs are cryptographically healthy.");
+            } else {
+                if !report.corrupted_packs.is_empty() {
+                    eprintln!("Corrupted pack files: {:?}", report.corrupted_packs);
+                }
+                if !report.corrupted_objects.is_empty() {
+                    eprintln!("Corrupted objects: {:?}", report.corrupted_objects);
+                }
+                bail!("Storage verification detected corruption!");
+            }
+        }
     }
 
     Ok(())
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.2} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+fn parse_duration(s: &str) -> Option<Duration> {
+    let s = s.trim().to_lowercase();
+    if s == "0" || s == "0s" || s == "none" {
+        return Some(Duration::ZERO);
+    }
+    if let Some(rest) = s.strip_suffix('d') {
+        let val: u64 = rest.parse().ok()?;
+        return Some(Duration::from_secs(val * 86400));
+    }
+    if let Some(rest) = s.strip_suffix('h') {
+        let val: u64 = rest.parse().ok()?;
+        return Some(Duration::from_secs(val * 3600));
+    }
+    if let Some(rest) = s.strip_suffix('m') {
+        let val: u64 = rest.parse().ok()?;
+        return Some(Duration::from_secs(val * 60));
+    }
+    if let Some(rest) = s.strip_suffix('s') {
+        let val: u64 = rest.parse().ok()?;
+        return Some(Duration::from_secs(val));
+    }
+    s.parse::<u64>().ok().map(Duration::from_secs)
 }

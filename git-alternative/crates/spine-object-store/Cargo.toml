@@ -12,3 +12,7 @@ zstd.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 tempfile.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true

@@ -192,3 +192,69 @@ fn test_diff_commands() {
     assert!(out.contains("test.txt"));
     assert!(out.contains("1 files changed"));
 }
+
+#[test]
+fn test_conflict_resolution_with_legitimate_conflict_marker_content() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+
+    run_spine(root, &["init"]);
+    fs::write(root.join("code.rs"), "fn main() {}\n").unwrap();
+    run_spine(root, &["add", "."]);
+    run_spine(root, &["commit", "-m", "Root"]);
+
+    // Branch feature modifies code.rs
+    run_spine(root, &["switch", "-c", "feature"]);
+    fs::write(root.join("code.rs"), "fn main() { /* feature */ }\n").unwrap();
+    run_spine(root, &["add", "."]);
+    run_spine(root, &["commit", "-m", "Feature commit"]);
+
+    // Main modifies code.rs differently
+    run_spine(root, &["switch", "main"]);
+    fs::write(root.join("code.rs"), "fn main() { /* main */ }\n").unwrap();
+    run_spine(root, &["add", "."]);
+    run_spine(root, &["commit", "-m", "Main commit"]);
+
+    // Merge feature -> conflict
+    let (ok, out, err) = run_spine(root, &["merge", "feature"]);
+    assert!(
+        ok,
+        "merge feature failed: stdout='{}', stderr='{}'",
+        out, err
+    );
+    assert!(root.join(".spine").join("MERGE_STATE").exists());
+
+    // Resolve conflict by intentionally including marker string as a legitimate code comment
+    fs::write(
+        root.join("code.rs"),
+        "// We handle <<<<<<< OURS and >>>>>>> THEIRS in parser tests\nfn main() {}\n",
+    )
+    .unwrap();
+
+    // 1. Before staging, merge --continue must fail because explicit resolution hasn't occurred
+    let (ok, out, err) = run_spine(root, &["merge", "--continue"]);
+    assert!(
+        !ok,
+        "continue should fail before add: out='{}', err='{}'",
+        out, err
+    );
+    assert!(err.contains("unresolved conflict"));
+
+    // 2. Stage the resolved file
+    let (ok, _, _) = run_spine(root, &["add", "code.rs"]);
+    assert!(ok);
+
+    // 3. Now merge --continue must succeed even though file contains '<<<<<<< OURS'
+    let (ok, out, err) = run_spine(root, &["merge", "--continue"]);
+    assert!(
+        ok,
+        "continue should succeed after add: out='{}', err='{}'",
+        out, err
+    );
+    assert!(out.contains("(merge-commit)"));
+    assert!(!root.join(".spine").join("MERGE_STATE").exists());
+
+    // Content should preserve the legitimate marker comment intact
+    let final_content = fs::read_to_string(root.join("code.rs")).unwrap();
+    assert!(final_content.contains("// We handle <<<<<<< OURS and >>>>>>> THEIRS in parser tests"));
+}

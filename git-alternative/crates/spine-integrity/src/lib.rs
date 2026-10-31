@@ -259,6 +259,36 @@ pub fn run_fsck<S: ObjectStore, P: AsRef<Path>>(
         }
     }
 
+    // 8. Audit pack catalog and active packfiles if present
+    let pack_dir = spine_path.join("objects").join("pack");
+    let catalog_path = pack_dir.join("catalog.json");
+    if catalog_path.exists() {
+        if let Ok(cat_bytes) = fs::read(&catalog_path) {
+            if let Ok(catalog) = serde_json::from_slice::<serde_json::Value>(&cat_bytes) {
+                if let Some(active_packs) = catalog.get("active_packs").and_then(|v| v.as_array()) {
+                    for p in active_packs {
+                        if let Some(id) = p.get("id").and_then(|v| v.as_str()) {
+                            let spk = pack_dir.join(format!("{}.spk", id));
+                            let spidx = pack_dir.join(format!("{}.spidx", id));
+                            if !spk.exists() {
+                                report.invalid_refs.push((
+                                    format!("pack:{}", id),
+                                    "Missing .spk file".to_string(),
+                                ));
+                            }
+                            if !spidx.exists() {
+                                report.invalid_refs.push((
+                                    format!("pack:{}", id),
+                                    "Missing .spidx file".to_string(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(report)
 }
 
