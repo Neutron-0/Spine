@@ -65,7 +65,7 @@ pub fn resolve_worktree_context<P: AsRef<Path>>(
                 let primary_spine_dir = gitdir
                     .parent()
                     .and_then(|p| p.parent())
-                    .map(|p| normalize_canonical_path(p.to_path_buf()))
+                    .map(normalize_canonical_path)
                     .unwrap_or_else(|| gitdir.clone());
                 return Ok((
                     normalize_canonical_path(&current),

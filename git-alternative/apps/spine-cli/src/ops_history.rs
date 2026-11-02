@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_reset(
     worktree_root: &Path,
     spine_dir: &Path,
@@ -222,6 +223,7 @@ pub fn cmd_reset(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_restore(
     worktree_root: &Path,
     spine_dir: &Path,
@@ -339,6 +341,7 @@ pub fn cmd_restore(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_revert(
     worktree_root: &Path,
     spine_dir: &Path,
@@ -589,6 +592,7 @@ pub fn cmd_revert(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_cherry_pick(
     worktree_root: &Path,
     spine_dir: &Path,
@@ -830,6 +834,7 @@ pub fn cmd_cherry_pick(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_rebase(
     worktree_root: &Path,
     spine_dir: &Path,

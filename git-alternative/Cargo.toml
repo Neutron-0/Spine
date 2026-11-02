@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "apps/spine-cli",
     "apps/spine-daemon",
+    "apps/spine-storage-node",
+    "apps/spine-coordinator",
     "crates/spine-core",
     "crates/spine-format",
     "crates/spine-object-store",
@@ -16,6 +18,7 @@ members = [
     "crates/spine-journal",
     "crates/spine-protocol",
     "crates/spine-net",
+    "crates/spine-cluster",
 ]
 
 [workspace.package]
@@ -38,6 +41,7 @@ spine-merge = { path = "crates/spine-merge" }
 spine-journal = { path = "crates/spine-journal" }
 spine-protocol = { path = "crates/spine-protocol" }
 spine-net = { path = "crates/spine-net" }
+spine-cluster = { path = "crates/spine-cluster" }
 
 tokio = { version = "1.38", features = ["full"] }
 blake3 = "1.5"

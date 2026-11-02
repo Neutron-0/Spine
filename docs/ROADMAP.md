@@ -43,15 +43,31 @@
 
 ## Next Milestones
 
-### Batch 07: Large Object Management & Partial Worktrees
-- Spine LFS: Content-addressed external asset store with chunked streaming and deduplication.
-- Sparse checkouts and path-filtered indexes for monorepo scale.
+### Batch 07: Distributed Storage Fabric, Repository Replication, Node Management, Failover and Data Recovery
+- Crate `spine-cluster`: Node lifecycle state machine, Ed25519 challenge-response enrollment, autonomous heartbeats, and failure domain tracking.
+- Durability policies (`SingleCopy`, `TwoCopies`, `ThreeCopies`) enforced via two-phase commit replication transactions (`Initiated` -> `Preparing` -> `Prepared` -> `CommitDecided` -> `Committed`).
+- Primary ownership epochs and fencing tokens preventing split-brain writes.
+- Automatic failover coordinator verifying health, committed generation, and cryptographic integrity before replica promotion.
+- Anti-Entropy reconciliation diffing immutable pack catalogs and streaming repair packs.
+- Distributed GC tombstones with mandatory retention grace periods and committed generation checks.
+- Production PostgreSQL metadata schema (`migrations/20261102000001_cluster_metadata.sql`) and `CoordinatorStore` abstraction with `FileBackedCoordinatorStore`.
+- Storage Node daemon (`spine-storage-node`) and Distributed Coordinator daemon (`spine-coordinator`).
+- Cluster administration CLI: `cluster status`, `node list/inspect/drain/quarantine/retire`, `storage placements/inspect/rebalance`, `replication status/repair`.
+- Multi-process local dev cluster automation (`scripts/dev_cluster.ps1`, `scripts/dev_cluster.sh`).
 
-### Batch 08: Spine Forge Architecture & Rust Backend
+---
+
+## Next Milestones
+
+### Batch 08: Spine Large Object Storage (LFS) & Partial Worktrees
+- Spine LFS: Content-addressed external binary asset store with chunked streaming and content-hash verification.
+- Sparse checkouts and path-filtered indexes for massive monorepos.
+
+### Batch 09: Spine Forge Architecture & Rust Backend
 - Forge daemon with multi-tenant repository hosting.
 - Role-based access control, organizational permissions, and SSH/SPWP gateway.
 - Pull request engine with automated mergeability testing and review commenting.
 
-### Batch 09: Spine Forge Web Frontend
+### Batch 10: Spine Forge Web Frontend
 - High-performance TypeScript / WebAssembly repository browser, code viewer, and graph visualizer.
 - Real-time review and collaborative workflow interface.

@@ -80,6 +80,7 @@ impl StashList {
 }
 
 /// Executes a `stash push`: snapshot dirty working tree, staged index, and optionally untracked files into a stash commit, then resets worktree to HEAD.
+#[allow(clippy::too_many_arguments)]
 pub fn stash_push<P: AsRef<Path>, Q: AsRef<Path>, S: ObjectStore>(
     root: P,
     spine_dir: Q,

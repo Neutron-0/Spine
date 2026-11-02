@@ -349,11 +349,7 @@ pub fn find_bisect_midpoint<S: ObjectStore>(
     for &cand in &eligible {
         let cand_ancestors = get_all_ancestors(store, &cand)?;
         let count_in_candidates = cand_ancestors.intersection(&candidates).count();
-        let diff = if count_in_candidates >= target {
-            count_in_candidates - target
-        } else {
-            target - count_in_candidates
-        };
+        let diff = count_in_candidates.abs_diff(target);
 
         if diff < best_diff {
             best_diff = diff;

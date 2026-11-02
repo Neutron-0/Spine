@@ -1,0 +1,28 @@
+[package]
+name = "spine-cluster"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+spine-core.workspace = true
+spine-format.workspace = true
+spine-object-store.workspace = true
+spine-protocol.workspace = true
+spine-net.workspace = true
+
+tokio.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+hex.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

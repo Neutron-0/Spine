@@ -1,3 +1,4 @@
+pub mod ops_cluster;
 pub mod ops_history;
 pub mod ops_tag;
 pub mod ops_worktree;
@@ -340,6 +341,26 @@ enum Commands {
         #[arg(short, long)]
         force: bool,
     },
+    /// Cluster control-plane status
+    Cluster {
+        #[command(subcommand)]
+        action: Option<ClusterAction>,
+    },
+    /// Storage node administration
+    Node {
+        #[command(subcommand)]
+        action: NodeAction,
+    },
+    /// Storage placement, inspect, and rebalance
+    Storage {
+        #[command(subcommand)]
+        action: StorageAction,
+    },
+    /// Replication status and repair
+    Replication {
+        #[command(subcommand)]
+        action: ReplicationAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -466,6 +487,47 @@ pub enum TagAction {
 }
 
 #[derive(Subcommand)]
+pub enum ClusterAction {
+    /// Show cluster status
+    Status,
+}
+
+#[derive(Subcommand)]
+pub enum NodeAction {
+    /// List storage nodes
+    List,
+    /// Inspect storage node
+    Inspect { node_id: String },
+    /// Drain storage node
+    Drain { node_id: String },
+    /// Quarantine storage node
+    Quarantine { node_id: String },
+    /// Retire storage node
+    Retire { node_id: String },
+}
+
+#[derive(Subcommand)]
+pub enum StorageAction {
+    /// List repository placements
+    Placements,
+    /// Inspect repository across cluster
+    Inspect { repository: String },
+    /// Rebalance storage placements
+    Rebalance {
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ReplicationAction {
+    /// Show replication status
+    Status,
+    /// Trigger replica repair
+    Repair { repository: String },
+}
+
+#[derive(Subcommand)]
 enum PackAction {
     /// List all active packfiles in catalog
     List,
@@ -536,7 +598,7 @@ pub fn load_repo_config(spine_dir: &Path) -> Result<SpineConfig> {
     let effective_spine_dir = if spine_dir
         .parent()
         .and_then(|p| p.file_name())
-        .map_or(false, |n| n == "worktrees")
+        .is_some_and(|n| n == "worktrees")
     {
         spine_dir.parent().unwrap().parent().unwrap()
     } else {
@@ -554,7 +616,7 @@ pub fn open_store(spine_dir: &Path, config: &SpineConfig) -> Result<CompositeObj
     let effective_spine_dir = if spine_dir
         .parent()
         .and_then(|p| p.file_name())
-        .map_or(false, |n| n == "worktrees")
+        .is_some_and(|n| n == "worktrees")
     {
         spine_dir.parent().unwrap().parent().unwrap()
     } else {
@@ -773,7 +835,7 @@ pub fn update_ref(spine_dir: &Path, target_ref: &str, new_oid: &ObjectId) -> Res
     let effective_spine_dir = if spine_dir
         .parent()
         .and_then(|p| p.file_name())
-        .map_or(false, |n| n == "worktrees")
+        .is_some_and(|n| n == "worktrees")
     {
         spine_dir.parent().unwrap().parent().unwrap()
     } else {
@@ -3662,6 +3724,35 @@ async fn main() -> Result<()> {
                 &ignore,
             )?;
         }
+
+        Commands::Cluster { action } => match action.unwrap_or(ClusterAction::Status) {
+            ClusterAction::Status => ops_cluster::cmd_cluster_status(None)?,
+        },
+
+        Commands::Node { action } => match action {
+            NodeAction::List => ops_cluster::cmd_node_list(None)?,
+            NodeAction::Inspect { node_id } => ops_cluster::cmd_node_inspect(&node_id, None)?,
+            NodeAction::Drain { node_id } => ops_cluster::cmd_node_drain(&node_id, None)?,
+            NodeAction::Quarantine { node_id } => ops_cluster::cmd_node_quarantine(&node_id, None)?,
+            NodeAction::Retire { node_id } => ops_cluster::cmd_node_retire(&node_id, None)?,
+        },
+
+        Commands::Storage { action } => match action {
+            StorageAction::Placements => ops_cluster::cmd_storage_placements(None)?,
+            StorageAction::Inspect { repository } => {
+                println!("Inspecting storage for repository '{}'...", repository);
+            }
+            StorageAction::Rebalance { dry_run } => {
+                ops_cluster::cmd_storage_rebalance(dry_run, None)?
+            }
+        },
+
+        Commands::Replication { action } => match action {
+            ReplicationAction::Status => ops_cluster::cmd_replication_status(None)?,
+            ReplicationAction::Repair { repository } => {
+                ops_cluster::cmd_replication_repair(&repository, None)?
+            }
+        },
     }
 
     Ok(())

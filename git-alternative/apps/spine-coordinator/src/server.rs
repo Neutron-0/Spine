@@ -1,0 +1,251 @@
+use anyhow::{Context, Result};
+use spine_cluster::failover::FailoverCoordinator;
+use spine_cluster::fencing::OwnershipEpoch;
+use spine_cluster::heartbeat::{
+    evaluate_node_health, DEFAULT_OFFLINE_TIMEOUT_NANOS, DEFAULT_SUSPECT_TIMEOUT_NANOS,
+};
+use spine_cluster::node::{FailureDomain, NodeStatus, StorageNodeInfo};
+use spine_cluster::protocol::{ClusterRpcRequest, ClusterRpcResponse};
+use spine_cluster::store::CoordinatorStore;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::time::{sleep, Duration};
+
+pub struct CoordinatorServer {
+    cluster_id: String,
+    listen_addr: String,
+    store: Arc<dyn CoordinatorStore>,
+    running: Arc<AtomicBool>,
+}
+
+impl CoordinatorServer {
+    pub fn new(cluster_id: String, listen_addr: String, store: Arc<dyn CoordinatorStore>) -> Self {
+        Self {
+            cluster_id,
+            listen_addr,
+            store,
+            running: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    pub fn shutdown(&self) {
+        self.running.store(false, Ordering::SeqCst);
+    }
+
+    pub async fn run(&self) -> Result<()> {
+        let listener = TcpListener::bind(&self.listen_addr)
+            .await
+            .with_context(|| format!("Binding coordinator to {}", self.listen_addr))?;
+
+        println!(
+            "Coordinator '{}' listening on {}",
+            self.cluster_id, self.listen_addr
+        );
+
+        // Spawn background health monitoring and failover task
+        let store = Arc::clone(&self.store);
+        let running = Arc::clone(&self.running);
+
+        tokio::spawn(async move {
+            while running.load(Ordering::SeqCst) {
+                let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                if let Ok(nodes) = store.list_nodes() {
+                    for node in &nodes {
+                        let new_status = evaluate_node_health(
+                            node.last_heartbeat_nanos,
+                            now,
+                            node.status,
+                            DEFAULT_SUSPECT_TIMEOUT_NANOS,
+                            DEFAULT_OFFLINE_TIMEOUT_NANOS,
+                        );
+
+                        if new_status != node.status {
+                            let _ = store.update_node_status(&node.node_id, new_status);
+
+                            // If primary went offline, check if any repositories need failover!
+                            if new_status == NodeStatus::Offline {
+                                if let Ok(repos) = store.list_repositories() {
+                                    for repo in repos {
+                                        if let Ok(Some(placement)) =
+                                            store.get_placement(&repo.repo_id)
+                                        {
+                                            if placement.primary_node_id == node.node_id {
+                                                if let Ok(replicas) =
+                                                    store.get_replicas(&repo.repo_id)
+                                                {
+                                                    if let Ok(fresh_nodes) = store.list_nodes() {
+                                                        if let Ok(promo) = FailoverCoordinator::evaluate_and_promote(
+                                                            &repo.repo_id,
+                                                            &node.node_id,
+                                                            OwnershipEpoch(repo.current_ownership_epoch),
+                                                            repo.committed_generation,
+                                                            &replicas,
+                                                            &fresh_nodes,
+                                                        ) {
+                                                            let _ = store.update_ownership_epoch(
+                                                                &repo.repo_id,
+                                                                promo.new_ownership_epoch,
+                                                                &promo.new_primary_id,
+                                                            );
+                                                            println!(
+                                                                "FAILOVER: Repository '{}' promoted new primary '{}' with epoch {}",
+                                                                repo.repo_id,
+                                                                promo.new_primary_id,
+                                                                promo.new_ownership_epoch
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                sleep(Duration::from_millis(500)).await;
+            }
+        });
+
+        while self.running.load(Ordering::SeqCst) {
+            tokio::select! {
+                res = listener.accept() => {
+                    match res {
+                        Ok((stream, _peer)) => {
+                            let store = Arc::clone(&self.store);
+                            let cluster_id = self.cluster_id.clone();
+                            tokio::spawn(async move {
+                                let _ = handle_coordinator_connection(stream, store, cluster_id).await;
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("Coordinator accept error: {}", e);
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    if !self.running.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        println!("Coordinator shutdown complete.");
+        Ok(())
+    }
+}
+
+async fn handle_coordinator_connection(
+    mut stream: TcpStream,
+    store: Arc<dyn CoordinatorStore>,
+    cluster_id: String,
+) -> Result<()> {
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+
+    let mut body = vec![0u8; len];
+    stream.read_exact(&mut body).await?;
+
+    let req = ClusterRpcRequest::from_bytes(&body)?;
+    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+    let resp = match req {
+        ClusterRpcRequest::Enroll(enroll_req) => match enroll_req.verify_signature(&cluster_id) {
+            Ok(_) => match store.get_token(&enroll_req.token) {
+                Ok(Some(token)) => match token.validate(&cluster_id, now) {
+                    Ok(_) => {
+                        let _ = store.consume_token(&enroll_req.token);
+                        let node_id = format!("node-{}", &enroll_req.public_key_hex[..8]);
+                        let fingerprint = format!("fp:{}", &enroll_req.public_key_hex[..12]);
+
+                        let mut info = StorageNodeInfo::new(
+                            node_id.clone(),
+                            enroll_req.public_key_hex.clone(),
+                            fingerprint,
+                            enroll_req.listen_addr,
+                            enroll_req.storage_root,
+                            FailureDomain {
+                                region: enroll_req.region,
+                                zone: enroll_req.zone,
+                                host: enroll_req.host,
+                            },
+                            enroll_req.total_capacity_bytes,
+                            now,
+                        );
+                        info.status = NodeStatus::Healthy;
+
+                        if let Err(e) = store.register_node(info) {
+                            ClusterRpcResponse::Error(e.to_string())
+                        } else {
+                            ClusterRpcResponse::EnrollSuccess(
+                                spine_cluster::enrollment::EnrollmentResponse {
+                                    node_id,
+                                    cluster_id,
+                                    enrolled_at_nanos: now,
+                                },
+                            )
+                        }
+                    }
+                    Err(e) => ClusterRpcResponse::Error(e.to_string()),
+                },
+                Ok(None) => ClusterRpcResponse::Error("Enrollment token not found".into()),
+                Err(e) => ClusterRpcResponse::Error(e.to_string()),
+            },
+            Err(e) => ClusterRpcResponse::Error(e.to_string()),
+        },
+        ClusterRpcRequest::Heartbeat(hb) => {
+            if let Err(e) = store.record_heartbeat(hb) {
+                ClusterRpcResponse::Error(e.to_string())
+            } else {
+                ClusterRpcResponse::HeartbeatAck {
+                    status: NodeStatus::Healthy,
+                }
+            }
+        }
+        ClusterRpcRequest::GetPlacement { repo_id } => match store.get_placement(&repo_id) {
+            Ok(p) => ClusterRpcResponse::PlacementResult(p),
+            Err(e) => ClusterRpcResponse::Error(e.to_string()),
+        },
+        ClusterRpcRequest::DrainNode { node_id } => {
+            match store.update_node_status(&node_id, NodeStatus::Draining) {
+                Ok(_) => ClusterRpcResponse::NodeStatusUpdated {
+                    node_id,
+                    new_status: NodeStatus::Draining,
+                },
+                Err(e) => ClusterRpcResponse::Error(e.to_string()),
+            }
+        }
+        ClusterRpcRequest::QuarantineNode { node_id } => {
+            match store.update_node_status(&node_id, NodeStatus::Quarantined) {
+                Ok(_) => ClusterRpcResponse::NodeStatusUpdated {
+                    node_id,
+                    new_status: NodeStatus::Quarantined,
+                },
+                Err(e) => ClusterRpcResponse::Error(e.to_string()),
+            }
+        }
+        ClusterRpcRequest::RetireNode { node_id } => {
+            match store.update_node_status(&node_id, NodeStatus::Retired) {
+                Ok(_) => ClusterRpcResponse::NodeStatusUpdated {
+                    node_id,
+                    new_status: NodeStatus::Retired,
+                },
+                Err(e) => ClusterRpcResponse::Error(e.to_string()),
+            }
+        }
+        _ => ClusterRpcResponse::Error("Unsupported coordinator request".into()),
+    };
+
+    let resp_bytes = resp.to_bytes()?;
+    let resp_len = (resp_bytes.len() as u32).to_be_bytes();
+    stream.write_all(&resp_len).await?;
+    stream.write_all(&resp_bytes).await?;
+    stream.flush().await?;
+
+    Ok(())
+}

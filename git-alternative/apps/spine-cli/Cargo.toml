@@ -31,6 +31,7 @@ spine-merge.workspace = true
 spine-journal.workspace = true
 spine-protocol.workspace = true
 spine-net.workspace = true
+spine-cluster.workspace = true
 
 tokio = { workspace = true, features = ["full"] }
 clap.workspace = true
@@ -43,3 +44,7 @@ tempfile.workspace = true
 criterion.workspace = true
 tokio-rustls.workspace = true
 rustls.workspace = true
+hex.workspace = true
+rand.workspace = true
+ed25519-dalek.workspace = true
+blake3.workspace = true

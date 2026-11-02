@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_stash_push(
     worktree_root: &Path,
     spine_dir: &Path,
@@ -336,26 +337,24 @@ pub fn cmd_rm(
 
         for path in matching {
             let file_abs = worktree_root.join(&path);
-            if !cached {
-                if file_abs.exists() {
-                    // Check if dirty unless force
-                    if !force {
-                        let _disk_content = fs::read(&file_abs)?;
-                        let (_mode, size, mtime_secs, mtime_nanos) =
-                            spine_worktree::metadata_to_stat(&fs::metadata(&file_abs)?);
-                        let cur_entry = index.get(&path).unwrap();
-                        if size != cur_entry.file_size
-                            || mtime_secs != cur_entry.mtime_secs
-                            || mtime_nanos != cur_entry.mtime_nanos
-                        {
-                            bail!(
-                                "error: the following file has local modifications:\n  {}\n(use --force to discard local changes)",
-                                path
-                            );
-                        }
+            if !cached && file_abs.exists() {
+                // Check if dirty unless force
+                if !force {
+                    let _disk_content = fs::read(&file_abs)?;
+                    let (_mode, size, mtime_secs, mtime_nanos) =
+                        spine_worktree::metadata_to_stat(&fs::metadata(&file_abs)?);
+                    let cur_entry = index.get(&path).unwrap();
+                    if size != cur_entry.file_size
+                        || mtime_secs != cur_entry.mtime_secs
+                        || mtime_nanos != cur_entry.mtime_nanos
+                    {
+                        bail!(
+                            "error: the following file has local modifications:\n  {}\n(use --force to discard local changes)",
+                            path
+                        );
                     }
-                    fs::remove_file(&file_abs)?;
                 }
+                fs::remove_file(&file_abs)?;
             }
             index.remove(&path);
             println!("rm '{}'", path);
