@@ -3,7 +3,7 @@
 //! Deterministic binary serialization and deserialization routines for Spine
 //! trees, commits, and container headers.
 
-use spine_core::{Commit, FileMode, ObjectId, ObjectType, TreeEntry};
+use spine_core::{AnnotatedTag, Commit, FileMode, ObjectId, ObjectType, TreeEntry};
 use std::convert::TryInto;
 use thiserror::Error;
 
@@ -13,6 +13,9 @@ pub const LOOSE_HEADER_SIZE: usize = 16;
 
 pub const COMMIT_MAGIC: &[u8; 4] = b"SPCM";
 pub const COMMIT_VERSION_2: u16 = 2;
+
+pub const TAG_MAGIC: &[u8; 4] = b"SPTG";
+pub const TAG_VERSION_1: u16 = 1;
 
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum FormatError {
@@ -464,6 +467,154 @@ fn deserialize_commit_v1(payload: &[u8]) -> Result<Commit, FormatError> {
     })
 }
 
+/// Serializes an `AnnotatedTag` into canonical binary representation.
+pub fn serialize_annotated_tag(tag: &AnnotatedTag) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(TAG_MAGIC);
+    buf.extend_from_slice(&tag.format_version.to_le_bytes());
+    buf.extend_from_slice(tag.target_object.as_bytes());
+    buf.push(tag.target_type.as_u8());
+
+    let tag_name_bytes = tag.tag_name.as_bytes();
+    buf.extend_from_slice(&(tag_name_bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(tag_name_bytes);
+
+    let tagger_name_bytes = tag.tagger_name.as_bytes();
+    buf.extend_from_slice(&(tagger_name_bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(tagger_name_bytes);
+
+    let tagger_email_bytes = tag.tagger_email.as_bytes();
+    buf.extend_from_slice(&(tagger_email_bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(tagger_email_bytes);
+
+    buf.extend_from_slice(&tag.timestamp_nanos.to_le_bytes());
+
+    let message_bytes = tag.message.as_bytes();
+    buf.extend_from_slice(&(message_bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(message_bytes);
+
+    buf
+}
+
+/// Deserializes a binary payload into an `AnnotatedTag`.
+pub fn deserialize_annotated_tag(payload: &[u8]) -> Result<AnnotatedTag, FormatError> {
+    // 4 magic + 2 version + 32 target_object + 1 target_type = 39 min
+    if payload.len() < 39 {
+        return Err(FormatError::BufferTooShort {
+            expected: 39,
+            actual: payload.len(),
+        });
+    }
+    if &payload[0..4] != TAG_MAGIC {
+        return Err(FormatError::InvalidMagic {
+            expected: TAG_MAGIC.to_vec(),
+            actual: payload[0..4].to_vec(),
+        });
+    }
+    let format_version = u16::from_le_bytes(payload[4..6].try_into().unwrap());
+    if format_version != TAG_VERSION_1 {
+        return Err(FormatError::UnsupportedVersion(format_version));
+    }
+
+    let mut cursor = 6;
+    let mut target_obj_bytes = [0u8; 32];
+    target_obj_bytes.copy_from_slice(&payload[cursor..cursor + 32]);
+    let target_object = ObjectId::from_bytes(target_obj_bytes);
+    cursor += 32;
+
+    let target_type = ObjectType::from_u8(payload[cursor])?;
+    cursor += 1;
+
+    if cursor + 2 > payload.len() {
+        return Err(FormatError::BufferTooShort {
+            expected: cursor + 2,
+            actual: payload.len(),
+        });
+    }
+    let tag_name_len = u16::from_le_bytes(payload[cursor..cursor + 2].try_into().unwrap()) as usize;
+    cursor += 2;
+    if cursor + tag_name_len > payload.len() {
+        return Err(FormatError::BufferTooShort {
+            expected: cursor + tag_name_len,
+            actual: payload.len(),
+        });
+    }
+    let tag_name = String::from_utf8(payload[cursor..cursor + tag_name_len].to_vec())?;
+    cursor += tag_name_len;
+
+    if cursor + 2 > payload.len() {
+        return Err(FormatError::BufferTooShort {
+            expected: cursor + 2,
+            actual: payload.len(),
+        });
+    }
+    let tagger_name_len =
+        u16::from_le_bytes(payload[cursor..cursor + 2].try_into().unwrap()) as usize;
+    cursor += 2;
+    if cursor + tagger_name_len > payload.len() {
+        return Err(FormatError::BufferTooShort {
+            expected: cursor + tagger_name_len,
+            actual: payload.len(),
+        });
+    }
+    let tagger_name = String::from_utf8(payload[cursor..cursor + tagger_name_len].to_vec())?;
+    cursor += tagger_name_len;
+
+    if cursor + 2 > payload.len() {
+        return Err(FormatError::BufferTooShort {
+            expected: cursor + 2,
+            actual: payload.len(),
+        });
+    }
+    let tagger_email_len =
+        u16::from_le_bytes(payload[cursor..cursor + 2].try_into().unwrap()) as usize;
+    cursor += 2;
+    if cursor + tagger_email_len > payload.len() {
+        return Err(FormatError::BufferTooShort {
+            expected: cursor + tagger_email_len,
+            actual: payload.len(),
+        });
+    }
+    let tagger_email = String::from_utf8(payload[cursor..cursor + tagger_email_len].to_vec())?;
+    cursor += tagger_email_len;
+
+    if cursor + 8 > payload.len() {
+        return Err(FormatError::BufferTooShort {
+            expected: cursor + 8,
+            actual: payload.len(),
+        });
+    }
+    let timestamp_nanos = i64::from_le_bytes(payload[cursor..cursor + 8].try_into().unwrap());
+    cursor += 8;
+
+    if cursor + 4 > payload.len() {
+        return Err(FormatError::BufferTooShort {
+            expected: cursor + 4,
+            actual: payload.len(),
+        });
+    }
+    let msg_len = u32::from_le_bytes(payload[cursor..cursor + 4].try_into().unwrap()) as usize;
+    cursor += 4;
+    if cursor + msg_len > payload.len() {
+        return Err(FormatError::BufferTooShort {
+            expected: cursor + msg_len,
+            actual: payload.len(),
+        });
+    }
+    let message = String::from_utf8(payload[cursor..cursor + msg_len].to_vec())?;
+
+    Ok(AnnotatedTag {
+        format_version,
+        target_object,
+        target_type,
+        tag_name,
+        tagger_name,
+        tagger_email,
+        timestamp_nanos,
+        message,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,5 +722,39 @@ mod tests {
         let bytes = vec![0x53, 0x50, 0x43, 0x4D, 0x02, 0x00]; // truncated after header
         let result = deserialize_commit(&bytes);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_annotated_tag_serialization_roundtrip() {
+        let tag = AnnotatedTag::new(
+            ObjectId::from_bytes([42u8; 32]),
+            ObjectType::Commit,
+            "v1.0.0".into(),
+            "Release Manager".into(),
+            "release@spine.org".into(),
+            1730000000000000000,
+            "Official Release v1.0.0\nSigned production build".into(),
+        );
+        let bytes = serialize_annotated_tag(&tag);
+        let decoded = deserialize_annotated_tag(&bytes).unwrap();
+        assert_eq!(tag, decoded);
+        assert_eq!(decoded.format_version, 1);
+        assert_eq!(decoded.target_type, ObjectType::Commit);
+        assert_eq!(decoded.tag_name, "v1.0.0");
+    }
+
+    #[test]
+    fn test_annotated_tag_invalid_magic_rejection() {
+        let mut bytes = serialize_annotated_tag(&AnnotatedTag::new(
+            ObjectId::ZERO,
+            ObjectType::Commit,
+            "v0.1".into(),
+            "Dev".into(),
+            "d@s.org".into(),
+            0,
+            "test".into(),
+        ));
+        bytes[0] = b'X';
+        assert!(deserialize_annotated_tag(&bytes).is_err());
     }
 }

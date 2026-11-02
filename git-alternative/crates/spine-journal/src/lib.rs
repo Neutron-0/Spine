@@ -35,6 +35,17 @@ pub enum OperationKind {
     MergeAbort,
     Undo,
     Redo,
+    Reset,
+    Restore,
+    Revert,
+    CherryPick,
+    Rebase,
+    StashPush,
+    StashApply,
+    StashDrop,
+    WorktreeAdd,
+    WorktreeRemove,
+    Bisect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +64,8 @@ pub struct RepoStateSnapshot {
     pub branch_tip: Option<ObjectId>,
     pub index_checksum: String,
     pub tree_id: Option<ObjectId>,
+    #[serde(default)]
+    pub worktree_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +80,8 @@ pub struct TransactionRecord {
     pub after_state: Option<RepoStateSnapshot>,
     pub target_tx_id: Option<String>,
     pub abort_reason: Option<String>,
+    #[serde(default)]
+    pub worktree_id: Option<String>,
 }
 
 pub struct Journal {
@@ -118,6 +133,7 @@ impl Journal {
             kind,
             description,
             status: TransactionStatus::Prepared,
+            worktree_id: before.worktree_id.clone(),
             before_state: before,
             after_state: None,
             target_tx_id,
@@ -335,6 +351,7 @@ mod tests {
             branch_tip: Some(ObjectId::from_bytes([0x01; 32])),
             index_checksum: "dummy_checksum".to_string(),
             tree_id: Some(ObjectId::from_bytes([0x02; 32])),
+            worktree_id: None,
         }
     }
 

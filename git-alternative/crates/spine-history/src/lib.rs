@@ -2,6 +2,12 @@
 //!
 //! Commit graph navigation, ancestor discovery, and topological history traversal.
 
+pub mod bisect;
+pub mod blame;
+
+pub use bisect::BisectState;
+pub use blame::{compute_blame, find_path_in_tree, BlameError, BlameLine, BlameResult};
+
 use spine_core::{Commit, ObjectId, ObjectType};
 use spine_format::{deserialize_commit, FormatError};
 use spine_object_store::{ObjectStore, ObjectStoreError};
@@ -218,6 +224,146 @@ pub fn find_best_merge_base<S: ObjectStore>(
     find_unique_merge_base(store, commit_a, commit_b)
 }
 
+/// Returns the list of commits reachable from `tip` but not reachable from `base`
+/// (the range `base..tip`), topologically ordered from oldest (child of base) to newest (`tip`).
+pub fn find_commits_between<S: ObjectStore>(
+    store: &S,
+    base: &ObjectId,
+    tip: &ObjectId,
+) -> Result<Vec<ObjectId>, HistoryError> {
+    if base == tip {
+        return Ok(Vec::new());
+    }
+
+    let base_ancestors = get_all_ancestors(store, base)?;
+    if base_ancestors.contains(tip) {
+        // tip is an ancestor of base; range is empty
+        return Ok(Vec::new());
+    }
+
+    // Collect all commits reachable from tip that are not in base_ancestors
+    let mut commits_in_range = HashSet::new();
+    let mut queue = VecDeque::new();
+
+    queue.push_back(*tip);
+    commits_in_range.insert(*tip);
+
+    while let Some(curr) = queue.pop_front() {
+        let commit = get_commit(store, &curr)?;
+        for parent in &commit.parents {
+            if !base_ancestors.contains(parent) && commits_in_range.insert(*parent) {
+                queue.push_back(*parent);
+            }
+        }
+    }
+
+    // Topologically sort commits_in_range: parents before children (oldest to newest)
+    let mut in_degree: std::collections::HashMap<ObjectId, usize> =
+        std::collections::HashMap::new();
+    let mut children_map: std::collections::HashMap<ObjectId, Vec<ObjectId>> =
+        std::collections::HashMap::new();
+
+    for id in &commits_in_range {
+        in_degree.entry(*id).or_insert(0);
+        let commit = get_commit(store, id)?;
+        for parent in &commit.parents {
+            if commits_in_range.contains(parent) {
+                *in_degree.entry(*id).or_insert(0) += 1;
+                children_map.entry(*parent).or_default().push(*id);
+            }
+        }
+    }
+
+    let mut ready: VecDeque<ObjectId> = in_degree
+        .iter()
+        .filter(|(_, &deg)| deg == 0)
+        .map(|(&id, _)| id)
+        .collect();
+
+    let mut ordered = Vec::with_capacity(commits_in_range.len());
+    while let Some(node) = ready.pop_front() {
+        ordered.push(node);
+        if let Some(children) = children_map.get(&node) {
+            for child in children {
+                if let Some(deg) = in_degree.get_mut(child) {
+                    *deg -= 1;
+                    if *deg == 0 {
+                        ready.push_back(*child);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(ordered)
+}
+
+/// Finds an optimal commit midpoint for binary search bisecting.
+///
+/// Given one or more `good_commits` (known good), a `bad_commit` (known bad),
+/// and an optional set of `skipped` commits:
+/// Returns a candidate commit from `(ancestors(bad) \ ancestors(good)) \ skipped`
+/// whose ancestor count inside the candidate set is as close to half of the candidate set as possible.
+pub fn find_bisect_midpoint<S: ObjectStore>(
+    store: &S,
+    good_commits: &[ObjectId],
+    bad_commit: &ObjectId,
+    skipped: &HashSet<ObjectId>,
+) -> Result<Option<ObjectId>, HistoryError> {
+    let mut good_ancestors = HashSet::new();
+    for good in good_commits {
+        good_ancestors.extend(get_all_ancestors(store, good)?);
+    }
+
+    if good_ancestors.contains(bad_commit) {
+        return Ok(None);
+    }
+
+    let bad_ancestors = get_all_ancestors(store, bad_commit)?;
+    let candidates: HashSet<ObjectId> =
+        bad_ancestors.difference(&good_ancestors).copied().collect();
+
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let eligible: Vec<ObjectId> = candidates
+        .iter()
+        .copied()
+        .filter(|id| !skipped.contains(id) && id != bad_commit)
+        .collect();
+
+    if eligible.is_empty() {
+        if !skipped.contains(bad_commit) {
+            return Ok(Some(*bad_commit));
+        }
+        return Ok(None);
+    }
+
+    let total_candidates = candidates.len();
+    let target = total_candidates / 2;
+
+    let mut best_commit = eligible[0];
+    let mut best_diff = usize::MAX;
+
+    for &cand in &eligible {
+        let cand_ancestors = get_all_ancestors(store, &cand)?;
+        let count_in_candidates = cand_ancestors.intersection(&candidates).count();
+        let diff = if count_in_candidates >= target {
+            count_in_candidates - target
+        } else {
+            target - count_in_candidates
+        };
+
+        if diff < best_diff {
+            best_diff = diff;
+            best_commit = cand;
+        }
+    }
+
+    Ok(Some(best_commit))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,5 +547,126 @@ mod tests {
             }
             other => panic!("Expected AmbiguousMergeBases, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_find_commits_between_and_bisect() {
+        let store = MemoryObjectStore::new(HashAlgorithm::Blake3);
+
+        // Linear chain: C0 -> C1 -> C2 -> C3 -> C4
+        let mut prev = None;
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let parents = if let Some(p) = prev { vec![p] } else { vec![] };
+            let c = Commit::new_simple(
+                ObjectId::ZERO,
+                parents,
+                "Dev".into(),
+                "d@s.org".into(),
+                i * 100,
+                format!("commit {}", i),
+            );
+            let cid = store
+                .write_object(ObjectType::Commit, &serialize_commit(&c))
+                .unwrap();
+            ids.push(cid);
+            prev = Some(cid);
+        }
+
+        // Commits between C1 and C4 should be [C2, C3, C4] in topological order
+        let between = find_commits_between(&store, &ids[1], &ids[4]).unwrap();
+        assert_eq!(between, vec![ids[2], ids[3], ids[4]]);
+
+        // Empty range when base == tip
+        let empty = find_commits_between(&store, &ids[2], &ids[2]).unwrap();
+        assert!(empty.is_empty());
+
+        // Bisect midpoint with good=C0, bad=C4
+        // candidates: C1, C2, C3, C4 (4 total)
+        // midpoint should divide candidates evenly (e.g. C2)
+        let skipped = HashSet::new();
+        let mid = find_bisect_midpoint(&store, &[ids[0]], &ids[4], &skipped).unwrap();
+        assert!(mid == Some(ids[2]) || mid == Some(ids[1]));
+    }
+
+    #[test]
+    fn test_blame_attribution() {
+        use spine_core::{FileMode, TreeEntry};
+        use spine_format::serialize_tree;
+
+        let store = MemoryObjectStore::new(HashAlgorithm::Blake3);
+
+        // Commit 1 creates "file.txt" with 2 lines: "line 1", "line 2"
+        let b1 = store
+            .write_object(ObjectType::Blob, b"line 1\nline 2\n")
+            .unwrap();
+        let t1 = store
+            .write_object(
+                ObjectType::Tree,
+                &serialize_tree(&[TreeEntry {
+                    mode: FileMode::Regular,
+                    name: "file.txt".into(),
+                    object_id: b1,
+                }]),
+            )
+            .unwrap();
+        let c1 = Commit::new_simple(
+            t1,
+            vec![],
+            "Alice".into(),
+            "alice@spine.org".into(),
+            1000,
+            "Initial commit".into(),
+        );
+        let c1_id = store
+            .write_object(ObjectType::Commit, &serialize_commit(&c1))
+            .unwrap();
+
+        // Commit 2 modifies "file.txt": "line 1", "line 2 changed by bob", "line 3 added by bob"
+        let b2 = store
+            .write_object(
+                ObjectType::Blob,
+                b"line 1\nline 2 changed by bob\nline 3 added by bob\n",
+            )
+            .unwrap();
+        let t2 = store
+            .write_object(
+                ObjectType::Tree,
+                &serialize_tree(&[TreeEntry {
+                    mode: FileMode::Regular,
+                    name: "file.txt".into(),
+                    object_id: b2,
+                }]),
+            )
+            .unwrap();
+        let c2 = Commit::new_simple(
+            t2,
+            vec![c1_id],
+            "Bob".into(),
+            "bob@spine.org".into(),
+            2000,
+            "Bob edits".into(),
+        );
+        let c2_id = store
+            .write_object(ObjectType::Commit, &serialize_commit(&c2))
+            .unwrap();
+
+        let blame = compute_blame(&store, &c2_id, "file.txt").unwrap();
+        assert_eq!(blame.lines.len(), 3);
+
+        // Line 1: should be attributed to Alice (c1_id)
+        assert_eq!(blame.lines[0].author_name, "Alice");
+        assert_eq!(blame.lines[0].commit_id, c1_id);
+        assert_eq!(blame.lines[0].content, "line 1");
+
+        // Line 2: modified by Bob (c2_id)
+        assert_eq!(blame.lines[1].author_name, "Bob");
+        assert_eq!(blame.lines[1].commit_id, c2_id);
+        assert_eq!(blame.lines[1].content, "line 2 changed by bob");
+
+        // Line 3: added by Bob (c2_id)
+        assert_eq!(blame.lines[2].author_name, "Bob");
+        assert_eq!(blame.lines[2].commit_id, c2_id);
+        assert_eq!(blame.lines[2].content, "line 3 added by bob");
     }
 }

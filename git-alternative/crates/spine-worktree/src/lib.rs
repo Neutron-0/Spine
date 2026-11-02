@@ -3,6 +3,17 @@
 //! Working tree traversal, ignore rules evaluation, stat-cache diffing,
 //! and staging mechanics for Spine repositories.
 
+pub mod multi;
+pub mod stash;
+
+pub use multi::{
+    add_worktree, get_checked_out_branches, list_worktrees, prune_worktrees, remove_worktree,
+    resolve_worktree_context, WorktreeInfo, WorktreeMetadata,
+};
+pub use stash::{
+    stash_apply, stash_clear, stash_drop, stash_pop, stash_push, StashEntry, StashList,
+};
+
 use spine_core::{FileMode, ObjectId, ObjectType, TreeEntry};
 use spine_format::deserialize_tree;
 use spine_index::{Index, IndexEntry, StageStatus};
@@ -633,4 +644,175 @@ fn remove_empty_parent_dirs(root: &Path, rel_file_path: &str) -> io::Result<()> 
         current = parent.to_path_buf();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spine_core::{Commit, HashAlgorithm};
+    use spine_format::serialize_commit;
+    use spine_object_store::MemoryObjectStore;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_stash_push_and_pop_lifecycle() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let spine_dir = root.join(".spine");
+        fs::create_dir_all(&spine_dir).unwrap();
+
+        let store = MemoryObjectStore::new(HashAlgorithm::Blake3);
+        let mut index = Index::new();
+        let ignore = IgnoreRules::default();
+
+        // Create base commit with file.txt = "base"
+        let b0 = store.write_object(ObjectType::Blob, b"base").unwrap();
+        let t0 = store
+            .write_object(
+                ObjectType::Tree,
+                &spine_format::serialize_tree(&[TreeEntry {
+                    mode: FileMode::Regular,
+                    name: "file.txt".into(),
+                    object_id: b0,
+                }]),
+            )
+            .unwrap();
+        let c0 = Commit::new_simple(
+            t0,
+            vec![],
+            "Author".into(),
+            "a@b.com".into(),
+            100,
+            "Initial".into(),
+        );
+        let c0_id = store
+            .write_object(ObjectType::Commit, &serialize_commit(&c0))
+            .unwrap();
+
+        // Working tree has file.txt on disk
+        fs::write(root.join("file.txt"), "modified on disk").unwrap();
+        index.add_or_update(IndexEntry {
+            path: "file.txt".into(),
+            mode: FileMode::Regular,
+            file_size: 4,
+            mtime_secs: 100,
+            mtime_nanos: 0,
+            inode: 0,
+            object_id: b0,
+            stage_status: StageStatus::Clean,
+        });
+
+        // Untracked file
+        fs::write(root.join("untracked.txt"), "hello untracked").unwrap();
+
+        // Stash push with untracked
+        let stashed = stash_push(
+            &root,
+            &spine_dir,
+            &mut index,
+            &store,
+            Some(&c0_id),
+            "main",
+            None,
+            true,
+            &ignore,
+        )
+        .unwrap();
+
+        assert!(stashed.is_some());
+        // Verify working tree is restored to clean base
+        let content_after = fs::read_to_string(root.join("file.txt")).unwrap();
+        assert_eq!(content_after, "base");
+        assert!(!root.join("untracked.txt").exists());
+
+        // Stash pop
+        let popped = stash_pop(&root, &spine_dir, &mut index, &store, 0, false).unwrap();
+        assert_eq!(popped.commit_id, stashed.unwrap().commit_id);
+
+        let content_popped = fs::read_to_string(root.join("file.txt")).unwrap();
+        assert_eq!(content_popped, "modified on disk");
+        assert!(root.join("untracked.txt").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("untracked.txt")).unwrap(),
+            "hello untracked"
+        );
+    }
+
+    #[test]
+    fn test_multi_worktree_lifecycle_and_branch_locking() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let spine_dir = root.join(".spine");
+        fs::create_dir_all(spine_dir.join("refs").join("heads")).unwrap();
+        fs::write(spine_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let store = MemoryObjectStore::new(HashAlgorithm::Blake3);
+
+        // Commit C0
+        let b0 = store.write_object(ObjectType::Blob, b"primary").unwrap();
+        let t0 = store
+            .write_object(
+                ObjectType::Tree,
+                &spine_format::serialize_tree(&[TreeEntry {
+                    mode: FileMode::Regular,
+                    name: "hello.txt".into(),
+                    object_id: b0,
+                }]),
+            )
+            .unwrap();
+        let c0 = Commit::new_simple(
+            t0,
+            vec![],
+            "Author".into(),
+            "a@b.com".into(),
+            100,
+            "Initial".into(),
+        );
+        let c0_id = store
+            .write_object(ObjectType::Commit, &serialize_commit(&c0))
+            .unwrap();
+        fs::write(
+            spine_dir.join("refs").join("heads").join("main"),
+            c0_id.to_hex(),
+        )
+        .unwrap();
+
+        // 1. Cannot add worktree with branch 'main' because it's checked out in primary
+        let wt_path = tmp.path().join("linked_feature");
+        let conflict = add_worktree(&spine_dir, &wt_path, Some("main"), &c0_id, &store);
+        assert!(conflict.is_err());
+        assert!(conflict
+            .unwrap_err()
+            .to_string()
+            .contains("already checked out"));
+
+        // 2. Add worktree with branch 'feature'
+        let wt = add_worktree(&spine_dir, &wt_path, Some("feature"), &c0_id, &store).unwrap();
+        assert_eq!(wt.branch, Some("feature".into()));
+        assert!(wt_path.join(".spine").is_file());
+        assert!(wt_path.join("hello.txt").is_file());
+
+        // 3. Resolve context inside linked worktree
+        let (wt_root, eff_spine, prim_spine, is_linked) =
+            resolve_worktree_context(&wt_path).unwrap();
+        assert!(is_linked);
+        assert_eq!(wt_root, wt.path);
+        assert_eq!(
+            prim_spine,
+            multi::normalize_canonical_path(spine_dir.canonicalize().unwrap())
+        );
+        assert!(eff_spine.ends_with(&wt.id));
+
+        // 4. List worktrees shows 2 entries (primary + feature)
+        let list = list_worktrees(&spine_dir).unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list[0].is_primary);
+        assert!(!list[1].is_primary);
+
+        // 5. Remove worktree
+        remove_worktree(&spine_dir, &wt.id, false).unwrap();
+        let list_after = list_worktrees(&spine_dir).unwrap();
+        assert_eq!(list_after.len(), 1);
+        assert!(!wt_path.exists());
+    }
 }

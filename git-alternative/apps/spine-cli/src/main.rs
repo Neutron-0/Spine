@@ -1,3 +1,7 @@
+pub mod ops_history;
+pub mod ops_tag;
+pub mod ops_worktree;
+
 use anyhow::{bail, Context, Result};
 use chrono::{TimeZone, Utc};
 use clap::{Parser, Subcommand};
@@ -205,10 +209,226 @@ enum Commands {
         #[command(subcommand)]
         action: Option<TagAction>,
     },
+    /// Reset current HEAD to the specified state or unstage paths
+    Reset {
+        /// Move HEAD to revision, leave index and working tree intact
+        #[arg(long)]
+        soft: bool,
+        /// Move HEAD and reset index, leave working tree intact (default)
+        #[arg(long)]
+        mixed: bool,
+        /// Move HEAD, reset index and discard all changes in working tree
+        #[arg(long)]
+        hard: bool,
+        /// Target revision (defaults to HEAD)
+        #[arg(default_value = "HEAD")]
+        revision: String,
+        /// Path-specific reset
+        paths: Vec<PathBuf>,
+    },
+    /// Restore working tree files or staging index
+    Restore {
+        /// Restore staging index
+        #[arg(long)]
+        staged: bool,
+        /// Restore working tree (default)
+        #[arg(long)]
+        worktree: bool,
+        /// Source revision (defaults to HEAD for staged, index for worktree)
+        #[arg(short, long)]
+        source: Option<String>,
+        /// Paths to restore
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
+    /// Revert an existing commit by creating an inverted diff commit
+    Revert {
+        /// Commit revision to revert
+        revision: Option<String>,
+        /// Mainline parent number for merge commits (1-based)
+        #[arg(short, long)]
+        mainline: Option<usize>,
+        /// Continue revert after resolving conflicts
+        #[arg(long = "continue")]
+        continue_revert: bool,
+        /// Abort revert and restore original HEAD
+        #[arg(long)]
+        abort: bool,
+    },
+    /// Apply changes introduced by an existing commit onto HEAD
+    CherryPick {
+        /// Commit revision to cherry-pick
+        revision: Option<String>,
+        /// Mainline parent number for merge commits (1-based)
+        #[arg(short, long)]
+        mainline: Option<usize>,
+        /// Continue cherry-pick after resolving conflicts
+        #[arg(long = "continue")]
+        continue_cherry_pick: bool,
+        /// Skip the current commit and continue
+        #[arg(long)]
+        skip: bool,
+        /// Abort cherry-pick and restore original HEAD
+        #[arg(long)]
+        abort: bool,
+    },
+    /// Reapply commits on top of another base tip
+    Rebase {
+        /// Upstream branch or commit
+        upstream: Option<String>,
+        /// New base commit to replay onto (defaults to upstream)
+        #[arg(long)]
+        onto: Option<String>,
+        /// Continue rebase after resolving conflicts
+        #[arg(long = "continue")]
+        continue_rebase: bool,
+        /// Skip the current commit and continue
+        #[arg(long)]
+        skip: bool,
+        /// Abort rebase and restore original branch/HEAD
+        #[arg(long)]
+        abort: bool,
+    },
+    /// Stash the changes in a dirty working directory away
+    Stash {
+        #[command(subcommand)]
+        action: Option<StashAction>,
+    },
+    /// Manage multiple linked working trees
+    Worktree {
+        #[command(subcommand)]
+        action: WorktreeAction,
+    },
+    /// Show what revision and author last modified each line of a file
+    Blame {
+        /// File path to blame
+        path: String,
+        /// Commit revision (defaults to HEAD)
+        #[arg(short, long, default_value = "HEAD")]
+        revision: String,
+    },
+    /// Use binary search to find the commit that introduced a bug
+    Bisect {
+        #[command(subcommand)]
+        action: BisectAction,
+    },
+    /// Move or rename a file or directory
+    Mv {
+        /// Source path
+        source: PathBuf,
+        /// Destination path
+        destination: PathBuf,
+    },
+    /// Remove files from the working tree and index
+    Rm {
+        /// Paths to remove
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Only remove from index; keep working tree files
+        #[arg(long)]
+        cached: bool,
+        /// Force removal even if files have unstaged modifications
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Remove untracked files from the working tree
+    Clean {
+        /// Dry-run: show what would be removed
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+        /// Force removal of untracked files
+        #[arg(short, long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
-enum RemoteAction {
+pub enum StashAction {
+    /// Save local changes to a new stash
+    Push {
+        /// Stash message
+        #[arg(short, long)]
+        message: Option<String>,
+        /// Include untracked files
+        #[arg(short = 'u', long)]
+        include_untracked: bool,
+    },
+    /// List all stash entries
+    List,
+    /// Show stash diff summary
+    Show {
+        #[arg(default_value = "0")]
+        index: usize,
+    },
+    /// Apply stash entry
+    Apply {
+        #[arg(default_value = "0")]
+        index: usize,
+        /// Reinstate index staging state
+        #[arg(long)]
+        index_reinstate: bool,
+    },
+    /// Apply stash entry and remove it from stash list
+    Pop {
+        #[arg(default_value = "0")]
+        index: usize,
+        /// Reinstate index staging state
+        #[arg(long)]
+        index_reinstate: bool,
+    },
+    /// Remove a single stash entry
+    Drop {
+        #[arg(default_value = "0")]
+        index: usize,
+    },
+    /// Clear all stash entries
+    Clear,
+}
+
+#[derive(Subcommand)]
+pub enum WorktreeAction {
+    /// Add a new linked worktree
+    Add {
+        /// Worktree path
+        path: PathBuf,
+        /// Branch name to check out
+        branch: Option<String>,
+    },
+    /// List all linked worktrees
+    List,
+    /// Remove a linked worktree
+    Remove {
+        /// Worktree ID or path
+        id_or_path: String,
+        /// Force removal even if worktree has modifications
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Prune worktree records whose disk directories no longer exist
+    Prune,
+}
+
+#[derive(Subcommand)]
+pub enum BisectAction {
+    /// Start bisect session with optional bad and good commits
+    Start {
+        bad: Option<String>,
+        good: Option<String>,
+    },
+    /// Mark a revision as bad
+    Bad { rev: Option<String> },
+    /// Mark a revision as good
+    Good { rev: Option<String> },
+    /// Skip current or specified revision
+    Skip { rev: Option<String> },
+    /// Show bisect session status
+    Status,
+    /// Abort bisect and return to original HEAD
+    Reset,
+}
+
+#[derive(Subcommand)]
+pub enum RemoteAction {
     /// Add a new remote repository
     Add { name: String, url: String },
     /// List all configured remotes
@@ -222,7 +442,7 @@ enum RemoteAction {
 }
 
 #[derive(Subcommand)]
-enum TagAction {
+pub enum TagAction {
     /// List all tags
     List,
     /// Create a new tag pointing to rev (default HEAD)
@@ -230,7 +450,17 @@ enum TagAction {
         name: String,
         #[arg(default_value = "HEAD")]
         rev: String,
+        /// Create an annotated tag object
+        #[arg(short, long)]
+        annotate: bool,
+        /// Tag message
+        #[arg(short, long)]
+        message: Option<String>,
     },
+    /// Show details of an annotated or lightweight tag
+    Show { name: String },
+    /// Verify cryptographic integrity of tag and target object
+    Verify { name: String },
     /// Delete a tag
     Delete { name: String },
 }
@@ -274,36 +504,78 @@ enum ConfigAction {
     Set { key: String, value: String },
 }
 
-fn find_repo_root() -> Result<(PathBuf, PathBuf)> {
-    let mut current = env::current_dir().context("Failed to get current working directory")?;
-    loop {
-        let spine_dir = current.join(".spine");
-        if spine_dir.is_dir() && spine_dir.join("spine.toml").is_file() {
-            return Ok((current, spine_dir));
-        }
-        if !current.pop() {
-            bail!("fatal: not a spine repository (or any of the parent directories): .spine");
-        }
+pub struct RepoContext {
+    pub worktree_root: PathBuf,
+    pub spine_dir: PathBuf,
+    pub primary_spine_dir: PathBuf,
+    pub is_linked: bool,
+}
+
+pub fn get_repo_context() -> Result<RepoContext> {
+    let current = env::current_dir().context("Failed to get current working directory")?;
+    let (worktree_root, spine_dir, primary_spine_dir, is_linked) =
+        spine_worktree::resolve_worktree_context(&current).map_err(|_| {
+            anyhow::anyhow!(
+                "fatal: not a spine repository (or any of the parent directories): .spine"
+            )
+        })?;
+    Ok(RepoContext {
+        worktree_root,
+        spine_dir,
+        primary_spine_dir,
+        is_linked,
+    })
+}
+
+pub fn find_repo_root() -> Result<(PathBuf, PathBuf)> {
+    let ctx = get_repo_context()?;
+    Ok((ctx.worktree_root, ctx.spine_dir))
+}
+
+pub fn load_repo_config(spine_dir: &Path) -> Result<SpineConfig> {
+    let effective_spine_dir = if spine_dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .map_or(false, |n| n == "worktrees")
+    {
+        spine_dir.parent().unwrap().parent().unwrap()
+    } else {
+        spine_dir
+    };
+    let config_path = effective_spine_dir.join("spine.toml");
+    if config_path.exists() {
+        Ok(SpineConfig::load_from_file(&config_path)?)
+    } else {
+        Ok(SpineConfig::default())
     }
 }
 
-fn open_store(spine_dir: &Path, config: &SpineConfig) -> Result<CompositeObjectStore> {
+pub fn open_store(spine_dir: &Path, config: &SpineConfig) -> Result<CompositeObjectStore> {
+    let effective_spine_dir = if spine_dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .map_or(false, |n| n == "worktrees")
+    {
+        spine_dir.parent().unwrap().parent().unwrap()
+    } else {
+        spine_dir
+    };
     let algo = match config.repository.hash_algorithm.as_str() {
         "sha256" => HashAlgorithm::Sha256,
         _ => HashAlgorithm::Blake3,
     };
-    let store =
-        CompositeObjectStore::new(spine_dir, algo, 3).context("Failed to open object store")?;
+    let store = CompositeObjectStore::new(effective_spine_dir, algo, 3)
+        .context("Failed to open object store")?;
     Ok(store)
 }
 
 #[derive(Clone, Debug)]
-struct RepoState {
-    head_ref_name: Option<String>,
-    head_commit_id: Option<ObjectId>,
+pub struct RepoState {
+    pub head_ref_name: Option<String>,
+    pub head_commit_id: Option<ObjectId>,
 }
 
-fn resolve_head(spine_dir: &Path) -> Result<RepoState> {
+pub fn resolve_head(spine_dir: &Path) -> Result<RepoState> {
     let head_path = spine_dir.join("HEAD");
     if !head_path.exists() {
         bail!("fatal: corrupt repository: missing HEAD");
@@ -320,6 +592,17 @@ fn resolve_head(spine_dir: &Path) -> Result<RepoState> {
             .unwrap_or(target_ref)
             .to_string();
         let ref_path = spine_dir.join(target_ref);
+        let ref_path = if ref_path.exists() {
+            ref_path
+        } else {
+            // Also check primary spine dir if this is a linked worktree
+            let prim_ref = spine_dir
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.join(target_ref));
+            prim_ref.unwrap_or(ref_path)
+        };
+
         if ref_path.exists() {
             let ref_content = fs::read_to_string(&ref_path)
                 .context("Failed to read branch reference")?
@@ -345,11 +628,71 @@ fn resolve_head(spine_dir: &Path) -> Result<RepoState> {
     }
 }
 
-fn resolve_commit_ref(
+pub fn peel_to_commit(store: &CompositeObjectStore, mut oid: ObjectId) -> Result<ObjectId> {
+    loop {
+        let (obj_type, payload) = store.read_object(&oid)?;
+        match obj_type {
+            ObjectType::Commit => return Ok(oid),
+            ObjectType::Tag => {
+                let tag = spine_format::deserialize_annotated_tag(&payload)?;
+                oid = tag.target_object;
+            }
+            _ => return Ok(oid),
+        }
+    }
+}
+
+pub fn resolve_commit_ref_advanced(
     spine_dir: &Path,
+    primary_spine_dir: &Path,
     store: &CompositeObjectStore,
     rev: &str,
 ) -> Result<ObjectId> {
+    let rev = rev.trim();
+    if rev.is_empty() {
+        bail!("fatal: empty revision");
+    }
+
+    // Handle HEAD~N, HEAD^, <rev>~N, <rev>^N
+    if let Some(idx) = rev.find('~') {
+        let base_rev = &rev[..idx];
+        let count_str = &rev[idx + 1..];
+        let count: usize = if count_str.is_empty() {
+            1
+        } else {
+            count_str.parse().context("Invalid ~ count in revision")?
+        };
+        let mut current_oid =
+            resolve_commit_ref_advanced(spine_dir, primary_spine_dir, store, base_rev)?;
+        for _ in 0..count {
+            let commit = get_commit(store, &current_oid)?;
+            let parent = commit.parents.first().ok_or_else(|| {
+                anyhow::anyhow!("Revision '{}' has no parent (reached root commit)", rev)
+            })?;
+            current_oid = *parent;
+        }
+        return Ok(current_oid);
+    }
+
+    if let Some(idx) = rev.find('^') {
+        let base_rev = &rev[..idx];
+        let parent_idx_str = &rev[idx + 1..];
+        let parent_idx: usize = if parent_idx_str.is_empty() {
+            1
+        } else {
+            parent_idx_str.parse().context("Invalid ^ parent index")?
+        };
+        if parent_idx == 0 {
+            return resolve_commit_ref_advanced(spine_dir, primary_spine_dir, store, base_rev);
+        }
+        let base_oid = resolve_commit_ref_advanced(spine_dir, primary_spine_dir, store, base_rev)?;
+        let commit = get_commit(store, &base_oid)?;
+        let parent = commit.parents.get(parent_idx - 1).ok_or_else(|| {
+            anyhow::anyhow!("Revision '{}' does not have parent #{}", rev, parent_idx)
+        })?;
+        return Ok(*parent);
+    }
+
     if rev == "HEAD" {
         let state = resolve_head(spine_dir)?;
         return state
@@ -358,42 +701,90 @@ fn resolve_commit_ref(
     }
 
     // Check branch
-    let branch_ref = spine_dir.join("refs").join("heads").join(rev);
-    if branch_ref.exists() {
-        let content = fs::read_to_string(branch_ref)?.trim().to_string();
-        return ObjectId::from_hex(&content).context("Invalid branch ref");
+    for dir in &[spine_dir, primary_spine_dir] {
+        let branch_ref = dir.join("refs").join("heads").join(rev);
+        if branch_ref.exists() {
+            let content = fs::read_to_string(branch_ref)?.trim().to_string();
+            let oid = ObjectId::from_hex(&content).context("Invalid branch ref")?;
+            return peel_to_commit(store, oid);
+        }
     }
 
     // Check tag
-    let tag_ref = spine_dir.join("refs").join("tags").join(rev);
-    if tag_ref.exists() {
-        let content = fs::read_to_string(tag_ref)?.trim().to_string();
-        return ObjectId::from_hex(&content).context("Invalid tag ref");
+    for dir in &[spine_dir, primary_spine_dir] {
+        let tag_ref = dir.join("refs").join("tags").join(rev);
+        if tag_ref.exists() {
+            let content = fs::read_to_string(tag_ref)?.trim().to_string();
+            let oid = ObjectId::from_hex(&content).context("Invalid tag ref")?;
+            return peel_to_commit(store, oid);
+        }
     }
 
     // Check remote tracking ref (e.g. origin/main)
-    let remote_ref = spine_dir.join("refs").join("remotes").join(rev);
-    if remote_ref.exists() {
-        let content = fs::read_to_string(remote_ref)?.trim().to_string();
-        return ObjectId::from_hex(&content).context("Invalid remote tracking ref");
+    for dir in &[spine_dir, primary_spine_dir] {
+        let remote_ref = dir.join("refs").join("remotes").join(rev);
+        if remote_ref.exists() {
+            let content = fs::read_to_string(remote_ref)?.trim().to_string();
+            let oid = ObjectId::from_hex(&content).context("Invalid remote tracking ref")?;
+            return peel_to_commit(store, oid);
+        }
     }
 
-    // Direct hash
+    // Direct 64-char hash
     if let Ok(oid) = ObjectId::from_hex(rev) {
         if store.has_object(&oid) {
-            return Ok(oid);
+            return peel_to_commit(store, oid);
+        }
+    }
+
+    // Unique prefix matching (at least 4 chars)
+    if rev.len() >= 4 && rev.chars().all(|c| c.is_ascii_hexdigit()) {
+        let prefix = rev.to_ascii_lowercase();
+        let loose = store.loose_store().list_objects()?;
+        let mut matches = Vec::new();
+        for oid in loose {
+            if oid.to_hex().starts_with(&prefix) {
+                matches.push(oid);
+            }
+        }
+        if matches.len() == 1 {
+            return peel_to_commit(store, matches[0]);
+        } else if matches.len() > 1 {
+            bail!(
+                "fatal: ambiguous revision prefix '{}' ({} matches)",
+                rev,
+                matches.len()
+            );
         }
     }
 
     bail!("fatal: Cannot resolve revision '{}'", rev)
 }
 
-fn update_ref(spine_dir: &Path, target_ref: &str, new_oid: &ObjectId) -> Result<()> {
-    let ref_path = spine_dir.join(target_ref);
+pub fn resolve_commit_ref(
+    spine_dir: &Path,
+    store: &CompositeObjectStore,
+    rev: &str,
+) -> Result<ObjectId> {
+    resolve_commit_ref_advanced(spine_dir, spine_dir, store, rev)
+}
+
+pub fn update_ref(spine_dir: &Path, target_ref: &str, new_oid: &ObjectId) -> Result<()> {
+    let effective_spine_dir = if spine_dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .map_or(false, |n| n == "worktrees")
+    {
+        spine_dir.parent().unwrap().parent().unwrap()
+    } else {
+        spine_dir
+    };
+
+    let ref_path = effective_spine_dir.join(target_ref);
     let parent = ref_path.parent().unwrap();
     fs::create_dir_all(parent)?;
 
-    let tmp_path = spine_dir
+    let tmp_path = effective_spine_dir
         .join("tmp")
         .join(format!("ref-{}", Uuid::new_v4()));
     fs::create_dir_all(tmp_path.parent().unwrap())?;
@@ -413,7 +804,7 @@ fn update_ref(spine_dir: &Path, target_ref: &str, new_oid: &ObjectId) -> Result<
     Ok(())
 }
 
-fn capture_snapshot(
+pub fn capture_snapshot(
     spine_dir: &Path,
     state: &RepoState,
     store: &CompositeObjectStore,
@@ -448,6 +839,7 @@ fn capture_snapshot(
         branch_tip: state.head_commit_id,
         index_checksum,
         tree_id,
+        worktree_id: None,
     })
 }
 
@@ -556,7 +948,7 @@ fn validate_branch_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn summarize_diff<S: ObjectStore>(
+pub fn summarize_diff<S: ObjectStore>(
     changes: &[spine_diff::TreeChange],
     store: &S,
 ) -> spine_diff::DiffSummary {
@@ -690,7 +1082,7 @@ async fn main() -> Result<()> {
 
         Commands::Add { paths } => {
             let (worktree_root, spine_dir) = find_repo_root()?;
-            let config = SpineConfig::load_from_file(spine_dir.join("spine.toml"))?;
+            let config = load_repo_config(&spine_dir)?;
             let store = open_store(&spine_dir, &config)?;
             let index_path = spine_dir.join("index");
             let mut index = Index::load_from_file(&index_path)?;
@@ -736,7 +1128,7 @@ async fn main() -> Result<()> {
 
         Commands::Status => {
             let (worktree_root, spine_dir) = find_repo_root()?;
-            let config = SpineConfig::load_from_file(spine_dir.join("spine.toml"))?;
+            let config = load_repo_config(&spine_dir)?;
             let store = open_store(&spine_dir, &config)?;
             let index_path = spine_dir.join("index");
             let index = Index::load_from_file(&index_path)?;
@@ -838,7 +1230,7 @@ async fn main() -> Result<()> {
 
         Commands::Commit { message } => {
             let (_worktree_root, spine_dir) = find_repo_root()?;
-            let config = SpineConfig::load_from_file(spine_dir.join("spine.toml"))?;
+            let config = load_repo_config(&spine_dir)?;
             let store = open_store(&spine_dir, &config)?;
             let index_path = spine_dir.join("index");
             let index = Index::load_from_file(&index_path)?;
@@ -957,7 +1349,7 @@ async fn main() -> Result<()> {
 
         Commands::Log { limit } => {
             let (_, spine_dir) = find_repo_root()?;
-            let config = SpineConfig::load_from_file(spine_dir.join("spine.toml"))?;
+            let config = load_repo_config(&spine_dir)?;
             let store = open_store(&spine_dir, &config)?;
             let state = resolve_head(&spine_dir)?;
 
@@ -1010,7 +1402,7 @@ async fn main() -> Result<()> {
 
         Commands::Show { object } => {
             let (_, spine_dir) = find_repo_root()?;
-            let config = SpineConfig::load_from_file(spine_dir.join("spine.toml"))?;
+            let config = load_repo_config(&spine_dir)?;
             let store = open_store(&spine_dir, &config)?;
 
             let target_cid = resolve_commit_ref(&spine_dir, &store, &object)?;
@@ -1049,7 +1441,7 @@ async fn main() -> Result<()> {
 
         Commands::Branch { action } => {
             let (_, spine_dir) = find_repo_root()?;
-            let config = SpineConfig::load_from_file(spine_dir.join("spine.toml"))?;
+            let config = load_repo_config(&spine_dir)?;
             let store = open_store(&spine_dir, &config)?;
             let state = resolve_head(&spine_dir)?;
             let mut journal = Journal::new(spine_dir.join("journal"))?;
@@ -1159,7 +1551,7 @@ async fn main() -> Result<()> {
 
         Commands::Switch { branch, create } => {
             let (worktree_root, spine_dir) = find_repo_root()?;
-            let config = SpineConfig::load_from_file(spine_dir.join("spine.toml"))?;
+            let config = load_repo_config(&spine_dir)?;
             let store = open_store(&spine_dir, &config)?;
             let index_path = spine_dir.join("index");
             let mut index = Index::load_from_file(&index_path)?;
@@ -1250,7 +1642,7 @@ async fn main() -> Result<()> {
             rev_b,
         } => {
             let (worktree_root, spine_dir) = find_repo_root()?;
-            let config = SpineConfig::load_from_file(spine_dir.join("spine.toml"))?;
+            let config = load_repo_config(&spine_dir)?;
             let store = open_store(&spine_dir, &config)?;
             let index_path = spine_dir.join("index");
             let index = Index::load_from_file(&index_path)?;
@@ -1366,7 +1758,7 @@ async fn main() -> Result<()> {
             message,
         } => {
             let (worktree_root, spine_dir) = find_repo_root()?;
-            let config = SpineConfig::load_from_file(spine_dir.join("spine.toml"))?;
+            let config = load_repo_config(&spine_dir)?;
             let store = open_store(&spine_dir, &config)?;
             let index_path = spine_dir.join("index");
             let mut index = Index::load_from_file(&index_path)?;
@@ -1746,7 +2138,7 @@ async fn main() -> Result<()> {
 
         Commands::Undo { list } => {
             let (worktree_root, spine_dir) = find_repo_root()?;
-            let config = SpineConfig::load_from_file(spine_dir.join("spine.toml"))?;
+            let config = load_repo_config(&spine_dir)?;
             let store = open_store(&spine_dir, &config)?;
             let mut journal = Journal::new(spine_dir.join("journal"))?;
 
@@ -1792,7 +2184,7 @@ async fn main() -> Result<()> {
 
         Commands::Redo => {
             let (worktree_root, spine_dir) = find_repo_root()?;
-            let config = SpineConfig::load_from_file(spine_dir.join("spine.toml"))?;
+            let config = load_repo_config(&spine_dir)?;
             let store = open_store(&spine_dir, &config)?;
             let mut journal = Journal::new(spine_dir.join("journal"))?;
 
@@ -1824,7 +2216,7 @@ async fn main() -> Result<()> {
 
         Commands::Fsck => {
             let (_, spine_dir) = find_repo_root()?;
-            let config = SpineConfig::load_from_file(spine_dir.join("spine.toml"))?;
+            let config = load_repo_config(&spine_dir)?;
             let store = open_store(&spine_dir, &config)?;
 
             println!(
@@ -1906,7 +2298,7 @@ async fn main() -> Result<()> {
 
         Commands::CountObjects => {
             let (_worktree_root, spine_dir) = find_repo_root()?;
-            let config = SpineConfig::load_from_file(spine_dir.join("spine.toml"))?;
+            let config = load_repo_config(&spine_dir)?;
             let store = open_store(&spine_dir, &config)?;
             let summary = store.count_objects();
 
@@ -1934,7 +2326,7 @@ async fn main() -> Result<()> {
 
         Commands::Pack { action } => {
             let (_worktree_root, spine_dir) = find_repo_root()?;
-            let config = SpineConfig::load_from_file(spine_dir.join("spine.toml"))?;
+            let config = load_repo_config(&spine_dir)?;
             let store = open_store(&spine_dir, &config)?;
 
             match action {
@@ -2020,7 +2412,7 @@ async fn main() -> Result<()> {
 
         Commands::Repack { dry_run, verify } => {
             let (_worktree_root, spine_dir) = find_repo_root()?;
-            let config = SpineConfig::load_from_file(spine_dir.join("spine.toml"))?;
+            let config = load_repo_config(&spine_dir)?;
             let store = open_store(&spine_dir, &config)?;
             let _lock = RepoLock::acquire(&spine_dir, "repack")?;
 
@@ -2073,34 +2465,152 @@ async fn main() -> Result<()> {
             dry_run,
             prune_before,
         } => {
-            let (_worktree_root, spine_dir) = find_repo_root()?;
-            let config = SpineConfig::load_from_file(spine_dir.join("spine.toml"))?;
-            let store = open_store(&spine_dir, &config)?;
-            let _lock = RepoLock::acquire(&spine_dir, "gc")?;
+            let ctx = get_repo_context()?;
+            let config = SpineConfig::load_from_file(ctx.primary_spine_dir.join("spine.toml"))?;
+            let store = open_store(&ctx.primary_spine_dir, &config)?;
+            let _lock = RepoLock::acquire(&ctx.primary_spine_dir, "gc")?;
 
-            // Enumerate roots: branch tips, HEAD, tags, merge state, journal records, index
+            // Comprehensive enumeration of all GC roots across repository:
+            // 1. Branch tips
             let mut roots = Vec::new();
-            for (_, oid_opt) in list_branches(&spine_dir)? {
+            for (_, oid_opt) in list_branches(&ctx.primary_spine_dir)? {
                 if let Some(oid) = oid_opt {
                     roots.push(oid);
                 }
             }
-            let head_state = resolve_head(&spine_dir)?;
-            if let Some(cid) = head_state.head_commit_id {
-                roots.push(cid);
+
+            // 2. All tags (annotated and lightweight)
+            let tags_dir = ctx.primary_spine_dir.join("refs").join("tags");
+            if tags_dir.exists() {
+                for entry in fs::read_dir(tags_dir)?.flatten() {
+                    if let Ok(c) = fs::read_to_string(entry.path()) {
+                        if let Ok(oid) = ObjectId::from_hex(c.trim()) {
+                            roots.push(oid);
+                        }
+                    }
+                }
             }
-            if let Ok(Some(ms)) = MergeState::load_from_dir(&spine_dir) {
+
+            // 3. Remote tracking refs
+            let remotes_dir = ctx.primary_spine_dir.join("refs").join("remotes");
+            if remotes_dir.exists() {
+                for entry in fs::read_dir(remotes_dir)?.flatten() {
+                    if entry.path().is_dir() {
+                        for sub in fs::read_dir(entry.path())?.flatten() {
+                            if let Ok(c) = fs::read_to_string(sub.path()) {
+                                if let Ok(oid) = ObjectId::from_hex(c.trim()) {
+                                    roots.push(oid);
+                                }
+                            }
+                        }
+                    } else if let Ok(c) = fs::read_to_string(entry.path()) {
+                        if let Ok(oid) = ObjectId::from_hex(c.trim()) {
+                            roots.push(oid);
+                        }
+                    }
+                }
+            }
+
+            // 4. Primary HEAD and current worktree HEAD
+            for s_dir in &[&ctx.primary_spine_dir, &ctx.spine_dir] {
+                if let Ok(state) = resolve_head(s_dir) {
+                    if let Some(cid) = state.head_commit_id {
+                        roots.push(cid);
+                    }
+                }
+            }
+
+            // 5. Stash stack entries and refs/stash
+            let refs_stash = ctx.primary_spine_dir.join("refs").join("stash");
+            if refs_stash.exists() {
+                if let Ok(c) = fs::read_to_string(refs_stash) {
+                    if let Ok(oid) = ObjectId::from_hex(c.trim()) {
+                        roots.push(oid);
+                    }
+                }
+            }
+            if let Ok(stash_list) = spine_worktree::StashList::load_from_dir(&ctx.primary_spine_dir)
+            {
+                for entry in stash_list.entries {
+                    roots.push(entry.commit_id);
+                    roots.push(entry.worktree_tree);
+                    roots.push(entry.index_tree);
+                    if let Some(utree) = entry.untracked_tree {
+                        roots.push(utree);
+                    }
+                }
+            }
+
+            // 6. Linked worktrees (HEADs and indexes)
+            if let Ok(worktrees) = spine_worktree::list_worktrees(&ctx.primary_spine_dir) {
+                for wt in worktrees {
+                    if let Some(h) = wt.head_oid {
+                        roots.push(h);
+                    }
+                    let wt_idx = ctx
+                        .primary_spine_dir
+                        .join("worktrees")
+                        .join(&wt.id)
+                        .join("index");
+                    if let Ok(idx) = Index::load_from_file(&wt_idx) {
+                        for entry in idx.iter() {
+                            roots.push(entry.object_id);
+                        }
+                    }
+                }
+            }
+
+            // 7. In-flight operation states
+            if let Ok(Some(ms)) = MergeState::load_from_dir(&ctx.spine_dir) {
                 roots.push(ms.ours_commit);
                 roots.push(ms.theirs_commit);
                 roots.push(ms.base_commit);
             }
-            let index_path = spine_dir.join("index");
+            if let Ok(Some(rs)) = spine_merge::RebaseState::load_from_dir(&ctx.spine_dir) {
+                roots.push(rs.onto);
+                roots.push(rs.orig_head);
+                if let Some(c) = rs.current_commit {
+                    roots.push(c);
+                }
+                for r in rs.remaining_commits {
+                    roots.push(r);
+                }
+                for (_, new_oid) in rs.old_to_new {
+                    roots.push(new_oid);
+                }
+            }
+            if let Ok(Some(cps)) = spine_merge::CherryPickState::load_from_dir(&ctx.spine_dir) {
+                roots.push(cps.target_commit);
+                roots.push(cps.orig_head);
+            }
+            if let Ok(Some(rvs)) = spine_merge::RevertState::load_from_dir(&ctx.spine_dir) {
+                roots.push(rvs.target_commit);
+                roots.push(rvs.orig_head);
+            }
+            if let Ok(Some(bs)) = spine_history::BisectState::load_from_dir(&ctx.spine_dir) {
+                roots.push(bs.bad_commit);
+                roots.push(bs.orig_head);
+                for g in bs.good_commits {
+                    roots.push(g);
+                }
+                for s in bs.skipped_commits {
+                    roots.push(s);
+                }
+                if let Some(curr) = bs.current_commit {
+                    roots.push(curr);
+                }
+            }
+
+            // 8. Staging index
+            let index_path = ctx.spine_dir.join("index");
             if let Ok(idx) = Index::load_from_file(&index_path) {
                 for entry in idx.iter() {
                     roots.push(entry.object_id);
                 }
             }
-            if let Ok(journal) = Journal::new(spine_dir.join("journal")) {
+
+            // 9. Operation journal records
+            if let Ok(journal) = Journal::new(ctx.spine_dir.join("journal")) {
                 if let Ok(records) = journal.list_records() {
                     for r in records {
                         if let Some(tip) = r.before_state.branch_tip {
@@ -2160,7 +2670,7 @@ async fn main() -> Result<()> {
 
         Commands::VerifyStorage => {
             let (_worktree_root, spine_dir) = find_repo_root()?;
-            let config = SpineConfig::load_from_file(spine_dir.join("spine.toml"))?;
+            let config = load_repo_config(&spine_dir)?;
             let store = open_store(&spine_dir, &config)?;
 
             println!("Verifying Storage Engine V2 repository integrity...");
@@ -2717,51 +3227,440 @@ async fn main() -> Result<()> {
         }
 
         Commands::Tag { action } => {
-            let (_worktree_root, spine_dir) = find_repo_root()?;
-            let config = SpineConfig::load_from_file(spine_dir.join("spine.toml"))?;
-            let store = open_store(&spine_dir, &config)?;
+            let ctx = get_repo_context()?;
+            let config = SpineConfig::load_from_file(ctx.primary_spine_dir.join("spine.toml"))?;
+            let store = open_store(&ctx.primary_spine_dir, &config)?;
 
             match action.unwrap_or(TagAction::List) {
                 TagAction::List => {
-                    let tags_dir = spine_dir.join("refs").join("tags");
-                    if tags_dir.exists() {
-                        let mut tag_names = Vec::new();
-                        for entry in fs::read_dir(tags_dir)?.flatten() {
-                            let name = entry.file_name().to_string_lossy().to_string();
-                            tag_names.push(name);
-                        }
-                        tag_names.sort();
-                        for name in tag_names {
-                            println!("{}", name);
-                        }
-                    }
+                    ops_tag::cmd_tag_list(&ctx.primary_spine_dir)?;
                 }
-                TagAction::Create { name, rev } => {
-                    let target_oid = resolve_commit_ref(&spine_dir, &store, &rev)?;
-                    let tag_file = spine_dir.join("refs").join("tags").join(&name);
-                    if tag_file.exists() {
-                        bail!("fatal: tag '{}' already exists", name);
-                    }
-                    if let Some(parent) = tag_file.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    fs::write(&tag_file, format!("{}\n", target_oid.to_hex()))?;
-                    println!(
-                        "Created tag '{}' pointing to {}",
-                        name,
-                        &target_oid.to_hex()[..7]
-                    );
+                TagAction::Create {
+                    name,
+                    rev,
+                    annotate,
+                    message,
+                } => {
+                    let target_oid = resolve_commit_ref_advanced(
+                        &ctx.spine_dir,
+                        &ctx.primary_spine_dir,
+                        &store,
+                        &rev,
+                    )?;
+                    ops_tag::cmd_tag_create(
+                        &ctx.primary_spine_dir,
+                        &store,
+                        &config,
+                        &name,
+                        target_oid,
+                        annotate,
+                        message,
+                    )?;
+                }
+                TagAction::Show { name } => {
+                    ops_tag::cmd_tag_show(&ctx.primary_spine_dir, &store, &name)?;
+                }
+                TagAction::Verify { name } => {
+                    ops_tag::cmd_tag_verify(&ctx.primary_spine_dir, &store, &name)?;
                 }
                 TagAction::Delete { name } => {
-                    let tag_file = spine_dir.join("refs").join("tags").join(&name);
-                    if tag_file.exists() {
-                        fs::remove_file(&tag_file)?;
-                        println!("Deleted tag '{}'", name);
-                    } else {
-                        bail!("error: tag '{}' not found", name);
-                    }
+                    ops_tag::cmd_tag_delete(&ctx.primary_spine_dir, &name)?;
                 }
             }
+        }
+
+        Commands::Reset {
+            soft,
+            mixed,
+            hard,
+            revision,
+            paths,
+        } => {
+            let ctx = get_repo_context()?;
+            let config = SpineConfig::load_from_file(ctx.primary_spine_dir.join("spine.toml"))?;
+            let store = open_store(&ctx.primary_spine_dir, &config)?;
+            let mut index = Index::load_from_file(ctx.spine_dir.join("index"))?;
+            let ignore = IgnoreRules::load_from_dir(&ctx.worktree_root);
+            let target_oid = resolve_commit_ref_advanced(
+                &ctx.spine_dir,
+                &ctx.primary_spine_dir,
+                &store,
+                &revision,
+            )?;
+
+            ops_history::cmd_reset(
+                &ctx.worktree_root,
+                &ctx.spine_dir,
+                &ctx.primary_spine_dir,
+                &mut index,
+                &store,
+                &target_oid,
+                soft,
+                mixed,
+                hard,
+                &paths,
+                &ignore,
+            )?;
+        }
+
+        Commands::Restore {
+            staged,
+            worktree,
+            source,
+            paths,
+        } => {
+            let ctx = get_repo_context()?;
+            let config = SpineConfig::load_from_file(ctx.primary_spine_dir.join("spine.toml"))?;
+            let store = open_store(&ctx.primary_spine_dir, &config)?;
+            let mut index = Index::load_from_file(ctx.spine_dir.join("index"))?;
+            let source_oid = match source {
+                Some(ref rev) => Some(resolve_commit_ref_advanced(
+                    &ctx.spine_dir,
+                    &ctx.primary_spine_dir,
+                    &store,
+                    rev,
+                )?),
+                None => {
+                    if staged {
+                        resolve_head(&ctx.spine_dir)?.head_commit_id
+                    } else {
+                        None
+                    }
+                }
+            };
+
+            ops_history::cmd_restore(
+                &ctx.worktree_root,
+                &ctx.spine_dir,
+                &mut index,
+                &store,
+                &paths,
+                staged,
+                worktree,
+                source_oid,
+            )?;
+        }
+
+        Commands::Revert {
+            revision,
+            mainline,
+            continue_revert,
+            abort,
+        } => {
+            let ctx = get_repo_context()?;
+            let config = SpineConfig::load_from_file(ctx.primary_spine_dir.join("spine.toml"))?;
+            let store = open_store(&ctx.primary_spine_dir, &config)?;
+            let mut index = Index::load_from_file(ctx.spine_dir.join("index"))?;
+
+            let target_oid = match revision {
+                Some(ref r) => Some(resolve_commit_ref_advanced(
+                    &ctx.spine_dir,
+                    &ctx.primary_spine_dir,
+                    &store,
+                    r,
+                )?),
+                None => None,
+            };
+
+            ops_history::cmd_revert(
+                &ctx.worktree_root,
+                &ctx.spine_dir,
+                &ctx.primary_spine_dir,
+                &mut index,
+                &store,
+                target_oid,
+                mainline,
+                continue_revert,
+                abort,
+                config.user.name.as_deref().unwrap_or("Spine Developer"),
+                config.user.email.as_deref().unwrap_or("dev@spine.org"),
+            )?;
+        }
+
+        Commands::CherryPick {
+            revision,
+            mainline,
+            continue_cherry_pick,
+            skip,
+            abort,
+        } => {
+            let ctx = get_repo_context()?;
+            let config = SpineConfig::load_from_file(ctx.primary_spine_dir.join("spine.toml"))?;
+            let store = open_store(&ctx.primary_spine_dir, &config)?;
+            let mut index = Index::load_from_file(ctx.spine_dir.join("index"))?;
+
+            let target_oid = match revision {
+                Some(ref r) => Some(resolve_commit_ref_advanced(
+                    &ctx.spine_dir,
+                    &ctx.primary_spine_dir,
+                    &store,
+                    r,
+                )?),
+                None => None,
+            };
+
+            ops_history::cmd_cherry_pick(
+                &ctx.worktree_root,
+                &ctx.spine_dir,
+                &ctx.primary_spine_dir,
+                &mut index,
+                &store,
+                target_oid,
+                mainline,
+                continue_cherry_pick,
+                skip,
+                abort,
+            )?;
+        }
+
+        Commands::Rebase {
+            upstream,
+            onto,
+            continue_rebase,
+            skip,
+            abort,
+        } => {
+            let ctx = get_repo_context()?;
+            let config = SpineConfig::load_from_file(ctx.primary_spine_dir.join("spine.toml"))?;
+            let store = open_store(&ctx.primary_spine_dir, &config)?;
+            let mut index = Index::load_from_file(ctx.spine_dir.join("index"))?;
+
+            let upstream_oid = match upstream {
+                Some(ref u) => Some(resolve_commit_ref_advanced(
+                    &ctx.spine_dir,
+                    &ctx.primary_spine_dir,
+                    &store,
+                    u,
+                )?),
+                None => None,
+            };
+
+            let onto_oid = match onto {
+                Some(ref o) => Some(resolve_commit_ref_advanced(
+                    &ctx.spine_dir,
+                    &ctx.primary_spine_dir,
+                    &store,
+                    o,
+                )?),
+                None => None,
+            };
+
+            ops_history::cmd_rebase(
+                &ctx.worktree_root,
+                &ctx.spine_dir,
+                &ctx.primary_spine_dir,
+                &mut index,
+                &store,
+                upstream_oid,
+                onto_oid,
+                continue_rebase,
+                skip,
+                abort,
+            )?;
+        }
+
+        Commands::Stash { action } => {
+            let ctx = get_repo_context()?;
+            let config = SpineConfig::load_from_file(ctx.primary_spine_dir.join("spine.toml"))?;
+            let store = open_store(&ctx.primary_spine_dir, &config)?;
+            let mut index = Index::load_from_file(ctx.spine_dir.join("index"))?;
+            let ignore = IgnoreRules::load_from_dir(&ctx.worktree_root);
+            let state = resolve_head(&ctx.spine_dir)?;
+
+            match action.unwrap_or(StashAction::Push {
+                message: None,
+                include_untracked: false,
+            }) {
+                StashAction::Push {
+                    message,
+                    include_untracked,
+                } => {
+                    let branch_name = state.head_ref_name.unwrap_or_else(|| "HEAD".into());
+                    ops_worktree::cmd_stash_push(
+                        &ctx.worktree_root,
+                        &ctx.spine_dir,
+                        &ctx.primary_spine_dir,
+                        &mut index,
+                        &store,
+                        state.head_commit_id.as_ref(),
+                        &branch_name,
+                        message.as_deref(),
+                        include_untracked,
+                        &ignore,
+                    )?;
+                }
+                StashAction::List => {
+                    ops_worktree::cmd_stash_list(&ctx.primary_spine_dir)?;
+                }
+                StashAction::Show { index: idx } => {
+                    ops_worktree::cmd_stash_show(&ctx.primary_spine_dir, &store, idx)?;
+                }
+                StashAction::Apply {
+                    index: idx,
+                    index_reinstate,
+                } => {
+                    ops_worktree::cmd_stash_apply(
+                        &ctx.worktree_root,
+                        &ctx.spine_dir,
+                        &ctx.primary_spine_dir,
+                        &mut index,
+                        &store,
+                        idx,
+                        index_reinstate,
+                    )?;
+                }
+                StashAction::Pop {
+                    index: idx,
+                    index_reinstate,
+                } => {
+                    ops_worktree::cmd_stash_pop(
+                        &ctx.worktree_root,
+                        &ctx.spine_dir,
+                        &ctx.primary_spine_dir,
+                        &mut index,
+                        &store,
+                        idx,
+                        index_reinstate,
+                    )?;
+                }
+                StashAction::Drop { index: idx } => {
+                    ops_worktree::cmd_stash_drop(&ctx.primary_spine_dir, idx)?;
+                }
+                StashAction::Clear => {
+                    ops_worktree::cmd_stash_clear(&ctx.primary_spine_dir)?;
+                }
+            }
+        }
+
+        Commands::Worktree { action } => {
+            let ctx = get_repo_context()?;
+            let config = SpineConfig::load_from_file(ctx.primary_spine_dir.join("spine.toml"))?;
+            let store = open_store(&ctx.primary_spine_dir, &config)?;
+
+            match action {
+                WorktreeAction::Add { path, branch } => {
+                    let head_state = resolve_head(&ctx.spine_dir)?;
+                    let target_oid = if let Some(ref b) = branch {
+                        if let Ok(oid) = resolve_commit_ref_advanced(
+                            &ctx.spine_dir,
+                            &ctx.primary_spine_dir,
+                            &store,
+                            b,
+                        ) {
+                            oid
+                        } else {
+                            head_state
+                                .head_commit_id
+                                .ok_or_else(|| anyhow::anyhow!("HEAD has no commits yet"))?
+                        }
+                    } else {
+                        head_state
+                            .head_commit_id
+                            .ok_or_else(|| anyhow::anyhow!("HEAD has no commits yet"))?
+                    };
+
+                    ops_worktree::cmd_worktree_add(
+                        &ctx.primary_spine_dir,
+                        &store,
+                        &path,
+                        branch,
+                        &target_oid,
+                    )?;
+                }
+                WorktreeAction::List => {
+                    ops_worktree::cmd_worktree_list(&ctx.primary_spine_dir)?;
+                }
+                WorktreeAction::Remove { id_or_path, force } => {
+                    ops_worktree::cmd_worktree_remove(&ctx.primary_spine_dir, &id_or_path, force)?;
+                }
+                WorktreeAction::Prune => {
+                    ops_worktree::cmd_worktree_prune(&ctx.primary_spine_dir)?;
+                }
+            }
+        }
+
+        Commands::Blame { path, revision } => {
+            let ctx = get_repo_context()?;
+            let config = SpineConfig::load_from_file(ctx.primary_spine_dir.join("spine.toml"))?;
+            let store = open_store(&ctx.primary_spine_dir, &config)?;
+            let target_oid = resolve_commit_ref_advanced(
+                &ctx.spine_dir,
+                &ctx.primary_spine_dir,
+                &store,
+                &revision,
+            )?;
+            ops_history::cmd_blame(&store, &target_oid, &path)?;
+        }
+
+        Commands::Bisect { action } => {
+            let ctx = get_repo_context()?;
+            let config = SpineConfig::load_from_file(ctx.primary_spine_dir.join("spine.toml"))?;
+            let store = open_store(&ctx.primary_spine_dir, &config)?;
+            let mut index = Index::load_from_file(ctx.spine_dir.join("index"))?;
+
+            ops_history::cmd_bisect(
+                &ctx.worktree_root,
+                &ctx.spine_dir,
+                &ctx.primary_spine_dir,
+                &mut index,
+                &store,
+                &action,
+            )?;
+        }
+
+        Commands::Mv {
+            source,
+            destination,
+        } => {
+            let ctx = get_repo_context()?;
+            let mut index = Index::load_from_file(ctx.spine_dir.join("index"))?;
+            ops_worktree::cmd_mv(
+                &ctx.worktree_root,
+                &ctx.spine_dir,
+                &mut index,
+                &source,
+                &destination,
+            )?;
+        }
+
+        Commands::Rm {
+            paths,
+            cached,
+            force,
+        } => {
+            let ctx = get_repo_context()?;
+            let mut index = Index::load_from_file(ctx.spine_dir.join("index"))?;
+            ops_worktree::cmd_rm(
+                &ctx.worktree_root,
+                &ctx.spine_dir,
+                &mut index,
+                &paths,
+                cached,
+                force,
+            )?;
+        }
+
+        Commands::Clean { dry_run, force } => {
+            let ctx = get_repo_context()?;
+            let config = SpineConfig::load_from_file(ctx.primary_spine_dir.join("spine.toml"))?;
+            let store = open_store(&ctx.primary_spine_dir, &config)?;
+            let index = Index::load_from_file(ctx.spine_dir.join("index"))?;
+            let ignore = IgnoreRules::load_from_dir(&ctx.worktree_root);
+            let state = resolve_head(&ctx.spine_dir)?;
+            let head_tree_id = match state.head_commit_id {
+                Some(cid) => get_commit(&store, &cid).ok().map(|c| c.root_tree),
+                None => None,
+            };
+
+            ops_worktree::cmd_clean(
+                &ctx.worktree_root,
+                &index,
+                &store,
+                head_tree_id.as_ref(),
+                dry_run,
+                force,
+                &ignore,
+            )?;
         }
     }
 

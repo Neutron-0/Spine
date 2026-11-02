@@ -10,4 +10,10 @@ spine-core.workspace = true
 spine-format.workspace = true
 spine-index.workspace = true
 spine-object-store.workspace = true
+chrono.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

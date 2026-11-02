@@ -58,7 +58,14 @@ pub fn compute_reachable_set(
                         }
                     }
                 }
-                ObjectType::Blob | ObjectType::Tag => {}
+                ObjectType::Tag => {
+                    if let Ok(tag) = spine_format::deserialize_annotated_tag(&payload) {
+                        if reachable.insert(tag.target_object) {
+                            queue.push_back(tag.target_object);
+                        }
+                    }
+                }
+                ObjectType::Blob => {}
             }
         }
     }

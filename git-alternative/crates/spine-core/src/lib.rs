@@ -294,6 +294,42 @@ impl Commit {
     }
 }
 
+/// An immutable annotated tag pointing to an object in the repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnnotatedTag {
+    pub format_version: u16,
+    pub target_object: ObjectId,
+    pub target_type: ObjectType,
+    pub tag_name: String,
+    pub tagger_name: String,
+    pub tagger_email: String,
+    pub timestamp_nanos: i64,
+    pub message: String,
+}
+
+impl AnnotatedTag {
+    pub fn new(
+        target_object: ObjectId,
+        target_type: ObjectType,
+        tag_name: String,
+        tagger_name: String,
+        tagger_email: String,
+        timestamp_nanos: i64,
+        message: String,
+    ) -> Self {
+        Self {
+            format_version: 1,
+            target_object,
+            target_type,
+            tag_name,
+            tagger_name,
+            tagger_email,
+            timestamp_nanos,
+            message,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3,6 +3,9 @@
 //! Three-way merge engine, conflict detection, line-level three-way text merging,
 //! conflict markers generation, and persistent merge state tracking for Spine VCS.
 
+pub mod replay;
+pub use replay::{CherryPickState, RebaseState, RevertState};
+
 use serde::{Deserialize, Serialize};
 use spine_core::{FileMode, ObjectId, ObjectType};
 use spine_diff::{compute_line_diff, is_binary};
