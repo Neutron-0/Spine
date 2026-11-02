@@ -41,3 +41,5 @@ tempfile.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true

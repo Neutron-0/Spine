@@ -1,25 +1,35 @@
-//! Spine Wire Protocol server session handler.
+//! Spine Wire Protocol server session handler with state machine validation,
+//! cryptographic authentication, RBAC, lease-based force push, and object closure verification.
 
-use crate::auth::verify_auth_signature;
+use crate::auth::{
+    verify_asymmetric_auth, verify_auth_signature, verify_symmetric_auth_signature, AuthError,
+    AuthTranscript, BoundedReplayCache, KeyRegistry, Role, DEFAULT_SECRET_KEY,
+};
+use crate::closure::validate_push_object_closure;
 use crate::negotiation::compute_missing_objects;
 use crate::pack_transfer::{create_pack_file, receive_and_ingest_pack, send_pack_file};
+use rand::RngCore;
 use spine_core::{HashAlgorithm, ObjectId};
 use spine_history::is_ancestor;
 use spine_object_store::{lock::RepoLock, CompositeObjectStore};
 use spine_protocol::{
-    frame::{Frame, FrameType, ProtocolError},
+    frame::{Frame, FrameType, ProtocolError, SessionState},
     messages::{
         AuthChallenge, AuthResponse, AuthResult, ErrorMessage, FetchNegotiate, FetchPlan,
         HelloAckMessage, HelloMessage, ProtocolMessage, PushBegin, RefAdvertise, RefUpdateReq,
         RefUpdateRes, RefUpdateStatus, RepoInfo, RepoOpen,
     },
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+
+const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Error, Debug)]
 pub enum ServerError {
@@ -33,6 +43,34 @@ pub enum ServerError {
     Negotiation(#[from] crate::negotiation::NegotiationError),
     #[error("Repository error: {0}")]
     Repository(String),
+    #[error("Authentication error: {0}")]
+    Auth(#[from] AuthError),
+    #[error("Timeout: operation timed out after {0:?}")]
+    Timeout(Duration),
+}
+
+/// Server session configuration parameters.
+#[derive(Clone)]
+pub struct ServerSessionConfig {
+    pub secret_key: [u8; 32],
+    pub key_registry: Arc<KeyRegistry>,
+    pub replay_cache: Arc<BoundedReplayCache>,
+    pub server_id: String,
+    pub allow_symmetric_auth: bool,
+    pub require_tls: bool,
+}
+
+impl Default for ServerSessionConfig {
+    fn default() -> Self {
+        Self {
+            secret_key: *DEFAULT_SECRET_KEY,
+            key_registry: Arc::new(KeyRegistry::new()),
+            replay_cache: Arc::new(BoundedReplayCache::new()),
+            server_id: "spine-daemon-node-01".to_string(),
+            allow_symmetric_auth: true,
+            require_tls: false,
+        }
+    }
 }
 
 /// Discovers all local branches and tags in a `.spine` repository.
@@ -69,14 +107,86 @@ pub fn scan_repository_refs(spine_dir: &Path) -> BTreeMap<String, ObjectId> {
     refs
 }
 
-/// Executes a single client session from connection to termination.
+/// Safely resolves and canonicalizes repository paths to prevent directory traversal.
+fn resolve_safe_repo_path(
+    repositories_root: &Path,
+    requested_path: &str,
+) -> Result<PathBuf, ServerError> {
+    let trimmed = requested_path.trim().trim_matches('/').replace('\\', "/");
+    if trimmed.is_empty()
+        || trimmed.contains("..")
+        || trimmed.starts_with('/')
+        || trimmed.contains(':')
+    {
+        return Err(ServerError::Repository(
+            "Invalid repository path: directory traversal attempt".to_string(),
+        ));
+    }
+
+    let candidate = repositories_root.join(&trimmed);
+    let canonical_root = match repositories_root.canonicalize() {
+        Ok(c) => c,
+        Err(_) => repositories_root.to_path_buf(),
+    };
+
+    let target_dir = if candidate.join(".spine").exists() {
+        candidate.join(".spine")
+    } else if candidate.exists() && candidate.join("objects").exists() {
+        candidate // Bare repo
+    } else {
+        return Err(ServerError::Repository(format!(
+            "Repository not found: {}",
+            requested_path
+        )));
+    };
+
+    let canonical_target = target_dir.canonicalize().map_err(|_| {
+        ServerError::Repository(format!("Repository not found: {}", requested_path))
+    })?;
+
+    if !canonical_target.starts_with(&canonical_root) {
+        return Err(ServerError::Repository(
+            "Security violation: path escapes repository root".to_string(),
+        ));
+    }
+
+    Ok(canonical_target)
+}
+
+/// Reads a frame with timeout.
+async fn read_frame_with_timeout<S: AsyncRead + Unpin>(
+    stream: &mut S,
+) -> Result<Frame, ServerError> {
+    match tokio::time::timeout(FRAME_TIMEOUT, Frame::read_from_async(stream)).await {
+        Ok(res) => res.map_err(ServerError::Protocol),
+        Err(_) => Err(ServerError::Timeout(FRAME_TIMEOUT)),
+    }
+}
+
+/// Convenience entrypoint for standard TCP stream connections.
 pub async fn handle_server_session(
-    mut stream: TcpStream,
+    stream: TcpStream,
     repositories_root: PathBuf,
     secret_key: [u8; 32],
 ) -> Result<(), ServerError> {
-    // 1. Handshake HELLO
-    let hello_frame = Frame::read_from_async(&mut stream).await?;
+    let config = ServerSessionConfig {
+        secret_key,
+        ..Default::default()
+    };
+    handle_server_session_stream(stream, repositories_root, config).await
+}
+
+/// Executes a complete server session over any asynchronous stream with state machine enforcement.
+pub async fn handle_server_session_stream<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    mut stream: S,
+    repositories_root: PathBuf,
+    config: ServerSessionConfig,
+) -> Result<(), ServerError> {
+    let mut session_state = SessionState::Connected;
+
+    // 1. Handshake: Expect HELLO
+    let hello_frame = read_frame_with_timeout(&mut stream).await?;
+    session_state.validate_frame(hello_frame.header.frame_type)?;
     let _hello = HelloMessage::from_frame(&hello_frame)?;
 
     let ack = HelloAckMessage {
@@ -86,43 +196,104 @@ pub async fn handle_server_session(
             "pack_zstd".to_string(),
             "ed25519_auth".to_string(),
             "cas_push".to_string(),
+            "closure_validation".to_string(),
         ],
-        server_id: "spine-daemon-node-01".to_string(),
+        server_id: config.server_id.clone(),
     };
     ack.to_frame()?.write_to_async(&mut stream).await?;
+    session_state = SessionState::VersionNegotiated;
 
     // 2. Authentication challenge
     let mut nonce = [0u8; 32];
-    let uuid_bytes = uuid::Uuid::new_v4();
-    nonce[0..16].copy_from_slice(uuid_bytes.as_bytes());
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
 
+    let session_id = (nonce[0] as u32) | ((nonce[1] as u32) << 8);
     let challenge = AuthChallenge {
         nonce,
         timestamp_ms: now_ms,
+        session_id,
+        server_id: config.server_id.clone(),
     };
     challenge.to_frame()?.write_to_async(&mut stream).await?;
 
-    let auth_resp_frame = Frame::read_from_async(&mut stream).await?;
+    let auth_resp_frame = read_frame_with_timeout(&mut stream).await?;
+    session_state.validate_frame(auth_resp_frame.header.frame_type)?;
     let auth_resp = AuthResponse::from_frame(&auth_resp_frame)?;
 
-    let is_authed = verify_auth_signature(
-        &secret_key,
-        &auth_resp.user_id,
-        &nonce,
-        now_ms,
-        &auth_resp.signature,
-    )
-    .unwrap_or(false);
+    // Verify authentication: prefer Ed25519 asymmetric, fall back to symmetric if enabled
+    let mut authenticated_principal = "anonymous".to_string();
+    let mut user_role = Role::Reader;
+    let mut is_authed = false;
+    let mut auth_key_id: Option<String> = None;
+
+    if let (Some(pk), true) = (&auth_resp.public_key, auth_resp.signature.len() == 64) {
+        let transcript = AuthTranscript::new(
+            1,
+            config.server_id.clone(),
+            session_id,
+            nonce,
+            now_ms,
+            "".to_string(),
+            auth_resp
+                .scope
+                .clone()
+                .unwrap_or_else(|| "default".to_string()),
+        );
+
+        match verify_asymmetric_auth(
+            &transcript,
+            pk,
+            &auth_resp.signature,
+            &config.key_registry,
+            &config.replay_cache,
+        ) {
+            Ok(entry) => {
+                is_authed = true;
+                authenticated_principal = entry.principal;
+                user_role = entry.role;
+                auth_key_id = auth_resp.key_id.clone();
+            }
+            Err(e) => {
+                eprintln!("Asymmetric auth failed: {}", e);
+            }
+        }
+    } else if config.allow_symmetric_auth {
+        // Fallback symmetric BLAKE3 keyed hash
+        if let Ok(true) = verify_symmetric_auth_signature(
+            &config.secret_key,
+            &auth_resp.user_id,
+            &nonce,
+            now_ms,
+            &auth_resp.signature,
+            &config.replay_cache,
+        ) {
+            is_authed = true;
+            authenticated_principal = auth_resp.user_id.clone();
+            user_role = Role::Admin; // Development symmetric secret grants Admin
+        } else if verify_auth_signature(
+            &config.secret_key,
+            &auth_resp.user_id,
+            &nonce,
+            now_ms,
+            &auth_resp.signature,
+        )
+        .unwrap_or(false)
+        {
+            is_authed = true;
+            authenticated_principal = auth_resp.user_id.clone();
+            user_role = Role::Contributor;
+        }
+    }
 
     let auth_result = AuthResult {
         authenticated: is_authed,
-        user: auth_resp.user_id.clone(),
+        user: authenticated_principal.clone(),
         role: if is_authed {
-            "contributor".to_string()
+            user_role.to_string()
         } else {
             "none".to_string()
         },
@@ -131,6 +302,7 @@ pub async fn handle_server_session(
         } else {
             "Invalid credentials".to_string()
         },
+        key_id: auth_key_id,
     };
     auth_result.to_frame()?.write_to_async(&mut stream).await?;
 
@@ -138,23 +310,25 @@ pub async fn handle_server_session(
         return Ok(());
     }
 
-    // 3. Repository selection
-    let repo_open_frame = Frame::read_from_async(&mut stream).await?;
+    session_state = SessionState::Authenticated;
+
+    // 3. Repository selection & Anti-enumeration privacy
+    let repo_open_frame = read_frame_with_timeout(&mut stream).await?;
+    session_state.validate_frame(repo_open_frame.header.frame_type)?;
     let repo_open = RepoOpen::from_frame(&repo_open_frame)?;
 
-    let repo_dir = repositories_root.join(&repo_open.path);
-    let spine_dir = if repo_dir.join(".spine").exists() {
-        repo_dir.join(".spine")
-    } else if repo_dir.exists() && repo_dir.join("objects").exists() {
-        repo_dir // Bare repository
-    } else {
-        let err = ErrorMessage {
-            code: 404,
-            category: "not_found".to_string(),
-            message: format!("Repository not found: {}", repo_open.path),
-        };
-        err.to_frame()?.write_to_async(&mut stream).await?;
-        return Ok(());
+    let spine_dir = match resolve_safe_repo_path(&repositories_root, &repo_open.path) {
+        Ok(p) => p,
+        Err(_) => {
+            // Anti-enumeration: Return 404 regardless of whether repo doesn't exist or is unauthorized
+            let err = ErrorMessage {
+                code: 404,
+                category: "not_found".to_string(),
+                message: format!("Repository not found: {}", repo_open.path),
+            };
+            err.to_frame()?.write_to_async(&mut stream).await?;
+            return Ok(());
+        }
     };
 
     let store = match CompositeObjectStore::new(&spine_dir, HashAlgorithm::Blake3, 3) {
@@ -186,16 +360,30 @@ pub async fn handle_server_session(
     let ref_adv = RefAdvertise { refs };
     ref_adv.to_frame()?.write_to_async(&mut stream).await?;
 
+    session_state = SessionState::RepositoryOpen;
+
     // 5. Command loop
     loop {
-        let frame = match Frame::read_from_async(&mut stream).await {
+        let frame = match read_frame_with_timeout(&mut stream).await {
             Ok(f) => f,
-            Err(ProtocolError::UnexpectedEof) => break, // Clean disconnect
-            Err(e) => return Err(ServerError::Protocol(e)),
+            Err(ServerError::Protocol(ProtocolError::UnexpectedEof)) => break,
+            Err(e) => return Err(e),
         };
+
+        session_state.validate_frame(frame.header.frame_type)?;
 
         match frame.header.frame_type {
             FrameType::FetchNegotiate => {
+                if !user_role.can_read() {
+                    let err = ErrorMessage {
+                        code: 403,
+                        category: "forbidden".to_string(),
+                        message: "Read permission denied".to_string(),
+                    };
+                    err.to_frame()?.write_to_async(&mut stream).await?;
+                    continue;
+                }
+
                 let req = FetchNegotiate::from_frame(&frame)?;
                 let missing_oids = compute_missing_objects(&store, &req.want, &req.have)?;
 
@@ -215,10 +403,30 @@ pub async fn handle_server_session(
                 }
             }
             FrameType::PushBegin => {
+                if !user_role.can_push() {
+                    let err = ErrorMessage {
+                        code: 403,
+                        category: "forbidden".to_string(),
+                        message: "Push permission denied for current role".to_string(),
+                    };
+                    err.to_frame()?.write_to_async(&mut stream).await?;
+                    continue;
+                }
+
                 let _push_begin = PushBegin::from_frame(&frame)?;
                 receive_and_ingest_pack(&mut stream, &spine_dir, &store).await?;
             }
             FrameType::RefUpdateReq => {
+                if !user_role.can_push() {
+                    let err = ErrorMessage {
+                        code: 403,
+                        category: "forbidden".to_string(),
+                        message: "Push permission denied for current role".to_string(),
+                    };
+                    err.to_frame()?.write_to_async(&mut stream).await?;
+                    continue;
+                }
+
                 let req = RefUpdateReq::from_frame(&frame)?;
                 let _lock = RepoLock::acquire(&spine_dir, "push_ref_update").map_err(|e| {
                     ServerError::Repository(format!("Could not acquire repo lock: {}", e))
@@ -242,7 +450,25 @@ pub async fn handle_server_session(
                         None
                     };
 
-                    // Check CAS condition
+                    // 1. Lease check
+                    if let Some(lease) = update.lease_oid {
+                        if current_oid != Some(lease) {
+                            overall_success = false;
+                            results.push(RefUpdateStatus {
+                                ref_name: update.ref_name.clone(),
+                                status: "stale_ref".to_string(),
+                                current_oid,
+                                message: Some(format!(
+                                    "Lease mismatch: expected remote tip {}, but current tip is {:?}",
+                                    lease.to_hex(),
+                                    current_oid.map(|o| o.to_hex())
+                                )),
+                            });
+                            continue;
+                        }
+                    }
+
+                    // 2. Expected old OID CAS check
                     let matches_expected = match (current_oid, update.expected_old_oid) {
                         (Some(cur), Some(exp)) => cur == exp,
                         (None, None) => true,
@@ -262,7 +488,38 @@ pub async fn handle_server_session(
                         continue;
                     }
 
-                    // Check fast-forward reachability
+                    // 3. Protected branch and admin permission check
+                    let is_protected = update.ref_name == "refs/heads/main"
+                        || update.ref_name == "refs/heads/master"
+                        || update.ref_name.starts_with("refs/heads/release");
+
+                    if is_protected && !user_role.can_modify_protected() {
+                        overall_success = false;
+                        results.push(RefUpdateStatus {
+                            ref_name: update.ref_name.clone(),
+                            status: "permission_denied".to_string(),
+                            current_oid,
+                            message: Some(format!(
+                                "Modifying protected branch '{}' requires Admin role (current role: {})",
+                                update.ref_name, user_role
+                            )),
+                        });
+                        continue;
+                    }
+
+                    // 4. Force push permissions check
+                    if update.force && !user_role.can_force_push() {
+                        overall_success = false;
+                        results.push(RefUpdateStatus {
+                            ref_name: update.ref_name.clone(),
+                            status: "permission_denied".to_string(),
+                            current_oid,
+                            message: Some("Force push requires Admin role".to_string()),
+                        });
+                        continue;
+                    }
+
+                    // 5. Fast-forward reachability check
                     if let (Some(old), false) = (current_oid, update.force) {
                         let is_ff = is_ancestor(&store, &old, &update.new_oid).unwrap_or(false);
                         if !is_ff {
@@ -280,7 +537,24 @@ pub async fn handle_server_session(
                         }
                     }
 
-                    // Apply update atomically
+                    // 6. Object closure validation: verify complete transitive graph before ref publication
+                    let mut boundary = HashSet::new();
+                    if let Some(old) = current_oid {
+                        boundary.insert(old);
+                    }
+                    if let Err(e) = validate_push_object_closure(&store, &update.new_oid, &boundary)
+                    {
+                        overall_success = false;
+                        results.push(RefUpdateStatus {
+                            ref_name: update.ref_name.clone(),
+                            status: "missing_object".to_string(),
+                            current_oid,
+                            message: Some(format!("Object closure validation failed: {}", e)),
+                        });
+                        continue;
+                    }
+
+                    // 7. Apply update atomically
                     if let Some(parent) = ref_file.parent() {
                         fs::create_dir_all(parent)?;
                     }
@@ -311,5 +585,6 @@ pub async fn handle_server_session(
         }
     }
 
+    let _ = session_state;
     Ok(())
 }

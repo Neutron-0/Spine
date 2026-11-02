@@ -24,13 +24,22 @@ pub struct HelloAckMessage {
 pub struct AuthChallenge {
     pub nonce: [u8; 32],
     pub timestamp_ms: u64,
+    #[serde(default)]
+    pub session_id: u32,
+    #[serde(default)]
+    pub server_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuthResponse {
     pub user_id: String,
     pub signature: Vec<u8>,
+    #[serde(default)]
     pub public_key: Option<Vec<u8>>,
+    #[serde(default)]
+    pub key_id: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -39,6 +48,8 @@ pub struct AuthResult {
     pub user: String,
     pub role: String,
     pub message: String,
+    #[serde(default)]
+    pub key_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -65,6 +76,8 @@ pub struct RefUpdateProposal {
     pub expected_old_oid: Option<ObjectId>,
     pub new_oid: ObjectId,
     pub force: bool,
+    #[serde(default)]
+    pub lease_oid: Option<ObjectId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

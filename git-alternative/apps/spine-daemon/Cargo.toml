@@ -17,6 +17,7 @@ spine-format.workspace = true
 spine-object-store.workspace = true
 spine-history.workspace = true
 tokio = { workspace = true, features = ["full"] }
+tokio-rustls.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

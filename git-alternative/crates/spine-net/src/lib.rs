@@ -2,16 +2,35 @@
 
 pub mod auth;
 pub mod client;
+pub mod closure;
+pub mod identity;
 pub mod negotiation;
 pub mod pack_transfer;
 pub mod server;
+pub mod tls;
 pub mod url;
 
-pub use auth::{compute_auth_signature, verify_auth_signature, DEFAULT_SECRET_KEY};
-pub use client::{ClientError, SpineClient};
+pub use auth::{
+    compute_auth_signature, verify_asymmetric_auth, verify_auth_signature,
+    verify_symmetric_auth_signature, AuthError, AuthTranscript, AuthorizedKey, BoundedReplayCache,
+    KeyRegistry, Role, DEFAULT_SECRET_KEY,
+};
+pub use client::{ClientConnectOptions, ClientError, SpineClient};
+pub use closure::{validate_push_object_closure, ClosureError};
+pub use identity::{
+    fingerprint_from_verifying_key, parse_verifying_key, verify_signature, IdentityError,
+    SpineIdentity,
+};
 pub use negotiation::compute_missing_objects;
 pub use pack_transfer::{create_pack_file, receive_and_ingest_pack, send_pack_file, TransferError};
-pub use server::{handle_server_session, scan_repository_refs, ServerError};
+pub use server::{
+    handle_server_session, handle_server_session_stream, scan_repository_refs, ServerError,
+    ServerSessionConfig,
+};
+pub use tls::{
+    build_client_tls_config, build_server_tls_config, generate_self_signed_cert_der,
+    is_loopback_addr, SpineStream, TlsError,
+};
 pub use url::{SpineUrl, UrlError, DEFAULT_SPINE_PORT};
 
 #[cfg(test)]

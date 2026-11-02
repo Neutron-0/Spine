@@ -17,6 +17,13 @@ serde_json.workspace = true
 blake3.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+hex.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pki-types.workspace = true
+rcgen.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

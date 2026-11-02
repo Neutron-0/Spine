@@ -83,13 +83,26 @@ Total fixed header overhead: **20 bytes**.
 
 ### 4.2 Authentication Messages
 - **`0x0010` — `AUTH_CHALLENGE` (Server $\to$ Client)**
-  - Payload: 32 bytes random nonce + 8 bytes timestamp (`u64` LE Unix milliseconds) = 40 bytes.
+  - Payload: JSON object:
+    ```json
+    {
+      "nonce": [0, 1, 2, ...],
+      "timestamp_ms": 1730527200000,
+      "session_id": 1001,
+      "server_id": "spine-daemon-node-01"
+    }
+    ```
 - **`0x0011` — `AUTH_RESPONSE` (Client $\to$ Server)**
-  - Payload:
-    - `user_id_len`: `u16` LE.
-    - `user_id`: UTF-8 string bytes.
-    - `public_key`: 32 bytes (Ed25519 public key).
-    - `signature`: 64 bytes (Ed25519 signature over `nonce || timestamp || user_id`).
+  - Payload: JSON object:
+    ```json
+    {
+      "user_id": "alice",
+      "signature": [ ... 64 bytes Ed25519 signature ... ],
+      "public_key": [ ... 32 bytes Ed25519 public key ... ],
+      "key_id": "spkey1:4f8a29e160c883e4bc3911029e84d720",
+      "scope": "default"
+    }
+    ```
 - **`0x0012` — `AUTH_RESULT` (Server $\to$ Client)**
   - Payload: JSON object:
     ```json
@@ -97,6 +110,7 @@ Total fixed header overhead: **20 bytes**.
       "authenticated": true,
       "user": "alice",
       "role": "contributor",
+      "key_id": "spkey1:4f8a29e160c883e4bc3911029e84d720",
       "message": "Authentication successful"
     }
     ```
@@ -158,7 +172,7 @@ Total fixed header overhead: **20 bytes**.
   - Indicates pack transmission completion.
   - Payload: 32 bytes (expected cumulative BLAKE3 checksum of the complete `.spk` file).
 
-### 4.6 Compare-and-Swap Reference Update
+### 4.6 Compare-and-Swap Reference Update with Lease
 - **`0x0031` — `REF_UPDATE_REQ` (Client $\to$ Server)**
   - Payload:
     ```json
@@ -168,7 +182,8 @@ Total fixed header overhead: **20 bytes**.
           "ref_name": "refs/heads/main",
           "expected_old_oid": "4f1a2380...",
           "new_oid": "89ab0123...",
-          "force": false
+          "force": false,
+          "lease_oid": "4f1a2380..."
         }
       ]
     }
@@ -182,12 +197,39 @@ Total fixed header overhead: **20 bytes**.
         {
           "ref_name": "refs/heads/main",
           "status": "ok",
-          "current_oid": "89ab0123..."
+          "current_oid": "89ab0123...",
+          "message": null
         }
       ]
     }
     ```
-  - Status codes: `ok`, `stale_ref`, `non_fast_forward`, `permission_denied`, `object_missing`.
+  - Status codes: `ok`, `stale_ref`, `non_fast_forward`, `permission_denied`, `missing_object`.
+
+---
+
+## 5. Explicit Session State Machine
+
+The connection lifecycle strictly adheres to `SessionState`:
+
+```text
+[DISCONNECTED] 
+     │  TCP / TLS 1.3 Handshake
+     ▼
+[Connected] ──────── (Receives HELLO) ─────────► [VersionNegotiated]
+                                                        │
+                         (Receives AUTH_RESPONSE)       │
+                                                        ▼
+[RepositoryOpen] ◄─── (Receives REPO_OPEN) ──── [Authenticated]
+     │       ▲
+     │       │ (Pack Complete)
+     ▼       │
+[Transferring]
+     │
+     ▼ (Clean Termination)
+[Completed]
+```
+
+Frames received outside their permitted states immediately trigger `ProtocolError::InvalidStateTransition` and close the connection.
 
 ### 4.7 Diagnostics and Keepalive
 - **`0x0060` — `ERROR` (Bidirectional)**

@@ -4,8 +4,8 @@ pub mod frame;
 pub mod messages;
 
 pub use frame::{
-    compute_checksum, Frame, FrameFlags, FrameHeader, FrameType, ProtocolError, HEADER_SIZE,
-    MAX_PAYLOAD_SIZE, SPWP_MAGIC, SPWP_VERSION_1,
+    compute_checksum, Frame, FrameFlags, FrameHeader, FrameType, ProtocolError, SessionState,
+    HEADER_SIZE, MAX_PAYLOAD_SIZE, SPWP_MAGIC, SPWP_VERSION_1,
 };
 pub use messages::*;
 

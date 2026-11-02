@@ -188,6 +188,9 @@ enum Commands {
         /// Force update remote references (bypass fast-forward check)
         #[arg(short, long)]
         force: bool,
+        /// Require remote branch to match expected OID or tracking tip before updating
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        force_with_lease: Option<String>,
     },
     /// Fetch from and integrate with another repository or branch
     Pull {
@@ -2450,6 +2453,7 @@ async fn main() -> Result<()> {
             remote,
             branch,
             force,
+            force_with_lease,
         } => {
             let (_worktree_root, spine_dir) = find_repo_root()?;
             let config_path = spine_dir.join("spine.toml");
@@ -2496,11 +2500,37 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
+            let tracking_file = spine_dir
+                .join("refs")
+                .join("remotes")
+                .join(&remote)
+                .join(&target_branch);
+
+            let tracking_oid = if tracking_file.exists() {
+                fs::read_to_string(&tracking_file)
+                    .ok()
+                    .and_then(|s| ObjectId::from_hex(s.trim()).ok())
+            } else {
+                None
+            };
+
+            let (effective_force, lease_oid) = if let Some(lease_spec) = force_with_lease {
+                let lease = if lease_spec.is_empty() {
+                    tracking_oid.or(remote_oid)
+                } else {
+                    Some(ObjectId::from_hex(&lease_spec)?)
+                };
+                (true, lease)
+            } else {
+                (force, None)
+            };
+
             let proposal = RefUpdateProposal {
                 ref_name: remote_ref_name.clone(),
                 expected_old_oid: remote_oid,
                 new_oid: local_oid,
-                force,
+                force: effective_force,
+                lease_oid,
             };
 
             let remote_tips: Vec<ObjectId> = advertised.values().copied().collect();
@@ -2511,11 +2541,6 @@ async fn main() -> Result<()> {
 
             for update_res in res.results {
                 if update_res.status == "ok" {
-                    let tracking_file = spine_dir
-                        .join("refs")
-                        .join("remotes")
-                        .join(&remote)
-                        .join(&target_branch);
                     if let Some(parent) = tracking_file.parent() {
                         fs::create_dir_all(parent)?;
                     }
@@ -2543,16 +2568,40 @@ async fn main() -> Result<()> {
                         "hint: 'spine pull {} {}') before pushing again.",
                         remote, target_branch
                     );
-                    eprintln!("hint: See 'spine push --help' for options like --force.");
+                    eprintln!("hint: See 'spine push --help' for options like --force or --force-with-lease.");
                     bail!("Push rejected: non-fast-forward");
                 } else if update_res.status == "stale_ref" {
                     eprintln!("To {}", r.url);
                     eprintln!(
-                        " ! [rejected]        {} -> {} (stale reference)",
+                        " ! [rejected]        {} -> {} (stale reference or lease mismatch)",
                         target_branch, target_branch
                     );
-                    eprintln!("error: Remote reference changed concurrently by another user.");
+                    if let Some(msg) = update_res.message {
+                        eprintln!("error: {}", msg);
+                    } else {
+                        eprintln!("error: Remote reference changed concurrently by another user.");
+                    }
                     bail!("Push rejected: stale reference");
+                } else if update_res.status == "permission_denied" {
+                    eprintln!("To {}", r.url);
+                    eprintln!(
+                        " ! [rejected]        {} -> {} (permission denied)",
+                        target_branch, target_branch
+                    );
+                    if let Some(msg) = update_res.message {
+                        eprintln!("error: {}", msg);
+                    }
+                    bail!("Push rejected: permission denied");
+                } else if update_res.status == "missing_object" {
+                    eprintln!("To {}", r.url);
+                    eprintln!(
+                        " ! [rejected]        {} -> {} (object closure incomplete)",
+                        target_branch, target_branch
+                    );
+                    if let Some(msg) = update_res.message {
+                        eprintln!("error: {}", msg);
+                    }
+                    bail!("Push rejected: missing object in packfile");
                 } else {
                     bail!("Push failed: {}", update_res.status);
                 }

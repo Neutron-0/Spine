@@ -24,12 +24,95 @@ pub enum ProtocolError {
     ChecksumMismatch([u8; 4], [u8; 4]),
     #[error("Unexpected EOF reading frame")]
     UnexpectedEof,
+    #[error("Invalid frame state transition: frame {received_frame:?} is not allowed in state {current_state}")]
+    InvalidStateTransition {
+        current_state: String,
+        received_frame: FrameType,
+    },
+    #[error("Invalid frame header: {0}")]
+    InvalidFrameHeader(String),
+    #[error("Malformed frame payload: {0}")]
+    MalformedPayload(String),
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("Protocol error: {0}")]
     Protocol(String),
+}
+
+/// Explicit connection states for the SPWP session state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum SessionState {
+    /// Newly established connection. Client must initiate with `Hello`.
+    Connected,
+    /// Protocol version negotiated via `HelloAck`. Awaiting authentication challenge/response.
+    VersionNegotiated,
+    /// Client identity verified. Awaiting repository selection (`RepoOpen`).
+    Authenticated,
+    /// Repository opened and references advertised. Ready for fetch, push, or ref update.
+    RepositoryOpen,
+    /// Currently streaming pack data frames (`PackData`, `PackProgress`, `PackEnd`).
+    Transferring,
+    /// Session finished or terminating cleanly.
+    Completed,
+}
+
+impl SessionState {
+    /// Returns true if the given `FrameType` is valid to receive in this state.
+    pub fn is_frame_allowed(&self, frame_type: FrameType) -> bool {
+        match self {
+            SessionState::Connected => {
+                matches!(
+                    frame_type,
+                    FrameType::Hello | FrameType::Ping | FrameType::Error
+                )
+            }
+            SessionState::VersionNegotiated => matches!(
+                frame_type,
+                FrameType::AuthChallenge
+                    | FrameType::AuthResponse
+                    | FrameType::Ping
+                    | FrameType::Error
+            ),
+            SessionState::Authenticated => matches!(
+                frame_type,
+                FrameType::RepoOpen | FrameType::Ping | FrameType::Error
+            ),
+            SessionState::RepositoryOpen => matches!(
+                frame_type,
+                FrameType::FetchNegotiate
+                    | FrameType::PushBegin
+                    | FrameType::RefUpdateReq
+                    | FrameType::RepoOpen
+                    | FrameType::Ping
+                    | FrameType::Error
+            ),
+            SessionState::Transferring => matches!(
+                frame_type,
+                FrameType::PackData
+                    | FrameType::PackProgress
+                    | FrameType::PackEnd
+                    | FrameType::Ping
+                    | FrameType::Error
+            ),
+            SessionState::Completed => {
+                matches!(frame_type, FrameType::Ping | FrameType::Error)
+            }
+        }
+    }
+
+    /// Verifies that receiving `frame_type` is valid in the current state, returning an error otherwise.
+    pub fn validate_frame(&self, frame_type: FrameType) -> Result<(), ProtocolError> {
+        if self.is_frame_allowed(frame_type) {
+            Ok(())
+        } else {
+            Err(ProtocolError::InvalidStateTransition {
+                current_state: format!("{:?}", self),
+                received_frame: frame_type,
+            })
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

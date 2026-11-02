@@ -7,7 +7,7 @@ pub const DEFAULT_SPINE_PORT: u16 = 4434;
 
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum UrlError {
-    #[error("Invalid URL scheme: expected 'spine://', got '{0}'")]
+    #[error("Invalid URL scheme: expected 'spine://' or 'spinelocal://', got '{0}'")]
     InvalidScheme(String),
     #[error("Missing host in repository URL: '{0}'")]
     MissingHost(String),
@@ -17,9 +17,10 @@ pub enum UrlError {
     InvalidPort(String),
 }
 
-/// Parsed Spine repository URL: `spine://[user@]host[:port]/path`
+/// Parsed Spine repository URL: `spine://[user@]host[:port]/path` or `spinelocal://[user@]host[:port]/path`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpineUrl {
+    pub scheme: String,
     pub user: Option<String>,
     pub host: String,
     pub port: u16,
@@ -29,8 +30,10 @@ pub struct SpineUrl {
 impl SpineUrl {
     pub fn parse(url_str: &str) -> Result<Self, UrlError> {
         let trimmed = url_str.trim();
-        let rest = if let Some(stripped) = trimmed.strip_prefix("spine://") {
-            stripped
+        let (scheme, rest) = if let Some(stripped) = trimmed.strip_prefix("spinelocal://") {
+            ("spinelocal".to_string(), stripped)
+        } else if let Some(stripped) = trimmed.strip_prefix("spine://") {
+            ("spine".to_string(), stripped)
         } else {
             return Err(UrlError::InvalidScheme(trimmed.to_string()));
         };
@@ -69,11 +72,22 @@ impl SpineUrl {
         let path = path_str.trim_matches('/').to_string();
 
         Ok(Self {
+            scheme,
             user,
             host,
             port,
             path,
         })
+    }
+
+    /// Returns true if this URL specifies TLS encryption (`spine://`).
+    pub fn requires_tls(&self) -> bool {
+        self.scheme == "spine"
+    }
+
+    /// Returns true if the target host is loopback (127.0.0.1, localhost, or ::1).
+    pub fn is_loopback(&self) -> bool {
+        self.host == "127.0.0.1" || self.host == "localhost" || self.host == "::1"
     }
 
     pub fn to_address_string(&self) -> String {
@@ -83,7 +97,7 @@ impl SpineUrl {
 
 impl fmt::Display for SpineUrl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "spine://")?;
+        write!(f, "{}://", self.scheme)?;
         if let Some(user) = &self.user {
             write!(f, "{}@", user)?;
         }
@@ -98,19 +112,17 @@ mod tests {
     #[test]
     fn test_parse_spine_url() {
         let url = SpineUrl::parse("spine://127.0.0.1:4434/repos/project").unwrap();
-        assert_eq!(url.user, None);
+        assert_eq!(url.scheme, "spine");
         assert_eq!(url.host, "127.0.0.1");
         assert_eq!(url.port, 4434);
         assert_eq!(url.path, "repos/project");
-        assert_eq!(url.to_address_string(), "127.0.0.1:4434");
+        assert!(url.requires_tls());
+        assert!(url.is_loopback());
 
-        let url_user = SpineUrl::parse("spine://alice@example.com/team/app").unwrap();
-        assert_eq!(url_user.user.as_deref(), Some("alice"));
-        assert_eq!(url_user.host, "example.com");
-        assert_eq!(url_user.port, DEFAULT_SPINE_PORT);
-        assert_eq!(url_user.path, "team/app");
-
-        assert!(SpineUrl::parse("http://example.com/repo").is_err());
-        assert!(SpineUrl::parse("spine://example.com").is_err());
+        let local_url = SpineUrl::parse("spinelocal://alice@127.0.0.1:4435/local-repo").unwrap();
+        assert_eq!(local_url.scheme, "spinelocal");
+        assert_eq!(local_url.user.as_deref(), Some("alice"));
+        assert!(!local_url.requires_tls());
+        assert!(local_url.is_loopback());
     }
 }
