@@ -426,14 +426,15 @@ impl Database for PgDatabase {
 
     async fn create_repository(&self, repo: ForgeRepository) -> Result<ForgeRepository, ForgeError> {
         let query = r#"
-            INSERT INTO forge_repositories (id, owner_user_id, owner_username, name, normalized_name, description, is_private, default_branch, native_repo_id, durability_policy, provisioning_status, created_at_nanos, updated_at_nanos, archived)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            INSERT INTO forge_repositories (id, owner_user_id, owner_username, owner_org_id, name, normalized_name, description, is_private, default_branch, native_repo_id, durability_policy, provisioning_status, created_at_nanos, updated_at_nanos, archived)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             ON CONFLICT (owner_user_id, normalized_name) DO NOTHING
         "#;
         let res = sqlx::query(query)
             .bind(&repo.id)
             .bind(&repo.owner_user_id)
             .bind(&repo.owner_username)
+            .bind(&repo.owner_org_id)
             .bind(&repo.name)
             .bind(&repo.normalized_name)
             .bind(&repo.description)
@@ -456,7 +457,7 @@ impl Database for PgDatabase {
     }
 
     async fn get_repository_by_id(&self, id: &str) -> Result<Option<ForgeRepository>, ForgeError> {
-        let query = "SELECT id, owner_user_id, owner_username, name, normalized_name, description, is_private, default_branch, native_repo_id, durability_policy, provisioning_status, created_at_nanos, updated_at_nanos, archived FROM forge_repositories WHERE id = $1";
+        let query = "SELECT id, owner_user_id, owner_username, owner_org_id, name, normalized_name, description, is_private, default_branch, native_repo_id, durability_policy, provisioning_status, created_at_nanos, updated_at_nanos, archived FROM forge_repositories WHERE id = $1";
         let row = sqlx::query(query)
             .bind(id)
             .fetch_optional(&self.pool)
@@ -464,28 +465,29 @@ impl Database for PgDatabase {
             .map_err(|e| ForgeError::Internal(e.to_string()))?;
 
         if let Some(r) = row {
-            let policy_str: String = r.get(9);
+            let policy_str: String = r.get(10);
             let policy = match policy_str.as_str() {
                 "SingleCopy" | "SINGLE_COPY" => spine_cluster::durability::DurabilityPolicy::SingleCopy,
                 "TwoCopies" | "TWO_COPIES" => spine_cluster::durability::DurabilityPolicy::TwoCopies,
                 _ => spine_cluster::durability::DurabilityPolicy::ThreeCopies,
             };
-            let status_str: String = r.get(10);
+            let status_str: String = r.get(11);
             Ok(Some(ForgeRepository {
                 id: r.get(0),
                 owner_user_id: r.get(1),
                 owner_username: r.get(2),
-                name: r.get(3),
-                normalized_name: r.get(4),
-                description: r.get(5),
-                is_private: r.get(6),
-                default_branch: r.get(7),
-                native_repo_id: r.get(8),
+                owner_org_id: r.get(3),
+                name: r.get(4),
+                normalized_name: r.get(5),
+                description: r.get(6),
+                is_private: r.get(7),
+                default_branch: r.get(8),
+                native_repo_id: r.get(9),
                 durability_policy: policy,
                 provisioning_status: ProvisioningStatus::from_str_lossy(&status_str),
-                created_at_nanos: r.get(11),
-                updated_at_nanos: r.get(12),
-                archived: r.get(13),
+                created_at_nanos: r.get(12),
+                updated_at_nanos: r.get(13),
+                archived: r.get(14),
             }))
         } else {
             Ok(None)
@@ -499,7 +501,7 @@ impl Database for PgDatabase {
     ) -> Result<Option<ForgeRepository>, ForgeError> {
         let norm_owner = owner.trim().to_lowercase();
         let norm_name = name.trim().to_lowercase();
-        let query = "SELECT id, owner_user_id, owner_username, name, normalized_name, description, is_private, default_branch, native_repo_id, durability_policy, provisioning_status, created_at_nanos, updated_at_nanos, archived FROM forge_repositories WHERE LOWER(owner_username) = $1 AND normalized_name = $2";
+        let query = "SELECT id, owner_user_id, owner_username, owner_org_id, name, normalized_name, description, is_private, default_branch, native_repo_id, durability_policy, provisioning_status, created_at_nanos, updated_at_nanos, archived FROM forge_repositories WHERE LOWER(owner_username) = $1 AND normalized_name = $2";
         let row = sqlx::query(query)
             .bind(&norm_owner)
             .bind(&norm_name)
@@ -508,28 +510,29 @@ impl Database for PgDatabase {
             .map_err(|e| ForgeError::Internal(e.to_string()))?;
 
         if let Some(r) = row {
-            let policy_str: String = r.get(9);
+            let policy_str: String = r.get(10);
             let policy = match policy_str.as_str() {
                 "SingleCopy" | "SINGLE_COPY" => spine_cluster::durability::DurabilityPolicy::SingleCopy,
                 "TwoCopies" | "TWO_COPIES" => spine_cluster::durability::DurabilityPolicy::TwoCopies,
                 _ => spine_cluster::durability::DurabilityPolicy::ThreeCopies,
             };
-            let status_str: String = r.get(10);
+            let status_str: String = r.get(11);
             Ok(Some(ForgeRepository {
                 id: r.get(0),
                 owner_user_id: r.get(1),
                 owner_username: r.get(2),
-                name: r.get(3),
-                normalized_name: r.get(4),
-                description: r.get(5),
-                is_private: r.get(6),
-                default_branch: r.get(7),
-                native_repo_id: r.get(8),
+                owner_org_id: r.get(3),
+                name: r.get(4),
+                normalized_name: r.get(5),
+                description: r.get(6),
+                is_private: r.get(7),
+                default_branch: r.get(8),
+                native_repo_id: r.get(9),
                 durability_policy: policy,
                 provisioning_status: ProvisioningStatus::from_str_lossy(&status_str),
-                created_at_nanos: r.get(11),
-                updated_at_nanos: r.get(12),
-                archived: r.get(13),
+                created_at_nanos: r.get(12),
+                updated_at_nanos: r.get(13),
+                archived: r.get(14),
             }))
         } else {
             Ok(None)
@@ -541,7 +544,7 @@ impl Database for PgDatabase {
         user_id: &str,
     ) -> Result<Vec<ForgeRepository>, ForgeError> {
         let query = r#"
-            SELECT DISTINCT r.id, r.owner_user_id, r.owner_username, r.name, r.normalized_name, r.description, r.is_private, r.default_branch, r.native_repo_id, r.durability_policy, r.provisioning_status, r.created_at_nanos, r.updated_at_nanos, r.archived
+            SELECT DISTINCT r.id, r.owner_user_id, r.owner_username, r.owner_org_id, r.name, r.normalized_name, r.description, r.is_private, r.default_branch, r.native_repo_id, r.durability_policy, r.provisioning_status, r.created_at_nanos, r.updated_at_nanos, r.archived
             FROM forge_repositories r
             LEFT JOIN repository_permissions p ON p.repo_id = r.id AND p.user_id = $1
             WHERE r.archived = FALSE AND (r.is_private = FALSE OR r.owner_user_id = $1 OR p.user_id IS NOT NULL)
@@ -555,35 +558,77 @@ impl Database for PgDatabase {
 
         let mut list = Vec::new();
         for r in rows {
-            let policy_str: String = r.get(9);
+            let policy_str: String = r.get(10);
             let policy = match policy_str.as_str() {
                 "SingleCopy" | "SINGLE_COPY" => spine_cluster::durability::DurabilityPolicy::SingleCopy,
                 "TwoCopies" | "TWO_COPIES" => spine_cluster::durability::DurabilityPolicy::TwoCopies,
                 _ => spine_cluster::durability::DurabilityPolicy::ThreeCopies,
             };
-            let status_str: String = r.get(10);
+            let status_str: String = r.get(11);
             list.push(ForgeRepository {
                 id: r.get(0),
                 owner_user_id: r.get(1),
                 owner_username: r.get(2),
-                name: r.get(3),
-                normalized_name: r.get(4),
-                description: r.get(5),
-                is_private: r.get(6),
-                default_branch: r.get(7),
-                native_repo_id: r.get(8),
+                owner_org_id: r.get(3),
+                name: r.get(4),
+                normalized_name: r.get(5),
+                description: r.get(6),
+                is_private: r.get(7),
+                default_branch: r.get(8),
+                native_repo_id: r.get(9),
                 durability_policy: policy,
                 provisioning_status: ProvisioningStatus::from_str_lossy(&status_str),
-                created_at_nanos: r.get(11),
-                updated_at_nanos: r.get(12),
-                archived: r.get(13),
+                created_at_nanos: r.get(12),
+                updated_at_nanos: r.get(13),
+                archived: r.get(14),
+            });
+        }
+        Ok(list)
+    }
+
+    async fn list_repositories_for_org(
+        &self,
+        org_id: &str,
+    ) -> Result<Vec<ForgeRepository>, ForgeError> {
+        let query = "SELECT id, owner_user_id, owner_username, owner_org_id, name, normalized_name, description, is_private, default_branch, native_repo_id, durability_policy, provisioning_status, created_at_nanos, updated_at_nanos, archived FROM forge_repositories WHERE owner_org_id = $1 AND archived = FALSE ORDER BY updated_at_nanos DESC";
+        let rows = sqlx::query(query)
+            .bind(org_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let mut list = Vec::new();
+        for r in rows {
+            let policy_str: String = r.get(10);
+            let policy = match policy_str.as_str() {
+                "SingleCopy" | "SINGLE_COPY" => spine_cluster::durability::DurabilityPolicy::SingleCopy,
+                "TwoCopies" | "TWO_COPIES" => spine_cluster::durability::DurabilityPolicy::TwoCopies,
+                _ => spine_cluster::durability::DurabilityPolicy::ThreeCopies,
+            };
+            let status_str: String = r.get(11);
+            list.push(ForgeRepository {
+                id: r.get(0),
+                owner_user_id: r.get(1),
+                owner_username: r.get(2),
+                owner_org_id: r.get(3),
+                name: r.get(4),
+                normalized_name: r.get(5),
+                description: r.get(6),
+                is_private: r.get(7),
+                default_branch: r.get(8),
+                native_repo_id: r.get(9),
+                durability_policy: policy,
+                provisioning_status: ProvisioningStatus::from_str_lossy(&status_str),
+                created_at_nanos: r.get(12),
+                updated_at_nanos: r.get(13),
+                archived: r.get(14),
             });
         }
         Ok(list)
     }
 
     async fn list_public_repositories(&self) -> Result<Vec<ForgeRepository>, ForgeError> {
-        let query = "SELECT id, owner_user_id, owner_username, name, normalized_name, description, is_private, default_branch, native_repo_id, durability_policy, provisioning_status, created_at_nanos, updated_at_nanos, archived FROM forge_repositories WHERE is_private = FALSE AND archived = FALSE ORDER BY updated_at_nanos DESC";
+        let query = "SELECT id, owner_user_id, owner_username, owner_org_id, name, normalized_name, description, is_private, default_branch, native_repo_id, durability_policy, provisioning_status, created_at_nanos, updated_at_nanos, archived FROM forge_repositories WHERE is_private = FALSE AND archived = FALSE ORDER BY updated_at_nanos DESC";
         let rows = sqlx::query(query)
             .fetch_all(&self.pool)
             .await
@@ -591,31 +636,54 @@ impl Database for PgDatabase {
 
         let mut list = Vec::new();
         for r in rows {
-            let policy_str: String = r.get(9);
+            let policy_str: String = r.get(10);
             let policy = match policy_str.as_str() {
                 "SingleCopy" | "SINGLE_COPY" => spine_cluster::durability::DurabilityPolicy::SingleCopy,
                 "TwoCopies" | "TWO_COPIES" => spine_cluster::durability::DurabilityPolicy::TwoCopies,
                 _ => spine_cluster::durability::DurabilityPolicy::ThreeCopies,
             };
-            let status_str: String = r.get(10);
+            let status_str: String = r.get(11);
             list.push(ForgeRepository {
                 id: r.get(0),
                 owner_user_id: r.get(1),
                 owner_username: r.get(2),
-                name: r.get(3),
-                normalized_name: r.get(4),
-                description: r.get(5),
-                is_private: r.get(6),
-                default_branch: r.get(7),
-                native_repo_id: r.get(8),
+                owner_org_id: r.get(3),
+                name: r.get(4),
+                normalized_name: r.get(5),
+                description: r.get(6),
+                is_private: r.get(7),
+                default_branch: r.get(8),
+                native_repo_id: r.get(9),
                 durability_policy: policy,
                 provisioning_status: ProvisioningStatus::from_str_lossy(&status_str),
-                created_at_nanos: r.get(11),
-                updated_at_nanos: r.get(12),
-                archived: r.get(13),
+                created_at_nanos: r.get(12),
+                updated_at_nanos: r.get(13),
+                archived: r.get(14),
             });
         }
         Ok(list)
+    }
+
+    async fn update_repository_owner_org(
+        &self,
+        repo_id: &str,
+        org_id: &str,
+        org_name: &str,
+    ) -> Result<(), ForgeError> {
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let query = "UPDATE forge_repositories SET owner_org_id = $1, owner_username = $2, updated_at_nanos = $3 WHERE id = $4";
+        let res = sqlx::query(query)
+            .bind(org_id)
+            .bind(org_name)
+            .bind(now)
+            .bind(repo_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if res.rows_affected() == 0 {
+            return Err(ForgeError::NotFound("Repository not found".into()));
+        }
+        Ok(())
     }
 
     async fn update_repository_status(
@@ -803,5 +871,1474 @@ impl Database for PgDatabase {
             .await
             .map_err(|e| ForgeError::Internal(e.to_string()))?;
         Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Organizations & Membership (Batch 09)
+    // -------------------------------------------------------------------------
+    async fn create_organization(&self, org: Organization) -> Result<Organization, ForgeError> {
+        let query = r#"
+            INSERT INTO organizations (id, name, normalized_name, display_name, description, avatar_url, owner_user_id, is_private, created_at_nanos, updated_at_nanos)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ON CONFLICT (normalized_name) DO NOTHING
+        "#;
+        let res = sqlx::query(query)
+            .bind(&org.id)
+            .bind(&org.name)
+            .bind(&org.normalized_name)
+            .bind(&org.display_name)
+            .bind(&org.description)
+            .bind(&org.avatar_url)
+            .bind(&org.owner_user_id)
+            .bind(org.is_private)
+            .bind(org.created_at_nanos)
+            .bind(org.updated_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        if res.rows_affected() == 0 {
+            return Err(ForgeError::Conflict(format!("Organization '{}' already exists", org.name)));
+        }
+        Ok(org)
+    }
+
+    async fn get_organization_by_id(&self, id: &str) -> Result<Option<Organization>, ForgeError> {
+        let query = "SELECT id, name, normalized_name, display_name, description, avatar_url, owner_user_id, is_private, created_at_nanos, updated_at_nanos FROM organizations WHERE id = $1";
+        let row = sqlx::query(query)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        if let Some(r) = row {
+            Ok(Some(Organization {
+                id: r.get(0),
+                name: r.get(1),
+                normalized_name: r.get(2),
+                display_name: r.get(3),
+                description: r.get(4),
+                avatar_url: r.get(5),
+                owner_user_id: r.get(6),
+                is_private: r.get(7),
+                created_at_nanos: r.get(8),
+                updated_at_nanos: r.get(9),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn get_organization_by_slug(&self, slug: &str) -> Result<Option<Organization>, ForgeError> {
+        let norm = slug.trim().to_lowercase();
+        let query = "SELECT id, name, normalized_name, display_name, description, avatar_url, owner_user_id, is_private, created_at_nanos, updated_at_nanos FROM organizations WHERE normalized_name = $1";
+        let row = sqlx::query(query)
+            .bind(&norm)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        if let Some(r) = row {
+            Ok(Some(Organization {
+                id: r.get(0),
+                name: r.get(1),
+                normalized_name: r.get(2),
+                display_name: r.get(3),
+                description: r.get(4),
+                avatar_url: r.get(5),
+                owner_user_id: r.get(6),
+                is_private: r.get(7),
+                created_at_nanos: r.get(8),
+                updated_at_nanos: r.get(9),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn list_organizations_for_user(&self, user_id: &str) -> Result<Vec<Organization>, ForgeError> {
+        let query = r#"
+            SELECT DISTINCT o.id, o.name, o.normalized_name, o.display_name, o.description, o.avatar_url, o.owner_user_id, o.is_private, o.created_at_nanos, o.updated_at_nanos
+            FROM organizations o
+            LEFT JOIN organization_memberships m ON m.org_id = o.id AND m.user_id = $1
+            WHERE o.owner_user_id = $1 OR m.user_id = $1
+            ORDER BY o.name ASC
+        "#;
+        let rows = sqlx::query(query)
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| Organization {
+            id: r.get(0),
+            name: r.get(1),
+            normalized_name: r.get(2),
+            display_name: r.get(3),
+            description: r.get(4),
+            avatar_url: r.get(5),
+            owner_user_id: r.get(6),
+            is_private: r.get(7),
+            created_at_nanos: r.get(8),
+            updated_at_nanos: r.get(9),
+        }).collect();
+        Ok(list)
+    }
+
+    async fn update_organization(&self, org: Organization) -> Result<Organization, ForgeError> {
+        let query = "UPDATE organizations SET display_name = $1, description = $2, avatar_url = $3, is_private = $4, updated_at_nanos = $5 WHERE id = $6";
+        let res = sqlx::query(query)
+            .bind(&org.display_name)
+            .bind(&org.description)
+            .bind(&org.avatar_url)
+            .bind(org.is_private)
+            .bind(org.updated_at_nanos)
+            .bind(&org.id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        if res.rows_affected() == 0 {
+            return Err(ForgeError::NotFound("Organization not found".into()));
+        }
+        Ok(org)
+    }
+
+    async fn delete_organization(&self, org_id: &str) -> Result<(), ForgeError> {
+        let query = "DELETE FROM organizations WHERE id = $1";
+        let res = sqlx::query(query)
+            .bind(org_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if res.rows_affected() == 0 {
+            return Err(ForgeError::NotFound("Organization not found".into()));
+        }
+        Ok(())
+    }
+
+    async fn add_organization_member(&self, membership: OrganizationMembership) -> Result<(), ForgeError> {
+        let query = "INSERT INTO organization_memberships (id, org_id, user_id, role, created_at_nanos) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (org_id, user_id) DO UPDATE SET role = EXCLUDED.role";
+        sqlx::query(query)
+            .bind(&membership.id)
+            .bind(&membership.org_id)
+            .bind(&membership.user_id)
+            .bind(membership.role.as_str())
+            .bind(membership.created_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_organization_membership(
+        &self,
+        org_id: &str,
+        user_id: &str,
+    ) -> Result<Option<OrganizationMembership>, ForgeError> {
+        let query = "SELECT id, org_id, user_id, role, created_at_nanos FROM organization_memberships WHERE org_id = $1 AND user_id = $2";
+        let row = sqlx::query(query)
+            .bind(org_id)
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        if let Some(r) = row {
+            let role_str: String = r.get(3);
+            Ok(Some(OrganizationMembership {
+                id: r.get(0),
+                org_id: r.get(1),
+                user_id: r.get(2),
+                role: OrganizationRole::from_str_lossy(&role_str),
+                created_at_nanos: r.get(4),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn list_organization_members(&self, org_id: &str) -> Result<Vec<OrganizationMembership>, ForgeError> {
+        let query = "SELECT id, org_id, user_id, role, created_at_nanos FROM organization_memberships WHERE org_id = $1 ORDER BY created_at_nanos ASC";
+        let rows = sqlx::query(query)
+            .bind(org_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| {
+            let role_str: String = r.get(3);
+            OrganizationMembership {
+                id: r.get(0),
+                org_id: r.get(1),
+                user_id: r.get(2),
+                role: OrganizationRole::from_str_lossy(&role_str),
+                created_at_nanos: r.get(4),
+            }
+        }).collect();
+        Ok(list)
+    }
+
+    async fn remove_organization_member(&self, org_id: &str, user_id: &str) -> Result<(), ForgeError> {
+        let query = "DELETE FROM organization_memberships WHERE org_id = $1 AND user_id = $2";
+        sqlx::query(query)
+            .bind(org_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn update_organization_member_role(
+        &self,
+        org_id: &str,
+        user_id: &str,
+        role: OrganizationRole,
+    ) -> Result<(), ForgeError> {
+        let query = "UPDATE organization_memberships SET role = $1 WHERE org_id = $2 AND user_id = $3";
+        sqlx::query(query)
+            .bind(role.as_str())
+            .bind(org_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn create_organization_invitation(&self, inv: OrganizationInvitation) -> Result<OrganizationInvitation, ForgeError> {
+        let query = "INSERT INTO organization_invitations (id, org_id, inviter_user_id, invitee_email, role, token_hash, status, expires_at_nanos, created_at_nanos, responded_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
+        sqlx::query(query)
+            .bind(&inv.id)
+            .bind(&inv.org_id)
+            .bind(&inv.inviter_user_id)
+            .bind(&inv.invitee_email)
+            .bind(inv.role.as_str())
+            .bind(&inv.token_hash)
+            .bind(&inv.status)
+            .bind(inv.expires_at_nanos)
+            .bind(inv.created_at_nanos)
+            .bind(inv.responded_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(inv)
+    }
+
+    async fn get_organization_invitation_by_token(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<OrganizationInvitation>, ForgeError> {
+        let query = "SELECT id, org_id, inviter_user_id, invitee_email, role, token_hash, status, expires_at_nanos, created_at_nanos, responded_at_nanos FROM organization_invitations WHERE token_hash = $1";
+        let row = sqlx::query(query)
+            .bind(token_hash)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        if let Some(r) = row {
+            let role_str: String = r.get(4);
+            Ok(Some(OrganizationInvitation {
+                id: r.get(0),
+                org_id: r.get(1),
+                inviter_user_id: r.get(2),
+                invitee_email: r.get(3),
+                role: OrganizationRole::from_str_lossy(&role_str),
+                token_hash: r.get(5),
+                status: r.get(6),
+                expires_at_nanos: r.get(7),
+                created_at_nanos: r.get(8),
+                responded_at_nanos: r.get(9),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn list_organization_invitations(&self, org_id: &str) -> Result<Vec<OrganizationInvitation>, ForgeError> {
+        let query = "SELECT id, org_id, inviter_user_id, invitee_email, role, token_hash, status, expires_at_nanos, created_at_nanos, responded_at_nanos FROM organization_invitations WHERE org_id = $1 AND status = 'PENDING' ORDER BY created_at_nanos DESC";
+        let rows = sqlx::query(query)
+            .bind(org_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| {
+            let role_str: String = r.get(4);
+            OrganizationInvitation {
+                id: r.get(0),
+                org_id: r.get(1),
+                inviter_user_id: r.get(2),
+                invitee_email: r.get(3),
+                role: OrganizationRole::from_str_lossy(&role_str),
+                token_hash: r.get(5),
+                status: r.get(6),
+                expires_at_nanos: r.get(7),
+                created_at_nanos: r.get(8),
+                responded_at_nanos: r.get(9),
+            }
+        }).collect();
+        Ok(list)
+    }
+
+    async fn update_organization_invitation_status(
+        &self,
+        id: &str,
+        status: &str,
+        now_nanos: i64,
+    ) -> Result<(), ForgeError> {
+        let query = "UPDATE organization_invitations SET status = $1, responded_at_nanos = $2 WHERE id = $3";
+        sqlx::query(query)
+            .bind(status)
+            .bind(now_nanos)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Teams & Team Permissions (Batch 09)
+    // -------------------------------------------------------------------------
+    async fn create_team(&self, team: Team) -> Result<Team, ForgeError> {
+        let query = "INSERT INTO teams (id, org_id, name, normalized_slug, description, created_at_nanos, updated_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7)";
+        sqlx::query(query)
+            .bind(&team.id)
+            .bind(&team.org_id)
+            .bind(&team.name)
+            .bind(&team.normalized_slug)
+            .bind(&team.description)
+            .bind(team.created_at_nanos)
+            .bind(team.updated_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(team)
+    }
+
+    async fn get_team_by_id(&self, id: &str) -> Result<Option<Team>, ForgeError> {
+        let query = "SELECT id, org_id, name, normalized_slug, description, created_at_nanos, updated_at_nanos FROM teams WHERE id = $1";
+        let row = sqlx::query(query)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        if let Some(r) = row {
+            Ok(Some(Team {
+                id: r.get(0),
+                org_id: r.get(1),
+                name: r.get(2),
+                normalized_slug: r.get(3),
+                description: r.get(4),
+                created_at_nanos: r.get(5),
+                updated_at_nanos: r.get(6),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn get_team_by_slug(&self, org_id: &str, slug: &str) -> Result<Option<Team>, ForgeError> {
+        let norm = slug.trim().to_lowercase();
+        let query = "SELECT id, org_id, name, normalized_slug, description, created_at_nanos, updated_at_nanos FROM teams WHERE org_id = $1 AND normalized_slug = $2";
+        let row = sqlx::query(query)
+            .bind(org_id)
+            .bind(&norm)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        if let Some(r) = row {
+            Ok(Some(Team {
+                id: r.get(0),
+                org_id: r.get(1),
+                name: r.get(2),
+                normalized_slug: r.get(3),
+                description: r.get(4),
+                created_at_nanos: r.get(5),
+                updated_at_nanos: r.get(6),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn list_teams_for_org(&self, org_id: &str) -> Result<Vec<Team>, ForgeError> {
+        let query = "SELECT id, org_id, name, normalized_slug, description, created_at_nanos, updated_at_nanos FROM teams WHERE org_id = $1 ORDER BY name ASC";
+        let rows = sqlx::query(query)
+            .bind(org_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| Team {
+            id: r.get(0),
+            org_id: r.get(1),
+            name: r.get(2),
+            normalized_slug: r.get(3),
+            description: r.get(4),
+            created_at_nanos: r.get(5),
+            updated_at_nanos: r.get(6),
+        }).collect();
+        Ok(list)
+    }
+
+    async fn delete_team(&self, team_id: &str) -> Result<(), ForgeError> {
+        let query = "DELETE FROM teams WHERE id = $1";
+        sqlx::query(query)
+            .bind(team_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn add_team_member(&self, membership: TeamMembership) -> Result<(), ForgeError> {
+        let query = "INSERT INTO team_memberships (id, team_id, user_id, is_maintainer, created_at_nanos) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (team_id, user_id) DO UPDATE SET is_maintainer = EXCLUDED.is_maintainer";
+        sqlx::query(query)
+            .bind(&membership.id)
+            .bind(&membership.team_id)
+            .bind(&membership.user_id)
+            .bind(membership.is_maintainer)
+            .bind(membership.created_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn remove_team_member(&self, team_id: &str, user_id: &str) -> Result<(), ForgeError> {
+        let query = "DELETE FROM team_memberships WHERE team_id = $1 AND user_id = $2";
+        sqlx::query(query)
+            .bind(team_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_team_members(&self, team_id: &str) -> Result<Vec<TeamMembership>, ForgeError> {
+        let query = "SELECT id, team_id, user_id, is_maintainer, created_at_nanos FROM team_memberships WHERE team_id = $1 ORDER BY created_at_nanos ASC";
+        let rows = sqlx::query(query)
+            .bind(team_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| TeamMembership {
+            id: r.get(0),
+            team_id: r.get(1),
+            user_id: r.get(2),
+            is_maintainer: r.get(3),
+            created_at_nanos: r.get(4),
+        }).collect();
+        Ok(list)
+    }
+
+    async fn set_team_repository_permission(
+        &self,
+        perm: TeamRepositoryPermission,
+    ) -> Result<(), ForgeError> {
+        let query = "INSERT INTO team_repository_permissions (id, team_id, repo_id, permission_level, created_at_nanos) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (team_id, repo_id) DO UPDATE SET permission_level = EXCLUDED.permission_level";
+        sqlx::query(query)
+            .bind(&perm.id)
+            .bind(&perm.team_id)
+            .bind(&perm.repo_id)
+            .bind(perm.permission_level.as_str())
+            .bind(perm.created_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_team_repository_permission(
+        &self,
+        team_id: &str,
+        repo_id: &str,
+    ) -> Result<Option<TeamPermissionLevel>, ForgeError> {
+        let query = "SELECT permission_level FROM team_repository_permissions WHERE team_id = $1 AND repo_id = $2";
+        let row = sqlx::query(query)
+            .bind(team_id)
+            .bind(repo_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        if let Some(r) = row {
+            let lvl_str: String = r.get(0);
+            Ok(Some(TeamPermissionLevel::from_str_lossy(&lvl_str)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn list_team_repository_permissions_for_repo(
+        &self,
+        repo_id: &str,
+    ) -> Result<Vec<TeamRepositoryPermission>, ForgeError> {
+        let query = "SELECT id, team_id, repo_id, permission_level, created_at_nanos FROM team_repository_permissions WHERE repo_id = $1";
+        let rows = sqlx::query(query)
+            .bind(repo_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| {
+            let lvl_str: String = r.get(3);
+            TeamRepositoryPermission {
+                id: r.get(0),
+                team_id: r.get(1),
+                repo_id: r.get(2),
+                permission_level: TeamPermissionLevel::from_str_lossy(&lvl_str),
+                created_at_nanos: r.get(4),
+            }
+        }).collect();
+        Ok(list)
+    }
+
+    async fn list_teams_for_user_in_org(
+        &self,
+        org_id: &str,
+        user_id: &str,
+    ) -> Result<Vec<Team>, ForgeError> {
+        let query = r#"
+            SELECT t.id, t.org_id, t.name, t.normalized_slug, t.description, t.created_at_nanos, t.updated_at_nanos
+            FROM teams t
+            JOIN team_memberships tm ON tm.team_id = t.id
+            WHERE t.org_id = $1 AND tm.user_id = $2
+            ORDER BY t.name ASC
+        "#;
+        let rows = sqlx::query(query)
+            .bind(org_id)
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| Team {
+            id: r.get(0),
+            org_id: r.get(1),
+            name: r.get(2),
+            normalized_slug: r.get(3),
+            description: r.get(4),
+            created_at_nanos: r.get(5),
+            updated_at_nanos: r.get(6),
+        }).collect();
+        Ok(list)
+    }
+
+    // -------------------------------------------------------------------------
+    // Milestones & Labels (Batch 09)
+    // -------------------------------------------------------------------------
+    async fn create_milestone(&self, milestone: Milestone) -> Result<Milestone, ForgeError> {
+        let query = "INSERT INTO milestones (id, repo_id, title, description, state, due_date_nanos, created_at_nanos, updated_at_nanos, closed_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)";
+        sqlx::query(query)
+            .bind(&milestone.id)
+            .bind(&milestone.repo_id)
+            .bind(&milestone.title)
+            .bind(&milestone.description)
+            .bind(&milestone.state)
+            .bind(milestone.due_date_nanos)
+            .bind(milestone.created_at_nanos)
+            .bind(milestone.updated_at_nanos)
+            .bind(milestone.closed_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(milestone)
+    }
+
+    async fn get_milestone_by_id(&self, id: &str) -> Result<Option<Milestone>, ForgeError> {
+        let query = "SELECT id, repo_id, title, description, state, due_date_nanos, created_at_nanos, updated_at_nanos, closed_at_nanos FROM milestones WHERE id = $1";
+        let row = sqlx::query(query)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        if let Some(r) = row {
+            Ok(Some(Milestone {
+                id: r.get(0),
+                repo_id: r.get(1),
+                title: r.get(2),
+                description: r.get(3),
+                state: r.get(4),
+                due_date_nanos: r.get(5),
+                created_at_nanos: r.get(6),
+                updated_at_nanos: r.get(7),
+                closed_at_nanos: r.get(8),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn list_milestones_for_repo(&self, repo_id: &str) -> Result<Vec<Milestone>, ForgeError> {
+        let query = "SELECT id, repo_id, title, description, state, due_date_nanos, created_at_nanos, updated_at_nanos, closed_at_nanos FROM milestones WHERE repo_id = $1 ORDER BY created_at_nanos DESC";
+        let rows = sqlx::query(query)
+            .bind(repo_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| Milestone {
+            id: r.get(0),
+            repo_id: r.get(1),
+            title: r.get(2),
+            description: r.get(3),
+            state: r.get(4),
+            due_date_nanos: r.get(5),
+            created_at_nanos: r.get(6),
+            updated_at_nanos: r.get(7),
+            closed_at_nanos: r.get(8),
+        }).collect();
+        Ok(list)
+    }
+
+    async fn update_milestone(&self, milestone: Milestone) -> Result<Milestone, ForgeError> {
+        let query = "UPDATE milestones SET title = $1, description = $2, state = $3, due_date_nanos = $4, updated_at_nanos = $5, closed_at_nanos = $6 WHERE id = $7";
+        let res = sqlx::query(query)
+            .bind(&milestone.title)
+            .bind(&milestone.description)
+            .bind(&milestone.state)
+            .bind(milestone.due_date_nanos)
+            .bind(milestone.updated_at_nanos)
+            .bind(milestone.closed_at_nanos)
+            .bind(&milestone.id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        if res.rows_affected() == 0 {
+            return Err(ForgeError::NotFound("Milestone not found".into()));
+        }
+        Ok(milestone)
+    }
+
+    async fn delete_milestone(&self, id: &str) -> Result<(), ForgeError> {
+        let query = "DELETE FROM milestones WHERE id = $1";
+        sqlx::query(query)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn create_label(&self, label: RepositoryLabel) -> Result<RepositoryLabel, ForgeError> {
+        let query = "INSERT INTO repository_labels (id, repo_id, name, color, description, created_at_nanos) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (repo_id, name) DO UPDATE SET color = EXCLUDED.color, description = EXCLUDED.description";
+        sqlx::query(query)
+            .bind(&label.id)
+            .bind(&label.repo_id)
+            .bind(&label.name)
+            .bind(&label.color)
+            .bind(&label.description)
+            .bind(label.created_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(label)
+    }
+
+    async fn list_labels_for_repo(&self, repo_id: &str) -> Result<Vec<RepositoryLabel>, ForgeError> {
+        let query = "SELECT id, repo_id, name, color, description, created_at_nanos FROM repository_labels WHERE repo_id = $1 ORDER BY name ASC";
+        let rows = sqlx::query(query)
+            .bind(repo_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| RepositoryLabel {
+            id: r.get(0),
+            repo_id: r.get(1),
+            name: r.get(2),
+            color: r.get(3),
+            description: r.get(4),
+            created_at_nanos: r.get(5),
+        }).collect();
+        Ok(list)
+    }
+
+    async fn delete_label(&self, id: &str) -> Result<(), ForgeError> {
+        let query = "DELETE FROM repository_labels WHERE id = $1";
+        sqlx::query(query)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Issues & Comments (Batch 09)
+    // -------------------------------------------------------------------------
+    async fn create_issue(&self, mut issue: Issue) -> Result<Issue, ForgeError> {
+        if issue.issue_number <= 0 {
+            let max_row = sqlx::query("SELECT COALESCE(MAX(issue_number), 0) + 1 FROM issues WHERE repo_id = $1")
+                .bind(&issue.repo_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+            issue.issue_number = max_row.get(0);
+        }
+
+        let query = r#"
+            INSERT INTO issues (id, repo_id, issue_number, author_id, title, body, status, milestone_id, closed_by_user_id, closed_at_nanos, created_at_nanos, updated_at_nanos)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        "#;
+        sqlx::query(query)
+            .bind(&issue.id)
+            .bind(&issue.repo_id)
+            .bind(issue.issue_number)
+            .bind(&issue.author_id)
+            .bind(&issue.title)
+            .bind(&issue.body)
+            .bind(&issue.status)
+            .bind(&issue.milestone_id)
+            .bind(&issue.closed_by_user_id)
+            .bind(issue.closed_at_nanos)
+            .bind(issue.created_at_nanos)
+            .bind(issue.updated_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(issue)
+    }
+
+    async fn get_issue_by_number(
+        &self,
+        repo_id: &str,
+        issue_number: i64,
+    ) -> Result<Option<Issue>, ForgeError> {
+        let query = "SELECT id, repo_id, issue_number, author_id, title, body, status, milestone_id, closed_by_user_id, closed_at_nanos, created_at_nanos, updated_at_nanos FROM issues WHERE repo_id = $1 AND issue_number = $2";
+        let row = sqlx::query(query)
+            .bind(repo_id)
+            .bind(issue_number)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        if let Some(r) = row {
+            Ok(Some(Issue {
+                id: r.get(0),
+                repo_id: r.get(1),
+                issue_number: r.get(2),
+                author_id: r.get(3),
+                title: r.get(4),
+                body: r.get(5),
+                status: r.get(6),
+                milestone_id: r.get(7),
+                closed_by_user_id: r.get(8),
+                closed_at_nanos: r.get(9),
+                created_at_nanos: r.get(10),
+                updated_at_nanos: r.get(11),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn list_issues_for_repo(
+        &self,
+        repo_id: &str,
+        status: Option<&str>,
+    ) -> Result<Vec<Issue>, ForgeError> {
+        let rows = if let Some(st) = status {
+            let query = "SELECT id, repo_id, issue_number, author_id, title, body, status, milestone_id, closed_by_user_id, closed_at_nanos, created_at_nanos, updated_at_nanos FROM issues WHERE repo_id = $1 AND status = $2 ORDER BY issue_number DESC";
+            sqlx::query(query)
+                .bind(repo_id)
+                .bind(st)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| ForgeError::Internal(e.to_string()))?
+        } else {
+            let query = "SELECT id, repo_id, issue_number, author_id, title, body, status, milestone_id, closed_by_user_id, closed_at_nanos, created_at_nanos, updated_at_nanos FROM issues WHERE repo_id = $1 ORDER BY issue_number DESC";
+            sqlx::query(query)
+                .bind(repo_id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| ForgeError::Internal(e.to_string()))?
+        };
+
+        let list = rows.into_iter().map(|r| Issue {
+            id: r.get(0),
+            repo_id: r.get(1),
+            issue_number: r.get(2),
+            author_id: r.get(3),
+            title: r.get(4),
+            body: r.get(5),
+            status: r.get(6),
+            milestone_id: r.get(7),
+            closed_by_user_id: r.get(8),
+            closed_at_nanos: r.get(9),
+            created_at_nanos: r.get(10),
+            updated_at_nanos: r.get(11),
+        }).collect();
+        Ok(list)
+    }
+
+    async fn update_issue(&self, issue: Issue) -> Result<Issue, ForgeError> {
+        let query = "UPDATE issues SET title = $1, body = $2, status = $3, milestone_id = $4, closed_by_user_id = $5, closed_at_nanos = $6, updated_at_nanos = $7 WHERE id = $8";
+        let res = sqlx::query(query)
+            .bind(&issue.title)
+            .bind(&issue.body)
+            .bind(&issue.status)
+            .bind(&issue.milestone_id)
+            .bind(&issue.closed_by_user_id)
+            .bind(issue.closed_at_nanos)
+            .bind(issue.updated_at_nanos)
+            .bind(&issue.id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        if res.rows_affected() == 0 {
+            return Err(ForgeError::NotFound("Issue not found".into()));
+        }
+        Ok(issue)
+    }
+
+    async fn assign_issue(&self, issue_id: &str, user_id: &str) -> Result<(), ForgeError> {
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let id = format!("ia_{}", uuid::Uuid::new_v4().simple());
+        let query = "INSERT INTO issue_assignees (id, issue_id, user_id, created_at_nanos) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING";
+        sqlx::query(query)
+            .bind(&id)
+            .bind(issue_id)
+            .bind(user_id)
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn unassign_issue(&self, issue_id: &str, user_id: &str) -> Result<(), ForgeError> {
+        let query = "DELETE FROM issue_assignees WHERE issue_id = $1 AND user_id = $2";
+        sqlx::query(query)
+            .bind(issue_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_issue_assignees(&self, issue_id: &str) -> Result<Vec<String>, ForgeError> {
+        let query = "SELECT user_id FROM issue_assignees WHERE issue_id = $1";
+        let rows = sqlx::query(query)
+            .bind(issue_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(rows.into_iter().map(|r| r.get(0)).collect())
+    }
+
+    async fn add_issue_label(&self, issue_id: &str, label_id: &str) -> Result<(), ForgeError> {
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let id = format!("il_{}", uuid::Uuid::new_v4().simple());
+        let query = "INSERT INTO issue_labels (id, issue_id, label_id, created_at_nanos) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING";
+        sqlx::query(query)
+            .bind(&id)
+            .bind(issue_id)
+            .bind(label_id)
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn remove_issue_label(&self, issue_id: &str, label_id: &str) -> Result<(), ForgeError> {
+        let query = "DELETE FROM issue_labels WHERE issue_id = $1 AND label_id = $2";
+        sqlx::query(query)
+            .bind(issue_id)
+            .bind(label_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_issue_labels(&self, issue_id: &str) -> Result<Vec<String>, ForgeError> {
+        let query = "SELECT label_id FROM issue_labels WHERE issue_id = $1";
+        let rows = sqlx::query(query)
+            .bind(issue_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(rows.into_iter().map(|r| r.get(0)).collect())
+    }
+
+    async fn create_issue_comment(&self, comment: IssueComment) -> Result<IssueComment, ForgeError> {
+        let query = "INSERT INTO issue_comments (id, issue_id, author_id, body, created_at_nanos, updated_at_nanos) VALUES ($1, $2, $3, $4, $5, $6)";
+        sqlx::query(query)
+            .bind(&comment.id)
+            .bind(&comment.issue_id)
+            .bind(&comment.author_id)
+            .bind(&comment.body)
+            .bind(comment.created_at_nanos)
+            .bind(comment.updated_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(comment)
+    }
+
+    async fn list_issue_comments(&self, issue_id: &str) -> Result<Vec<IssueComment>, ForgeError> {
+        let query = "SELECT id, issue_id, author_id, body, created_at_nanos, updated_at_nanos FROM issue_comments WHERE issue_id = $1 ORDER BY created_at_nanos ASC";
+        let rows = sqlx::query(query)
+            .bind(issue_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| IssueComment {
+            id: r.get(0),
+            issue_id: r.get(1),
+            author_id: r.get(2),
+            body: r.get(3),
+            created_at_nanos: r.get(4),
+            updated_at_nanos: r.get(5),
+        }).collect();
+        Ok(list)
+    }
+
+    // -------------------------------------------------------------------------
+    // Pull Requests, Reviews & Inline Comments (Batch 09)
+    // -------------------------------------------------------------------------
+    async fn create_pull_request(&self, mut pr: PullRequest) -> Result<PullRequest, ForgeError> {
+        if pr.pr_number <= 0 {
+            let max_row = sqlx::query("SELECT COALESCE(MAX(pr_number), 0) + 1 FROM pull_requests WHERE repo_id = $1")
+                .bind(&pr.repo_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+            pr.pr_number = max_row.get(0);
+        }
+
+        let query = r#"
+            INSERT INTO pull_requests (id, repo_id, pr_number, author_id, title, body, base_branch, head_branch, base_commit_id, head_commit_id, state, is_draft, merged_by_user_id, merge_commit_id, merge_strategy, closed_at_nanos, merged_at_nanos, created_at_nanos, updated_at_nanos)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+        "#;
+        sqlx::query(query)
+            .bind(&pr.id)
+            .bind(&pr.repo_id)
+            .bind(pr.pr_number)
+            .bind(&pr.author_id)
+            .bind(&pr.title)
+            .bind(&pr.body)
+            .bind(&pr.base_branch)
+            .bind(&pr.head_branch)
+            .bind(&pr.base_commit_id)
+            .bind(&pr.head_commit_id)
+            .bind(&pr.state)
+            .bind(pr.is_draft)
+            .bind(&pr.merged_by_user_id)
+            .bind(&pr.merge_commit_id)
+            .bind(&pr.merge_strategy)
+            .bind(pr.closed_at_nanos)
+            .bind(pr.merged_at_nanos)
+            .bind(pr.created_at_nanos)
+            .bind(pr.updated_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(pr)
+    }
+
+    async fn get_pull_request_by_number(
+        &self,
+        repo_id: &str,
+        pr_number: i64,
+    ) -> Result<Option<PullRequest>, ForgeError> {
+        let query = "SELECT id, repo_id, pr_number, author_id, title, body, base_branch, head_branch, base_commit_id, head_commit_id, state, is_draft, merged_by_user_id, merge_commit_id, merge_strategy, closed_at_nanos, merged_at_nanos, created_at_nanos, updated_at_nanos FROM pull_requests WHERE repo_id = $1 AND pr_number = $2";
+        let row = sqlx::query(query)
+            .bind(repo_id)
+            .bind(pr_number)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        if let Some(r) = row {
+            Ok(Some(PullRequest {
+                id: r.get(0),
+                repo_id: r.get(1),
+                pr_number: r.get(2),
+                author_id: r.get(3),
+                title: r.get(4),
+                body: r.get(5),
+                base_branch: r.get(6),
+                head_branch: r.get(7),
+                base_commit_id: r.get(8),
+                head_commit_id: r.get(9),
+                state: r.get(10),
+                is_draft: r.get(11),
+                merged_by_user_id: r.get(12),
+                merge_commit_id: r.get(13),
+                merge_strategy: r.get(14),
+                closed_at_nanos: r.get(15),
+                merged_at_nanos: r.get(16),
+                created_at_nanos: r.get(17),
+                updated_at_nanos: r.get(18),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn list_pull_requests_for_repo(
+        &self,
+        repo_id: &str,
+        state: Option<&str>,
+    ) -> Result<Vec<PullRequest>, ForgeError> {
+        let rows = if let Some(st) = state {
+            let query = "SELECT id, repo_id, pr_number, author_id, title, body, base_branch, head_branch, base_commit_id, head_commit_id, state, is_draft, merged_by_user_id, merge_commit_id, merge_strategy, closed_at_nanos, merged_at_nanos, created_at_nanos, updated_at_nanos FROM pull_requests WHERE repo_id = $1 AND state = $2 ORDER BY pr_number DESC";
+            sqlx::query(query)
+                .bind(repo_id)
+                .bind(st)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| ForgeError::Internal(e.to_string()))?
+        } else {
+            let query = "SELECT id, repo_id, pr_number, author_id, title, body, base_branch, head_branch, base_commit_id, head_commit_id, state, is_draft, merged_by_user_id, merge_commit_id, merge_strategy, closed_at_nanos, merged_at_nanos, created_at_nanos, updated_at_nanos FROM pull_requests WHERE repo_id = $1 ORDER BY pr_number DESC";
+            sqlx::query(query)
+                .bind(repo_id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| ForgeError::Internal(e.to_string()))?
+        };
+
+        let list = rows.into_iter().map(|r| PullRequest {
+            id: r.get(0),
+            repo_id: r.get(1),
+            pr_number: r.get(2),
+            author_id: r.get(3),
+            title: r.get(4),
+            body: r.get(5),
+            base_branch: r.get(6),
+            head_branch: r.get(7),
+            base_commit_id: r.get(8),
+            head_commit_id: r.get(9),
+            state: r.get(10),
+            is_draft: r.get(11),
+            merged_by_user_id: r.get(12),
+            merge_commit_id: r.get(13),
+            merge_strategy: r.get(14),
+            closed_at_nanos: r.get(15),
+            merged_at_nanos: r.get(16),
+            created_at_nanos: r.get(17),
+            updated_at_nanos: r.get(18),
+        }).collect();
+        Ok(list)
+    }
+
+    async fn update_pull_request(&self, pr: PullRequest) -> Result<PullRequest, ForgeError> {
+        let query = r#"
+            UPDATE pull_requests
+            SET title = $1, body = $2, base_commit_id = $3, head_commit_id = $4, state = $5, is_draft = $6,
+                merged_by_user_id = $7, merge_commit_id = $8, merge_strategy = $9, closed_at_nanos = $10,
+                merged_at_nanos = $11, updated_at_nanos = $12
+            WHERE id = $13
+        "#;
+        let res = sqlx::query(query)
+            .bind(&pr.title)
+            .bind(&pr.body)
+            .bind(&pr.base_commit_id)
+            .bind(&pr.head_commit_id)
+            .bind(&pr.state)
+            .bind(pr.is_draft)
+            .bind(&pr.merged_by_user_id)
+            .bind(&pr.merge_commit_id)
+            .bind(&pr.merge_strategy)
+            .bind(pr.closed_at_nanos)
+            .bind(pr.merged_at_nanos)
+            .bind(pr.updated_at_nanos)
+            .bind(&pr.id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        if res.rows_affected() == 0 {
+            return Err(ForgeError::NotFound("Pull request not found".into()));
+        }
+        Ok(pr)
+    }
+
+    async fn request_pr_reviewer(
+        &self,
+        pr_id: &str,
+        reviewer_id: &str,
+        requested_by: &str,
+    ) -> Result<(), ForgeError> {
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let id = format!("prr_{}", uuid::Uuid::new_v4().simple());
+        let query = "INSERT INTO pull_request_reviewers (id, pr_id, reviewer_id, requested_by_user_id, created_at_nanos) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING";
+        sqlx::query(query)
+            .bind(&id)
+            .bind(pr_id)
+            .bind(reviewer_id)
+            .bind(requested_by)
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_pr_requested_reviewers(&self, pr_id: &str) -> Result<Vec<String>, ForgeError> {
+        let query = "SELECT reviewer_id FROM pull_request_reviewers WHERE pr_id = $1";
+        let rows = sqlx::query(query)
+            .bind(pr_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(rows.into_iter().map(|r| r.get(0)).collect())
+    }
+
+    async fn create_pr_review(&self, review: PullRequestReview) -> Result<PullRequestReview, ForgeError> {
+        let query = "INSERT INTO pull_request_reviews (id, pr_id, reviewer_id, commit_id, state, body, dismissed_by_user_id, created_at_nanos, updated_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)";
+        sqlx::query(query)
+            .bind(&review.id)
+            .bind(&review.pr_id)
+            .bind(&review.reviewer_id)
+            .bind(&review.commit_id)
+            .bind(&review.state)
+            .bind(&review.body)
+            .bind(&review.dismissed_by_user_id)
+            .bind(review.created_at_nanos)
+            .bind(review.updated_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(review)
+    }
+
+    async fn list_pr_reviews(&self, pr_id: &str) -> Result<Vec<PullRequestReview>, ForgeError> {
+        let query = "SELECT id, pr_id, reviewer_id, commit_id, state, body, dismissed_by_user_id, created_at_nanos, updated_at_nanos FROM pull_request_reviews WHERE pr_id = $1 ORDER BY created_at_nanos ASC";
+        let rows = sqlx::query(query)
+            .bind(pr_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| PullRequestReview {
+            id: r.get(0),
+            pr_id: r.get(1),
+            reviewer_id: r.get(2),
+            commit_id: r.get(3),
+            state: r.get(4),
+            body: r.get(5),
+            dismissed_by_user_id: r.get(6),
+            created_at_nanos: r.get(7),
+            updated_at_nanos: r.get(8),
+        }).collect();
+        Ok(list)
+    }
+
+    async fn dismiss_pr_review(
+        &self,
+        review_id: &str,
+        dismissed_by: &str,
+        now_nanos: i64,
+    ) -> Result<(), ForgeError> {
+        let query = "UPDATE pull_request_reviews SET state = 'DISMISSED', dismissed_by_user_id = $1, updated_at_nanos = $2 WHERE id = $3";
+        let res = sqlx::query(query)
+            .bind(dismissed_by)
+            .bind(now_nanos)
+            .bind(review_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if res.rows_affected() == 0 {
+            return Err(ForgeError::NotFound("Review not found".into()));
+        }
+        Ok(())
+    }
+
+    async fn create_pr_review_comment(
+        &self,
+        comment: PullRequestReviewComment,
+    ) -> Result<PullRequestReviewComment, ForgeError> {
+        let query = "INSERT INTO pull_request_review_comments (id, pr_id, review_id, author_id, file_path, commit_id, diff_side, line_number, body, is_resolved, created_at_nanos, updated_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)";
+        sqlx::query(query)
+            .bind(&comment.id)
+            .bind(&comment.pr_id)
+            .bind(&comment.review_id)
+            .bind(&comment.author_id)
+            .bind(&comment.file_path)
+            .bind(&comment.commit_id)
+            .bind(&comment.diff_side)
+            .bind(comment.line_number)
+            .bind(&comment.body)
+            .bind(comment.is_resolved)
+            .bind(comment.created_at_nanos)
+            .bind(comment.updated_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(comment)
+    }
+
+    async fn list_pr_review_comments(
+        &self,
+        pr_id: &str,
+    ) -> Result<Vec<PullRequestReviewComment>, ForgeError> {
+        let query = "SELECT id, pr_id, review_id, author_id, file_path, commit_id, diff_side, line_number, body, is_resolved, created_at_nanos, updated_at_nanos FROM pull_request_review_comments WHERE pr_id = $1 ORDER BY created_at_nanos ASC";
+        let rows = sqlx::query(query)
+            .bind(pr_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| PullRequestReviewComment {
+            id: r.get(0),
+            pr_id: r.get(1),
+            review_id: r.get(2),
+            author_id: r.get(3),
+            file_path: r.get(4),
+            commit_id: r.get(5),
+            diff_side: r.get(6),
+            line_number: r.get(7),
+            body: r.get(8),
+            is_resolved: r.get(9),
+            created_at_nanos: r.get(10),
+            updated_at_nanos: r.get(11),
+        }).collect();
+        Ok(list)
+    }
+
+    async fn resolve_pr_review_comment(&self, comment_id: &str, resolved: bool) -> Result<(), ForgeError> {
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let query = "UPDATE pull_request_review_comments SET is_resolved = $1, updated_at_nanos = $2 WHERE id = $3";
+        let res = sqlx::query(query)
+            .bind(resolved)
+            .bind(now)
+            .bind(comment_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if res.rows_affected() == 0 {
+            return Err(ForgeError::NotFound("Review comment not found".into()));
+        }
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Branch Protection Rules (Batch 09)
+    // -------------------------------------------------------------------------
+    async fn set_branch_protection(
+        &self,
+        rule: BranchProtectionRule,
+    ) -> Result<BranchProtectionRule, ForgeError> {
+        let query = r#"
+            INSERT INTO branch_protection_rules (id, repo_id, branch_pattern, require_pull_request, required_approvals, prevent_self_approval, require_changes_addressed, dismiss_stale_reviews_on_push, restrict_merges_to_admins, created_at_nanos, updated_at_nanos)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            ON CONFLICT (repo_id, branch_pattern) DO UPDATE SET
+                require_pull_request = EXCLUDED.require_pull_request,
+                required_approvals = EXCLUDED.required_approvals,
+                prevent_self_approval = EXCLUDED.prevent_self_approval,
+                require_changes_addressed = EXCLUDED.require_changes_addressed,
+                dismiss_stale_reviews_on_push = EXCLUDED.dismiss_stale_reviews_on_push,
+                restrict_merges_to_admins = EXCLUDED.restrict_merges_to_admins,
+                updated_at_nanos = EXCLUDED.updated_at_nanos
+        "#;
+        sqlx::query(query)
+            .bind(&rule.id)
+            .bind(&rule.repo_id)
+            .bind(&rule.branch_pattern)
+            .bind(rule.require_pull_request)
+            .bind(rule.required_approvals)
+            .bind(rule.prevent_self_approval)
+            .bind(rule.require_changes_addressed)
+            .bind(rule.dismiss_stale_reviews_on_push)
+            .bind(rule.restrict_merges_to_admins)
+            .bind(rule.created_at_nanos)
+            .bind(rule.updated_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(rule)
+    }
+
+    async fn get_branch_protection(
+        &self,
+        repo_id: &str,
+        branch: &str,
+    ) -> Result<Option<BranchProtectionRule>, ForgeError> {
+        let rules = self.list_branch_protection_rules(repo_id).await?;
+        for r in rules {
+            if r.branch_pattern == branch || r.branch_pattern == "*" {
+                return Ok(Some(r));
+            }
+            if r.branch_pattern.ends_with('*') {
+                let prefix = &r.branch_pattern[..r.branch_pattern.len() - 1];
+                if branch.starts_with(prefix) {
+                    return Ok(Some(r));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    async fn list_branch_protection_rules(
+        &self,
+        repo_id: &str,
+    ) -> Result<Vec<BranchProtectionRule>, ForgeError> {
+        let query = "SELECT id, repo_id, branch_pattern, require_pull_request, required_approvals, prevent_self_approval, require_changes_addressed, dismiss_stale_reviews_on_push, restrict_merges_to_admins, created_at_nanos, updated_at_nanos FROM branch_protection_rules WHERE repo_id = $1";
+        let rows = sqlx::query(query)
+            .bind(repo_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| BranchProtectionRule {
+            id: r.get(0),
+            repo_id: r.get(1),
+            branch_pattern: r.get(2),
+            require_pull_request: r.get(3),
+            required_approvals: r.get(4),
+            prevent_self_approval: r.get(5),
+            require_changes_addressed: r.get(6),
+            dismiss_stale_reviews_on_push: r.get(7),
+            restrict_merges_to_admins: r.get(8),
+            created_at_nanos: r.get(9),
+            updated_at_nanos: r.get(10),
+        }).collect();
+        Ok(list)
+    }
+
+    async fn delete_branch_protection(&self, rule_id: &str) -> Result<(), ForgeError> {
+        let query = "DELETE FROM branch_protection_rules WHERE id = $1";
+        sqlx::query(query)
+            .bind(rule_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Notifications & Activity Events (Batch 09)
+    // -------------------------------------------------------------------------
+    async fn create_notification(&self, notif: UserNotification) -> Result<UserNotification, ForgeError> {
+        let query = "INSERT INTO user_notifications (id, user_id, reason, resource_type, resource_id, title, message, is_read, created_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)";
+        sqlx::query(query)
+            .bind(&notif.id)
+            .bind(&notif.user_id)
+            .bind(&notif.reason)
+            .bind(&notif.resource_type)
+            .bind(&notif.resource_id)
+            .bind(&notif.title)
+            .bind(&notif.message)
+            .bind(notif.is_read)
+            .bind(notif.created_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(notif)
+    }
+
+    async fn list_user_notifications(
+        &self,
+        user_id: &str,
+        unread_only: bool,
+    ) -> Result<Vec<UserNotification>, ForgeError> {
+        let rows = if unread_only {
+            let query = "SELECT id, user_id, reason, resource_type, resource_id, title, message, is_read, created_at_nanos FROM user_notifications WHERE user_id = $1 AND is_read = FALSE ORDER BY created_at_nanos DESC";
+            sqlx::query(query)
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| ForgeError::Internal(e.to_string()))?
+        } else {
+            let query = "SELECT id, user_id, reason, resource_type, resource_id, title, message, is_read, created_at_nanos FROM user_notifications WHERE user_id = $1 ORDER BY created_at_nanos DESC";
+            sqlx::query(query)
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| ForgeError::Internal(e.to_string()))?
+        };
+
+        let list = rows.into_iter().map(|r| UserNotification {
+            id: r.get(0),
+            user_id: r.get(1),
+            reason: r.get(2),
+            resource_type: r.get(3),
+            resource_id: r.get(4),
+            title: r.get(5),
+            message: r.get(6),
+            is_read: r.get(7),
+            created_at_nanos: r.get(8),
+        }).collect();
+        Ok(list)
+    }
+
+    async fn mark_notification_read(&self, notif_id: &str, user_id: &str) -> Result<(), ForgeError> {
+        let query = "UPDATE user_notifications SET is_read = TRUE WHERE id = $1 AND user_id = $2";
+        let res = sqlx::query(query)
+            .bind(notif_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if res.rows_affected() == 0 {
+            return Err(ForgeError::NotFound("Notification not found".into()));
+        }
+        Ok(())
+    }
+
+    async fn mark_all_notifications_read(&self, user_id: &str) -> Result<(), ForgeError> {
+        let query = "UPDATE user_notifications SET is_read = TRUE WHERE user_id = $1";
+        sqlx::query(query)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn record_activity_event(&self, event: RepositoryActivityEvent) -> Result<(), ForgeError> {
+        let query = "INSERT INTO repository_activity_events (id, repo_id, actor_id, event_type, payload, created_at_nanos) VALUES ($1, $2, $3, $4, $5, $6)";
+        sqlx::query(query)
+            .bind(&event.id)
+            .bind(&event.repo_id)
+            .bind(&event.actor_id)
+            .bind(&event.event_type)
+            .bind(&event.payload)
+            .bind(event.created_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_activity_events_for_repo(
+        &self,
+        repo_id: &str,
+        limit: usize,
+    ) -> Result<Vec<RepositoryActivityEvent>, ForgeError> {
+        let query = "SELECT id, repo_id, actor_id, event_type, payload, created_at_nanos FROM repository_activity_events WHERE repo_id = $1 ORDER BY created_at_nanos DESC LIMIT $2";
+        let rows = sqlx::query(query)
+            .bind(repo_id)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| RepositoryActivityEvent {
+            id: r.get(0),
+            repo_id: r.get(1),
+            actor_id: r.get(2),
+            event_type: r.get(3),
+            payload: r.get(4),
+            created_at_nanos: r.get(5),
+        }).collect();
+        Ok(list)
     }
 }

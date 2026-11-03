@@ -4,7 +4,9 @@ use async_trait::async_trait;
 
 #[async_trait]
 pub trait Database: Send + Sync {
+    // -------------------------------------------------------------------------
     // Users
+    // -------------------------------------------------------------------------
     async fn create_user(&self, user: User) -> Result<User, ForgeError>;
     async fn get_user_by_id(&self, id: &str) -> Result<Option<User>, ForgeError>;
     async fn get_user_by_username(&self, username: &str) -> Result<Option<User>, ForgeError>;
@@ -17,14 +19,18 @@ pub trait Database: Send + Sync {
         now_nanos: i64,
     ) -> Result<(), ForgeError>;
 
+    // -------------------------------------------------------------------------
     // Sessions
+    // -------------------------------------------------------------------------
     async fn create_session(&self, session: UserSession) -> Result<UserSession, ForgeError>;
     async fn get_session_by_hash(&self, token_hash: &str) -> Result<Option<UserSession>, ForgeError>;
     async fn revoke_session(&self, session_id: &str) -> Result<(), ForgeError>;
     async fn revoke_all_user_sessions(&self, user_id: &str) -> Result<(), ForgeError>;
     async fn list_user_sessions(&self, user_id: &str) -> Result<Vec<UserSession>, ForgeError>;
 
+    // -------------------------------------------------------------------------
     // Verification & Reset Tokens
+    // -------------------------------------------------------------------------
     async fn create_email_token(
         &self,
         token_hash: &str,
@@ -49,7 +55,9 @@ pub trait Database: Send + Sync {
         now_nanos: i64,
     ) -> Result<Option<String>, ForgeError>;
 
+    // -------------------------------------------------------------------------
     // Personal Access Tokens
+    // -------------------------------------------------------------------------
     async fn create_pat(&self, pat: PersonalAccessToken) -> Result<PersonalAccessToken, ForgeError>;
     async fn get_pat_by_hash(
         &self,
@@ -63,7 +71,9 @@ pub trait Database: Send + Sync {
     async fn list_user_pats(&self, user_id: &str) -> Result<Vec<PersonalAccessToken>, ForgeError>;
     async fn revoke_pat(&self, pat_id: &str, user_id: &str) -> Result<(), ForgeError>;
 
+    // -------------------------------------------------------------------------
     // Repositories
+    // -------------------------------------------------------------------------
     async fn create_repository(&self, repo: ForgeRepository) -> Result<ForgeRepository, ForgeError>;
     async fn get_repository_by_id(&self, id: &str) -> Result<Option<ForgeRepository>, ForgeError>;
     async fn get_repository_by_owner_name(
@@ -75,6 +85,10 @@ pub trait Database: Send + Sync {
         &self,
         user_id: &str,
     ) -> Result<Vec<ForgeRepository>, ForgeError>;
+    async fn list_repositories_for_org(
+        &self,
+        org_id: &str,
+    ) -> Result<Vec<ForgeRepository>, ForgeError>;
     async fn list_public_repositories(&self) -> Result<Vec<ForgeRepository>, ForgeError>;
     async fn update_repository_status(
         &self,
@@ -82,9 +96,17 @@ pub trait Database: Send + Sync {
         status: ProvisioningStatus,
         now_nanos: i64,
     ) -> Result<(), ForgeError>;
+    async fn update_repository_owner_org(
+        &self,
+        repo_id: &str,
+        org_id: &str,
+        org_name: &str,
+    ) -> Result<(), ForgeError>;
     async fn delete_repository(&self, repo_id: &str) -> Result<(), ForgeError>;
 
-    // Permissions
+    // -------------------------------------------------------------------------
+    // Permissions (Direct Collaborator)
+    // -------------------------------------------------------------------------
     async fn create_permission(
         &self,
         perm: RepositoryPermission,
@@ -100,7 +122,9 @@ pub trait Database: Send + Sync {
     ) -> Result<Vec<RepositoryPermission>, ForgeError>;
     async fn delete_permission(&self, repo_id: &str, user_id: &str) -> Result<(), ForgeError>;
 
+    // -------------------------------------------------------------------------
     // Provisioning Jobs (Outbox)
+    // -------------------------------------------------------------------------
     async fn create_provisioning_job(
         &self,
         job: ProvisioningJob,
@@ -114,6 +138,195 @@ pub trait Database: Send + Sync {
         now_nanos: i64,
     ) -> Result<(), ForgeError>;
 
-    // Audit Events
+    // -------------------------------------------------------------------------
+    // Organizations & Membership (Batch 09)
+    // -------------------------------------------------------------------------
+    async fn create_organization(&self, org: Organization) -> Result<Organization, ForgeError>;
+    async fn get_organization_by_id(&self, id: &str) -> Result<Option<Organization>, ForgeError>;
+    async fn get_organization_by_slug(&self, slug: &str) -> Result<Option<Organization>, ForgeError>;
+    async fn list_organizations_for_user(&self, user_id: &str) -> Result<Vec<Organization>, ForgeError>;
+    async fn update_organization(&self, org: Organization) -> Result<Organization, ForgeError>;
+    async fn delete_organization(&self, org_id: &str) -> Result<(), ForgeError>;
+
+    async fn add_organization_member(&self, membership: OrganizationMembership) -> Result<(), ForgeError>;
+    async fn get_organization_membership(
+        &self,
+        org_id: &str,
+        user_id: &str,
+    ) -> Result<Option<OrganizationMembership>, ForgeError>;
+    async fn list_organization_members(&self, org_id: &str) -> Result<Vec<OrganizationMembership>, ForgeError>;
+    async fn remove_organization_member(&self, org_id: &str, user_id: &str) -> Result<(), ForgeError>;
+    async fn update_organization_member_role(
+        &self,
+        org_id: &str,
+        user_id: &str,
+        role: OrganizationRole,
+    ) -> Result<(), ForgeError>;
+
+    async fn create_organization_invitation(&self, inv: OrganizationInvitation) -> Result<OrganizationInvitation, ForgeError>;
+    async fn get_organization_invitation_by_token(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<OrganizationInvitation>, ForgeError>;
+    async fn list_organization_invitations(&self, org_id: &str) -> Result<Vec<OrganizationInvitation>, ForgeError>;
+    async fn update_organization_invitation_status(
+        &self,
+        id: &str,
+        status: &str,
+        now_nanos: i64,
+    ) -> Result<(), ForgeError>;
+
+    // -------------------------------------------------------------------------
+    // Teams & Team Permissions (Batch 09)
+    // -------------------------------------------------------------------------
+    async fn create_team(&self, team: Team) -> Result<Team, ForgeError>;
+    async fn get_team_by_id(&self, id: &str) -> Result<Option<Team>, ForgeError>;
+    async fn get_team_by_slug(&self, org_id: &str, slug: &str) -> Result<Option<Team>, ForgeError>;
+    async fn list_teams_for_org(&self, org_id: &str) -> Result<Vec<Team>, ForgeError>;
+    async fn delete_team(&self, team_id: &str) -> Result<(), ForgeError>;
+
+    async fn add_team_member(&self, membership: TeamMembership) -> Result<(), ForgeError>;
+    async fn remove_team_member(&self, team_id: &str, user_id: &str) -> Result<(), ForgeError>;
+    async fn list_team_members(&self, team_id: &str) -> Result<Vec<TeamMembership>, ForgeError>;
+
+    async fn set_team_repository_permission(
+        &self,
+        perm: TeamRepositoryPermission,
+    ) -> Result<(), ForgeError>;
+    async fn get_team_repository_permission(
+        &self,
+        team_id: &str,
+        repo_id: &str,
+    ) -> Result<Option<TeamPermissionLevel>, ForgeError>;
+    async fn list_team_repository_permissions_for_repo(
+        &self,
+        repo_id: &str,
+    ) -> Result<Vec<TeamRepositoryPermission>, ForgeError>;
+    async fn list_teams_for_user_in_org(
+        &self,
+        org_id: &str,
+        user_id: &str,
+    ) -> Result<Vec<Team>, ForgeError>;
+
+    // -------------------------------------------------------------------------
+    // Milestones & Labels (Batch 09)
+    // -------------------------------------------------------------------------
+    async fn create_milestone(&self, milestone: Milestone) -> Result<Milestone, ForgeError>;
+    async fn get_milestone_by_id(&self, id: &str) -> Result<Option<Milestone>, ForgeError>;
+    async fn list_milestones_for_repo(&self, repo_id: &str) -> Result<Vec<Milestone>, ForgeError>;
+    async fn update_milestone(&self, milestone: Milestone) -> Result<Milestone, ForgeError>;
+    async fn delete_milestone(&self, id: &str) -> Result<(), ForgeError>;
+
+    async fn create_label(&self, label: RepositoryLabel) -> Result<RepositoryLabel, ForgeError>;
+    async fn list_labels_for_repo(&self, repo_id: &str) -> Result<Vec<RepositoryLabel>, ForgeError>;
+    async fn delete_label(&self, id: &str) -> Result<(), ForgeError>;
+
+    // -------------------------------------------------------------------------
+    // Issues & Issue Comments (Batch 09)
+    // -------------------------------------------------------------------------
+    async fn create_issue(&self, issue: Issue) -> Result<Issue, ForgeError>;
+    async fn get_issue_by_number(
+        &self,
+        repo_id: &str,
+        issue_number: i64,
+    ) -> Result<Option<Issue>, ForgeError>;
+    async fn list_issues_for_repo(
+        &self,
+        repo_id: &str,
+        status: Option<&str>,
+    ) -> Result<Vec<Issue>, ForgeError>;
+    async fn update_issue(&self, issue: Issue) -> Result<Issue, ForgeError>;
+
+    async fn assign_issue(&self, issue_id: &str, user_id: &str) -> Result<(), ForgeError>;
+    async fn unassign_issue(&self, issue_id: &str, user_id: &str) -> Result<(), ForgeError>;
+    async fn list_issue_assignees(&self, issue_id: &str) -> Result<Vec<String>, ForgeError>;
+
+    async fn add_issue_label(&self, issue_id: &str, label_id: &str) -> Result<(), ForgeError>;
+    async fn remove_issue_label(&self, issue_id: &str, label_id: &str) -> Result<(), ForgeError>;
+    async fn list_issue_labels(&self, issue_id: &str) -> Result<Vec<String>, ForgeError>;
+
+    async fn create_issue_comment(&self, comment: IssueComment) -> Result<IssueComment, ForgeError>;
+    async fn list_issue_comments(&self, issue_id: &str) -> Result<Vec<IssueComment>, ForgeError>;
+
+    // -------------------------------------------------------------------------
+    // Pull Requests, Reviews & Inline Comments (Batch 09)
+    // -------------------------------------------------------------------------
+    async fn create_pull_request(&self, pr: PullRequest) -> Result<PullRequest, ForgeError>;
+    async fn get_pull_request_by_number(
+        &self,
+        repo_id: &str,
+        pr_number: i64,
+    ) -> Result<Option<PullRequest>, ForgeError>;
+    async fn list_pull_requests_for_repo(
+        &self,
+        repo_id: &str,
+        state: Option<&str>,
+    ) -> Result<Vec<PullRequest>, ForgeError>;
+    async fn update_pull_request(&self, pr: PullRequest) -> Result<PullRequest, ForgeError>;
+
+    async fn request_pr_reviewer(
+        &self,
+        pr_id: &str,
+        reviewer_id: &str,
+        requested_by: &str,
+    ) -> Result<(), ForgeError>;
+    async fn list_pr_requested_reviewers(&self, pr_id: &str) -> Result<Vec<String>, ForgeError>;
+
+    async fn create_pr_review(&self, review: PullRequestReview) -> Result<PullRequestReview, ForgeError>;
+    async fn list_pr_reviews(&self, pr_id: &str) -> Result<Vec<PullRequestReview>, ForgeError>;
+    async fn dismiss_pr_review(
+        &self,
+        review_id: &str,
+        dismissed_by: &str,
+        now_nanos: i64,
+    ) -> Result<(), ForgeError>;
+
+    async fn create_pr_review_comment(
+        &self,
+        comment: PullRequestReviewComment,
+    ) -> Result<PullRequestReviewComment, ForgeError>;
+    async fn list_pr_review_comments(
+        &self,
+        pr_id: &str,
+    ) -> Result<Vec<PullRequestReviewComment>, ForgeError>;
+    async fn resolve_pr_review_comment(&self, comment_id: &str, resolved: bool) -> Result<(), ForgeError>;
+
+    // -------------------------------------------------------------------------
+    // Branch Protection Rules (Batch 09)
+    // -------------------------------------------------------------------------
+    async fn set_branch_protection(
+        &self,
+        rule: BranchProtectionRule,
+    ) -> Result<BranchProtectionRule, ForgeError>;
+    async fn get_branch_protection(
+        &self,
+        repo_id: &str,
+        branch: &str,
+    ) -> Result<Option<BranchProtectionRule>, ForgeError>;
+    async fn list_branch_protection_rules(
+        &self,
+        repo_id: &str,
+    ) -> Result<Vec<BranchProtectionRule>, ForgeError>;
+    async fn delete_branch_protection(&self, rule_id: &str) -> Result<(), ForgeError>;
+
+    // -------------------------------------------------------------------------
+    // Notifications & Activity Events (Batch 09)
+    // -------------------------------------------------------------------------
+    async fn create_notification(&self, notif: UserNotification) -> Result<UserNotification, ForgeError>;
+    async fn list_user_notifications(
+        &self,
+        user_id: &str,
+        unread_only: bool,
+    ) -> Result<Vec<UserNotification>, ForgeError>;
+    async fn mark_notification_read(&self, notif_id: &str, user_id: &str) -> Result<(), ForgeError>;
+    async fn mark_all_notifications_read(&self, user_id: &str) -> Result<(), ForgeError>;
+
+    async fn record_activity_event(&self, event: RepositoryActivityEvent) -> Result<(), ForgeError>;
+    async fn list_activity_events_for_repo(
+        &self,
+        repo_id: &str,
+        limit: usize,
+    ) -> Result<Vec<RepositoryActivityEvent>, ForgeError>;
+
     async fn record_audit_event(&self, event: AuditEvent) -> Result<(), ForgeError>;
 }

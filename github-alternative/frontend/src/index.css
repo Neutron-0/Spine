@@ -336,3 +336,181 @@ body {
   gap: 1.5rem;
   margin-top: 0.35rem;
 }
+
+/* -------------------------------------------------------------------------- */
+/* Batch 09 Collaboration Styles                                              */
+/* -------------------------------------------------------------------------- */
+
+.badge-open {
+  background-color: #238636;
+  color: #ffffff;
+}
+
+.badge-closed {
+  background-color: #8957e5;
+  color: #ffffff;
+}
+
+.badge-merged {
+  background-color: #8957e5;
+  color: #ffffff;
+}
+
+.badge-draft {
+  background-color: #6e7681;
+  color: #ffffff;
+}
+
+.tag-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.15rem 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  border-radius: 12px;
+  margin-right: 0.35rem;
+  color: #ffffff;
+}
+
+.diff-container {
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  margin-bottom: 1.5rem;
+  overflow: hidden;
+}
+
+.diff-header {
+  background-color: #161b22;
+  padding: 0.6rem 1rem;
+  font-family: monospace;
+  font-size: 0.85rem;
+  font-weight: 600;
+  border-bottom: 1px solid #30363d;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.diff-body {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.8rem;
+  line-height: 1.4;
+  overflow-x: auto;
+  background-color: #0d1117;
+}
+
+.diff-line {
+  display: flex;
+  padding: 0.1rem 0.5rem;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.diff-line-add {
+  background-color: rgba(46, 160, 67, 0.15);
+  color: #7ee787;
+  border-left: 3px solid #3fb950;
+}
+
+.diff-line-del {
+  background-color: rgba(248, 81, 73, 0.15);
+  color: #ff7b72;
+  border-left: 3px solid #f85149;
+}
+
+.diff-line-context {
+  color: #c9d1d9;
+}
+
+.comment-card {
+  background-color: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  margin-bottom: 1rem;
+}
+
+.comment-card-header {
+  background-color: #21262d;
+  padding: 0.5rem 0.8rem;
+  font-size: 0.8rem;
+  color: #8b949e;
+  border-bottom: 1px solid #30363d;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.comment-card-body {
+  padding: 0.8rem 1rem;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  color: #e6edf3;
+}
+
+.merge-box {
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 1.25rem;
+  margin-top: 1.5rem;
+  background-color: #161b22;
+}
+
+.merge-box-clean {
+  border-left: 4px solid #238636;
+}
+
+.merge-box-conflict {
+  border-left: 4px solid #f85149;
+}
+
+.review-badge-approved {
+  background-color: rgba(46, 160, 67, 0.15);
+  color: #3fb950;
+  border: 1px solid rgba(46, 160, 67, 0.4);
+  padding: 0.2rem 0.6rem;
+  border-radius: 12px;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.review-badge-changes {
+  background-color: rgba(248, 81, 73, 0.15);
+  color: #f85149;
+  border: 1px solid rgba(248, 81, 73, 0.4);
+  padding: 0.2rem 0.6rem;
+  border-radius: 12px;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.review-badge-commented {
+  background-color: rgba(110, 118, 129, 0.15);
+  color: #8b949e;
+  border: 1px solid rgba(110, 118, 129, 0.4);
+  padding: 0.2rem 0.6rem;
+  border-radius: 12px;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.notif-bell-btn {
+  position: relative;
+  background: transparent;
+  border: none;
+  color: #c9d1d9;
+  cursor: pointer;
+  font-size: 1.1rem;
+  padding: 0.4rem;
+}
+
+.notif-count {
+  position: absolute;
+  top: 0;
+  right: 0;
+  background-color: #1f6feb;
+  color: white;
+  border-radius: 10px;
+  font-size: 0.65rem;
+  padding: 0.1rem 0.35rem;
+  font-weight: 700;
+}

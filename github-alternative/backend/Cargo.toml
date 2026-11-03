@@ -16,6 +16,7 @@ spine-format = { path = "../../git-alternative/crates/spine-format" }
 spine-object-store = { path = "../../git-alternative/crates/spine-object-store" }
 spine-history = { path = "../../git-alternative/crates/spine-history" }
 spine-diff = { path = "../../git-alternative/crates/spine-diff" }
+spine-merge = { path = "../../git-alternative/crates/spine-merge" }
 spine-cluster = { path = "../../git-alternative/crates/spine-cluster" }
 spine-net = { path = "../../git-alternative/crates/spine-net" }
 spine-config = { path = "../../git-alternative/crates/spine-config" }

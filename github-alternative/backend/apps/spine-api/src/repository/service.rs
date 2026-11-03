@@ -58,6 +58,7 @@ impl RepositoryService {
             id: repo_id.clone(),
             owner_user_id: creator.id.clone(),
             owner_username: creator.username.clone(),
+            owner_org_id: None,
             name: valid_name,
             normalized_name: normalized,
             description: description.unwrap_or_default(),

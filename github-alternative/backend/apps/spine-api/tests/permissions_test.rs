@@ -27,6 +27,7 @@ fn make_test_repo(id: &str, owner_id: &str, owner_username: &str, name: &str, is
         id: id.to_string(),
         owner_user_id: owner_id.to_string(),
         owner_username: owner_username.to_string(),
+        owner_org_id: None,
         name: name.to_string(),
         normalized_name: name.to_lowercase(),
         description: "Test repo".to_string(),

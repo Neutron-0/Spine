@@ -65,18 +65,30 @@
 - Native CLI integration: `spine auth login/status/logout` and `spine repo create` via a custom zero-dependency async HTTP client.
 - Production Docker Compose topology (`docker-compose.yml`), `.env.example`, and local runner scripts (`scripts/dev_forge.ps1`, `scripts/dev_forge.sh`).
 
+### Batch 09: Spine Forge Organizations, Collaboration, Issues, Pull Requests, Code Reviews, and Notifications
+- First-class organizational multi-tenancy: `organizations`, `organization_memberships`, and auditable `organization_invitations` with role hierarchies (`Owner`, `Admin`, `Member`) and last-owner protection.
+- Teams and granular RBAC: `teams`, `team_memberships`, and `team_repository_permissions` with 6-level permission evaluation (`ADMIN` > `MAINTAIN` > `WRITE` > `READ`) and strict `404 Not Found` metadata leakage prevention.
+- Issue tracking & metadata: `issues`, `issue_assignees`, `issue_labels`, `issue_comments`, `repository_labels`, and `milestones`.
+- Automatic issue closing: PR titles and descriptions scanned for closing keywords (`Fixes #123`, `Closes #456`) executing atomic status transition upon merge.
+- Pull request engine: `pull_requests` and `pull_request_reviewers` tracking branch divergence, automated mergeability analysis, and state transitions (`OPEN`, `CLOSED`, `MERGED`).
+- Native VCS diff & mergeability: zero Git/libgit2 execution; tree flattening, Myers unified diff formatting (`spine-diff`), fast-forward detection, and 3-way tree conflict analysis (`spine-merge`).
+- Code review subsystem: `pull_request_reviews` (`APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`), line-anchored `pull_request_review_comments`, self-approval prevention, and thread resolution tracking.
+- Branch protection gatekeeper: `branch_protection_rules` enforcing PR requirements, approval thresholds, self-approval prevention, and unresolved discussion blocking before merge.
+- Atomic 3-way merge execution: creation of native two-parent `Commit` objects and atomic `.spine/refs/heads/<base>` ref updates via `.lock` safety.
+- Notification & activity feed: `user_notifications` (`REVIEW_REQUESTED`, `ASSIGNED`, `MENTIONED`, `MERGED`) with read state tracking and immutable append-only `repository_activity_events` audit trail.
+- Full React 18 + TypeScript frontend collaboration suite: Code browsing, Issues management, Pull Requests with unified diffs, Organizations & Teams administration, Branch Protection configuration, and real-time Notification drawer.
+
 ---
 
 ## Next Milestones
-
-### Batch 09: Pull Requests, Code Review, Inline Comments, and Mergeability Engine
-- Pull request data models, source/target branch references, and automated 3-way mergeability checks.
-- Unified and side-by-side diff viewers for commit and branch comparisons.
-- Threaded code review discussions with line-level code comments and resolution tracking.
-- Branch protection rules (required reviews, passing CI checks, linear history).
 
 ### Batch 10: Real-time Collaboration, Webhooks, CI/CD Pipeline Gateway, and Large Object Storage (LFS)
 - Real-time updates via WebSockets for collaborative review and notification feeds.
 - Webhook dispatch system with HMAC-SHA256 payload signing and retry queues.
 - Spine LFS: Content-addressed external binary asset store with chunked streaming and content-hash verification.
 - Partial and sparse worktree support for monorepo development.
+
+### Batch 11: Enterprise Audit Logging, SAML/OIDC SSO, and Global Federation
+- Enterprise Single Sign-On (SAML 2.0 and OIDC).
+- Comprehensive immutable audit log exports and compliance reporting.
+- Global repository replication and geo-distributed caching mirrors.

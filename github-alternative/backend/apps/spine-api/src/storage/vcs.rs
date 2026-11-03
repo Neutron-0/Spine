@@ -1,8 +1,13 @@
 use crate::core::error::ForgeError;
+use crate::core::types::{DiffFileDto, MergeResultDto, MergeabilityReport, PullRequestDiffDto};
 use serde::Serialize;
-use spine_core::{FileMode, HashAlgorithm, ObjectId, ObjectType};
-use spine_format::{deserialize_commit, deserialize_tree};
+use spine_core::{Commit, FileMode, HashAlgorithm, ObjectId, ObjectType, TreeEntry};
+use spine_diff::{compare_trees, compute_line_diff, format_unified_diff, is_binary, DiffOp, TreeChange};
+use spine_format::{deserialize_commit, deserialize_tree, serialize_commit, serialize_tree};
+use spine_history::{find_merge_bases, get_commit, is_ancestor};
+use spine_merge::{merge_3way_trees, ResolvedPath};
 use spine_object_store::{CompositeObjectStore, ObjectStore};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -386,5 +391,422 @@ impl NativeVcsService {
         }
 
         Err(ForgeError::NotFound("File not found".into()))
+    }
+
+    /// Recursively flattens an object tree into a map of full-path -> (FileMode, ObjectId).
+    pub fn flatten_tree<S: ObjectStore>(
+        &self,
+        store: &S,
+        tree_oid: &ObjectId,
+        prefix: &str,
+        out: &mut BTreeMap<String, (FileMode, ObjectId)>,
+    ) -> Result<(), ForgeError> {
+        let (obj_type, payload) = store
+            .read_object(tree_oid)
+            .map_err(|e| ForgeError::Internal(format!("Tree read failed: {}", e)))?;
+        if obj_type != ObjectType::Tree {
+            return Ok(());
+        }
+        let entries = deserialize_tree(&payload)
+            .map_err(|e| ForgeError::Internal(format!("Tree deserialize error: {}", e)))?;
+        for entry in entries {
+            let path = if prefix.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{}/{}", prefix, entry.name)
+            };
+            if entry.mode == FileMode::Directory {
+                self.flatten_tree(store, &entry.object_id, &path, out)?;
+            } else {
+                out.insert(path, (entry.mode, entry.object_id));
+            }
+        }
+        Ok(())
+    }
+
+    /// Recursively converts a flattened path map into nested Tree objects written to the store.
+    pub fn write_tree_recursive<S: ObjectStore>(
+        &self,
+        store: &S,
+        entries_map: &BTreeMap<String, (FileMode, ObjectId)>,
+    ) -> Result<ObjectId, ForgeError> {
+        let mut direct_entries = Vec::new();
+        let mut subdirs: BTreeMap<String, BTreeMap<String, (FileMode, ObjectId)>> = BTreeMap::new();
+
+        for (path, (mode, oid)) in entries_map {
+            if let Some((dir, rest)) = path.split_once('/') {
+                subdirs
+                    .entry(dir.to_string())
+                    .or_default()
+                    .insert(rest.to_string(), (*mode, *oid));
+            } else {
+                direct_entries.push(TreeEntry {
+                    mode: *mode,
+                    name: path.clone(),
+                    object_id: *oid,
+                });
+            }
+        }
+
+        for (dir_name, sub_map) in subdirs {
+            let sub_tree_oid = self.write_tree_recursive(store, &sub_map)?;
+            direct_entries.push(TreeEntry {
+                mode: FileMode::Directory,
+                name: dir_name,
+                object_id: sub_tree_oid,
+            });
+        }
+
+        let payload = serialize_tree(&direct_entries);
+        store
+            .write_object(ObjectType::Tree, &payload)
+            .map_err(|e| ForgeError::Internal(format!("Failed to write tree object: {}", e)))
+    }
+
+    /// Computes full branch comparison and unified diff for Pull Requests.
+    pub fn compare_branches(
+        &self,
+        native_repo_id: &str,
+        base_ref: &str,
+        head_ref: &str,
+    ) -> Result<PullRequestDiffDto, ForgeError> {
+        let base_oid = self.resolve_ref(native_repo_id, base_ref)?;
+        let head_oid = self.resolve_ref(native_repo_id, head_ref)?;
+        let store = self.open_store(native_repo_id)?;
+
+        let merge_bases = find_merge_bases(&store, &base_oid, &head_oid)
+            .map_err(|e| ForgeError::Internal(format!("Failed to calculate merge base: {}", e)))?;
+        let merge_base_oid = merge_bases.first().cloned().unwrap_or(base_oid);
+
+        let base_commit = get_commit(&store, &merge_base_oid)
+            .map_err(|e| ForgeError::Internal(format!("Failed to read base commit: {}", e)))?;
+        let head_commit = get_commit(&store, &head_oid)
+            .map_err(|e| ForgeError::Internal(format!("Failed to read head commit: {}", e)))?;
+
+        let mut base_map = BTreeMap::new();
+        self.flatten_tree(&store, &base_commit.root_tree, "", &mut base_map)?;
+
+        let mut head_map = BTreeMap::new();
+        self.flatten_tree(&store, &head_commit.root_tree, "", &mut head_map)?;
+
+        let tree_changes = compare_trees(&base_map, &head_map);
+
+        let mut files = Vec::new();
+        let mut total_additions = 0;
+        let mut total_deletions = 0;
+
+        for change in tree_changes {
+            match change {
+                TreeChange::Added { path, object_id } => {
+                    let (_, blob_bytes) = store
+                        .read_object(&object_id)
+                        .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                    let bin = is_binary(&blob_bytes);
+                    let (patch, adds, dels) = if !bin {
+                        let text = String::from_utf8_lossy(&blob_bytes);
+                        let ops = compute_line_diff("", &text);
+                        let adds_cnt = ops
+                            .iter()
+                            .filter(|op| matches!(op, DiffOp::Addition(_)))
+                            .count();
+                        let p = format_unified_diff(&path, "", &text);
+                        (p, adds_cnt, 0)
+                    } else {
+                        ("(Binary file added)".to_string(), 0, 0)
+                    };
+                    total_additions += adds;
+                    total_deletions += dels;
+                    files.push(DiffFileDto {
+                        path,
+                        old_path: None,
+                        change_type: "ADDED".to_string(),
+                        is_binary: bin,
+                        patch,
+                        additions: adds,
+                        deletions: dels,
+                    });
+                }
+                TreeChange::Deleted { path, object_id } => {
+                    let (_, blob_bytes) = store
+                        .read_object(&object_id)
+                        .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                    let bin = is_binary(&blob_bytes);
+                    let (patch, adds, dels) = if !bin {
+                        let text = String::from_utf8_lossy(&blob_bytes);
+                        let ops = compute_line_diff(&text, "");
+                        let dels_cnt = ops
+                            .iter()
+                            .filter(|op| matches!(op, DiffOp::Deletion(_)))
+                            .count();
+                        let p = format_unified_diff(&path, &text, "");
+                        (p, 0, dels_cnt)
+                    } else {
+                        ("(Binary file removed)".to_string(), 0, 0)
+                    };
+                    total_additions += adds;
+                    total_deletions += dels;
+                    files.push(DiffFileDto {
+                        path: path.clone(),
+                        old_path: Some(path),
+                        change_type: "DELETED".to_string(),
+                        is_binary: bin,
+                        patch,
+                        additions: adds,
+                        deletions: dels,
+                    });
+                }
+                TreeChange::Modified {
+                    path,
+                    old_id,
+                    new_id,
+                } => {
+                    let (_, old_bytes) = store
+                        .read_object(&old_id)
+                        .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                    let (_, new_bytes) = store
+                        .read_object(&new_id)
+                        .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                    let bin = is_binary(&old_bytes) || is_binary(&new_bytes);
+                    let (patch, adds, dels) = if !bin {
+                        let old_text = String::from_utf8_lossy(&old_bytes);
+                        let new_text = String::from_utf8_lossy(&new_bytes);
+                        let ops = compute_line_diff(&old_text, &new_text);
+                        let adds_cnt = ops
+                            .iter()
+                            .filter(|op| matches!(op, DiffOp::Addition(_)))
+                            .count();
+                        let dels_cnt = ops
+                            .iter()
+                            .filter(|op| matches!(op, DiffOp::Deletion(_)))
+                            .count();
+                        let p = format_unified_diff(&path, &old_text, &new_text);
+                        (p, adds_cnt, dels_cnt)
+                    } else {
+                        ("(Binary file modified)".to_string(), 0, 0)
+                    };
+                    total_additions += adds;
+                    total_deletions += dels;
+                    files.push(DiffFileDto {
+                        path: path.clone(),
+                        old_path: Some(path),
+                        change_type: "MODIFIED".to_string(),
+                        is_binary: bin,
+                        patch,
+                        additions: adds,
+                        deletions: dels,
+                    });
+                }
+            }
+        }
+
+        // Count commits from head to merge_base
+        let mut commits_count = 0;
+        let mut queue = vec![head_oid];
+        let mut visited = std::collections::HashSet::new();
+        while let Some(cid) = queue.pop() {
+            if cid == merge_base_oid || !visited.insert(cid) {
+                continue;
+            }
+            commits_count += 1;
+            if let Ok(c) = get_commit(&store, &cid) {
+                for p in c.parents {
+                    queue.push(p);
+                }
+            }
+        }
+
+        Ok(PullRequestDiffDto {
+            base_commit_id: base_oid.to_hex(),
+            head_commit_id: head_oid.to_hex(),
+            merge_base_commit_id: merge_base_oid.to_hex(),
+            files,
+            total_additions,
+            total_deletions,
+            commits_count,
+        })
+    }
+
+    /// Evaluates mergeability dry-run and returns conflict files if any.
+    pub fn check_mergeability(
+        &self,
+        native_repo_id: &str,
+        base_ref: &str,
+        head_ref: &str,
+    ) -> Result<MergeabilityReport, ForgeError> {
+        let base_oid = self.resolve_ref(native_repo_id, base_ref)?;
+        let head_oid = self.resolve_ref(native_repo_id, head_ref)?;
+        let store = self.open_store(native_repo_id)?;
+
+        if base_oid == head_oid {
+            return Ok(MergeabilityReport {
+                mergeable: true,
+                status: "UP_TO_DATE".to_string(),
+                conflict_files: Vec::new(),
+                base_commit_id: base_oid.to_hex(),
+                head_commit_id: head_oid.to_hex(),
+            });
+        }
+
+        if is_ancestor(&store, &base_oid, &head_oid).unwrap_or(false) {
+            // Fast-forwardable
+            return Ok(MergeabilityReport {
+                mergeable: true,
+                status: "CLEAN".to_string(),
+                conflict_files: Vec::new(),
+                base_commit_id: base_oid.to_hex(),
+                head_commit_id: head_oid.to_hex(),
+            });
+        }
+
+        let merge_bases = find_merge_bases(&store, &base_oid, &head_oid)
+            .map_err(|e| ForgeError::Internal(format!("Failed to calculate merge base: {}", e)))?;
+        let merge_base_oid = merge_bases.first().cloned().unwrap_or(base_oid);
+
+        let base_commit = get_commit(&store, &base_oid)
+            .map_err(|e| ForgeError::Internal(format!("Failed to read base commit: {}", e)))?;
+        let head_commit = get_commit(&store, &head_oid)
+            .map_err(|e| ForgeError::Internal(format!("Failed to read head commit: {}", e)))?;
+        let mb_commit = get_commit(&store, &merge_base_oid)
+            .map_err(|e| ForgeError::Internal(format!("Failed to read merge base commit: {}", e)))?;
+
+        let mut base_map = BTreeMap::new();
+        self.flatten_tree(&store, &base_commit.root_tree, "", &mut base_map)?;
+
+        let mut head_map = BTreeMap::new();
+        self.flatten_tree(&store, &head_commit.root_tree, "", &mut head_map)?;
+
+        let mut mb_map = BTreeMap::new();
+        self.flatten_tree(&store, &mb_commit.root_tree, "", &mut mb_map)?;
+
+        let resolutions = merge_3way_trees(&store, &mb_map, &base_map, &head_map)
+            .map_err(|e| ForgeError::Internal(format!("3-way merge check failed: {}", e)))?;
+
+        let mut conflict_files = Vec::new();
+        for (path, res) in resolutions {
+            if matches!(res, ResolvedPath::Conflict(_)) {
+                conflict_files.push(path);
+            }
+        }
+
+        let mergeable = conflict_files.is_empty();
+        let status = if mergeable { "CLEAN" } else { "CONFLICT" }.to_string();
+
+        Ok(MergeabilityReport {
+            mergeable,
+            status,
+            conflict_files,
+            base_commit_id: base_oid.to_hex(),
+            head_commit_id: head_oid.to_hex(),
+        })
+    }
+
+    /// Performs atomic 3-way merge, creates merge commit, and updates target branch ref.
+    pub fn execute_merge(
+        &self,
+        native_repo_id: &str,
+        base_branch: &str,
+        head_branch: &str,
+        author_name: &str,
+        author_email: &str,
+        commit_message: &str,
+    ) -> Result<MergeResultDto, ForgeError> {
+        let base_oid = self.resolve_ref(native_repo_id, base_branch)?;
+        let head_oid = self.resolve_ref(native_repo_id, head_branch)?;
+        let store = self.open_store(native_repo_id)?;
+
+        let merge_bases = find_merge_bases(&store, &base_oid, &head_oid)
+            .map_err(|e| ForgeError::Internal(format!("Merge base error: {}", e)))?;
+        let merge_base_oid = merge_bases.first().cloned().unwrap_or(base_oid);
+
+        let base_commit = get_commit(&store, &base_oid)
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let head_commit = get_commit(&store, &head_oid)
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mb_commit = get_commit(&store, &merge_base_oid)
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let mut base_map = BTreeMap::new();
+        self.flatten_tree(&store, &base_commit.root_tree, "", &mut base_map)?;
+
+        let mut head_map = BTreeMap::new();
+        self.flatten_tree(&store, &head_commit.root_tree, "", &mut head_map)?;
+
+        let mut mb_map = BTreeMap::new();
+        self.flatten_tree(&store, &mb_commit.root_tree, "", &mut mb_map)?;
+
+        let resolutions = merge_3way_trees(&store, &mb_map, &base_map, &head_map)
+            .map_err(|e| ForgeError::Internal(format!("Merge failed: {}", e)))?;
+
+        let mut merged_map = BTreeMap::new();
+        let mut conflicts = Vec::new();
+
+        for (path, res) in resolutions {
+            match res {
+                ResolvedPath::KeepOurs => {
+                    if let Some(entry) = base_map.get(&path) {
+                        merged_map.insert(path, *entry);
+                    }
+                }
+                ResolvedPath::TakeTheirs {
+                    mode, object_id, ..
+                } => {
+                    merged_map.insert(path, (mode, object_id));
+                }
+                ResolvedPath::MergedClean { mode, content, .. } => {
+                    let blob_oid = store
+                        .write_object(ObjectType::Blob, &content)
+                        .map_err(|e| {
+                            ForgeError::Internal(format!("Failed to write merged blob: {}", e))
+                        })?;
+                    merged_map.insert(path, (mode, blob_oid));
+                }
+                ResolvedPath::Delete => {}
+                ResolvedPath::Conflict(c) => {
+                    conflicts.push(c.path);
+                }
+            }
+        }
+
+        if !conflicts.is_empty() {
+            return Err(ForgeError::Conflict(format!(
+                "Cannot merge due to conflicts in: {}",
+                conflicts.join(", ")
+            )));
+        }
+
+        // Construct merged tree
+        let root_tree_oid = self.write_tree_recursive(&store, &merged_map)?;
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+        let commit = Commit::new(
+            root_tree_oid,
+            vec![base_oid, head_oid],
+            author_name.to_string(),
+            author_email.to_string(),
+            author_name.to_string(),
+            author_email.to_string(),
+            now,
+            commit_message.to_string(),
+        );
+
+        let commit_payload = serialize_commit(&commit);
+        let merge_commit_oid = store
+            .write_object(ObjectType::Commit, &commit_payload)
+            .map_err(|e| ForgeError::Internal(format!("Failed to write merge commit: {}", e)))?;
+
+        // Update target branch ref
+        let spine_dir = self.repo_spine_dir(native_repo_id)?;
+        let branch_ref_file = spine_dir.join("refs").join("heads").join(base_branch);
+        if let Some(parent) = branch_ref_file.parent() {
+            fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
+        }
+        fs::write(&branch_ref_file, format!("{}\n", merge_commit_oid.to_hex()))
+            .map_err(|e| ForgeError::Internal(format!("Failed to update branch ref: {}", e)))?;
+
+        Ok(MergeResultDto {
+            success: true,
+            merge_commit_id: Some(merge_commit_oid.to_hex()),
+            message: format!("Successfully merged {} into {}", head_branch, base_branch),
+        })
     }
 }

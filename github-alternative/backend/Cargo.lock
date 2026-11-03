@@ -1878,6 +1878,7 @@ dependencies = [
  "spine-diff",
  "spine-format",
  "spine-history",
+ "spine-merge",
  "spine-net",
  "spine-object-store",
  "sqlx",
@@ -1958,6 +1959,33 @@ dependencies = [
  "spine-core",
  "spine-diff",
  "spine-format",
+ "spine-object-store",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
+name = "spine-index"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "spine-core",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "spine-merge"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "spine-core",
+ "spine-diff",
+ "spine-format",
+ "spine-history",
+ "spine-index",
  "spine-object-store",
  "thiserror",
  "toml",

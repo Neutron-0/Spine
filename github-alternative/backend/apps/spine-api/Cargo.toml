@@ -15,6 +15,7 @@ spine-format.workspace = true
 spine-object-store.workspace = true
 spine-history.workspace = true
 spine-diff.workspace = true
+spine-merge.workspace = true
 spine-cluster.workspace = true
 spine-net.workspace = true
 spine-config.workspace = true

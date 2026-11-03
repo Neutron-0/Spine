@@ -1,14 +1,22 @@
 pub mod middleware;
+pub mod routes_activity;
 pub mod routes_auth;
 pub mod routes_health;
+pub mod routes_issues;
+pub mod routes_notifications;
+pub mod routes_orgs;
+pub mod routes_protection;
+pub mod routes_pulls;
 pub mod routes_repos;
+pub mod routes_reviews;
+pub mod routes_teams;
 pub mod routes_users;
 
 pub use middleware::AppState;
 
 use axum::{
     middleware as axum_middleware,
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use tower_http::cors::{Any, CorsLayer};
@@ -68,6 +76,62 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/users/me/pats/:pat_id",
             delete(routes_users::revoke_pat),
         )
+        // Organization endpoints (Batch 09)
+        .route(
+            "/api/v1/orgs",
+            get(routes_orgs::list_organizations).post(routes_orgs::create_organization),
+        )
+        .route(
+            "/api/v1/orgs/:org_name",
+            get(routes_orgs::get_organization)
+                .patch(routes_orgs::update_organization)
+                .delete(routes_orgs::delete_organization),
+        )
+        .route(
+            "/api/v1/orgs/:org_name/members",
+            get(routes_orgs::list_organization_members)
+                .post(routes_orgs::add_or_update_member),
+        )
+        .route(
+            "/api/v1/orgs/:org_name/members/:user_id",
+            delete(routes_orgs::remove_member),
+        )
+        .route(
+            "/api/v1/orgs/:org_name/invitations",
+            get(routes_orgs::list_invitations)
+                .post(routes_orgs::create_invitation),
+        )
+        .route(
+            "/api/v1/orgs/invitations/:token/accept",
+            post(routes_orgs::accept_invitation),
+        )
+        .route(
+            "/api/v1/orgs/:org_name/repos",
+            get(routes_orgs::list_org_repositories)
+                .post(routes_orgs::create_org_repository),
+        )
+        // Team endpoints (Batch 09)
+        .route(
+            "/api/v1/orgs/:org_name/teams",
+            get(routes_teams::list_teams).post(routes_teams::create_team),
+        )
+        .route(
+            "/api/v1/orgs/:org_name/teams/:team_slug",
+            get(routes_teams::get_team).delete(routes_teams::delete_team),
+        )
+        .route(
+            "/api/v1/orgs/:org_name/teams/:team_slug/members",
+            get(routes_teams::list_team_members)
+                .post(routes_teams::add_team_member),
+        )
+        .route(
+            "/api/v1/orgs/:org_name/teams/:team_slug/members/:user_id",
+            delete(routes_teams::remove_team_member),
+        )
+        .route(
+            "/api/v1/orgs/:org_name/teams/:team_slug/repos/:repo_name",
+            put(routes_teams::set_team_repository_permission),
+        )
         // Repository management endpoints
         .route(
             "/api/v1/repos",
@@ -97,6 +161,112 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/repos/:owner/:name/blob/:ref/*path",
             get(routes_repos::get_repo_blob),
+        )
+        // Activity events endpoint (Batch 09)
+        .route(
+            "/api/v1/repos/:owner/:name/activity",
+            get(routes_activity::list_repo_activity),
+        )
+        // Issues, Comments, Labels, Milestones (Batch 09)
+        .route(
+            "/api/v1/repos/:owner/:name/issues",
+            get(routes_issues::list_issues).post(routes_issues::create_issue),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/issues/:number",
+            get(routes_issues::get_issue).patch(routes_issues::update_issue),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/issues/:number/comments",
+            get(routes_issues::list_issue_comments)
+                .post(routes_issues::create_issue_comment),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/labels",
+            get(routes_issues::list_labels).post(routes_issues::create_label),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/labels/:label_id",
+            delete(routes_issues::delete_label),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/milestones",
+            get(routes_issues::list_milestones)
+                .post(routes_issues::create_milestone),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/milestones/:milestone_id",
+            patch(routes_issues::update_milestone)
+                .delete(routes_issues::delete_milestone),
+        )
+        // Pull Requests & Native Diffs & Merges (Batch 09)
+        .route(
+            "/api/v1/repos/:owner/:name/pulls",
+            get(routes_pulls::list_pull_requests)
+                .post(routes_pulls::create_pull_request),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/pulls/:number",
+            get(routes_pulls::get_pull_request)
+                .patch(routes_pulls::update_pull_request),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/pulls/:number/diff",
+            get(routes_pulls::get_pull_request_diff),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/pulls/:number/mergeability",
+            get(routes_pulls::get_pull_request_mergeability),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/pulls/:number/merge",
+            post(routes_pulls::execute_pull_request_merge),
+        )
+        // Reviews & Review Comments (Batch 09)
+        .route(
+            "/api/v1/repos/:owner/:name/pulls/:number/reviews",
+            get(routes_reviews::list_reviews)
+                .post(routes_reviews::create_review),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/pulls/:number/reviews/:review_id/dismiss",
+            post(routes_reviews::dismiss_review),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/pulls/:number/reviewers",
+            post(routes_reviews::request_reviewer),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/pulls/:number/comments",
+            get(routes_reviews::list_review_comments)
+                .post(routes_reviews::create_review_comment),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/pulls/:number/comments/:comment_id/resolve",
+            patch(routes_reviews::resolve_review_comment),
+        )
+        // Branch Protection (Batch 09)
+        .route(
+            "/api/v1/repos/:owner/:name/protection",
+            get(routes_protection::list_branch_protection)
+                .post(routes_protection::set_branch_protection),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/protection/:rule_id",
+            delete(routes_protection::delete_branch_protection),
+        )
+        // Notifications (Batch 09)
+        .route(
+            "/api/v1/notifications",
+            get(routes_notifications::list_notifications),
+        )
+        .route(
+            "/api/v1/notifications/:notif_id/read",
+            patch(routes_notifications::mark_notification_read),
+        )
+        .route(
+            "/api/v1/notifications/read-all",
+            post(routes_notifications::mark_all_notifications_read),
         )
         // Layers
         .layer(axum_middleware::from_fn_with_state(
