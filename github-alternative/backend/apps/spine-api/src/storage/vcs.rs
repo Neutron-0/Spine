@@ -1,6 +1,12 @@
 use crate::core::error::ForgeError;
 use crate::core::types::{DiffFileDto, MergeResultDto, MergeabilityReport, PullRequestDiffDto};
 use serde::Serialize;
+use spine_cluster::{
+    AuthoritativeRefUpdate, AuthoritativeRepositoryWriter, BranchProtectionRule,
+    CoordinatorStore, DurabilityPolicy, DurabilityVerificationReport,
+    FileBackedCoordinatorStore, LocalBackendStorageDispatcher, PlacementPlan,
+    PrProtectionContext, RepositoryMeta, WriteActor,
+};
 use spine_core::{Commit, FileMode, HashAlgorithm, ObjectId, ObjectType, TreeEntry};
 use spine_diff::{compare_trees, compute_line_diff, format_unified_diff, is_binary, DiffOp, TreeChange};
 use spine_format::{deserialize_commit, deserialize_tree, serialize_commit, serialize_tree};
@@ -10,6 +16,7 @@ use spine_object_store::{CompositeObjectStore, ObjectStore};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct BranchDto {
@@ -53,13 +60,82 @@ pub struct BlobContentDto {
 
 pub struct NativeVcsService {
     storage_root: PathBuf,
+    writer: Arc<AuthoritativeRepositoryWriter>,
+    coordinator_store: Arc<dyn CoordinatorStore>,
 }
 
 impl NativeVcsService {
     pub fn new<P: AsRef<Path>>(storage_root: P) -> Self {
+        let root = storage_root.as_ref().to_path_buf();
+        let coord_file = root.join("coordinator_metadata.json");
+        let coord_store: Arc<dyn CoordinatorStore> = Arc::new(
+            FileBackedCoordinatorStore::new_file_backed(&coord_file)
+                .unwrap_or_else(|_| FileBackedCoordinatorStore::new_in_memory()),
+        );
+
+        let dispatcher = Arc::new(LocalBackendStorageDispatcher::new());
+        dispatcher.register_node("primary".to_string(), root.clone());
+
+        let rules = vec![
+            BranchProtectionRule {
+                branch_pattern: "main".into(),
+                require_pull_request: true,
+                required_approvals: 1,
+                prevent_self_approval: true,
+                require_changes_addressed: true,
+                allow_force_push: false,
+            },
+            BranchProtectionRule {
+                branch_pattern: "master".into(),
+                require_pull_request: true,
+                required_approvals: 1,
+                prevent_self_approval: true,
+                require_changes_addressed: true,
+                allow_force_push: false,
+            },
+        ];
+
+        let writer = Arc::new(AuthoritativeRepositoryWriter::new(
+            Arc::clone(&coord_store),
+            dispatcher,
+            rules,
+        ));
+
+        Self {
+            storage_root: root,
+            writer,
+            coordinator_store: coord_store,
+        }
+    }
+
+    pub fn new_with_writer<P: AsRef<Path>>(
+        storage_root: P,
+        writer: Arc<AuthoritativeRepositoryWriter>,
+        coordinator_store: Arc<dyn CoordinatorStore>,
+    ) -> Self {
         Self {
             storage_root: storage_root.as_ref().to_path_buf(),
+            writer,
+            coordinator_store,
         }
+    }
+
+    pub fn writer(&self) -> &Arc<AuthoritativeRepositoryWriter> {
+        &self.writer
+    }
+
+    pub fn coordinator_store(&self) -> &Arc<dyn CoordinatorStore> {
+        &self.coordinator_store
+    }
+
+    pub async fn verify_durability(
+        &self,
+        native_repo_id: &str,
+    ) -> Result<DurabilityVerificationReport, ForgeError> {
+        self.writer
+            .verify_durability(native_repo_id)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))
     }
 
     fn repo_spine_dir(&self, native_repo_id: &str) -> Result<PathBuf, ForgeError> {
@@ -217,6 +293,27 @@ impl NativeVcsService {
         }
 
         Ok(commits)
+    }
+
+    pub fn get_commit(&self, native_repo_id: &str, commit_id: &str) -> Result<CommitDto, ForgeError> {
+        let oid = ObjectId::from_hex(commit_id)
+            .map_err(|e| ForgeError::BadRequest(format!("Invalid commit id: {}", e)))?;
+        let store = self.open_store(native_repo_id)?;
+        match store.read_object(&oid) {
+            Ok((ObjectType::Commit, payload)) => {
+                let commit = deserialize_commit(&payload)
+                    .map_err(|e| ForgeError::Internal(format!("Failed to parse commit: {}", e)))?;
+                Ok(CommitDto {
+                    id: oid.to_hex(),
+                    parents: commit.parents.iter().map(|p| p.to_hex()).collect(),
+                    author_name: commit.author_name,
+                    author_email: commit.author_email,
+                    timestamp_nanos: commit.timestamp_nanos,
+                    message: commit.message,
+                })
+            }
+            _ => Err(ForgeError::NotFound(format!("Commit '{}' not found", commit_id))),
+        }
     }
 
     pub fn get_tree(
@@ -700,15 +797,18 @@ impl NativeVcsService {
         })
     }
 
-    /// Performs atomic 3-way merge, creates merge commit, and updates target branch ref.
-    pub fn execute_merge(
+    /// Performs atomic 3-way merge, creates merge commit, and updates target branch ref
+    /// through the Authoritative Distributed Write Pipeline.
+    pub async fn execute_merge(
         &self,
         native_repo_id: &str,
         base_branch: &str,
         head_branch: &str,
+        author_id: &str,
         author_name: &str,
         author_email: &str,
         commit_message: &str,
+        pr_context: Option<&PrProtectionContext>,
     ) -> Result<MergeResultDto, ForgeError> {
         let base_oid = self.resolve_ref(native_repo_id, base_branch)?;
         let head_oid = self.resolve_ref(native_repo_id, head_branch)?;
@@ -794,14 +894,94 @@ impl NativeVcsService {
             .write_object(ObjectType::Commit, &commit_payload)
             .map_err(|e| ForgeError::Internal(format!("Failed to write merge commit: {}", e)))?;
 
-        // Update target branch ref
-        let spine_dir = self.repo_spine_dir(native_repo_id)?;
-        let branch_ref_file = spine_dir.join("refs").join("heads").join(base_branch);
-        if let Some(parent) = branch_ref_file.parent() {
-            fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
+        // Ensure placement exists in coordinator for this repository
+        if let Ok(None) = self.coordinator_store.get_placement(native_repo_id) {
+            let plan = PlacementPlan {
+                repo_id: native_repo_id.to_string(),
+                primary_node_id: "primary".to_string(),
+                replica_node_ids: vec![],
+                required_copies: 1,
+                placement_generation: 1,
+            };
+            let meta = RepositoryMeta {
+                repo_id: native_repo_id.to_string(),
+                name: native_repo_id.to_string(),
+                owner: author_name.to_string(),
+                durability_policy: DurabilityPolicy::SingleCopy,
+                committed_generation: 0,
+                current_ownership_epoch: 1,
+                storage_quota_bytes: 10 * 1024 * 1024 * 1024,
+                state: "HEALTHY".into(),
+                created_at_nanos: now,
+                updated_at_nanos: now,
+            };
+            let _ = self.coordinator_store.create_repository(meta);
+            let _ = self.coordinator_store.set_placement(plan);
         }
-        fs::write(&branch_ref_file, format!("{}\n", merge_commit_oid.to_hex()))
-            .map_err(|e| ForgeError::Internal(format!("Failed to update branch ref: {}", e)))?;
+
+        // Build genuine .spk packfile and .spidx index for the merge objects
+        let mut new_objects = vec![merge_commit_oid, root_tree_oid];
+        for (_p, (_m, oid)) in &merged_map {
+            new_objects.push(*oid);
+        }
+        new_objects.sort();
+        new_objects.dedup();
+
+        let tmp_pack_dir = tempfile::tempdir().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let pack_id = format!("pack_{}", uuid::Uuid::new_v4().simple());
+        let spk_path = tmp_pack_dir.path().join(format!("{}.spk", pack_id));
+        let spidx_path = tmp_pack_dir.path().join(format!("{}.spidx", pack_id));
+
+        spine_net::pack_transfer::create_pack_file(&store, &new_objects, &spk_path)
+            .map_err(|e| ForgeError::Internal(format!("Failed to build merge packfile: {}", e)))?;
+
+        let mut pack_reader = spine_object_store::pack::PackReader::open(&spk_path)
+            .map_err(|e| ForgeError::Internal(format!("Failed to open packfile for indexing: {}", e)))?;
+        let entries = pack_reader.scan_index_entries()
+            .map_err(|e| ForgeError::Internal(format!("Failed to scan packfile entries: {}", e)))?;
+        spine_object_store::pack_index::PackIndexWriter::write_index(
+            &spidx_path,
+            store.algorithm(),
+            entries,
+        )
+        .map_err(|e| ForgeError::Internal(format!("Failed to write pack index: {}", e)))?;
+
+        let pack_bytes = std::fs::read(&spk_path)
+            .map_err(|e| ForgeError::Internal(format!("Failed to read merge packfile: {}", e)))?;
+        let index_bytes = std::fs::read(&spidx_path)
+            .map_err(|e| ForgeError::Internal(format!("Failed to read merge indexfile: {}", e)))?;
+
+        let spine_dir = self.repo_spine_dir(native_repo_id)?;
+        let actor = WriteActor {
+            actor_id: author_id.to_string(),
+            username: author_name.to_string(),
+            role: spine_net::auth::Role::Contributor,
+        };
+
+        let update = AuthoritativeRefUpdate {
+            ref_name: format!("refs/heads/{}", base_branch),
+            expected_old_oid: Some(base_oid),
+            new_oid: merge_commit_oid,
+            lease_oid: None,
+            force: false,
+        };
+
+        // Submit through the Authoritative Distributed Write Service
+        self.writer
+            .execute_write(
+                native_repo_id,
+                &actor,
+                &[update],
+                &pack_id,
+                &pack_bytes,
+                &index_bytes,
+                &spine_dir,
+                &store,
+                true,
+                pr_context,
+            )
+            .await
+            .map_err(|e| ForgeError::Internal(format!("Authoritative distributed write rejected: {}", e)))?;
 
         Ok(MergeResultDto {
             success: true,

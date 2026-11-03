@@ -78,17 +78,27 @@
 - Notification & activity feed: `user_notifications` (`REVIEW_REQUESTED`, `ASSIGNED`, `MENTIONED`, `MERGED`) with read state tracking and immutable append-only `repository_activity_events` audit trail.
 - Full React 18 + TypeScript frontend collaboration suite: Code browsing, Issues management, Pull Requests with unified diffs, Organizations & Teams administration, Branch Protection configuration, and real-time Notification drawer.
 
+### Batch 10: Native Hosting Completion, Authenticated Remote Operations, Distributed Write Transactions, and Repository Consistency
+- Single Authoritative Write Pipeline (`AuthoritativeRepositoryWriter`): Unified write boundary orchestrating all repository modifications across CLI `push`, wire SPWP transport, and Forge PR merges.
+- Cryptographic Capability Tickets (`CapabilityTicket`): Short-lived BLAKE3 signed tokens issued via `POST /api/v1/repos/:owner/:repo/capability` binding caller identity, native repository ID, and operation role (`Reader`, `Contributor`, `Admin`).
+- SPWP Server Capability Auth Integration: Daemon authenticates incoming `ticket:<hex>.<sig>` sessions and enforces strict repository namespace containment (mismatched repository path rejected with `403 Forbidden`).
+- OS-Native Secure Credential Storage (`OsCredentialManager`): Win32 `advapi32.dll` (`CredWriteW`, `CredReadW`, `CredDeleteW`) integration via `WindowsCredentialStorage`, with zero raw token terminal leakage (token masking redaction) and restricted keyring file fallback (`SecureFallbackStorage`).
+- Unified 2PC Distributed Write Transactions: Phase 1 staging on Primary and Replicas (`PreparePush`), quorum verification against `DurabilityPolicy` (`SingleCopy`, `TwoCopies`, `ThreeCopies`), and Phase 2 commit decision (`CommitPush`) with atomic `.lock` reference publication.
+- Durability Status Verification: Endpoint `GET /api/v1/repos/:owner/:repo/status/durability` returning real-time copy verification reports (`DurabilityVerificationReport`).
+- PR Merge Distributed Integration: PR merges directly construct genuine `.spk` and `.spidx` packfiles from 3-way tree and commit objects, submitting through `AuthoritativeRepositoryWriter` with cross-service crash reconciliation.
+- Comprehensive Test Suites: 109 VCS/CLI tests and 25 Forge API tests passing with zero failures.
+
 ---
 
 ## Next Milestones
 
-### Batch 10: Real-time Collaboration, Webhooks, CI/CD Pipeline Gateway, and Large Object Storage (LFS)
+### Batch 11: Real-time Collaboration, Webhooks, CI/CD Pipeline Gateway, and Large Object Storage (LFS)
 - Real-time updates via WebSockets for collaborative review and notification feeds.
 - Webhook dispatch system with HMAC-SHA256 payload signing and retry queues.
 - Spine LFS: Content-addressed external binary asset store with chunked streaming and content-hash verification.
 - Partial and sparse worktree support for monorepo development.
 
-### Batch 11: Enterprise Audit Logging, SAML/OIDC SSO, and Global Federation
+### Batch 12: Enterprise Audit Logging, SAML/OIDC SSO, and Global Federation
 - Enterprise Single Sign-On (SAML 2.0 and OIDC).
 - Comprehensive immutable audit log exports and compliance reporting.
 - Global repository replication and geo-distributed caching mirrors.

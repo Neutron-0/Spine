@@ -1907,6 +1907,7 @@ dependencies = [
  "serde_json",
  "spine-core",
  "spine-format",
+ "spine-history",
  "spine-net",
  "spine-object-store",
  "spine-protocol",

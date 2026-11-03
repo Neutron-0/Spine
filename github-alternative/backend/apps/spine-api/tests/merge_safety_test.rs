@@ -208,10 +208,12 @@ async fn test_branch_protection_and_atomic_merge() {
         native_repo_id,
         "main",
         "feature",
-        "Admin",
-        "admin@spine.build",
+        &admin.id,
+        &admin.display_name,
+        &admin.email,
         "Merge branch 'feature' into main",
-    ).unwrap();
+        None,
+    ).await.unwrap();
 
     assert!(merge_res.success);
     let merge_cid_hex = merge_res.merge_commit_id.unwrap();

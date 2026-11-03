@@ -10,6 +10,7 @@ pub mod protocol;
 pub mod repair;
 pub mod store;
 pub mod transaction;
+pub mod write_pipeline;
 
 pub use durability::{DurabilityError, DurabilityPolicy};
 pub use enrollment::{EnrollmentError, EnrollmentRequest, EnrollmentResponse, EnrollmentToken};
@@ -23,6 +24,12 @@ pub use protocol::{ClusterRpcRequest, ClusterRpcResponse};
 pub use repair::{AntiEntropy, RepairJob, RepairStatus};
 pub use store::{CoordinatorStore, FileBackedCoordinatorStore, RepositoryMeta};
 pub use transaction::{ReplicationTransaction, TransactionError, TransactionPhase};
+pub use write_pipeline::{
+    AuthoritativeRefUpdate, AuthoritativeRepositoryWriter, AuthoritativeWriteResult,
+    BranchProtectionRule, DurabilityVerificationReport, LocalBackendStorageDispatcher,
+    NetworkStorageDispatcher, PrProtectionContext, StorageDispatcher, WriteActor,
+    WritePipelineError,
+};
 
 #[cfg(test)]
 mod tests {

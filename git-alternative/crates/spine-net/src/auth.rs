@@ -91,6 +91,86 @@ impl FromStr for Role {
     }
 }
 
+/// Short-lived signed capability ticket issued by Spine Forge for remote repository operations.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CapabilityTicket {
+    pub version: u8,
+    pub ticket_id: String,
+    pub user_id: String,
+    pub username: String,
+    pub repo_id: String,
+    pub native_repo_id: String,
+    pub role: Role,
+    pub issued_at_nanos: i64,
+    pub expires_at_nanos: i64,
+    pub issuer: String,
+    pub nonce: String,
+}
+
+impl CapabilityTicket {
+    pub fn new(
+        user_id: String,
+        username: String,
+        repo_id: String,
+        native_repo_id: String,
+        role: Role,
+        validity_duration_nanos: i64,
+        now_nanos: i64,
+    ) -> Self {
+        Self {
+            version: 1,
+            ticket_id: format!("tkt_{}", uuid::Uuid::new_v4().simple()),
+            user_id,
+            username,
+            repo_id,
+            native_repo_id,
+            role,
+            issued_at_nanos: now_nanos,
+            expires_at_nanos: now_nanos + validity_duration_nanos,
+            issuer: "spine-forge-api".to_string(),
+            nonce: format!("{:016x}", rand::random::<u64>()),
+        }
+    }
+
+    pub fn encode_and_sign(&self, secret_key: &[u8; 32]) -> String {
+        let json_bytes = serde_json::to_vec(self).unwrap_or_default();
+        let payload_hex = hex::encode(json_bytes);
+        let sig = blake3::keyed_hash(secret_key, payload_hex.as_bytes())
+            .to_hex()
+            .to_string();
+        format!("{}.{}", payload_hex, sig)
+    }
+
+    pub fn decode_and_verify(
+        ticket_str: &str,
+        secret_key: &[u8; 32],
+        now_nanos: i64,
+    ) -> Result<Self, AuthError> {
+        let parts: Vec<&str> = ticket_str.split('.').collect();
+        if parts.len() != 2 {
+            return Err(AuthError::FormatError(
+                "Invalid capability ticket format".into(),
+            ));
+        }
+        let payload_hex = parts[0];
+        let expected_sig = parts[1];
+        let computed_sig = blake3::keyed_hash(secret_key, payload_hex.as_bytes())
+            .to_hex()
+            .to_string();
+        if computed_sig != expected_sig {
+            return Err(AuthError::InvalidSignature);
+        }
+        let json_bytes = hex::decode(payload_hex)
+            .map_err(|e| AuthError::FormatError(format!("Invalid ticket hex: {}", e)))?;
+        let ticket: CapabilityTicket = serde_json::from_slice(&json_bytes)
+            .map_err(|e| AuthError::FormatError(format!("Invalid ticket JSON: {}", e)))?;
+        if now_nanos > ticket.expires_at_nanos {
+            return Err(AuthError::KeyExpired);
+        }
+        Ok(ticket)
+    }
+}
+
 /// Deterministic authentication transcript for domain-separated signing.
 #[derive(Debug, Clone)]
 pub struct AuthTranscript {

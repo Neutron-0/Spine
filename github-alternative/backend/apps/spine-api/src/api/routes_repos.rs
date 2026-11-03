@@ -7,7 +7,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use spine_cluster::durability::DurabilityPolicy;
 
 #[derive(Deserialize)]
@@ -175,4 +175,121 @@ pub async fn get_repo_blob(
         .vcs
         .get_blob(&repo.native_repo_id, &ref_name, &path)?;
     Ok(Json(blob))
+}
+
+#[derive(Deserialize, Default)]
+pub struct CapabilityTicketRequest {
+    pub operation: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct CapabilityTicketResponse {
+    pub ticket: String,
+    pub expires_at_nanos: i64,
+    pub role: String,
+    pub repo_id: String,
+    pub native_repo_id: String,
+}
+
+pub async fn issue_capability_ticket(
+    State(state): State<AppState>,
+    user: Option<Extension<User>>,
+    Path((owner, name)): Path<(String, String)>,
+    payload: Option<Json<CapabilityTicketRequest>>,
+) -> Result<impl IntoResponse, ForgeError> {
+    let caller = user.map(|Extension(u)| u);
+    let repo = state
+        .repositories
+        .get_repository(caller.as_ref(), &owner, &name)
+        .await?;
+
+    let op = payload
+        .and_then(|Json(p)| p.operation)
+        .unwrap_or_else(|| "read".to_string());
+    let op_lower = op.to_lowercase();
+
+    let role = if op_lower == "write" || op_lower == "push" {
+        let perm_role = state
+            .permissions
+            .check_write_access(caller.as_ref(), &repo)
+            .await?;
+        match perm_role {
+            PermissionRole::Owner => spine_net::auth::Role::Admin,
+            PermissionRole::Collaborator => spine_net::auth::Role::Contributor,
+            _ => {
+                return Err(ForgeError::Forbidden(
+                    "Write permission required for this repository".into(),
+                ))
+            }
+        }
+    } else if op_lower == "admin" || op_lower == "owner" {
+        let perm_role = state
+            .permissions
+            .check_write_access(caller.as_ref(), &repo)
+            .await?;
+        match perm_role {
+            PermissionRole::Owner => spine_net::auth::Role::Admin,
+            _ => {
+                return Err(ForgeError::Forbidden(
+                    "Admin permission required for this repository".into(),
+                ))
+            }
+        }
+    } else {
+        let perm_role = state
+            .permissions
+            .check_read_access(caller.as_ref(), &repo)
+            .await?;
+        match perm_role {
+            PermissionRole::Owner => spine_net::auth::Role::Admin,
+            PermissionRole::Collaborator => spine_net::auth::Role::Contributor,
+            PermissionRole::Reader => spine_net::auth::Role::Reader,
+        }
+    };
+
+    let (user_id, username) = match caller {
+        Some(u) => (u.id, u.username),
+        None => ("anon_user".to_string(), "anonymous".to_string()),
+    };
+
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64;
+    let validity_nanos = 3600 * 1_000_000_000i64; // 1 hour
+
+    let ticket = spine_net::auth::CapabilityTicket::new(
+        user_id,
+        username,
+        repo.id.clone(),
+        repo.native_repo_id.clone(),
+        role,
+        validity_nanos,
+        now_nanos,
+    );
+
+    let signed_ticket = ticket.encode_and_sign(spine_net::auth::DEFAULT_SECRET_KEY);
+
+    Ok(Json(CapabilityTicketResponse {
+        ticket: signed_ticket,
+        expires_at_nanos: ticket.expires_at_nanos,
+        role: role.to_string(),
+        repo_id: repo.id,
+        native_repo_id: repo.native_repo_id,
+    }))
+}
+
+pub async fn get_repo_durability_status(
+    State(state): State<AppState>,
+    user: Option<Extension<User>>,
+    Path((owner, name)): Path<(String, String)>,
+) -> Result<impl IntoResponse, ForgeError> {
+    let caller = user.map(|Extension(u)| u);
+    let repo = state
+        .repositories
+        .get_repository(caller.as_ref(), &owner, &name)
+        .await?;
+
+    let report = state.vcs.verify_durability(&repo.native_repo_id).await?;
+    Ok(Json(report))
 }

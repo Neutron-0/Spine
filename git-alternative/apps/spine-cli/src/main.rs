@@ -1,4 +1,5 @@
 pub mod ops_cluster;
+pub mod ops_credentials;
 pub mod ops_forge;
 pub mod ops_history;
 pub mod ops_tag;
@@ -2913,7 +2914,8 @@ async fn main() -> Result<()> {
             let store = CompositeObjectStore::new(&spine_dir, HashAlgorithm::Blake3, 3)?;
 
             // 3. Connect to remote
-            let mut client = SpineClient::connect(&url, None, None)
+            let auth_override = ops_forge::resolve_remote_auth(&url, "read").await;
+            let mut client = SpineClient::connect(&url, auth_override.as_deref(), None)
                 .await
                 .context("Failed to connect to Spine daemon")?;
 
@@ -3002,7 +3004,8 @@ async fn main() -> Result<()> {
 
             for (r_name, r_url) in remotes_to_fetch {
                 println!("Fetching from {} ({})", r_name, r_url);
-                let mut client = SpineClient::connect(r_url, None, None)
+                let auth_override = ops_forge::resolve_remote_auth(r_url, "read").await;
+                let mut client = SpineClient::connect(r_url, auth_override.as_deref(), None)
                     .await
                     .context(format!("Failed to connect to remote '{}'", r_name))?;
 
@@ -3115,7 +3118,8 @@ async fn main() -> Result<()> {
             let local_oid = ObjectId::from_hex(local_oid_str.trim())?;
 
             println!("Pushing to {} ({})", remote, r.url);
-            let mut client = SpineClient::connect(&r.url, None, None)
+            let auth_override = ops_forge::resolve_remote_auth(&r.url, "write").await;
+            let mut client = SpineClient::connect(&r.url, auth_override.as_deref(), None)
                 .await
                 .context(format!("Failed to connect to remote '{}'", remote))?;
 
@@ -3261,7 +3265,8 @@ async fn main() -> Result<()> {
                 )
             })?;
 
-            let mut client = SpineClient::connect(&r.url, None, None)
+            let auth_override = ops_forge::resolve_remote_auth(&r.url, "read").await;
+            let mut client = SpineClient::connect(&r.url, auth_override.as_deref(), None)
                 .await
                 .context(format!("Failed to connect to remote '{}'", remote))?;
 

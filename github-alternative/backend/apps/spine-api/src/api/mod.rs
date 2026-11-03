@@ -141,6 +141,14 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/repos/:owner/:name",
             get(routes_repos::get_repository).delete(routes_repos::delete_repository),
         )
+        .route(
+            "/api/v1/repos/:owner/:name/capability",
+            post(routes_repos::issue_capability_ticket),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/status/durability",
+            get(routes_repos::get_repo_durability_status),
+        )
         // Repository inspection endpoints
         .route(
             "/api/v1/repos/:owner/:name/branches",

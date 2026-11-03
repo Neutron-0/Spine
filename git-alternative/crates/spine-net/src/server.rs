@@ -224,13 +224,32 @@ pub async fn handle_server_session_stream<S: AsyncRead + AsyncWrite + Unpin + Se
     session_state.validate_frame(auth_resp_frame.header.frame_type)?;
     let auth_resp = AuthResponse::from_frame(&auth_resp_frame)?;
 
-    // Verify authentication: prefer Ed25519 asymmetric, fall back to symmetric if enabled
+    // Verify authentication: prefer CapabilityTicket, then Ed25519 asymmetric, fall back to symmetric if enabled
     let mut authenticated_principal = "anonymous".to_string();
     let mut user_role = Role::Reader;
     let mut is_authed = false;
     let mut auth_key_id: Option<String> = None;
+    let mut verified_ticket: Option<crate::auth::CapabilityTicket> = None;
 
-    if let (Some(pk), true) = (&auth_resp.public_key, auth_resp.signature.len() == 64) {
+    if auth_resp.user_id.starts_with("ticket:") {
+        let ticket_str = auth_resp.user_id.trim_start_matches("ticket:");
+        let now_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as i64;
+        match crate::auth::CapabilityTicket::decode_and_verify(ticket_str, &config.secret_key, now_nanos) {
+            Ok(ticket) => {
+                is_authed = true;
+                authenticated_principal = ticket.username.clone();
+                user_role = ticket.role;
+                auth_key_id = Some(ticket.ticket_id.clone());
+                verified_ticket = Some(ticket);
+            }
+            Err(e) => {
+                eprintln!("Capability ticket verification failed: {}", e);
+            }
+        }
+    } else if let (Some(pk), true) = (&auth_resp.public_key, auth_resp.signature.len() == 64) {
         let transcript = AuthTranscript::new(
             1,
             config.server_id.clone(),
@@ -330,6 +349,24 @@ pub async fn handle_server_session_stream<S: AsyncRead + AsyncWrite + Unpin + Se
             return Ok(());
         }
     };
+
+    // If authenticated via capability ticket, verify ticket matches target repo
+    if let Some(ref ticket) = verified_ticket {
+        let req_clean = repo_open.path.trim().trim_matches('/').replace('\\', "/");
+        let matches_repo = req_clean == ticket.native_repo_id
+            || req_clean == ticket.repo_id
+            || req_clean.ends_with(&ticket.native_repo_id)
+            || req_clean.replace('/', "_") == ticket.native_repo_id;
+        if !matches_repo {
+            let err = ErrorMessage {
+                code: 403,
+                category: "forbidden".to_string(),
+                message: "Capability ticket is not authorized for requested repository".to_string(),
+            };
+            err.to_frame()?.write_to_async(&mut stream).await?;
+            return Ok(());
+        }
+    }
 
     let store = match CompositeObjectStore::new(&spine_dir, HashAlgorithm::Blake3, 3) {
         Ok(s) => s,

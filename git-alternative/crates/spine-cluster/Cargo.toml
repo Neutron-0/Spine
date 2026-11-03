@@ -11,6 +11,7 @@ spine-format.workspace = true
 spine-object-store.workspace = true
 spine-protocol.workspace = true
 spine-net.workspace = true
+spine-history.workspace = true
 
 tokio.workspace = true
 blake3.workspace = true

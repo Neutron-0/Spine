@@ -8,6 +8,7 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
+use spine_cluster::PrProtectionContext;
 
 #[derive(Deserialize)]
 pub struct ListPullsQuery {
@@ -344,19 +345,52 @@ pub async fn execute_pull_request_merge(
         format!("Merge pull request #{} from {}\n\n{}", pr.pr_number, pr.head_branch, pr.title)
     });
 
-    let merge_result = state.vcs.execute_merge(
-        &repo.native_repo_id,
-        &pr.base_branch,
-        &pr.head_branch,
-        &caller.display_name,
-        &caller.email,
-        &commit_message,
-    )?;
+    // Check cross-service crash reconciliation
+    let current_base_oid = state.vcs.resolve_ref(&repo.native_repo_id, &pr.base_branch).ok();
+    let mut already_merged = false;
+    if let Some(cur_oid) = current_base_oid {
+        if let Ok(commit) = state.vcs.get_commit(&repo.native_repo_id, &cur_oid.to_hex()) {
+            if commit.parents.len() == 2 && commit.parents[0] == pr.base_commit_id && commit.parents[1] == pr.head_commit_id {
+                already_merged = true;
+            }
+        }
+    }
+
+    let merge_commit_id = if already_merged {
+        current_base_oid.unwrap().to_hex()
+    } else {
+        let reviews = state.db.list_pr_reviews(&pr.id).await.unwrap_or_default();
+        let comments = state.db.list_pr_review_comments(&pr.id).await.unwrap_or_default();
+        let approved_count = reviews.iter().filter(|r| r.state == "APPROVED" && r.reviewer_id != pr.author_id).count() as u32;
+        let has_active_change_requests = reviews.iter().any(|r| r.state == "CHANGES_REQUESTED");
+        let has_unresolved_comments = comments.iter().any(|c| !c.is_resolved);
+
+        let pr_context = PrProtectionContext {
+            pr_number: pr.pr_number as u64,
+            author_id: pr.author_id.clone(),
+            approved_count,
+            has_active_change_requests,
+            has_unresolved_comments,
+        };
+
+        let merge_result = state.vcs.execute_merge(
+            &repo.native_repo_id,
+            &pr.base_branch,
+            &pr.head_branch,
+            &caller.id,
+            &caller.display_name,
+            &caller.email,
+            &commit_message,
+            Some(&pr_context),
+        ).await?;
+
+        merge_result.merge_commit_id.unwrap_or_default()
+    };
 
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
     pr.state = "MERGED".to_string();
     pr.merged_by_user_id = Some(caller.id.clone());
-    pr.merge_commit_id = merge_result.merge_commit_id.clone();
+    pr.merge_commit_id = Some(merge_commit_id.clone());
     pr.merged_at_nanos = Some(now);
     pr.closed_at_nanos = Some(now);
     pr.updated_at_nanos = now;
@@ -411,10 +445,14 @@ pub async fn execute_pull_request_merge(
         payload: serde_json::json!({
             "pr_number": pr.pr_number,
             "title": pr.title,
-            "merge_commit_id": merge_result.merge_commit_id,
+            "merge_commit_id": merge_commit_id,
         }),
         created_at_nanos: now,
     }).await;
 
-    Ok(Json(merge_result))
+    Ok(Json(MergeResultDto {
+        success: true,
+        merge_commit_id: Some(merge_commit_id),
+        message: format!("Successfully merged {} into {}", pr.head_branch, pr.base_branch),
+    }))
 }
