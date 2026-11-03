@@ -1,4 +1,5 @@
 pub mod ops_cluster;
+pub mod ops_forge;
 pub mod ops_history;
 pub mod ops_tag;
 pub mod ops_worktree;
@@ -360,6 +361,61 @@ enum Commands {
     Replication {
         #[command(subcommand)]
         action: ReplicationAction,
+    },
+    /// Authentication against Spine Forge platform
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+    /// Manage Spine Forge repositories
+    Repo {
+        #[command(subcommand)]
+        action: RepoAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AuthAction {
+    /// Log in to a Spine Forge instance
+    Login {
+        /// Forge host URL (e.g. http://127.0.0.1:3000)
+        #[arg(long, default_value = "http://127.0.0.1:3000")]
+        host: String,
+        /// Username or email
+        #[arg(short, long)]
+        username: Option<String>,
+        /// Personal access token or session token
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Show current authentication status
+    Status,
+    /// Log out from Spine Forge
+    Logout {
+        /// Forge host URL
+        #[arg(long)]
+        host: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RepoAction {
+    /// Create a new repository on Spine Forge
+    Create {
+        /// Repository name
+        name: String,
+        /// Repository description
+        #[arg(short, long)]
+        description: Option<String>,
+        /// Make repository private
+        #[arg(long)]
+        private: bool,
+        /// Durability policy: SingleCopy, TwoCopies, ThreeCopies
+        #[arg(long, default_value = "ThreeCopies")]
+        durability: String,
+        /// Forge host URL
+        #[arg(long)]
+        host: Option<String>,
     },
 }
 
@@ -3751,6 +3807,35 @@ async fn main() -> Result<()> {
             ReplicationAction::Status => ops_cluster::cmd_replication_status(None)?,
             ReplicationAction::Repair { repository } => {
                 ops_cluster::cmd_replication_repair(&repository, None)?
+            }
+        },
+
+        Commands::Auth { action } => match action {
+            AuthAction::Login {
+                host,
+                username,
+                token,
+            } => ops_forge::cmd_auth_login(&host, username.as_deref(), token.as_deref()).await?,
+            AuthAction::Status => ops_forge::cmd_auth_status().await?,
+            AuthAction::Logout { host } => ops_forge::cmd_auth_logout(host.as_deref()).await?,
+        },
+
+        Commands::Repo { action } => match action {
+            RepoAction::Create {
+                name,
+                description,
+                private,
+                durability,
+                host,
+            } => {
+                ops_forge::cmd_repo_create(
+                    &name,
+                    description.as_deref(),
+                    private,
+                    &durability,
+                    host.as_deref(),
+                )
+                .await?
             }
         },
     }

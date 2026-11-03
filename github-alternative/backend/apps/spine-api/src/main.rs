@@ -1,49 +1,45 @@
-use axum::{extract::Path, http::StatusCode, response::IntoResponse, routing::get, Json, Router};
-use serde::{Deserialize, Serialize};
-use spine_core::ObjectId;
+use clap::Parser;
+use spine_api::{
+    auth::{DevMailCatcher, RateLimiter},
+    build_router, AppState, CoordinatorClient, Database, InMemoryDatabase, NativeVcsService,
+    PermissionService, PgDatabase, ProvisioningWorker, RepositoryService,
+};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tower_http::cors::{Any, CorsLayer};
-use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-#[derive(Clone)]
-struct AppState {
-    pub _api_version: &'static str,
-}
+#[derive(Parser, Debug)]
+#[command(
+    name = "spine-api",
+    author = "Spine Project Engineers",
+    version = "0.1.0",
+    about = "Spine Forge User-Facing Application & Control Plane Server"
+)]
+struct ServerArgs {
+    /// Bind IP address
+    #[arg(short, long, default_value = "127.0.0.1")]
+    bind: String,
 
-#[derive(Serialize)]
-struct HealthResponse {
-    status: &'static str,
-    version: &'static str,
-    service: &'static str,
-}
+    /// Listening port
+    #[arg(short, long, default_value_t = 3000)]
+    port: u16,
 
-#[derive(Serialize, Deserialize, Clone)]
-struct RepositoryMeta {
-    id: String,
-    owner: String,
-    name: String,
-    description: String,
-    is_private: bool,
-    default_branch: String,
-    created_at: String,
-}
+    /// PostgreSQL Database URL (e.g. postgres://spine:spine@127.0.0.1:5432/spine_forge)
+    #[arg(long)]
+    database_url: Option<String>,
 
-#[derive(Deserialize)]
-struct CreateRepoRequest {
-    name: String,
-    description: Option<String>,
-    is_private: Option<bool>,
-}
+    /// Force in-memory database for local zero-config development and testing
+    #[arg(long, default_value_t = false)]
+    in_memory_db: bool,
 
-#[derive(Serialize)]
-struct CommitDto {
-    id: String,
-    author_name: String,
-    author_email: String,
-    timestamp: i64,
-    message: String,
+    /// Spine Coordinator RPC address (e.g. 127.0.0.1:9000)
+    #[arg(long)]
+    coordinator_addr: Option<String>,
+
+    /// Storage root hosting native repositories
+    #[arg(long, default_value = "./.spine-dev-cluster/node-1")]
+    storage_root: PathBuf,
 }
 
 #[tokio::main]
@@ -56,106 +52,87 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let state = Arc::new(AppState {
-        _api_version: "0.1.0",
+    let args = ServerArgs::parse();
+
+    let database_url = args
+        .database_url
+        .or_else(|| std::env::var("DATABASE_URL").ok());
+    let coordinator_addr = args
+        .coordinator_addr
+        .or_else(|| std::env::var("COORDINATOR_ADDR").ok());
+
+    // 1. Initialize Database backend
+    let db: Arc<dyn Database> = if args.in_memory_db || database_url.is_none() {
+        tracing::info!("Initializing Spine Forge with InMemoryDatabase adapter");
+        Arc::new(InMemoryDatabase::new())
+    } else {
+        let db_url = database_url.unwrap();
+        tracing::info!("Connecting to PostgreSQL database...");
+        Arc::new(PgDatabase::connect(&db_url).await?)
+    };
+
+    // 2. Initialize Coordinator Client
+    let coordinator = coordinator_addr.map(|addr| {
+        tracing::info!("Configured Spine Coordinator at {}", addr);
+        CoordinatorClient::new(addr)
     });
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    // 3. Ensure Storage Root exists
+    std::fs::create_dir_all(&args.storage_root)?;
+    let storage_root_canonical = std::fs::canonicalize(&args.storage_root)?;
+    tracing::info!("Storage root: {}", storage_root_canonical.display());
 
-    let app = Router::new()
-        .route("/health", get(health_check))
-        .route(
-            "/api/v1/repos",
-            get(list_repositories).post(create_repository),
-        )
-        .route("/api/v1/repos/:owner/:repo/commits", get(get_repo_commits))
-        .layer(cors)
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
+    let permissions = Arc::new(PermissionService::new(Arc::clone(&db)));
+    let repositories = Arc::new(RepositoryService::new(
+        Arc::clone(&db),
+        Arc::clone(&permissions),
+    ));
+    let vcs = Arc::new(NativeVcsService::new(&storage_root_canonical));
+    let rate_limiter = Arc::new(RateLimiter::new());
+    let mail = Arc::new(DevMailCatcher::new());
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let state = AppState {
+        db: Arc::clone(&db),
+        permissions: Arc::clone(&permissions),
+        repositories: Arc::clone(&repositories),
+        vcs: Arc::clone(&vcs),
+        rate_limiter,
+        mail,
+        coordinator: coordinator.clone(),
+    };
+
+    // 4. Spawn background provisioning worker
+    let worker = Arc::new(ProvisioningWorker::new(
+        Arc::clone(&db),
+        coordinator,
+        &storage_root_canonical,
+    ));
+    let worker_clone = Arc::clone(&worker);
+    let worker_handle = tokio::spawn(async move {
+        tracing::info!("Starting background repository provisioning worker");
+        worker_clone.run().await;
+    });
+
+    // 5. Start HTTP server
+    let app = build_router(state);
+    let addr: SocketAddr = format!("{}:{}", args.bind, args.port).parse()?;
     tracing::info!("Spine Forge API listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
 
-    Ok(())
-}
-
-async fn health_check() -> impl IntoResponse {
-    Json(HealthResponse {
-        status: "ok",
-        version: "0.1.0",
-        service: "spine-forge-api",
-    })
-}
-
-async fn list_repositories() -> impl IntoResponse {
-    let mock_repos = vec![
-        RepositoryMeta {
-            id: "repo_01j9".into(),
-            owner: "spine-org".into(),
-            name: "spine-core".into(),
-            description: "High-performance Rust-native distributed version-control engine".into(),
-            is_private: false,
-            default_branch: "main".into(),
-            created_at: "2026-10-31T00:00:00Z".into(),
-        },
-        RepositoryMeta {
-            id: "repo_02k1".into(),
-            owner: "spine-org".into(),
-            name: "spine-forge".into(),
-            description: "Modern developer collaboration platform and distributed storage".into(),
-            is_private: false,
-            default_branch: "main".into(),
-            created_at: "2026-10-31T00:00:00Z".into(),
-        },
-    ];
-    Json(mock_repos)
-}
-
-async fn create_repository(
-    Json(payload): Json<CreateRepoRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if payload.name.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Repository name is required".into(),
-        ));
+    tokio::select! {
+        res = axum::serve(listener, app) => {
+            if let Err(e) = res {
+                tracing::error!("Server error: {}", e);
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Shutdown signal received, terminating gracefully...");
+        }
     }
 
-    let new_repo = RepositoryMeta {
-        id: format!("repo_{}", &ObjectId::ZERO.to_hex()[..8]),
-        owner: "current-user".into(),
-        name: payload.name,
-        description: payload.description.unwrap_or_default(),
-        is_private: payload.is_private.unwrap_or(false),
-        default_branch: "main".into(),
-        created_at: "2026-10-31T00:15:00Z".into(),
-    };
-
-    Ok((StatusCode::CREATED, Json(new_repo)))
-}
-
-async fn get_repo_commits(Path((_owner, _repo)): Path<(String, String)>) -> impl IntoResponse {
-    let mock_commits = vec![
-        CommitDto {
-            id: "e4d909c290d0fb1ca068ffaddf22cbd0add22cbd0add22cbd0add22cbd0add22".into(),
-            author_name: "Alice Engineer".into(),
-            author_email: "alice@spine.org".into(),
-            timestamp: 1730332800000000000,
-            message: "feat: implement initial content-addressed storage engine".into(),
-        },
-        CommitDto {
-            id: "1c2b3a4f5e6d7c8b9a0f1e2d3c4b5a6f7e8d9c0b1a2f3e4d5c6b7a8f9e0d1c2b".into(),
-            author_name: "Bob Architect".into(),
-            author_email: "bob@spine.org".into(),
-            timestamp: 1730332805000000000,
-            message: "docs: add repository binary format specification".into(),
-        },
-    ];
-    Json(mock_commits)
+    worker.shutdown();
+    let _ = worker_handle.await;
+    tracing::info!("Spine Forge shutdown complete.");
+    Ok(())
 }

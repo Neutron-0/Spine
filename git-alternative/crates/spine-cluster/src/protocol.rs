@@ -1,3 +1,4 @@
+use crate::durability::DurabilityPolicy;
 use crate::enrollment::{EnrollmentRequest, EnrollmentResponse};
 use crate::heartbeat::NodeHeartbeat;
 use crate::node::NodeStatus;
@@ -9,6 +10,15 @@ pub enum ClusterRpcRequest {
     Enroll(EnrollmentRequest),
     Heartbeat(NodeHeartbeat),
     GetPlacement {
+        repo_id: String,
+    },
+    AllocateRepository {
+        repo_id: String,
+        name: String,
+        owner: String,
+        durability_policy: DurabilityPolicy,
+    },
+    DeleteRepository {
         repo_id: String,
     },
     PreparePush {
@@ -74,6 +84,14 @@ pub enum ClusterRpcResponse {
         status: NodeStatus,
     },
     PlacementResult(Option<PlacementPlan>),
+    AllocationResult {
+        repo_id: String,
+        placement: PlacementPlan,
+    },
+    DeleteResult {
+        repo_id: String,
+        success: bool,
+    },
     PrepareAck {
         transaction_id: String,
         prepared: bool,

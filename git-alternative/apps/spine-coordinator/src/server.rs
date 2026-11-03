@@ -5,8 +5,9 @@ use spine_cluster::heartbeat::{
     evaluate_node_health, DEFAULT_OFFLINE_TIMEOUT_NANOS, DEFAULT_SUSPECT_TIMEOUT_NANOS,
 };
 use spine_cluster::node::{FailureDomain, NodeStatus, StorageNodeInfo};
+use spine_cluster::placement::PlacementScheduler;
 use spine_cluster::protocol::{ClusterRpcRequest, ClusterRpcResponse};
-use spine_cluster::store::CoordinatorStore;
+use spine_cluster::store::{CoordinatorStore, RepositoryMeta};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -210,6 +211,83 @@ async fn handle_coordinator_connection(
         ClusterRpcRequest::GetPlacement { repo_id } => match store.get_placement(&repo_id) {
             Ok(p) => ClusterRpcResponse::PlacementResult(p),
             Err(e) => ClusterRpcResponse::Error(e.to_string()),
+        },
+        ClusterRpcRequest::AllocateRepository {
+            repo_id,
+            name,
+            owner,
+            durability_policy,
+        } => match store.get_placement(&repo_id) {
+            Ok(Some(existing_plan)) => ClusterRpcResponse::AllocationResult {
+                repo_id,
+                placement: existing_plan,
+            },
+            _ => match store.list_nodes() {
+                Ok(nodes) => {
+                    match PlacementScheduler::schedule_placement(&repo_id, durability_policy, &nodes, 0, 1) {
+                        Ok(plan) => {
+                            let meta = RepositoryMeta {
+                                repo_id: repo_id.clone(),
+                                name,
+                                owner,
+                                durability_policy,
+                                committed_generation: 0,
+                                current_ownership_epoch: 1,
+                                storage_quota_bytes: 10 * 1024 * 1024 * 1024,
+                                state: "HEALTHY".to_string(),
+                                created_at_nanos: now,
+                                updated_at_nanos: now,
+                            };
+                            let _ = store.create_repository(meta);
+                            let _ = store.set_placement(plan.clone());
+                            let _ = store.update_replica_state(
+                                &repo_id,
+                                &plan.primary_node_id,
+                                true,
+                                0,
+                                true,
+                                now,
+                            );
+                            for rep in &plan.replica_node_ids {
+                                let _ = store.update_replica_state(
+                                    &repo_id,
+                                    rep,
+                                    false,
+                                    0,
+                                    true,
+                                    now,
+                                );
+                            }
+                            let _ = store.update_ownership_epoch(
+                                &repo_id,
+                                1,
+                                &plan.primary_node_id,
+                            );
+                            ClusterRpcResponse::AllocationResult { repo_id, placement: plan }
+                        }
+                        Err(e) => ClusterRpcResponse::Error(format!("Scheduling failed: {}", e)),
+                    }
+                }
+                Err(e) => ClusterRpcResponse::Error(format!("Listing nodes failed: {}", e)),
+            },
+        },
+        ClusterRpcRequest::DeleteRepository { repo_id } => {
+            let tombstone = spine_cluster::gc::TombstoneRecord::new(
+                format!("tb-{}", uuid::Uuid::new_v4()),
+                repo_id.clone(),
+                "ALL_PACKS".to_string(),
+                None,
+                0,
+                86400,
+                now,
+            );
+            match store.create_tombstone(tombstone) {
+                Ok(_) => ClusterRpcResponse::DeleteResult {
+                    repo_id,
+                    success: true,
+                },
+                Err(e) => ClusterRpcResponse::Error(e.to_string()),
+            }
         },
         ClusterRpcRequest::DrainNode { node_id } => {
             match store.update_node_status(&node_id, NodeStatus::Draining) {

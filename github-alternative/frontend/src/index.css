@@ -16,7 +16,7 @@ body {
 .container {
   max-width: 1200px;
   margin: 0 auto;
-  padding: 2rem;
+  padding: 1.5rem;
 }
 
 .header {
@@ -25,7 +25,7 @@ body {
   align-items: center;
   border-bottom: 1px solid #30363d;
   padding-bottom: 1rem;
-  margin-bottom: 2rem;
+  margin-bottom: 1.5rem;
 }
 
 .logo {
@@ -35,6 +35,13 @@ body {
   font-size: 1.5rem;
   font-weight: 700;
   color: #58a6ff;
+  cursor: pointer;
+}
+
+.nav-actions {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
 }
 
 .badge {
@@ -43,6 +50,71 @@ body {
   border-radius: 12px;
   background-color: #238636;
   color: white;
+  font-weight: 500;
+}
+
+.badge-ready {
+  background-color: #238636;
+  color: #ffffff;
+}
+
+.badge-provisioning {
+  background-color: #9e6a03;
+  color: #ffffff;
+}
+
+.badge-pending {
+  background-color: #1f6feb;
+  color: #ffffff;
+}
+
+.badge-private {
+  background-color: #30363d;
+  color: #8b949e;
+  border: 1px solid #484f58;
+}
+
+.badge-durability {
+  background-color: #1f242c;
+  color: #79c0ff;
+  border: 1px solid #388bfd33;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.4rem 0.9rem;
+  font-size: 0.9rem;
+  font-weight: 500;
+  border-radius: 6px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: all 0.15s ease;
+}
+
+.btn-primary {
+  background-color: #238636;
+  color: white;
+  border-color: rgba(240, 246, 252, 0.1);
+}
+.btn-primary:hover {
+  background-color: #2ea043;
+}
+
+.btn-secondary {
+  background-color: #21262d;
+  color: #c9d1d9;
+  border-color: #30363d;
+}
+.btn-secondary:hover {
+  background-color: #30363d;
+  border-color: #8b949e;
+}
+
+.btn-danger {
+  background-color: #da3633;
+  color: white;
 }
 
 .repo-card {
@@ -50,29 +122,142 @@ body {
   border: 1px solid #30363d;
   border-radius: 6px;
   padding: 1.25rem;
-  margin-bottom: 1rem;
+  margin-bottom: 0.75rem;
   cursor: pointer;
-  transition: border-color 0.2s;
+  transition: border-color 0.2s, background-color 0.2s;
 }
 
 .repo-card:hover {
   border-color: #58a6ff;
+  background-color: #1c2128;
+}
+
+.repo-card-selected {
+  border-color: #58a6ff;
+  background-color: #1c2128;
 }
 
 .repo-title {
   font-size: 1.15rem;
   font-weight: 600;
   color: #58a6ff;
-  margin-bottom: 0.5rem;
+  margin-bottom: 0.35rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
 }
 
 .repo-desc {
   color: #8b949e;
-  font-size: 0.95rem;
+  font-size: 0.9rem;
+  margin-bottom: 0.5rem;
+}
+
+.repo-meta {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.clone-box {
+  background-color: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+  margin-bottom: 1.25rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.clone-cmd {
+  font-family: monospace;
+  color: #58a6ff;
+  font-size: 0.9rem;
+}
+
+.tabs {
+  display: flex;
+  gap: 1rem;
+  border-bottom: 1px solid #30363d;
+  margin-bottom: 1.25rem;
+}
+
+.tab {
+  padding: 0.5rem 0.75rem;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  color: #8b949e;
+  font-weight: 500;
+}
+
+.tab-active {
+  color: #f0f6fc;
+  border-bottom-color: #f78166;
+}
+
+.tree-table {
+  width: 100%;
+  border-collapse: collapse;
+  background-color: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.tree-row {
+  border-bottom: 1px solid #21262d;
+  cursor: pointer;
+  transition: background-color 0.1s;
+}
+
+.tree-row:hover {
+  background-color: #21262d;
+}
+
+.tree-cell {
+  padding: 0.6rem 1rem;
+  font-size: 0.9rem;
+}
+
+.file-icon {
+  margin-right: 0.5rem;
+  color: #8b949e;
+}
+
+.file-viewer {
+  background-color: #0d1117;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.file-viewer-header {
+  background-color: #161b22;
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid #30363d;
+  font-family: monospace;
+  font-size: 0.85rem;
+  color: #8b949e;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.file-content {
+  padding: 1rem;
+  font-family: "JetBrains Mono", Consolas, "Courier New", monospace;
+  font-size: 0.85rem;
+  line-height: 1.45;
+  white-space: pre;
+  overflow-x: auto;
+  color: #e6edf3;
+  margin: 0;
 }
 
 .commit-card {
   background-color: #161b22;
+  border: 1px solid #30363d;
   border-left: 3px solid #1f6feb;
   padding: 0.75rem 1rem;
   margin-bottom: 0.5rem;
@@ -93,4 +278,61 @@ body {
 .commit-meta {
   color: #8b949e;
   font-size: 0.8rem;
+  margin-top: 0.25rem;
+}
+
+.modal-backdrop {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(0, 0, 0, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal-box {
+  background-color: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  width: 480px;
+  padding: 1.5rem;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+
+.form-group {
+  margin-bottom: 1rem;
+}
+
+.form-label {
+  display: block;
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-bottom: 0.35rem;
+  color: #c9d1d9;
+}
+
+.form-input {
+  width: 100%;
+  box-sizing: border-box;
+  background-color: #0d1117;
+  border: 1px solid #30363d;
+  color: #e6edf3;
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  font-size: 0.9rem;
+}
+
+.form-input:focus {
+  outline: none;
+  border-color: #58a6ff;
+}
+
+.radio-group {
+  display: flex;
+  gap: 1.5rem;
+  margin-top: 0.35rem;
 }

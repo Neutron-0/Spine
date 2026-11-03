@@ -1,0 +1,133 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: spine-forge-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: spine_forge
+      POSTGRES_USER: spine_app
+      POSTGRES_PASSWORD: spine_dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations/20261103000001_forge_metadata.sql:/docker-entrypoint-initdb.d/01_forge_metadata.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spine_app -d spine_forge"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  coordinator:
+    build:
+      context: .
+      dockerfile: git-alternative/Dockerfile.coordinator
+    container_name: spine-coordinator
+    restart: unless-stopped
+    ports:
+      - "8400:8400"
+    environment:
+      SPINE_COORDINATOR_PORT: "8400"
+      SPINE_STORE_PATH: "/var/lib/spine/coordinator.state"
+    volumes:
+      - coordinator_data:/var/lib/spine
+
+  storage-node-1:
+    build:
+      context: .
+      dockerfile: git-alternative/Dockerfile.storage-node
+    container_name: spine-storage-node-1
+    restart: unless-stopped
+    ports:
+      - "9101:9101"
+    environment:
+      SPINE_NODE_ID: "node-1"
+      SPINE_ZONE: "zone-a"
+      SPINE_CAPACITY_BYTES: "107374182400"
+      SPINE_COORDINATOR_ADDR: "coordinator:8400"
+      SPINE_DATA_DIR: "/var/lib/spine/node-1"
+    volumes:
+      - storage_1_data:/var/lib/spine/node-1
+    depends_on:
+      - coordinator
+
+  storage-node-2:
+    build:
+      context: .
+      dockerfile: git-alternative/Dockerfile.storage-node
+    container_name: spine-storage-node-2
+    restart: unless-stopped
+    ports:
+      - "9102:9102"
+    environment:
+      SPINE_NODE_ID: "node-2"
+      SPINE_ZONE: "zone-b"
+      SPINE_CAPACITY_BYTES: "107374182400"
+      SPINE_COORDINATOR_ADDR: "coordinator:8400"
+      SPINE_DATA_DIR: "/var/lib/spine/node-2"
+    volumes:
+      - storage_2_data:/var/lib/spine/node-2
+    depends_on:
+      - coordinator
+
+  storage-node-3:
+    build:
+      context: .
+      dockerfile: git-alternative/Dockerfile.storage-node
+    container_name: spine-storage-node-3
+    restart: unless-stopped
+    ports:
+      - "9103:9103"
+    environment:
+      SPINE_NODE_ID: "node-3"
+      SPINE_ZONE: "zone-c"
+      SPINE_CAPACITY_BYTES: "107374182400"
+      SPINE_COORDINATOR_ADDR: "coordinator:8400"
+      SPINE_DATA_DIR: "/var/lib/spine/node-3"
+    volumes:
+      - storage_3_data:/var/lib/spine/node-3
+    depends_on:
+      - coordinator
+
+  spine-api:
+    build:
+      context: .
+      dockerfile: github-alternative/backend/Dockerfile.api
+    container_name: spine-forge-api
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: "3000"
+      DATABASE_URL: "postgres://spine_app:spine_dev_password@postgres:5432/spine_forge"
+      COORDINATOR_ADDR: "coordinator:8400"
+      STORAGE_ROOT: "/var/lib/spine/storage"
+      RUST_LOG: "info,spine_api=debug"
+    volumes:
+      - spine_storage:/var/lib/spine/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      coordinator:
+        condition: service_started
+
+  spine-frontend:
+    build:
+      context: github-alternative/frontend
+      dockerfile: Dockerfile
+    container_name: spine-forge-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      - spine-api
+
+volumes:
+  postgres_data:
+  coordinator_data:
+  storage_1_data:
+  storage_2_data:
+  storage_3_data:
+  spine_storage:

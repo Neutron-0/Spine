@@ -39,10 +39,6 @@
 - Workspace filesystem helpers: `mv`, `rm`, `clean`.
 - GC protection across worktrees, stashes, tags, and in-flight states.
 
----
-
-## Next Milestones
-
 ### Batch 07: Distributed Storage Fabric, Repository Replication, Node Management, Failover and Data Recovery
 - Crate `spine-cluster`: Node lifecycle state machine, Ed25519 challenge-response enrollment, autonomous heartbeats, and failure domain tracking.
 - Durability policies (`SingleCopy`, `TwoCopies`, `ThreeCopies`) enforced via two-phase commit replication transactions (`Initiated` -> `Preparing` -> `Prepared` -> `CommitDecided` -> `Committed`).
@@ -55,19 +51,32 @@
 - Cluster administration CLI: `cluster status`, `node list/inspect/drain/quarantine/retire`, `storage placements/inspect/rebalance`, `replication status/repair`.
 - Multi-process local dev cluster automation (`scripts/dev_cluster.ps1`, `scripts/dev_cluster.sh`).
 
+### Batch 08: Spine Forge Identity, Authentication, Repository Provisioning, and Native Repository Hosting
+- Rust backend `spine-api` using Axum 0.7, Tokio, and SQLx.
+- Dual database abstraction (`Database` trait): `PgDatabase` (production PostgreSQL) and `InMemoryDatabase` (zero-external-dependency test runner).
+- Cryptographic identity: Argon2id password hashing with random salt, constant-time verification, strict complexity validation.
+- Session & Token engine: CSPRNG 32-byte tokens prefixed with `sp_sess_` and `sp_pat_`, BLAKE3 hash storage, sliding expiry, atomic revocation.
+- Granular authorization (`PermissionService`): Reader, Collaborator, Owner, and Admin roles.
+- Private repository metadata isolation: unauthorized requests to private repositories strictly return `404 Not Found` to prevent discovery of confidential project names.
+- Asynchronous repository provisioning outbox (`repository_provisioning_jobs`) with idempotency keys and background worker (`ProvisioningWorker`).
+- Coordinator RPC integration: `AllocateRepository` and `DeleteRepository` protocol requests with rack-aware placement plan creation.
+- Native VCS inspection: `NativeVcsService` directly inspects on-disk `.spine` repositories (branches, tags, commits, tree navigation, blob content) via `CompositeObjectStore` with zero Git runtime execution.
+- React 18 / TypeScript / Vite frontend: responsive developer UI for authentication, repository creation, branch switching, directory browsing, and commit history.
+- Native CLI integration: `spine auth login/status/logout` and `spine repo create` via a custom zero-dependency async HTTP client.
+- Production Docker Compose topology (`docker-compose.yml`), `.env.example`, and local runner scripts (`scripts/dev_forge.ps1`, `scripts/dev_forge.sh`).
+
 ---
 
 ## Next Milestones
 
-### Batch 08: Spine Large Object Storage (LFS) & Partial Worktrees
+### Batch 09: Pull Requests, Code Review, Inline Comments, and Mergeability Engine
+- Pull request data models, source/target branch references, and automated 3-way mergeability checks.
+- Unified and side-by-side diff viewers for commit and branch comparisons.
+- Threaded code review discussions with line-level code comments and resolution tracking.
+- Branch protection rules (required reviews, passing CI checks, linear history).
+
+### Batch 10: Real-time Collaboration, Webhooks, CI/CD Pipeline Gateway, and Large Object Storage (LFS)
+- Real-time updates via WebSockets for collaborative review and notification feeds.
+- Webhook dispatch system with HMAC-SHA256 payload signing and retry queues.
 - Spine LFS: Content-addressed external binary asset store with chunked streaming and content-hash verification.
-- Sparse checkouts and path-filtered indexes for massive monorepos.
-
-### Batch 09: Spine Forge Architecture & Rust Backend
-- Forge daemon with multi-tenant repository hosting.
-- Role-based access control, organizational permissions, and SSH/SPWP gateway.
-- Pull request engine with automated mergeability testing and review commenting.
-
-### Batch 10: Spine Forge Web Frontend
-- High-performance TypeScript / WebAssembly repository browser, code viewer, and graph visualizer.
-- Real-time review and collaborative workflow interface.
+- Partial and sparse worktree support for monorepo development.

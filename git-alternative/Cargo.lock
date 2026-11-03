@@ -1214,6 +1214,8 @@ dependencies = [
  "hex",
  "rand 0.8.8",
  "rustls",
+ "serde",
+ "serde_json",
  "spine-cluster",
  "spine-config",
  "spine-core",
@@ -1231,6 +1233,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
+ "toml",
  "uuid",
 ]
 
