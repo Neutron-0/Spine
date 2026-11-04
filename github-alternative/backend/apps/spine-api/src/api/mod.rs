@@ -19,6 +19,10 @@ pub mod routes_webhooks;
 pub mod routes_workflows;
 pub mod routes_runners;
 pub mod routes_secrets;
+pub mod routes_search;
+pub mod routes_discussions;
+pub mod routes_discovery;
+pub mod routes_security;
 
 pub use middleware::AppState;
 
@@ -388,6 +392,33 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/repos/:owner/:repo/secrets/:name", put(routes_secrets::upsert_repo_secret).delete(routes_secrets::delete_repo_secret))
         .route("/api/v1/orgs/:org/secrets", get(routes_secrets::list_org_secrets))
         .route("/api/v1/orgs/:org/secrets/:name", put(routes_secrets::upsert_org_secret).delete(routes_secrets::delete_org_secret))
+        // Search (Batch 13)
+        .route("/api/v1/search", get(routes_search::search_handler))
+        // Discussions (Batch 13)
+        .route("/api/v1/repos/:owner/:repo/discussions/categories", get(routes_discussions::list_categories).post(routes_discussions::create_category))
+        .route("/api/v1/repos/:owner/:repo/discussions", get(routes_discussions::list_discussions).post(routes_discussions::create_discussion))
+        .route("/api/v1/repos/:owner/:repo/discussions/:number", get(routes_discussions::get_discussion).patch(routes_discussions::update_discussion))
+        .route("/api/v1/repos/:owner/:repo/discussions/:number/comments", get(routes_discussions::list_comments).post(routes_discussions::create_comment))
+        .route("/api/v1/repos/:owner/:repo/discussions/:number/answer/:comment_id", post(routes_discussions::mark_answer))
+        .route("/api/v1/repos/:owner/:repo/discussions/:number/comments/:comment_id/reactions", post(routes_discussions::toggle_comment_reaction))
+        // Discovery, Topics, Languages, Profiles (Batch 13)
+        .route("/api/v1/users/:username/profile", get(routes_discovery::get_profile).put(routes_discovery::update_profile))
+        .route("/api/v1/explore/topics", get(routes_discovery::list_popular_topics))
+        .route("/api/v1/explore/repositories", get(routes_discovery::list_explore_repositories))
+        .route("/api/v1/repos/:owner/:repo/topics", get(routes_discovery::list_repo_topics).put(routes_discovery::set_repo_topics))
+        .route("/api/v1/repos/:owner/:repo/languages", get(routes_discovery::list_repo_languages))
+        .route("/api/v1/repos/:owner/:repo/languages/analyze", post(routes_discovery::analyze_repo_languages))
+        // Security Center (Batch 13)
+        .route("/api/v1/repos/:owner/:repo/security/scans/secrets", post(routes_security::trigger_secret_scan))
+        .route("/api/v1/repos/:owner/:repo/security/secrets", get(routes_security::list_secret_findings))
+        .route("/api/v1/repos/:owner/:repo/security/secrets/:id", patch(routes_security::remediate_secret_finding))
+        .route("/api/v1/repos/:owner/:repo/security/scans/dependencies", post(routes_security::trigger_dependency_audit))
+        .route("/api/v1/repos/:owner/:repo/security/dependencies", get(routes_security::list_dependencies))
+        .route("/api/v1/repos/:owner/:repo/security/vulnerabilities", get(routes_security::list_vulnerabilities))
+        .route("/api/v1/repos/:owner/:repo/security/vulnerabilities/:id", patch(routes_security::remediate_vulnerability))
+        .route("/api/v1/repos/:owner/:repo/security/sbom/spdx", get(routes_security::export_sbom_spdx))
+        .route("/api/v1/repos/:owner/:repo/security/sbom/cyclonedx", get(routes_security::export_sbom_cyclonedx))
+        .route("/api/v1/repos/:owner/:repo/security/summary", get(routes_security::get_security_summary))
         // Layers
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),

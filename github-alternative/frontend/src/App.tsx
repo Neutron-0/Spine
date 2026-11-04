@@ -31,6 +31,19 @@ import {
   WorkflowLogChunkDto,
   RunnerRegistrationDto,
   SecretSummaryDto,
+  SearchResponseDto,
+  DiscussionCategoryDto,
+  DiscussionDto,
+  DiscussionCommentDto,
+  ExtendedUserProfileDto,
+  RepositoryTopicDto,
+  RepositoryLanguageDto,
+  PopularTopicDto,
+  RepositoryDiscoveryCardDto,
+  SecretScanFindingDto,
+  DependencyInventoryDto,
+  DependencyVulnerabilityDto,
+  SecuritySummaryDto,
 } from './types';
 
 export const App: React.FC = () => {
@@ -48,7 +61,7 @@ export const App: React.FC = () => {
   const [branches, setBranches] = useState<BranchDto[]>([]);
   const [currentBranch, setCurrentBranch] = useState<string>('main');
   const [commits, setCommits] = useState<CommitDto[]>([]);
-  const [activeTab, setActiveTab] = useState<'code' | 'issues' | 'pulls' | 'orgs' | 'protection' | 'releases' | 'packages' | 'actions' | 'webhooks' | 'runners' | 'secrets'>('code');
+  const [activeTab, setActiveTab] = useState<'code' | 'issues' | 'pulls' | 'orgs' | 'protection' | 'releases' | 'packages' | 'actions' | 'webhooks' | 'runners' | 'secrets' | 'search' | 'discussions' | 'discovery' | 'security'>('code');
   const [codeSubTab, setCodeSubTab] = useState<'files' | 'commits'>('files');
   const [treeEntries, setTreeEntries] = useState<TreeEntryDto[]>([]);
   const [selectedBlob, setSelectedBlob] = useState<BlobContentDto | null>(null);
@@ -287,6 +300,14 @@ export const App: React.FC = () => {
       fetchRunners();
     } else if (activeTab === 'secrets') {
       fetchSecrets();
+    } else if (activeTab === 'discussions') {
+      fetchDiscussions();
+    } else if (activeTab === 'discovery') {
+      fetchExplore();
+      if (selectedRepo) fetchRepoTopicsAndLangs();
+      if (currentUser) fetchUserProfile();
+    } else if (activeTab === 'security') {
+      fetchSecurityData();
     }
   }, [activeTab, selectedRepo]);
 
@@ -390,6 +411,404 @@ export const App: React.FC = () => {
       .then(res => res.ok ? res.json() : [])
       .then(data => setSecrets(Array.isArray(data) ? data : []))
       .catch(() => setSecrets([]));
+  };
+
+  // -------------------------------------------------------------
+  // Batch 13: Search, Discussions, Discovery & Security State & Handlers
+  // -------------------------------------------------------------
+  // Search
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [searchType, setSearchType] = useState<string>('all');
+  const [searchResults, setSearchResults] = useState<SearchResponseDto | null>(null);
+  const [searchLoading, setSearchLoading] = useState<boolean>(false);
+
+  const handleSearch = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!searchQuery.trim()) return;
+    setSearchLoading(true);
+    try {
+      const typeParam = searchType === 'all' ? '' : `&type=${searchType}`;
+      const repoParam = selectedRepo ? `&repo=${selectedRepo.owner}/${selectedRepo.name}` : '';
+      const res = await fetch(`/api/v1/search?q=${encodeURIComponent(searchQuery.trim())}${typeParam}${repoParam}`, {
+        headers: getAuthHeaders(),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setSearchResults(data);
+      }
+    } catch {
+      // ignore
+    } finally {
+      setSearchLoading(false);
+    }
+  };
+
+  // Discussions
+  const [discussionCategories, setDiscussionCategories] = useState<DiscussionCategoryDto[]>([]);
+  const [discussions, setDiscussions] = useState<DiscussionDto[]>([]);
+  const [selectedDiscussion, setSelectedDiscussion] = useState<DiscussionDto | null>(null);
+  const [discussionComments, setDiscussionComments] = useState<DiscussionCommentDto[]>([]);
+  const [selectedCategoryFilter, setSelectedCategoryFilter] = useState<string | null>(null);
+  const [showNewDiscussionModal, setShowNewDiscussionModal] = useState<boolean>(false);
+  const [newDiscussionTitle, setNewDiscussionTitle] = useState<string>('');
+  const [newDiscussionBody, setNewDiscussionBody] = useState<string>('');
+  const [newDiscussionCategory, setNewDiscussionCategory] = useState<string>('');
+  const [newDiscussionCommentBody, setNewDiscussionCommentBody] = useState<string>('');
+
+  const fetchDiscussions = async () => {
+    if (!selectedRepo) return;
+    try {
+      const catRes = await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/discussions/categories`, {
+        headers: getAuthHeaders(),
+      });
+      if (catRes.ok) {
+        const cats = await catRes.json();
+        setDiscussionCategories(cats);
+        if (cats.length > 0 && !newDiscussionCategory) {
+          setNewDiscussionCategory(cats[0].id);
+        }
+      }
+
+      const catFilter = selectedCategoryFilter ? `?category_id=${selectedCategoryFilter}` : '';
+      const discRes = await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/discussions${catFilter}`, {
+        headers: getAuthHeaders(),
+      });
+      if (discRes.ok) {
+        const list = await discRes.json();
+        setDiscussions(list);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const fetchDiscussionComments = async (discNum: number) => {
+    if (!selectedRepo) return;
+    try {
+      const res = await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/discussions/${discNum}/comments`, {
+        headers: getAuthHeaders(),
+      });
+      if (res.ok) {
+        const comments = await res.json();
+        setDiscussionComments(comments);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleCreateDiscussion = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedRepo || !newDiscussionTitle.trim() || !newDiscussionBody.trim() || !newDiscussionCategory) return;
+    try {
+      const res = await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/discussions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+        body: JSON.stringify({
+          category_id: newDiscussionCategory,
+          title: newDiscussionTitle.trim(),
+          body: newDiscussionBody.trim(),
+        }),
+      });
+      if (res.ok) {
+        setShowNewDiscussionModal(false);
+        setNewDiscussionTitle('');
+        setNewDiscussionBody('');
+        fetchDiscussions();
+      }
+    } catch (err) {
+      alert('Failed to create discussion: ' + err);
+    }
+  };
+
+  const handleCreateDiscussionComment = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedRepo || !selectedDiscussion || !newDiscussionCommentBody.trim()) return;
+    try {
+      const res = await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/discussions/${selectedDiscussion.number}/comments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+        body: JSON.stringify({ body: newDiscussionCommentBody.trim() }),
+      });
+      if (res.ok) {
+        setNewDiscussionCommentBody('');
+        fetchDiscussionComments(selectedDiscussion.number);
+        fetchDiscussions();
+      }
+    } catch (err) {
+      alert('Failed to post comment: ' + err);
+    }
+  };
+
+  const handleMarkAnswer = async (commentId: string) => {
+    if (!selectedRepo || !selectedDiscussion) return;
+    try {
+      const res = await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/discussions/${selectedDiscussion.number}/answer/${commentId}`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+      });
+      if (res.ok) {
+        const updated = await res.json();
+        setSelectedDiscussion(updated);
+        fetchDiscussionComments(selectedDiscussion.number);
+      }
+    } catch (err) {
+      alert('Failed to mark answer: ' + err);
+    }
+  };
+
+  const handleToggleReaction = async (commentId: string, reaction: string) => {
+    if (!selectedRepo || !selectedDiscussion) return;
+    try {
+      const res = await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/discussions/${selectedDiscussion.number}/comments/${commentId}/reactions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+        body: JSON.stringify({ reaction }),
+      });
+      if (res.ok) {
+        fetchDiscussionComments(selectedDiscussion.number);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  // Discovery & Profile
+  const [popularTopics, setPopularTopics] = useState<PopularTopicDto[]>([]);
+  const [exploreRepos, setExploreRepos] = useState<RepositoryDiscoveryCardDto[]>([]);
+  const [selectedTopicFilter, setSelectedTopicFilter] = useState<string | null>(null);
+  const [, setUserProfile] = useState<ExtendedUserProfileDto | null>(null);
+  const [profileBio, setProfileBio] = useState<string>('');
+  const [profileCompany, setProfileCompany] = useState<string>('');
+  const [profileLocation, setProfileLocation] = useState<string>('');
+  const [profileWebsite, setProfileWebsite] = useState<string>('');
+  const [profileTwitter, setProfileTwitter] = useState<string>('');
+  const [profileReadme, setProfileReadme] = useState<string>('');
+  const [repoTopics, setRepoTopics] = useState<RepositoryTopicDto[]>([]);
+  const [newTopicInput, setNewTopicInput] = useState<string>('');
+  const [repoLanguages, setRepoLanguages] = useState<RepositoryLanguageDto[]>([]);
+
+  const fetchExplore = async () => {
+    try {
+      const topRes = await fetch('/api/v1/explore/topics', { headers: getAuthHeaders() });
+      if (topRes.ok) setPopularTopics(await topRes.json());
+
+      const topicParam = selectedTopicFilter ? `?topic=${encodeURIComponent(selectedTopicFilter)}` : '';
+      const repoRes = await fetch(`/api/v1/explore/repositories${topicParam}`, { headers: getAuthHeaders() });
+      if (repoRes.ok) setExploreRepos(await repoRes.json());
+    } catch {
+      // ignore
+    }
+  };
+
+  const fetchRepoTopicsAndLangs = async () => {
+    if (!selectedRepo) return;
+    try {
+      const topRes = await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/topics`, { headers: getAuthHeaders() });
+      if (topRes.ok) setRepoTopics(await topRes.json());
+
+      const langRes = await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/languages`, { headers: getAuthHeaders() });
+      if (langRes.ok) setRepoLanguages(await langRes.json());
+    } catch {
+      // ignore
+    }
+  };
+
+  const fetchUserProfile = async () => {
+    if (!currentUser) return;
+    try {
+      const res = await fetch(`/api/v1/users/${currentUser.username}/profile`, { headers: getAuthHeaders() });
+      if (res.ok) {
+        const p: ExtendedUserProfileDto = await res.json();
+        setUserProfile(p);
+        setProfileBio(p.bio || '');
+        setProfileCompany(p.company || '');
+        setProfileLocation(p.location || '');
+        setProfileWebsite(p.website_url || '');
+        setProfileTwitter(p.twitter_username || '');
+        setProfileReadme(p.profile_readme || '');
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleSaveProfile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!currentUser) return;
+    try {
+      const res = await fetch(`/api/v1/users/${currentUser.username}/profile`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+        body: JSON.stringify({
+          bio: profileBio,
+          company: profileCompany,
+          location: profileLocation,
+          website_url: profileWebsite,
+          twitter_username: profileTwitter,
+          profile_readme: profileReadme,
+        }),
+      });
+      if (res.ok) {
+        const updated = await res.json();
+        setUserProfile(updated);
+        alert('Profile saved successfully!');
+      }
+    } catch (err) {
+      alert('Failed to save profile: ' + err);
+    }
+  };
+
+  const handleSaveTopics = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedRepo) return;
+    const currentList = repoTopics.map(t => t.topic);
+    if (newTopicInput.trim() && !currentList.includes(newTopicInput.trim().toLowerCase())) {
+      currentList.push(newTopicInput.trim().toLowerCase());
+    }
+    try {
+      const res = await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/topics`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+        body: JSON.stringify({ topics: currentList }),
+      });
+      if (res.ok) {
+        setNewTopicInput('');
+        setRepoTopics(await res.json());
+      }
+    } catch (err) {
+      alert('Failed to save topics: ' + err);
+    }
+  };
+
+  const handleAnalyzeLanguages = async () => {
+    if (!selectedRepo) return;
+    try {
+      const res = await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/languages/analyze`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+      });
+      if (res.ok) setRepoLanguages(await res.json());
+    } catch {
+      // ignore
+    }
+  };
+
+  // Security Center
+  const [securitySummary, setSecuritySummary] = useState<SecuritySummaryDto | null>(null);
+  const [secretFindings, setSecretFindings] = useState<SecretScanFindingDto[]>([]);
+  const [secretFilter, setSecretFilter] = useState<string>('ALL');
+  const [vulnerabilities, setVulnerabilities] = useState<DependencyVulnerabilityDto[]>([]);
+  const [dependencies, setDependencies] = useState<DependencyInventoryDto[]>([]);
+  const [securityLoading, setSecurityLoading] = useState<boolean>(false);
+  const [showSbomModal, setShowSbomModal] = useState<boolean>(false);
+  const [sbomModalTitle, setSbomModalTitle] = useState<string>('');
+  const [sbomModalContent, setSbomModalContent] = useState<string>('');
+
+  const fetchSecurityData = async () => {
+    if (!selectedRepo) return;
+    setSecurityLoading(true);
+    try {
+      const sumRes = await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/security/summary`, { headers: getAuthHeaders() });
+      if (sumRes.ok) setSecuritySummary(await sumRes.json());
+
+      const secFilterParam = secretFilter !== 'ALL' ? `?status=${secretFilter}` : '';
+      const secRes = await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/security/secrets${secFilterParam}`, { headers: getAuthHeaders() });
+      if (secRes.ok) setSecretFindings(await secRes.json());
+
+      const vulnRes = await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/security/vulnerabilities`, { headers: getAuthHeaders() });
+      if (vulnRes.ok) setVulnerabilities(await vulnRes.json());
+
+      const depRes = await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/security/dependencies`, { headers: getAuthHeaders() });
+      if (depRes.ok) setDependencies(await depRes.json());
+    } catch {
+      // ignore
+    } finally {
+      setSecurityLoading(false);
+    }
+  };
+
+  const handleTriggerSecretScan = async () => {
+    if (!selectedRepo) return;
+    setSecurityLoading(true);
+    try {
+      const res = await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/security/scans/secrets`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+        body: JSON.stringify({ commit_oid: 'HEAD' }),
+      });
+      if (res.ok) {
+        fetchSecurityData();
+      }
+    } catch {
+      // ignore
+    } finally {
+      setSecurityLoading(false);
+    }
+  };
+
+  const handleTriggerDependencyAudit = async () => {
+    if (!selectedRepo) return;
+    setSecurityLoading(true);
+    try {
+      const res = await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/security/scans/dependencies`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+        body: JSON.stringify({ commit_oid: 'HEAD' }),
+      });
+      if (res.ok) {
+        fetchSecurityData();
+      }
+    } catch {
+      // ignore
+    } finally {
+      setSecurityLoading(false);
+    }
+  };
+
+  const handleRemediateSecret = async (id: string, status: string) => {
+    if (!selectedRepo) return;
+    try {
+      const res = await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/security/secrets/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+        body: JSON.stringify({ status }),
+      });
+      if (res.ok) fetchSecurityData();
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleRemediateVuln = async (id: string, status: string) => {
+    if (!selectedRepo) return;
+    try {
+      const res = await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/security/vulnerabilities/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+        body: JSON.stringify({ status }),
+      });
+      if (res.ok) fetchSecurityData();
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleExportSbom = async (format: 'spdx' | 'cyclonedx') => {
+    if (!selectedRepo) return;
+    try {
+      const res = await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/security/sbom/${format}`, {
+        headers: getAuthHeaders(),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setSbomModalTitle(format === 'spdx' ? 'SPDX 2.3 Software Bill of Materials (SBOM)' : 'CycloneDX 1.5 Software Bill of Materials (SBOM)');
+        setSbomModalContent(JSON.stringify(data, null, 2));
+        setShowSbomModal(true);
+      }
+    } catch (err) {
+      alert('Failed to export SBOM: ' + err);
+    }
   };
 
   const handleCreateRelease = async (e: React.FormEvent) => {
@@ -927,6 +1346,30 @@ export const App: React.FC = () => {
               onClick={() => setActiveTab('secrets')}
             >
               🔑 Secrets
+            </button>
+            <button
+              className={`btn ${activeTab === 'search' ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setActiveTab('search')}
+            >
+              🔍 Search
+            </button>
+            <button
+              className={`btn ${activeTab === 'discussions' ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => { setActiveTab('discussions'); setSelectedDiscussion(null); }}
+            >
+              💬 Discussions
+            </button>
+            <button
+              className={`btn ${activeTab === 'discovery' ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setActiveTab('discovery')}
+            >
+              🌐 Explore
+            </button>
+            <button
+              className={`btn ${activeTab === 'security' ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setActiveTab('security')}
+            >
+              🛡️ Security
             </button>
           </div>
         </div>
@@ -2513,6 +2956,872 @@ index = "sparse+http://127.0.0.1:3000/index/"
                   No secrets defined. Secrets defined here are available as environment variables in workflow runners.
                 </div>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ---------------------------------------------------------------------- */}
+      {/* TAB: Search (Batch 13)                                                  */}
+      {/* ---------------------------------------------------------------------- */}
+      {activeTab === 'search' && (
+        <div>
+          <div style={{ marginBottom: '1.5rem' }}>
+            <h3 style={{ margin: 0, marginBottom: '0.25rem' }}>🔍 Global & Code Search</h3>
+            <p style={{ margin: 0, fontSize: '0.85rem', color: '#8b949e' }}>
+              Search code snapshots, repositories, issues, pull requests, and discussions with permission-aware scoping
+            </p>
+          </div>
+
+          <form onSubmit={handleSearch} style={{ display: 'flex', gap: '0.75rem', marginBottom: '1.5rem' }}>
+            <input
+              type="text"
+              className="input-field"
+              placeholder="Search code, functions, issues, pull requests..."
+              value={searchQuery}
+              onChange={e => setSearchQuery(e.target.value)}
+              style={{ flex: 1 }}
+            />
+            <select
+              className="input-field"
+              value={searchType}
+              onChange={e => setSearchType(e.target.value)}
+              style={{ width: '160px' }}
+            >
+              <option value="all">All Types</option>
+              <option value="code">💻 Code</option>
+              <option value="repo">📁 Repositories</option>
+              <option value="issue">🐞 Issues</option>
+              <option value="pull">🔀 Pull Requests</option>
+              <option value="discussion">💬 Discussions</option>
+            </select>
+            <button type="submit" className="btn btn-primary" disabled={searchLoading}>
+              {searchLoading ? 'Searching...' : 'Search'}
+            </button>
+          </form>
+
+          {searchResults && (
+            <div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+                <span style={{ fontSize: '0.9rem', color: '#8b949e' }}>
+                  Found <strong>{searchResults.total}</strong> results for &ldquo;{searchResults.query}&rdquo;
+                </span>
+              </div>
+
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                {searchResults.hits.map((hit, idx) => (
+                  <div key={idx} className="diff-container" style={{ padding: '1rem' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '0.5rem' }}>
+                      <div>
+                        <span className="badge badge-open" style={{ marginRight: '0.5rem', fontSize: '0.75rem' }}>
+                          {hit.result_type}
+                        </span>
+                        <strong style={{ fontSize: '1rem', color: '#58a6ff' }}>{hit.title}</strong>
+                        <span style={{ marginLeft: '0.5rem', fontSize: '0.8rem', color: '#8b949e' }}>
+                          in {hit.repo_name}
+                        </span>
+                      </div>
+                      {hit.line_number && (
+                        <span className="badge badge-secondary" style={{ fontSize: '0.75rem' }}>
+                          Line {hit.line_number}
+                        </span>
+                      )}
+                    </div>
+
+                    {hit.snippet && (
+                      <div style={{
+                        backgroundColor: '#0d1117',
+                        padding: '0.6rem',
+                        borderRadius: '4px',
+                        fontSize: '0.85rem',
+                        fontFamily: 'monospace',
+                        color: '#c9d1d9',
+                        overflowX: 'auto',
+                        whiteSpace: 'pre-wrap',
+                        border: '1px solid #30363d'
+                      }}>
+                        {hit.snippet}
+                      </div>
+                    )}
+                  </div>
+                ))}
+
+                {searchResults.hits.length === 0 && (
+                  <div style={{ textAlign: 'center', padding: '3rem', color: '#8b949e' }}>
+                    No results found matching your query.
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ---------------------------------------------------------------------- */}
+      {/* TAB: Discussions (Batch 13)                                             */}
+      {/* ---------------------------------------------------------------------- */}
+      {activeTab === 'discussions' && selectedRepo && (
+        <div>
+          {!selectedDiscussion ? (
+            <div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
+                <div>
+                  <h3 style={{ margin: 0, marginBottom: '0.25rem' }}>💬 Community Discussions</h3>
+                  <p style={{ margin: 0, fontSize: '0.85rem', color: '#8b949e' }}>
+                    Ask questions, share ideas, and collaborate with maintainers and contributors
+                  </p>
+                </div>
+                <button className="btn btn-primary" onClick={() => setShowNewDiscussionModal(true)}>
+                  + New Discussion
+                </button>
+              </div>
+
+              {/* Categories Bar */}
+              <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginBottom: '1.5rem' }}>
+                <button
+                  className={`btn ${selectedCategoryFilter === null ? 'btn-primary' : 'btn-secondary'}`}
+                  style={{ fontSize: '0.85rem' }}
+                  onClick={() => { setSelectedCategoryFilter(null); fetchDiscussions(); }}
+                >
+                  All Categories
+                </button>
+                {discussionCategories.map(cat => (
+                  <button
+                    key={cat.id}
+                    className={`btn ${selectedCategoryFilter === cat.id ? 'btn-primary' : 'btn-secondary'}`}
+                    style={{ fontSize: '0.85rem' }}
+                    onClick={() => { setSelectedCategoryFilter(cat.id); fetchDiscussions(); }}
+                  >
+                    {cat.emoji} {cat.name}
+                  </button>
+                ))}
+              </div>
+
+              {/* Discussions List */}
+              <div className="diff-container">
+                <div className="diff-header">
+                  <span>Discussions ({discussions.length})</span>
+                </div>
+                <div>
+                  {discussions.map(disc => (
+                    <div
+                      key={disc.id}
+                      onClick={() => { setSelectedDiscussion(disc); fetchDiscussionComments(disc.number); }}
+                      style={{
+                        padding: '1rem',
+                        borderBottom: '1px solid #30363d',
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        cursor: 'pointer',
+                        transition: 'background-color 0.2s',
+                      }}
+                      onMouseEnter={e => e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.03)'}
+                      onMouseLeave={e => e.currentTarget.style.backgroundColor = 'transparent'}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'flex-start', gap: '0.75rem' }}>
+                        <span style={{ fontSize: '1.25rem' }}>{disc.category.emoji}</span>
+                        <div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                            <strong style={{ fontSize: '1rem', color: '#58a6ff' }}>{disc.title}</strong>
+                            {disc.is_pinned && <span className="badge badge-secondary">📌 Pinned</span>}
+                            {disc.is_locked && <span className="badge badge-secondary">🔒 Locked</span>}
+                            {disc.answered_comment_id && <span className="badge badge-open">✓ Answered</span>}
+                          </div>
+                          <div style={{ fontSize: '0.8rem', color: '#8b949e', marginTop: '0.25rem' }}>
+                            #{disc.number} opened by <strong>{disc.author.display_name || disc.author.username}</strong> in {disc.category.name}
+                          </div>
+                        </div>
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: '#8b949e', fontSize: '0.85rem' }}>
+                        💬 {disc.comments_count}
+                      </div>
+                    </div>
+                  ))}
+
+                  {discussions.length === 0 && (
+                    <div style={{ textAlign: 'center', padding: '3rem', color: '#8b949e' }}>
+                      No discussions in this category yet. Start one!
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          ) : (
+            /* Selected Discussion Thread View */
+            <div>
+              <div style={{ marginBottom: '1.5rem' }}>
+                <button className="btn btn-secondary" style={{ marginBottom: '1rem' }} onClick={() => setSelectedDiscussion(null)}>
+                  ← Back to all discussions
+                </button>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                  <h2 style={{ margin: 0 }}>{selectedDiscussion.title}</h2>
+                  <span style={{ color: '#8b949e', fontSize: '1.2rem' }}>#{selectedDiscussion.number}</span>
+                  <span className="badge badge-secondary">{selectedDiscussion.category.emoji} {selectedDiscussion.category.name}</span>
+                  {selectedDiscussion.answered_comment_id && <span className="badge badge-open">✓ Answered</span>}
+                </div>
+                <div style={{ fontSize: '0.85rem', color: '#8b949e', marginTop: '0.5rem' }}>
+                  Author: <strong>{selectedDiscussion.author.display_name || selectedDiscussion.author.username}</strong> • Created: {new Date(selectedDiscussion.created_at_nanos / 1_000_000).toLocaleString()}
+                </div>
+              </div>
+
+              {/* Main Discussion Post */}
+              <div className="diff-container" style={{ marginBottom: '1.5rem' }}>
+                <div className="diff-header" style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span>{selectedDiscussion.author.username}</span>
+                  <span style={{ fontSize: '0.8rem', color: '#8b949e' }}>Discussion author</span>
+                </div>
+                <div style={{ padding: '1.25rem', whiteSpace: 'pre-wrap', lineHeight: '1.6' }}>
+                  {selectedDiscussion.body}
+                </div>
+              </div>
+
+              {/* Discussion Comments */}
+              <div style={{ marginBottom: '1.5rem' }}>
+                <h4 style={{ marginBottom: '1rem' }}>Replies ({discussionComments.length})</h4>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                  {discussionComments.map(comment => (
+                    <div
+                      key={comment.id}
+                      className="diff-container"
+                      style={{
+                        border: comment.is_answer ? '1px solid #238636' : '1px solid #30363d',
+                        backgroundColor: comment.is_answer ? 'rgba(35, 134, 54, 0.05)' : 'transparent',
+                      }}
+                    >
+                      <div className="diff-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <div>
+                          <strong>{comment.author.display_name || comment.author.username}</strong>
+                          <span style={{ fontSize: '0.8rem', color: '#8b949e', marginLeft: '0.5rem' }}>
+                            {new Date(comment.created_at_nanos / 1_000_000).toLocaleString()}
+                          </span>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                          {comment.is_answer && (
+                            <span className="badge badge-open" style={{ backgroundColor: '#238636' }}>
+                              ✓ Accepted Answer
+                            </span>
+                          )}
+                          {!comment.is_answer && selectedDiscussion.category.is_answerable && (
+                            <button
+                              className="btn btn-secondary"
+                              style={{ fontSize: '0.75rem', padding: '0.2rem 0.5rem' }}
+                              onClick={() => handleMarkAnswer(comment.id)}
+                            >
+                              ✓ Mark as Answer
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      <div style={{ padding: '1rem', whiteSpace: 'pre-wrap', lineHeight: '1.5' }}>
+                        {comment.body}
+                      </div>
+
+                      {/* Emoji Reactions Bar */}
+                      <div style={{ padding: '0.5rem 1rem', borderTop: '1px solid #30363d', display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                        {['👍', '👎', '❤️', '😄', '🚀', '👀'].map(emoji => {
+                          const reactObj = comment.reactions?.find(r => r.reaction === emoji);
+                          const count = reactObj ? reactObj.count : 0;
+                          return (
+                            <button
+                              key={emoji}
+                              className="btn btn-secondary"
+                              style={{
+                                fontSize: '0.8rem',
+                                padding: '0.15rem 0.45rem',
+                                backgroundColor: count > 0 ? 'rgba(56, 139, 253, 0.15)' : 'transparent',
+                                borderColor: count > 0 ? '#388bfd' : '#30363d',
+                              }}
+                              onClick={() => handleToggleReaction(comment.id, emoji)}
+                            >
+                              {emoji} {count > 0 && <span>{count}</span>}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+
+                  {discussionComments.length === 0 && (
+                    <div style={{ textAlign: 'center', padding: '2rem', color: '#8b949e' }}>
+                      No replies yet. Be the first to join the conversation!
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Reply Form */}
+              {!selectedDiscussion.is_locked ? (
+                <div className="diff-container" style={{ padding: '1rem' }}>
+                  <h4 style={{ margin: 0, marginBottom: '0.75rem' }}>Add a reply</h4>
+                  <form onSubmit={handleCreateDiscussionComment}>
+                    <textarea
+                      className="input-field"
+                      rows={4}
+                      placeholder="Write your response..."
+                      value={newDiscussionCommentBody}
+                      onChange={e => setNewDiscussionCommentBody(e.target.value)}
+                      style={{ width: '100%', marginBottom: '0.75rem' }}
+                      required
+                    />
+                    <button type="submit" className="btn btn-primary">
+                      Reply
+                    </button>
+                  </form>
+                </div>
+              ) : (
+                <div style={{ textAlign: 'center', padding: '1rem', color: '#8b949e', backgroundColor: 'rgba(255,255,255,0.02)', borderRadius: '6px' }}>
+                  🔒 This discussion has been locked by a maintainer.
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ---------------------------------------------------------------------- */}
+      {/* TAB: Discovery & Explore (Batch 13)                                     */}
+      {/* ---------------------------------------------------------------------- */}
+      {activeTab === 'discovery' && (
+        <div>
+          <div style={{ marginBottom: '1.5rem' }}>
+            <h3 style={{ margin: 0, marginBottom: '0.25rem' }}>🌐 Developer & Repository Discovery</h3>
+            <p style={{ margin: 0, fontSize: '0.85rem', color: '#8b949e' }}>
+              Explore trending topics, polyglot repositories, and manage your developer profile
+            </p>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: '1.5rem' }}>
+            {/* Left: Repositories & Topics */}
+            <div>
+              {/* Popular Topics Bar */}
+              <div style={{ marginBottom: '1.5rem' }}>
+                <h4 style={{ margin: 0, marginBottom: '0.75rem' }}>Popular Topics</h4>
+                <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                  <button
+                    className={`btn ${selectedTopicFilter === null ? 'btn-primary' : 'btn-secondary'}`}
+                    style={{ fontSize: '0.8rem', padding: '0.2rem 0.6rem' }}
+                    onClick={() => { setSelectedTopicFilter(null); fetchExplore(); }}
+                  >
+                    All
+                  </button>
+                  {popularTopics.map(pt => (
+                    <button
+                      key={pt.topic}
+                      className={`btn ${selectedTopicFilter === pt.topic ? 'btn-primary' : 'btn-secondary'}`}
+                      style={{ fontSize: '0.8rem', padding: '0.2rem 0.6rem' }}
+                      onClick={() => { setSelectedTopicFilter(pt.topic); fetchExplore(); }}
+                    >
+                      #{pt.topic} <span style={{ opacity: 0.7, marginLeft: '4px' }}>({pt.repository_count})</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Repositories Feed */}
+              <div>
+                <h4 style={{ margin: 0, marginBottom: '0.75rem' }}>
+                  {selectedTopicFilter ? `Repositories tagged #${selectedTopicFilter}` : 'Public Repositories'}
+                </h4>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                  {exploreRepos.map(card => (
+                    <div key={card.id} className="diff-container" style={{ padding: '1rem' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                        <div>
+                          <strong style={{ fontSize: '1.1rem', color: '#58a6ff' }}>
+                            {card.owner_name}/{card.name}
+                          </strong>
+                          <p style={{ margin: '0.35rem 0 0.5rem 0', fontSize: '0.85rem', color: '#c9d1d9' }}>
+                            {card.description || 'No description provided.'}
+                          </p>
+                        </div>
+                        {card.primary_language && (
+                          <span className="badge badge-secondary">
+                            ● {card.primary_language}
+                          </span>
+                        )}
+                      </div>
+
+                      {/* Topics */}
+                      {card.topics.length > 0 && (
+                        <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap', marginTop: '0.5rem' }}>
+                          {card.topics.map(t => (
+                            <span key={t} className="badge badge-secondary" style={{ fontSize: '0.75rem' }}>
+                              #{t}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+
+                  {exploreRepos.length === 0 && (
+                    <div style={{ textAlign: 'center', padding: '2rem', color: '#8b949e' }}>
+                      No repositories found for this topic.
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Current Repo Topic & Language Management */}
+              {selectedRepo && (
+                <div style={{ marginTop: '2rem' }}>
+                  <h4 style={{ margin: 0, marginBottom: '0.75rem' }}>
+                    Repository Topics & Polyglot Breakdown: {selectedRepo.name}
+                  </h4>
+                  <div className="diff-container" style={{ padding: '1rem' }}>
+                    {/* Topics Form */}
+                    <form onSubmit={handleSaveTopics} style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem' }}>
+                      <input
+                        type="text"
+                        className="input-field"
+                        placeholder="Add topic (e.g. rust, systems-programming)..."
+                        value={newTopicInput}
+                        onChange={e => setNewTopicInput(e.target.value)}
+                        style={{ flex: 1 }}
+                      />
+                      <button type="submit" className="btn btn-secondary">
+                        + Add Topic
+                      </button>
+                    </form>
+
+                    <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginBottom: '1rem' }}>
+                      {repoTopics.map(t => (
+                        <span key={t.id} className="badge badge-open">
+                          #{t.topic}
+                        </span>
+                      ))}
+                    </div>
+
+                    {/* Language Breakdown */}
+                    <div style={{ borderTop: '1px solid #30363d', paddingTop: '1rem' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
+                        <span style={{ fontSize: '0.9rem', fontWeight: 600 }}>Languages</span>
+                        <button className="btn btn-secondary" style={{ fontSize: '0.75rem' }} onClick={handleAnalyzeLanguages}>
+                          ⚡ Re-analyze Languages
+                        </button>
+                      </div>
+
+                      {repoLanguages.map(l => (
+                        <div key={l.id} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.85rem', padding: '0.25rem 0' }}>
+                          <span>● {l.language}</span>
+                          <span style={{ color: '#8b949e' }}>{l.percentage.toFixed(1)}% ({l.bytes} bytes)</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Right: Developer Profile Editor */}
+            <div>
+              <h4 style={{ margin: 0, marginBottom: '0.75rem' }}>Developer Profile</h4>
+              {currentUser ? (
+                <div className="diff-container" style={{ padding: '1rem' }}>
+                  <form onSubmit={handleSaveProfile} style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                    <div>
+                      <label style={{ display: 'block', fontSize: '0.8rem', color: '#8b949e', marginBottom: '0.2rem' }}>Bio</label>
+                      <input
+                        type="text"
+                        className="input-field"
+                        value={profileBio}
+                        onChange={e => setProfileBio(e.target.value)}
+                        placeholder="Systems engineer & VCS enthusiast"
+                        style={{ width: '100%' }}
+                      />
+                    </div>
+                    <div>
+                      <label style={{ display: 'block', fontSize: '0.8rem', color: '#8b949e', marginBottom: '0.2rem' }}>Company</label>
+                      <input
+                        type="text"
+                        className="input-field"
+                        value={profileCompany}
+                        onChange={e => setProfileCompany(e.target.value)}
+                        placeholder="Spine Labs"
+                        style={{ width: '100%' }}
+                      />
+                    </div>
+                    <div>
+                      <label style={{ display: 'block', fontSize: '0.8rem', color: '#8b949e', marginBottom: '0.2rem' }}>Location</label>
+                      <input
+                        type="text"
+                        className="input-field"
+                        value={profileLocation}
+                        onChange={e => setProfileLocation(e.target.value)}
+                        placeholder="San Francisco, CA"
+                        style={{ width: '100%' }}
+                      />
+                    </div>
+                    <div>
+                      <label style={{ display: 'block', fontSize: '0.8rem', color: '#8b949e', marginBottom: '0.2rem' }}>Website URL</label>
+                      <input
+                        type="text"
+                        className="input-field"
+                        value={profileWebsite}
+                        onChange={e => setProfileWebsite(e.target.value)}
+                        placeholder="https://spine.dev"
+                        style={{ width: '100%' }}
+                      />
+                    </div>
+                    <div>
+                      <label style={{ display: 'block', fontSize: '0.8rem', color: '#8b949e', marginBottom: '0.2rem' }}>Twitter / X</label>
+                      <input
+                        type="text"
+                        className="input-field"
+                        value={profileTwitter}
+                        onChange={e => setProfileTwitter(e.target.value)}
+                        placeholder="@spine_vcs"
+                        style={{ width: '100%' }}
+                      />
+                    </div>
+                    <div>
+                      <label style={{ display: 'block', fontSize: '0.8rem', color: '#8b949e', marginBottom: '0.2rem' }}>Profile README (Markdown)</label>
+                      <textarea
+                        className="input-field"
+                        rows={4}
+                        value={profileReadme}
+                        onChange={e => setProfileReadme(e.target.value)}
+                        placeholder="# Hello World..."
+                        style={{ width: '100%' }}
+                      />
+                    </div>
+                    <button type="submit" className="btn btn-primary" style={{ marginTop: '0.5rem' }}>
+                      Save Profile
+                    </button>
+                  </form>
+                </div>
+              ) : (
+                <div className="diff-container" style={{ padding: '1.5rem', textAlign: 'center', color: '#8b949e' }}>
+                  Log in to configure your public developer profile and pinned repositories.
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ---------------------------------------------------------------------- */}
+      {/* TAB: Security Center (Batch 13)                                         */}
+      {/* ---------------------------------------------------------------------- */}
+      {activeTab === 'security' && selectedRepo && (
+        <div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
+            <div>
+              <h3 style={{ margin: 0, marginBottom: '0.25rem' }}>🛡️ Security Center</h3>
+              <p style={{ margin: 0, fontSize: '0.85rem', color: '#8b949e' }}>
+                Safe credential scanning, dependency vulnerability alerts, and SPDX/CycloneDX SBOM compliance
+              </p>
+            </div>
+            <div style={{ display: 'flex', gap: '0.5rem' }}>
+              <button className="btn btn-primary" onClick={handleTriggerSecretScan} disabled={securityLoading}>
+                ⚡ Scan Secrets
+              </button>
+              <button className="btn btn-primary" onClick={handleTriggerDependencyAudit} disabled={securityLoading}>
+                📦 Audit Dependencies
+              </button>
+              <button className="btn btn-secondary" onClick={() => handleExportSbom('spdx')}>
+                📄 SPDX 2.3 SBOM
+              </button>
+              <button className="btn btn-secondary" onClick={() => handleExportSbom('cyclonedx')}>
+                📋 CycloneDX 1.5 SBOM
+              </button>
+            </div>
+          </div>
+
+          {/* Metrics Overview Cards */}
+          {securitySummary && (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: '1rem', marginBottom: '1.5rem' }}>
+              <div className="diff-container" style={{ padding: '1rem', textAlign: 'center' }}>
+                <div style={{ fontSize: '1.75rem', fontWeight: 700, color: securitySummary.critical_count > 0 ? '#f85149' : '#3fb950' }}>
+                  {securitySummary.critical_count}
+                </div>
+                <div style={{ fontSize: '0.8rem', color: '#8b949e', marginTop: '0.25rem' }}>Critical Alerts</div>
+              </div>
+              <div className="diff-container" style={{ padding: '1rem', textAlign: 'center' }}>
+                <div style={{ fontSize: '1.75rem', fontWeight: 700, color: securitySummary.high_count > 0 ? '#d29922' : '#3fb950' }}>
+                  {securitySummary.high_count}
+                </div>
+                <div style={{ fontSize: '0.8rem', color: '#8b949e', marginTop: '0.25rem' }}>High Alerts</div>
+              </div>
+              <div className="diff-container" style={{ padding: '1rem', textAlign: 'center' }}>
+                <div style={{ fontSize: '1.75rem', fontWeight: 700, color: securitySummary.open_secrets_count > 0 ? '#f85149' : '#3fb950' }}>
+                  {securitySummary.open_secrets_count}
+                </div>
+                <div style={{ fontSize: '0.8rem', color: '#8b949e', marginTop: '0.25rem' }}>Open Secrets</div>
+              </div>
+              <div className="diff-container" style={{ padding: '1rem', textAlign: 'center' }}>
+                <div style={{ fontSize: '1.75rem', fontWeight: 700, color: securitySummary.vulnerable_dependencies_count > 0 ? '#f85149' : '#3fb950' }}>
+                  {securitySummary.vulnerable_dependencies_count}
+                </div>
+                <div style={{ fontSize: '0.8rem', color: '#8b949e', marginTop: '0.25rem' }}>Vulnerable Crates</div>
+              </div>
+              <div className="diff-container" style={{ padding: '1rem', textAlign: 'center' }}>
+                <div style={{ fontSize: '1.75rem', fontWeight: 700, color: '#58a6ff' }}>
+                  {securitySummary.total_dependencies}
+                </div>
+                <div style={{ fontSize: '0.8rem', color: '#8b949e', marginTop: '0.25rem' }}>Total Dependencies</div>
+              </div>
+            </div>
+          )}
+
+          {/* Section 1: Secret Scan Findings */}
+          <div className="diff-container" style={{ marginBottom: '1.5rem' }}>
+            <div className="diff-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span>Secret Scan Findings ({secretFindings.length})</span>
+              <div style={{ display: 'flex', gap: '0.5rem' }}>
+                {['ALL', 'OPEN', 'RESOLVED'].map(st => (
+                  <button
+                    key={st}
+                    className={`btn ${secretFilter === st ? 'btn-primary' : 'btn-secondary'}`}
+                    style={{ fontSize: '0.75rem', padding: '0.15rem 0.5rem' }}
+                    onClick={() => { setSecretFilter(st); fetchSecurityData(); }}
+                  >
+                    {st}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div>
+              {secretFindings.map(finding => (
+                <div
+                  key={finding.id}
+                  style={{
+                    padding: '1rem',
+                    borderBottom: '1px solid #30363d',
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                  }}
+                >
+                  <div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                      <span className={`badge ${finding.severity === 'CRITICAL' ? 'badge-closed' : 'badge-open'}`}>
+                        {finding.severity}
+                      </span>
+                      <strong>{finding.rule_name}</strong>
+                      <span className="badge badge-secondary">{finding.rule_id}</span>
+                      <span style={{ fontSize: '0.85rem', color: '#8b949e' }}>
+                        {finding.file_path}:{finding.line_number}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: '0.85rem', fontFamily: 'monospace', color: '#c9d1d9', marginTop: '0.4rem' }}>
+                      Safe Fingerprint: <code>{finding.safe_fingerprint}</code>
+                    </div>
+                  </div>
+
+                  <div>
+                    {finding.status === 'OPEN' ? (
+                      <div style={{ display: 'flex', gap: '0.5rem' }}>
+                        <button
+                          className="btn btn-primary"
+                          style={{ fontSize: '0.75rem', backgroundColor: '#238636' }}
+                          onClick={() => handleRemediateSecret(finding.id, 'RESOLVED')}
+                        >
+                          ✓ Resolve
+                        </button>
+                        <button
+                          className="btn btn-secondary"
+                          style={{ fontSize: '0.75rem' }}
+                          onClick={() => handleRemediateSecret(finding.id, 'FALSE_POSITIVE')}
+                        >
+                          False Positive
+                        </button>
+                      </div>
+                    ) : (
+                      <span className="badge badge-secondary">{finding.status}</span>
+                    )}
+                  </div>
+                </div>
+              ))}
+
+              {secretFindings.length === 0 && (
+                <div style={{ textAlign: 'center', padding: '2rem', color: '#8b949e' }}>
+                  No secrets detected. Repository clean.
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Section 2: Dependency Vulnerabilities */}
+          <div className="diff-container" style={{ marginBottom: '1.5rem' }}>
+            <div className="diff-header">
+              <span>Vulnerability Intelligence Alerts ({vulnerabilities.length})</span>
+            </div>
+            <div>
+              {vulnerabilities.map(vuln => (
+                <div
+                  key={vuln.id}
+                  style={{
+                    padding: '1rem',
+                    borderBottom: '1px solid #30363d',
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                  }}
+                >
+                  <div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                      <span className={`badge ${vuln.severity === 'CRITICAL' ? 'badge-closed' : 'badge-open'}`}>
+                        {vuln.severity}
+                      </span>
+                      <strong>{vuln.package_name}</strong>
+                      <span className="badge badge-secondary">v{vuln.affected_version}</span>
+                      <span style={{ fontSize: '0.85rem', color: '#58a6ff' }}>{vuln.advisory_id}</span>
+                    </div>
+                    {vuln.patched_version && (
+                      <div style={{ fontSize: '0.85rem', color: '#3fb950', marginTop: '0.25rem' }}>
+                        Recommended upgrade: <strong>v{vuln.patched_version}</strong>
+                      </div>
+                    )}
+                  </div>
+
+                  <div>
+                    {vuln.status === 'OPEN' ? (
+                      <button
+                        className="btn btn-secondary"
+                        style={{ fontSize: '0.75rem' }}
+                        onClick={() => handleRemediateVuln(vuln.id, 'FIXED')}
+                      >
+                        Mark Fixed
+                      </button>
+                    ) : (
+                      <span className="badge badge-secondary">{vuln.status}</span>
+                    )}
+                  </div>
+                </div>
+              ))}
+
+              {vulnerabilities.length === 0 && (
+                <div style={{ textAlign: 'center', padding: '2rem', color: '#8b949e' }}>
+                  No dependency vulnerabilities found.
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Section 3: Dependency Inventory */}
+          <div className="diff-container">
+            <div className="diff-header">
+              <span>Cargo Dependency Inventory ({dependencies.length})</span>
+            </div>
+            <div style={{ padding: '0.75rem' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '0.5rem' }}>
+                {dependencies.map(dep => (
+                  <div key={dep.id} style={{ padding: '0.5rem', backgroundColor: '#0d1117', borderRadius: '4px', border: '1px solid #30363d', fontSize: '0.85rem' }}>
+                    <strong>{dep.package_name}</strong> <span style={{ color: '#8b949e' }}>v{dep.version}</span>
+                  </div>
+                ))}
+              </div>
+              {dependencies.length === 0 && (
+                <div style={{ textAlign: 'center', padding: '1rem', color: '#8b949e' }}>
+                  No dependencies indexed. Click &ldquo;Audit Dependencies&rdquo; to scan Cargo.lock.
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ---------------------------------------------------------------------- */}
+      {/* MODALS: New Discussion & SBOM Preview                                  */}
+      {/* ---------------------------------------------------------------------- */}
+      {showNewDiscussionModal && (
+        <div className="modal-backdrop" onClick={() => setShowNewDiscussionModal(false)}>
+          <div className="modal-box" style={{ width: '600px' }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+              <h3 style={{ margin: 0 }}>Start a new discussion</h3>
+              <button className="btn btn-secondary" onClick={() => setShowNewDiscussionModal(false)}>✕</button>
+            </div>
+            <form onSubmit={handleCreateDiscussion}>
+              <div style={{ marginBottom: '1rem' }}>
+                <label style={{ display: 'block', fontSize: '0.85rem', marginBottom: '0.25rem' }}>Category</label>
+                <select
+                  className="input-field"
+                  value={newDiscussionCategory}
+                  onChange={e => setNewDiscussionCategory(e.target.value)}
+                  style={{ width: '100%' }}
+                >
+                  {discussionCategories.map(cat => (
+                    <option key={cat.id} value={cat.id}>
+                      {cat.emoji} {cat.name} — {cat.description}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div style={{ marginBottom: '1rem' }}>
+                <label style={{ display: 'block', fontSize: '0.85rem', marginBottom: '0.25rem' }}>Title</label>
+                <input
+                  type="text"
+                  className="input-field"
+                  placeholder="Discussion title..."
+                  value={newDiscussionTitle}
+                  onChange={e => setNewDiscussionTitle(e.target.value)}
+                  style={{ width: '100%' }}
+                  required
+                />
+              </div>
+              <div style={{ marginBottom: '1rem' }}>
+                <label style={{ display: 'block', fontSize: '0.85rem', marginBottom: '0.25rem' }}>Body</label>
+                <textarea
+                  className="input-field"
+                  rows={6}
+                  placeholder="Share details, code snippets, or ideas..."
+                  value={newDiscussionBody}
+                  onChange={e => setNewDiscussionBody(e.target.value)}
+                  style={{ width: '100%' }}
+                  required
+                />
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5rem' }}>
+                <button type="button" className="btn btn-secondary" onClick={() => setShowNewDiscussionModal(false)}>
+                  Cancel
+                </button>
+                <button type="submit" className="btn btn-primary">
+                  Create Discussion
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {showSbomModal && (
+        <div className="modal-backdrop" onClick={() => setShowSbomModal(false)}>
+          <div className="modal-box" style={{ width: '750px', maxHeight: '85vh', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+              <h3 style={{ margin: 0 }}>{sbomModalTitle}</h3>
+              <button className="btn btn-secondary" onClick={() => setShowSbomModal(false)}>✕</button>
+            </div>
+            <pre style={{
+              flex: 1,
+              backgroundColor: '#0d1117',
+              padding: '1rem',
+              borderRadius: '6px',
+              border: '1px solid #30363d',
+              overflowY: 'auto',
+              fontSize: '0.8rem',
+              color: '#c9d1d9',
+              fontFamily: 'monospace',
+              maxHeight: '55vh',
+            }}>
+              {sbomModalContent}
+            </pre>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5rem', marginTop: '1rem' }}>
+              <button
+                className="btn btn-secondary"
+                onClick={() => {
+                  navigator.clipboard.writeText(sbomModalContent);
+                  alert('SBOM copied to clipboard!');
+                }}
+              >
+                📋 Copy JSON
+              </button>
+              <button className="btn btn-primary" onClick={() => setShowSbomModal(false)}>
+                Close
+              </button>
             </div>
           </div>
         </div>

@@ -1236,3 +1236,277 @@ pub struct WorkflowCheckResult {
     pub run_id: String,
     pub updated_at_nanos: i64,
 }
+
+// -----------------------------------------------------------------------------
+// Search Models (Batch 13)
+// -----------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SearchResultType {
+    Repository,
+    Code,
+    Issue,
+    PullRequest,
+    Discussion,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SearchHit {
+    pub result_type: SearchResultType,
+    pub repo_id: String,
+    pub repo_name: String,
+    pub title: String,
+    pub snippet: String,
+    pub file_path: Option<String>,
+    pub line_number: Option<usize>,
+    pub url: String,
+    pub score: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SearchResponse {
+    pub query: String,
+    pub total: usize,
+    pub hits: Vec<SearchHit>,
+}
+
+// -----------------------------------------------------------------------------
+// Discussions Models (Batch 13)
+// -----------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscussionCategory {
+    pub id: String,
+    pub repo_id: String,
+    pub name: String,
+    pub slug: String,
+    pub description: Option<String>,
+    pub emoji: String,
+    pub is_answerable: bool,
+    pub created_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Discussion {
+    pub id: String,
+    pub repo_id: String,
+    pub category_id: String,
+    pub number: i32,
+    pub title: String,
+    pub body: String,
+    pub author_id: String,
+    pub is_pinned: bool,
+    pub is_locked: bool,
+    pub answered_comment_id: Option<String>,
+    pub comments_count: i32,
+    pub created_at_nanos: i64,
+    pub updated_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscussionDto {
+    pub id: String,
+    pub repo_id: String,
+    pub category: DiscussionCategory,
+    pub number: i32,
+    pub title: String,
+    pub body: String,
+    pub author: UserDto,
+    pub is_pinned: bool,
+    pub is_locked: bool,
+    pub answered_comment_id: Option<String>,
+    pub comments_count: i32,
+    pub created_at_nanos: i64,
+    pub updated_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscussionComment {
+    pub id: String,
+    pub discussion_id: String,
+    pub parent_comment_id: Option<String>,
+    pub author_id: String,
+    pub body: String,
+    pub is_answer: bool,
+    pub created_at_nanos: i64,
+    pub updated_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscussionCommentDto {
+    pub id: String,
+    pub discussion_id: String,
+    pub parent_comment_id: Option<String>,
+    pub author: UserDto,
+    pub body: String,
+    pub is_answer: bool,
+    pub created_at_nanos: i64,
+    pub updated_at_nanos: i64,
+    pub reactions: Vec<DiscussionReactionDto>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscussionReaction {
+    pub id: String,
+    pub subject_type: String, // "DISCUSSION" or "COMMENT"
+    pub subject_id: String,
+    pub user_id: String,
+    pub reaction: String, // "+1", "-1", "heart", "smile", "rocket", "eyes"
+    pub created_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscussionReactionDto {
+    pub reaction: String,
+    pub count: usize,
+    pub user_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscussionSubscription {
+    pub user_id: String,
+    pub discussion_id: String,
+    pub state: String, // "SUBSCRIBED", "IGNORED"
+    pub updated_at_nanos: i64,
+}
+
+// -----------------------------------------------------------------------------
+// Discovery, Topics, Languages, Profiles (Batch 13)
+// -----------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtendedUserProfile {
+    pub user_id: String,
+    pub bio: Option<String>,
+    pub company: Option<String>,
+    pub location: Option<String>,
+    pub website_url: Option<String>,
+    pub twitter_username: Option<String>,
+    pub profile_readme: Option<String>,
+    pub pinned_repo_ids: Vec<String>,
+    pub updated_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryTopic {
+    pub id: String,
+    pub repo_id: String,
+    pub topic: String,
+    pub created_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RepositoryLanguage {
+    pub id: String,
+    pub repo_id: String,
+    pub language: String,
+    pub bytes: i64,
+    pub percentage: f64,
+    pub updated_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PopularTopicDto {
+    pub topic: String,
+    pub repository_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RepositoryDiscoveryCard {
+    pub id: String,
+    pub owner_name: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub is_private: bool,
+    pub topics: Vec<String>,
+    pub primary_language: Option<String>,
+    pub languages: Vec<RepositoryLanguage>,
+    pub stars_count: usize,
+    pub forks_count: usize,
+    pub updated_at_nanos: i64,
+}
+
+// -----------------------------------------------------------------------------
+// Security Center Models (Batch 13)
+// -----------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityScan {
+    pub id: String,
+    pub repo_id: String,
+    pub commit_oid: String,
+    pub scan_type: String, // "SECRET_SCAN", "DEPENDENCY_AUDIT"
+    pub status: String,    // "IN_PROGRESS", "COMPLETED", "FAILED"
+    pub findings_count: i32,
+    pub started_at_nanos: i64,
+    pub completed_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretScanFinding {
+    pub id: String,
+    pub repo_id: String,
+    pub commit_oid: String,
+    pub file_path: String,
+    pub line_number: i32,
+    pub rule_id: String,
+    pub rule_name: String,
+    pub severity: String, // "CRITICAL", "HIGH", "MEDIUM", "LOW"
+    pub safe_fingerprint: String, // Truncated safe hash (NEVER plaintext secret!)
+    pub status: String,   // "OPEN", "RESOLVED", "FALSE_POSITIVE"
+    pub created_at_nanos: i64,
+    pub resolved_at_nanos: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependencyInventory {
+    pub id: String,
+    pub repo_id: String,
+    pub ecosystem: String, // "CARGO"
+    pub package_name: String,
+    pub version: String,
+    pub is_direct: bool,
+    pub created_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityAdvisory {
+    pub id: String,
+    pub advisory_id: String, // e.g., "RUSTSEC-2023-0001"
+    pub ecosystem: String,
+    pub package_name: String,
+    pub vulnerable_version_range: String,
+    pub patched_version: Option<String>,
+    pub severity: String,
+    pub title: String,
+    pub description: String,
+    pub published_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependencyVulnerability {
+    pub id: String,
+    pub repo_id: String,
+    pub dependency_id: String,
+    pub advisory_id: String,
+    pub package_name: String,
+    pub affected_version: String,
+    pub severity: String,
+    pub patched_version: Option<String>,
+    pub status: String, // "OPEN", "FIXED", "DISMISSED"
+    pub created_at_nanos: i64,
+    pub resolved_at_nanos: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SecuritySummaryDto {
+    pub total_secrets_found: usize,
+    pub open_secrets_count: usize,
+    pub total_dependencies: usize,
+    pub vulnerable_dependencies_count: usize,
+    pub critical_count: usize,
+    pub high_count: usize,
+    pub medium_count: usize,
+    pub low_count: usize,
+}
+

@@ -97,6 +97,27 @@ struct MemoryState {
 
     workflow_secrets: HashMap<String, WorkflowSecret>,
     workflow_check_results: HashMap<(String, String, String), WorkflowCheckResult>,
+
+    // Discussions (Batch 13)
+    discussion_categories: HashMap<String, DiscussionCategory>,
+    discussions: HashMap<String, Discussion>,
+    discussion_by_repo_num: HashMap<(String, i32), String>,
+    next_discussion_number: HashMap<String, i32>,
+    discussion_comments: HashMap<String, DiscussionComment>,
+    discussion_reactions: Vec<DiscussionReaction>,
+    discussion_subscriptions: HashMap<(String, String), DiscussionSubscription>,
+
+    // Topics, Languages, Profiles (Batch 13)
+    repository_topics: HashMap<String, Vec<RepositoryTopic>>,
+    repository_languages: HashMap<String, Vec<RepositoryLanguage>>,
+    user_profiles: HashMap<String, ExtendedUserProfile>,
+
+    // Security Center (Batch 13)
+    security_scans: HashMap<String, SecurityScan>,
+    secret_scan_findings: HashMap<String, SecretScanFinding>,
+    dependency_inventories: HashMap<String, DependencyInventory>,
+    security_advisories: HashMap<String, SecurityAdvisory>,
+    dependency_vulnerabilities: HashMap<String, DependencyVulnerability>,
 }
 
 pub struct InMemoryDatabase {
@@ -2048,5 +2069,365 @@ impl Database for InMemoryDatabase {
             .collect();
         list.sort_by_key(|c| c.check_name.clone());
         Ok(list)
+    }
+
+    // -------------------------------------------------------------------------
+    // Discussions (Batch 13)
+    // -------------------------------------------------------------------------
+    async fn create_discussion_category(&self, cat: DiscussionCategory) -> Result<DiscussionCategory, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.discussion_categories.insert(cat.id.clone(), cat.clone());
+        Ok(cat)
+    }
+
+    async fn get_discussion_category(&self, id: &str) -> Result<Option<DiscussionCategory>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(state.discussion_categories.get(id).cloned())
+    }
+
+    async fn list_discussion_categories(&self, repo_id: &str) -> Result<Vec<DiscussionCategory>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut list: Vec<DiscussionCategory> = state
+            .discussion_categories
+            .values()
+            .filter(|c| c.repo_id == repo_id)
+            .cloned()
+            .collect();
+        list.sort_by_key(|c| c.created_at_nanos);
+        Ok(list)
+    }
+
+    async fn create_discussion(&self, mut disc: Discussion) -> Result<Discussion, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let next_num = state.next_discussion_number.entry(disc.repo_id.clone()).or_insert(1);
+        disc.number = *next_num;
+        *next_num += 1;
+
+        state.discussion_by_repo_num.insert((disc.repo_id.clone(), disc.number), disc.id.clone());
+        state.discussions.insert(disc.id.clone(), disc.clone());
+        Ok(disc)
+    }
+
+    async fn get_discussion(&self, id: &str) -> Result<Option<Discussion>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(state.discussions.get(id).cloned())
+    }
+
+    async fn get_discussion_by_number(&self, repo_id: &str, number: i32) -> Result<Option<Discussion>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(id) = state.discussion_by_repo_num.get(&(repo_id.to_string(), number)) {
+            Ok(state.discussions.get(id).cloned())
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn list_discussions(&self, repo_id: &str, category_id: Option<&str>) -> Result<Vec<Discussion>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut list: Vec<Discussion> = state
+            .discussions
+            .values()
+            .filter(|d| d.repo_id == repo_id && category_id.map_or(true, |c| d.category_id == c))
+            .cloned()
+            .collect();
+        list.sort_by(|a, b| b.is_pinned.cmp(&a.is_pinned).then_with(|| b.created_at_nanos.cmp(&a.created_at_nanos)));
+        Ok(list)
+    }
+
+    async fn update_discussion(&self, disc: Discussion) -> Result<Discussion, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.discussions.insert(disc.id.clone(), disc.clone());
+        Ok(disc)
+    }
+
+    async fn delete_discussion(&self, id: &str) -> Result<(), ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(disc) = state.discussions.remove(id) {
+            state.discussion_by_repo_num.remove(&(disc.repo_id, disc.number));
+        }
+        Ok(())
+    }
+
+    async fn create_discussion_comment(&self, comment: DiscussionComment) -> Result<DiscussionComment, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(d) = state.discussions.get_mut(&comment.discussion_id) {
+            d.comments_count += 1;
+        }
+        state.discussion_comments.insert(comment.id.clone(), comment.clone());
+        Ok(comment)
+    }
+
+    async fn get_discussion_comment(&self, id: &str) -> Result<Option<DiscussionComment>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(state.discussion_comments.get(id).cloned())
+    }
+
+    async fn list_discussion_comments(&self, discussion_id: &str) -> Result<Vec<DiscussionComment>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut list: Vec<DiscussionComment> = state
+            .discussion_comments
+            .values()
+            .filter(|c| c.discussion_id == discussion_id)
+            .cloned()
+            .collect();
+        list.sort_by_key(|c| c.created_at_nanos);
+        Ok(list)
+    }
+
+    async fn update_discussion_comment(&self, comment: DiscussionComment) -> Result<DiscussionComment, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.discussion_comments.insert(comment.id.clone(), comment.clone());
+        Ok(comment)
+    }
+
+    async fn delete_discussion_comment(&self, id: &str) -> Result<(), ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(comment) = state.discussion_comments.remove(id) {
+            if let Some(d) = state.discussions.get_mut(&comment.discussion_id) {
+                if d.comments_count > 0 {
+                    d.comments_count -= 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn add_discussion_reaction(&self, reaction: DiscussionReaction) -> Result<DiscussionReaction, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        // Check for existing reaction
+        if !state.discussion_reactions.iter().any(|r| {
+            r.subject_type == reaction.subject_type
+                && r.subject_id == reaction.subject_id
+                && r.user_id == reaction.user_id
+                && r.reaction == reaction.reaction
+        }) {
+            state.discussion_reactions.push(reaction.clone());
+        }
+        Ok(reaction)
+    }
+
+    async fn remove_discussion_reaction(&self, subject_type: &str, subject_id: &str, user_id: &str, reaction: &str) -> Result<(), ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.discussion_reactions.retain(|r| {
+            !(r.subject_type == subject_type
+                && r.subject_id == subject_id
+                && r.user_id == user_id
+                && r.reaction == reaction)
+        });
+        Ok(())
+    }
+
+    async fn list_discussion_reactions(&self, subject_type: &str, subject_id: &str) -> Result<Vec<DiscussionReaction>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let list: Vec<DiscussionReaction> = state
+            .discussion_reactions
+            .iter()
+            .filter(|r| r.subject_type == subject_type && r.subject_id == subject_id)
+            .cloned()
+            .collect();
+        Ok(list)
+    }
+
+    async fn set_discussion_subscription(&self, sub: DiscussionSubscription) -> Result<DiscussionSubscription, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.discussion_subscriptions.insert((sub.user_id.clone(), sub.discussion_id.clone()), sub.clone());
+        Ok(sub)
+    }
+
+    async fn get_discussion_subscription(&self, user_id: &str, discussion_id: &str) -> Result<Option<DiscussionSubscription>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(state.discussion_subscriptions.get(&(user_id.to_string(), discussion_id.to_string())).cloned())
+    }
+
+    // -------------------------------------------------------------------------
+    // Discovery, Topics, Languages, Profiles (Batch 13)
+    // -------------------------------------------------------------------------
+    async fn set_repository_topics(&self, repo_id: &str, topics: &[String]) -> Result<Vec<RepositoryTopic>, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let list: Vec<RepositoryTopic> = topics
+            .iter()
+            .map(|t| RepositoryTopic {
+                id: uuid::Uuid::new_v4().to_string(),
+                repo_id: repo_id.to_string(),
+                topic: t.to_lowercase(),
+                created_at_nanos: now,
+            })
+            .collect();
+        state.repository_topics.insert(repo_id.to_string(), list.clone());
+        Ok(list)
+    }
+
+    async fn list_repository_topics(&self, repo_id: &str) -> Result<Vec<RepositoryTopic>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(state.repository_topics.get(repo_id).cloned().unwrap_or_default())
+    }
+
+    async fn list_popular_topics(&self, limit: usize) -> Result<Vec<PopularTopicDto>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for list in state.repository_topics.values() {
+            for item in list {
+                *counts.entry(item.topic.clone()).or_insert(0) += 1;
+            }
+        }
+        let mut sorted: Vec<PopularTopicDto> = counts
+            .into_iter()
+            .map(|(topic, count)| PopularTopicDto { topic, repository_count: count })
+            .collect();
+        sorted.sort_by(|a, b| b.repository_count.cmp(&a.repository_count));
+        sorted.truncate(limit);
+        Ok(sorted)
+    }
+
+    async fn list_repositories_by_topic(&self, topic: &str) -> Result<Vec<ForgeRepository>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let topic_lower = topic.to_lowercase();
+        let mut matching_repo_ids = Vec::new();
+        for (repo_id, list) in &state.repository_topics {
+            if list.iter().any(|t| t.topic == topic_lower) {
+                matching_repo_ids.push(repo_id.clone());
+            }
+        }
+
+        let repos: Vec<ForgeRepository> = matching_repo_ids
+            .iter()
+            .filter_map(|id| state.repositories.get(id).cloned())
+            .collect();
+        Ok(repos)
+    }
+
+    async fn set_repository_languages(&self, repo_id: &str, langs: &[RepositoryLanguage]) -> Result<Vec<RepositoryLanguage>, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.repository_languages.insert(repo_id.to_string(), langs.to_vec());
+        Ok(langs.to_vec())
+    }
+
+    async fn list_repository_languages(&self, repo_id: &str) -> Result<Vec<RepositoryLanguage>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(state.repository_languages.get(repo_id).cloned().unwrap_or_default())
+    }
+
+    async fn get_extended_user_profile(&self, user_id: &str) -> Result<Option<ExtendedUserProfile>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(state.user_profiles.get(user_id).cloned())
+    }
+
+    async fn upsert_extended_user_profile(&self, profile: ExtendedUserProfile) -> Result<ExtendedUserProfile, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.user_profiles.insert(profile.user_id.clone(), profile.clone());
+        Ok(profile)
+    }
+
+    // -------------------------------------------------------------------------
+    // Security Center (Batch 13)
+    // -------------------------------------------------------------------------
+    async fn create_security_scan(&self, scan: SecurityScan) -> Result<SecurityScan, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.security_scans.insert(scan.id.clone(), scan.clone());
+        Ok(scan)
+    }
+
+    async fn list_security_scans(&self, repo_id: &str) -> Result<Vec<SecurityScan>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut list: Vec<SecurityScan> = state
+            .security_scans
+            .values()
+            .filter(|s| s.repo_id == repo_id)
+            .cloned()
+            .collect();
+        list.sort_by(|a, b| b.started_at_nanos.cmp(&a.started_at_nanos));
+        Ok(list)
+    }
+
+    async fn create_secret_scan_finding(&self, finding: SecretScanFinding) -> Result<SecretScanFinding, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.secret_scan_findings.insert(finding.id.clone(), finding.clone());
+        Ok(finding)
+    }
+
+    async fn list_secret_scan_findings(&self, repo_id: &str, status_filter: Option<&str>) -> Result<Vec<SecretScanFinding>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut list: Vec<SecretScanFinding> = state
+            .secret_scan_findings
+            .values()
+            .filter(|f| f.repo_id == repo_id && status_filter.map_or(true, |s| f.status == s))
+            .cloned()
+            .collect();
+        list.sort_by(|a, b| b.created_at_nanos.cmp(&a.created_at_nanos));
+        Ok(list)
+    }
+
+    async fn update_secret_scan_finding_status(&self, id: &str, status: &str, now_nanos: i64) -> Result<(), ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(f) = state.secret_scan_findings.get_mut(id) {
+            f.status = status.to_string();
+            f.resolved_at_nanos = Some(now_nanos);
+        }
+        Ok(())
+    }
+
+    async fn upsert_dependency_inventory(&self, items: &[DependencyInventory]) -> Result<(), ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        for item in items {
+            state.dependency_inventories.insert(item.id.clone(), item.clone());
+        }
+        Ok(())
+    }
+
+    async fn list_dependency_inventory(&self, repo_id: &str) -> Result<Vec<DependencyInventory>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut list: Vec<DependencyInventory> = state
+            .dependency_inventories
+            .values()
+            .filter(|d| d.repo_id == repo_id)
+            .cloned()
+            .collect();
+        list.sort_by_key(|d| d.package_name.clone());
+        Ok(list)
+    }
+
+    async fn upsert_security_advisory(&self, advisory: SecurityAdvisory) -> Result<SecurityAdvisory, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.security_advisories.insert(advisory.advisory_id.clone(), advisory.clone());
+        Ok(advisory)
+    }
+
+    async fn list_security_advisories(&self, ecosystem: &str) -> Result<Vec<SecurityAdvisory>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let list: Vec<SecurityAdvisory> = state
+            .security_advisories
+            .values()
+            .filter(|a| a.ecosystem == ecosystem)
+            .cloned()
+            .collect();
+        Ok(list)
+    }
+
+    async fn create_dependency_vulnerability(&self, vuln: DependencyVulnerability) -> Result<DependencyVulnerability, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.dependency_vulnerabilities.insert(vuln.id.clone(), vuln.clone());
+        Ok(vuln)
+    }
+
+    async fn list_dependency_vulnerabilities(&self, repo_id: &str, status_filter: Option<&str>) -> Result<Vec<DependencyVulnerability>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut list: Vec<DependencyVulnerability> = state
+            .dependency_vulnerabilities
+            .values()
+            .filter(|v| v.repo_id == repo_id && status_filter.map_or(true, |s| v.status == s))
+            .cloned()
+            .collect();
+        list.sort_by(|a, b| b.created_at_nanos.cmp(&a.created_at_nanos));
+        Ok(list)
+    }
+
+    async fn update_dependency_vulnerability_status(&self, id: &str, status: &str, now_nanos: i64) -> Result<(), ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(v) = state.dependency_vulnerabilities.get_mut(id) {
+            v.status = status.to_string();
+            v.resolved_at_nanos = Some(now_nanos);
+        }
+        Ok(())
     }
 }

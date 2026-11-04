@@ -38,6 +38,69 @@ pub struct AppState {
     pub scheduler: Arc<crate::workflow::WorkflowScheduler>,
     pub runners: Arc<crate::runner::RunnerService>,
     pub runner_executor: Arc<crate::runner::IsolatedRunnerExecutor>,
+    pub search: Arc<crate::search::SearchService>,
+    pub discussions: Arc<crate::discussions::DiscussionService>,
+    pub discovery: Arc<crate::discovery::DiscoveryService>,
+    pub security: Arc<crate::security::SecurityService>,
+}
+
+impl AppState {
+    pub fn new_with_defaults(
+        db: Arc<dyn Database>,
+        storage_root: &std::path::Path,
+        coordinator: Option<CoordinatorClient>,
+    ) -> Result<Self, anyhow::Error> {
+        let permissions = Arc::new(PermissionService::new(Arc::clone(&db)));
+        let repositories = Arc::new(RepositoryService::new(Arc::clone(&db), Arc::clone(&permissions)));
+        let vcs = Arc::new(NativeVcsService::new(storage_root));
+        let rate_limiter = Arc::new(RateLimiter::new());
+        let mail = Arc::new(crate::auth::DevMailCatcher::new());
+
+        let artifact_store_path = storage_root.join("artifacts");
+        let artifact_store = Arc::new(spine_artifact::LocalArtifactStore::new(artifact_store_path)?);
+        let artifacts = Arc::new(ArtifactService::new(Arc::clone(&db), artifact_store));
+        let releases = Arc::new(ReleaseService::new(Arc::clone(&db), Arc::clone(&artifacts)));
+        let packages = Arc::new(PackageService::new(Arc::clone(&db), Arc::clone(&artifacts)));
+        let cargo = Arc::new(CargoRegistryAdapter::new(Arc::clone(&packages)));
+
+        let ssrf = crate::webhook::SsrfValidator::new(true);
+        let webhooks = Arc::new(crate::webhook::WebhookService::new(Arc::clone(&db), ssrf.clone()));
+        let webhook_worker = Arc::new(crate::webhook::WebhookOutboxWorker::new(Arc::clone(&db), ssrf));
+        let scheduler = Arc::new(crate::workflow::WorkflowScheduler::new(Arc::clone(&db), Some((*webhooks).clone())));
+        let workflows = Arc::new(crate::workflow::WorkflowService::new(Arc::clone(&db), Some((*webhooks).clone())));
+        let runners = Arc::new(crate::runner::RunnerService::new(Arc::clone(&db), (*scheduler).clone()));
+        let runner_workspace_root = storage_root.join("runner_workspaces");
+        let runner_executor = Arc::new(crate::runner::IsolatedRunnerExecutor::new(runner_workspace_root));
+
+        let search = Arc::new(crate::search::SearchService::new(Arc::clone(&db), Arc::clone(&permissions), storage_root.to_path_buf()));
+        let discussions = Arc::new(crate::discussions::DiscussionService::new(Arc::clone(&db), Arc::clone(&permissions)));
+        let discovery = Arc::new(crate::discovery::DiscoveryService::new(Arc::clone(&db), Arc::clone(&permissions), storage_root.to_path_buf()));
+        let security = Arc::new(crate::security::SecurityService::new(Arc::clone(&db), Arc::clone(&permissions), storage_root.to_path_buf()));
+
+        Ok(Self {
+            db,
+            permissions,
+            repositories,
+            vcs,
+            rate_limiter,
+            mail,
+            coordinator,
+            artifacts,
+            releases,
+            packages,
+            cargo,
+            webhooks,
+            webhook_worker,
+            workflows,
+            scheduler,
+            runners,
+            runner_executor,
+            search,
+            discussions,
+            discovery,
+            security,
+        })
+    }
 }
 
 pub async fn auth_middleware(

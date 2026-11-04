@@ -109,6 +109,11 @@ async fn main() -> anyhow::Result<()> {
     let runner_workspace_root = storage_root_canonical.join("runner_workspaces");
     let runner_executor = Arc::new(IsolatedRunnerExecutor::new(runner_workspace_root));
 
+    let search = Arc::new(spine_api::SearchService::new(Arc::clone(&db), Arc::clone(&permissions), storage_root_canonical.clone()));
+    let discussions = Arc::new(spine_api::DiscussionService::new(Arc::clone(&db), Arc::clone(&permissions)));
+    let discovery = Arc::new(spine_api::DiscoveryService::new(Arc::clone(&db), Arc::clone(&permissions), storage_root_canonical.clone()));
+    let security = Arc::new(spine_api::SecurityService::new(Arc::clone(&db), Arc::clone(&permissions), storage_root_canonical.clone()));
+
     let state = AppState {
         db: Arc::clone(&db),
         permissions: Arc::clone(&permissions),
@@ -127,6 +132,10 @@ async fn main() -> anyhow::Result<()> {
         scheduler,
         runners,
         runner_executor,
+        search,
+        discussions,
+        discovery,
+        security,
     };
 
     // 4. Spawn background provisioning worker

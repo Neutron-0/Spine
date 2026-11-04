@@ -476,3 +476,192 @@ export interface SecretSummaryDto {
   created_at_nanos: number;
   updated_at_nanos: number;
 }
+
+// -----------------------------------------------------------------------------
+// Search Models (Batch 13)
+// -----------------------------------------------------------------------------
+
+export type SearchResultType = 'Repository' | 'Code' | 'Issue' | 'PullRequest' | 'Discussion';
+
+export interface SearchHitDto {
+  result_type: SearchResultType;
+  repo_id: string;
+  repo_name: string;
+  title: string;
+  snippet: string;
+  file_path?: string | null;
+  line_number?: number | null;
+  url: string;
+  score: number;
+}
+
+export interface SearchResponseDto {
+  query: string;
+  total: number;
+  hits: SearchHitDto[];
+}
+
+// -----------------------------------------------------------------------------
+// Discussion Models (Batch 13)
+// -----------------------------------------------------------------------------
+
+export interface DiscussionCategoryDto {
+  id: string;
+  repo_id: string;
+  name: string;
+  slug: string;
+  description?: string | null;
+  emoji: string;
+  is_answerable: boolean;
+  created_at_nanos: number;
+}
+
+export interface DiscussionReactionDto {
+  reaction: string;
+  count: number;
+  user_ids: string[];
+}
+
+export interface DiscussionCommentDto {
+  id: string;
+  discussion_id: string;
+  parent_comment_id?: string | null;
+  author: UserDto;
+  body: string;
+  is_answer: boolean;
+  created_at_nanos: number;
+  updated_at_nanos: number;
+  reactions: DiscussionReactionDto[];
+}
+
+export interface DiscussionDto {
+  id: string;
+  repo_id: string;
+  category: DiscussionCategoryDto;
+  number: number;
+  title: string;
+  body: string;
+  author: UserDto;
+  is_pinned: boolean;
+  is_locked: boolean;
+  answered_comment_id?: string | null;
+  comments_count: number;
+  created_at_nanos: number;
+  updated_at_nanos: number;
+}
+
+// -----------------------------------------------------------------------------
+// Discovery, Topics, Languages, Profiles (Batch 13)
+// -----------------------------------------------------------------------------
+
+export interface ExtendedUserProfileDto {
+  user_id: string;
+  bio?: string | null;
+  company?: string | null;
+  location?: string | null;
+  website_url?: string | null;
+  twitter_username?: string | null;
+  profile_readme?: string | null;
+  pinned_repo_ids: string[];
+  updated_at_nanos: number;
+}
+
+export interface RepositoryTopicDto {
+  id: string;
+  repo_id: string;
+  topic: string;
+  created_at_nanos: number;
+}
+
+export interface RepositoryLanguageDto {
+  id: string;
+  repo_id: string;
+  language: string;
+  bytes: number;
+  percentage: number;
+  updated_at_nanos: number;
+}
+
+export interface PopularTopicDto {
+  topic: string;
+  repository_count: number;
+}
+
+export interface RepositoryDiscoveryCardDto {
+  id: string;
+  owner_name: string;
+  name: string;
+  description?: string | null;
+  is_private: boolean;
+  topics: string[];
+  primary_language?: string | null;
+  languages: RepositoryLanguageDto[];
+  stars_count: number;
+  forks_count: number;
+  updated_at_nanos: number;
+}
+
+// -----------------------------------------------------------------------------
+// Security Center (Batch 13)
+// -----------------------------------------------------------------------------
+
+export interface SecurityScanDto {
+  id: string;
+  repo_id: string;
+  commit_oid: string;
+  scan_type: string;
+  status: string;
+  findings_count: number;
+  started_at_nanos: number;
+  completed_at_nanos: number;
+}
+
+export interface SecretScanFindingDto {
+  id: string;
+  repo_id: string;
+  commit_oid: string;
+  file_path: string;
+  line_number: number;
+  rule_id: string;
+  rule_name: string;
+  severity: string;
+  safe_fingerprint: string;
+  status: string;
+  created_at_nanos: number;
+  resolved_at_nanos?: number | null;
+}
+
+export interface DependencyInventoryDto {
+  id: string;
+  repo_id: string;
+  ecosystem: string;
+  package_name: string;
+  version: string;
+  is_direct: boolean;
+  created_at_nanos: number;
+}
+
+export interface DependencyVulnerabilityDto {
+  id: string;
+  repo_id: string;
+  dependency_id: string;
+  advisory_id: string;
+  package_name: string;
+  affected_version: string;
+  severity: string;
+  patched_version?: string | null;
+  status: string;
+  created_at_nanos: number;
+  resolved_at_nanos?: number | null;
+}
+
+export interface SecuritySummaryDto {
+  total_secrets_found: number;
+  open_secrets_count: number;
+  total_dependencies: number;
+  vulnerable_dependencies_count: number;
+  critical_count: number;
+  high_count: number;
+  medium_count: number;
+  low_count: number;
+}

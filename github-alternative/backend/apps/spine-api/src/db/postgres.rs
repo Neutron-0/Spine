@@ -3892,4 +3892,768 @@ impl Database for PgDatabase {
         }).collect();
         Ok(list)
     }
+
+    // -------------------------------------------------------------------------
+    // Discussions (Batch 13)
+    // -------------------------------------------------------------------------
+    async fn create_discussion_category(&self, cat: DiscussionCategory) -> Result<DiscussionCategory, ForgeError> {
+        let query = "INSERT INTO discussion_categories (id, repo_id, name, slug, description, emoji, is_answerable, created_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)";
+        sqlx::query(query)
+            .bind(&cat.id)
+            .bind(&cat.repo_id)
+            .bind(&cat.name)
+            .bind(&cat.slug)
+            .bind(&cat.description)
+            .bind(&cat.emoji)
+            .bind(cat.is_answerable)
+            .bind(cat.created_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(cat)
+    }
+
+    async fn get_discussion_category(&self, id: &str) -> Result<Option<DiscussionCategory>, ForgeError> {
+        let query = "SELECT id, repo_id, name, slug, description, emoji, is_answerable, created_at_nanos FROM discussion_categories WHERE id = $1";
+        let row = sqlx::query(query)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(row.map(|r| DiscussionCategory {
+            id: r.get(0),
+            repo_id: r.get(1),
+            name: r.get(2),
+            slug: r.get(3),
+            description: r.get(4),
+            emoji: r.get(5),
+            is_answerable: r.get(6),
+            created_at_nanos: r.get(7),
+        }))
+    }
+
+    async fn list_discussion_categories(&self, repo_id: &str) -> Result<Vec<DiscussionCategory>, ForgeError> {
+        let query = "SELECT id, repo_id, name, slug, description, emoji, is_answerable, created_at_nanos FROM discussion_categories WHERE repo_id = $1 ORDER BY created_at_nanos ASC";
+        let rows = sqlx::query(query)
+            .bind(repo_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(rows.into_iter().map(|r| DiscussionCategory {
+            id: r.get(0),
+            repo_id: r.get(1),
+            name: r.get(2),
+            slug: r.get(3),
+            description: r.get(4),
+            emoji: r.get(5),
+            is_answerable: r.get(6),
+            created_at_nanos: r.get(7),
+        }).collect())
+    }
+
+    async fn create_discussion(&self, mut disc: Discussion) -> Result<Discussion, ForgeError> {
+        let count_query = "SELECT COALESCE(MAX(number), 0) + 1 FROM discussions WHERE repo_id = $1";
+        let row = sqlx::query(count_query)
+            .bind(&disc.repo_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        disc.number = row.get(0);
+
+        let query = "INSERT INTO discussions (id, repo_id, category_id, number, title, body, author_id, is_pinned, is_locked, answered_comment_id, comments_count, created_at_nanos, updated_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)";
+        sqlx::query(query)
+            .bind(&disc.id)
+            .bind(&disc.repo_id)
+            .bind(&disc.category_id)
+            .bind(disc.number)
+            .bind(&disc.title)
+            .bind(&disc.body)
+            .bind(&disc.author_id)
+            .bind(disc.is_pinned)
+            .bind(disc.is_locked)
+            .bind(&disc.answered_comment_id)
+            .bind(disc.comments_count)
+            .bind(disc.created_at_nanos)
+            .bind(disc.updated_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(disc)
+    }
+
+    async fn get_discussion(&self, id: &str) -> Result<Option<Discussion>, ForgeError> {
+        let query = "SELECT id, repo_id, category_id, number, title, body, author_id, is_pinned, is_locked, answered_comment_id, comments_count, created_at_nanos, updated_at_nanos FROM discussions WHERE id = $1";
+        let row = sqlx::query(query)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(row.map(|r| Discussion {
+            id: r.get(0),
+            repo_id: r.get(1),
+            category_id: r.get(2),
+            number: r.get(3),
+            title: r.get(4),
+            body: r.get(5),
+            author_id: r.get(6),
+            is_pinned: r.get(7),
+            is_locked: r.get(8),
+            answered_comment_id: r.get(9),
+            comments_count: r.get(10),
+            created_at_nanos: r.get(11),
+            updated_at_nanos: r.get(12),
+        }))
+    }
+
+    async fn get_discussion_by_number(&self, repo_id: &str, number: i32) -> Result<Option<Discussion>, ForgeError> {
+        let query = "SELECT id, repo_id, category_id, number, title, body, author_id, is_pinned, is_locked, answered_comment_id, comments_count, created_at_nanos, updated_at_nanos FROM discussions WHERE repo_id = $1 AND number = $2";
+        let row = sqlx::query(query)
+            .bind(repo_id)
+            .bind(number)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(row.map(|r| Discussion {
+            id: r.get(0),
+            repo_id: r.get(1),
+            category_id: r.get(2),
+            number: r.get(3),
+            title: r.get(4),
+            body: r.get(5),
+            author_id: r.get(6),
+            is_pinned: r.get(7),
+            is_locked: r.get(8),
+            answered_comment_id: r.get(9),
+            comments_count: r.get(10),
+            created_at_nanos: r.get(11),
+            updated_at_nanos: r.get(12),
+        }))
+    }
+
+    async fn list_discussions(&self, repo_id: &str, category_id: Option<&str>) -> Result<Vec<Discussion>, ForgeError> {
+        let query = if let Some(cid) = category_id {
+            sqlx::query("SELECT id, repo_id, category_id, number, title, body, author_id, is_pinned, is_locked, answered_comment_id, comments_count, created_at_nanos, updated_at_nanos FROM discussions WHERE repo_id = $1 AND category_id = $2 ORDER BY is_pinned DESC, created_at_nanos DESC")
+                .bind(repo_id)
+                .bind(cid)
+        } else {
+            sqlx::query("SELECT id, repo_id, category_id, number, title, body, author_id, is_pinned, is_locked, answered_comment_id, comments_count, created_at_nanos, updated_at_nanos FROM discussions WHERE repo_id = $1 ORDER BY is_pinned DESC, created_at_nanos DESC")
+                .bind(repo_id)
+        };
+        let rows = query.fetch_all(&self.pool).await.map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(rows.into_iter().map(|r| Discussion {
+            id: r.get(0),
+            repo_id: r.get(1),
+            category_id: r.get(2),
+            number: r.get(3),
+            title: r.get(4),
+            body: r.get(5),
+            author_id: r.get(6),
+            is_pinned: r.get(7),
+            is_locked: r.get(8),
+            answered_comment_id: r.get(9),
+            comments_count: r.get(10),
+            created_at_nanos: r.get(11),
+            updated_at_nanos: r.get(12),
+        }).collect())
+    }
+
+    async fn update_discussion(&self, disc: Discussion) -> Result<Discussion, ForgeError> {
+        let query = "UPDATE discussions SET category_id = $1, title = $2, body = $3, is_pinned = $4, is_locked = $5, answered_comment_id = $6, comments_count = $7, updated_at_nanos = $8 WHERE id = $9";
+        sqlx::query(query)
+            .bind(&disc.category_id)
+            .bind(&disc.title)
+            .bind(&disc.body)
+            .bind(disc.is_pinned)
+            .bind(disc.is_locked)
+            .bind(&disc.answered_comment_id)
+            .bind(disc.comments_count)
+            .bind(disc.updated_at_nanos)
+            .bind(&disc.id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(disc)
+    }
+
+    async fn delete_discussion(&self, id: &str) -> Result<(), ForgeError> {
+        sqlx::query("DELETE FROM discussions WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn create_discussion_comment(&self, comment: DiscussionComment) -> Result<DiscussionComment, ForgeError> {
+        let query = "INSERT INTO discussion_comments (id, discussion_id, parent_comment_id, author_id, body, is_answer, created_at_nanos, updated_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)";
+        sqlx::query(query)
+            .bind(&comment.id)
+            .bind(&comment.discussion_id)
+            .bind(&comment.parent_comment_id)
+            .bind(&comment.author_id)
+            .bind(&comment.body)
+            .bind(comment.is_answer)
+            .bind(comment.created_at_nanos)
+            .bind(comment.updated_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let _ = sqlx::query("UPDATE discussions SET comments_count = comments_count + 1 WHERE id = $1")
+            .bind(&comment.discussion_id)
+            .execute(&self.pool)
+            .await;
+        Ok(comment)
+    }
+
+    async fn get_discussion_comment(&self, id: &str) -> Result<Option<DiscussionComment>, ForgeError> {
+        let query = "SELECT id, discussion_id, parent_comment_id, author_id, body, is_answer, created_at_nanos, updated_at_nanos FROM discussion_comments WHERE id = $1";
+        let row = sqlx::query(query)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(row.map(|r| DiscussionComment {
+            id: r.get(0),
+            discussion_id: r.get(1),
+            parent_comment_id: r.get(2),
+            author_id: r.get(3),
+            body: r.get(4),
+            is_answer: r.get(5),
+            created_at_nanos: r.get(6),
+            updated_at_nanos: r.get(7),
+        }))
+    }
+
+    async fn list_discussion_comments(&self, discussion_id: &str) -> Result<Vec<DiscussionComment>, ForgeError> {
+        let query = "SELECT id, discussion_id, parent_comment_id, author_id, body, is_answer, created_at_nanos, updated_at_nanos FROM discussion_comments WHERE discussion_id = $1 ORDER BY created_at_nanos ASC";
+        let rows = sqlx::query(query)
+            .bind(discussion_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(rows.into_iter().map(|r| DiscussionComment {
+            id: r.get(0),
+            discussion_id: r.get(1),
+            parent_comment_id: r.get(2),
+            author_id: r.get(3),
+            body: r.get(4),
+            is_answer: r.get(5),
+            created_at_nanos: r.get(6),
+            updated_at_nanos: r.get(7),
+        }).collect())
+    }
+
+    async fn update_discussion_comment(&self, comment: DiscussionComment) -> Result<DiscussionComment, ForgeError> {
+        let query = "UPDATE discussion_comments SET body = $1, is_answer = $2, updated_at_nanos = $3 WHERE id = $4";
+        sqlx::query(query)
+            .bind(&comment.body)
+            .bind(comment.is_answer)
+            .bind(comment.updated_at_nanos)
+            .bind(&comment.id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(comment)
+    }
+
+    async fn delete_discussion_comment(&self, id: &str) -> Result<(), ForgeError> {
+        if let Some(comment) = self.get_discussion_comment(id).await? {
+            let _ = sqlx::query("DELETE FROM discussion_comments WHERE id = $1")
+                .bind(id)
+                .execute(&self.pool)
+                .await;
+            let _ = sqlx::query("UPDATE discussions SET comments_count = GREATEST(comments_count - 1, 0) WHERE id = $1")
+                .bind(&comment.discussion_id)
+                .execute(&self.pool)
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn add_discussion_reaction(&self, reaction: DiscussionReaction) -> Result<DiscussionReaction, ForgeError> {
+        let query = "INSERT INTO discussion_reactions (id, subject_type, subject_id, user_id, reaction, created_at_nanos) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (subject_type, subject_id, user_id, reaction) DO NOTHING";
+        sqlx::query(query)
+            .bind(&reaction.id)
+            .bind(&reaction.subject_type)
+            .bind(&reaction.subject_id)
+            .bind(&reaction.user_id)
+            .bind(&reaction.reaction)
+            .bind(reaction.created_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(reaction)
+    }
+
+    async fn remove_discussion_reaction(&self, subject_type: &str, subject_id: &str, user_id: &str, reaction: &str) -> Result<(), ForgeError> {
+        let query = "DELETE FROM discussion_reactions WHERE subject_type = $1 AND subject_id = $2 AND user_id = $3 AND reaction = $4";
+        sqlx::query(query)
+            .bind(subject_type)
+            .bind(subject_id)
+            .bind(user_id)
+            .bind(reaction)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_discussion_reactions(&self, subject_type: &str, subject_id: &str) -> Result<Vec<DiscussionReaction>, ForgeError> {
+        let query = "SELECT id, subject_type, subject_id, user_id, reaction, created_at_nanos FROM discussion_reactions WHERE subject_type = $1 AND subject_id = $2";
+        let rows = sqlx::query(query)
+            .bind(subject_type)
+            .bind(subject_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(rows.into_iter().map(|r| DiscussionReaction {
+            id: r.get(0),
+            subject_type: r.get(1),
+            subject_id: r.get(2),
+            user_id: r.get(3),
+            reaction: r.get(4),
+            created_at_nanos: r.get(5),
+        }).collect())
+    }
+
+    async fn set_discussion_subscription(&self, sub: DiscussionSubscription) -> Result<DiscussionSubscription, ForgeError> {
+        let query = "INSERT INTO discussion_subscriptions (user_id, discussion_id, state, updated_at_nanos) VALUES ($1, $2, $3, $4) ON CONFLICT (user_id, discussion_id) DO UPDATE SET state = EXCLUDED.state, updated_at_nanos = EXCLUDED.updated_at_nanos";
+        sqlx::query(query)
+            .bind(&sub.user_id)
+            .bind(&sub.discussion_id)
+            .bind(&sub.state)
+            .bind(sub.updated_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(sub)
+    }
+
+    async fn get_discussion_subscription(&self, user_id: &str, discussion_id: &str) -> Result<Option<DiscussionSubscription>, ForgeError> {
+        let query = "SELECT user_id, discussion_id, state, updated_at_nanos FROM discussion_subscriptions WHERE user_id = $1 AND discussion_id = $2";
+        let row = sqlx::query(query)
+            .bind(user_id)
+            .bind(discussion_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(row.map(|r| DiscussionSubscription {
+            user_id: r.get(0),
+            discussion_id: r.get(1),
+            state: r.get(2),
+            updated_at_nanos: r.get(3),
+        }))
+    }
+
+    // -------------------------------------------------------------------------
+    // Discovery, Topics, Languages, Profiles (Batch 13)
+    // -------------------------------------------------------------------------
+    async fn set_repository_topics(&self, repo_id: &str, topics: &[String]) -> Result<Vec<RepositoryTopic>, ForgeError> {
+        sqlx::query("DELETE FROM repository_topics WHERE repo_id = $1")
+            .bind(repo_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let mut created = Vec::new();
+        for t in topics {
+            let item = RepositoryTopic {
+                id: uuid::Uuid::new_v4().to_string(),
+                repo_id: repo_id.to_string(),
+                topic: t.to_lowercase(),
+                created_at_nanos: now,
+            };
+            sqlx::query("INSERT INTO repository_topics (id, repo_id, topic, created_at_nanos) VALUES ($1, $2, $3, $4)")
+                .bind(&item.id)
+                .bind(&item.repo_id)
+                .bind(&item.topic)
+                .bind(item.created_at_nanos)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+            created.push(item);
+        }
+        Ok(created)
+    }
+
+    async fn list_repository_topics(&self, repo_id: &str) -> Result<Vec<RepositoryTopic>, ForgeError> {
+        let query = "SELECT id, repo_id, topic, created_at_nanos FROM repository_topics WHERE repo_id = $1 ORDER BY topic ASC";
+        let rows = sqlx::query(query)
+            .bind(repo_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(rows.into_iter().map(|r| RepositoryTopic {
+            id: r.get(0),
+            repo_id: r.get(1),
+            topic: r.get(2),
+            created_at_nanos: r.get(3),
+        }).collect())
+    }
+
+    async fn list_popular_topics(&self, limit: usize) -> Result<Vec<PopularTopicDto>, ForgeError> {
+        let query = "SELECT topic, COUNT(*)::bigint AS cnt FROM repository_topics GROUP BY topic ORDER BY cnt DESC LIMIT $1";
+        let rows = sqlx::query(query)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(rows.into_iter().map(|r| PopularTopicDto {
+            topic: r.get(0),
+            repository_count: r.get::<i64, _>(1) as usize,
+        }).collect())
+    }
+
+    async fn list_repositories_by_topic(&self, topic: &str) -> Result<Vec<ForgeRepository>, ForgeError> {
+        let query = "SELECT r.id, r.owner_user_id, r.owner_username, r.owner_org_id, r.name, r.normalized_name, r.description, r.is_private, r.default_branch, r.native_repo_id, r.durability_policy, r.provisioning_status, r.created_at_nanos, r.updated_at_nanos, r.archived FROM forge_repositories r JOIN repository_topics t ON r.id = t.repo_id WHERE t.topic = $1";
+        let rows = sqlx::query(query)
+            .bind(topic.to_lowercase())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let mut list = Vec::new();
+        for r in rows {
+            let policy_str: String = r.get(10);
+            let policy = match policy_str.as_str() {
+                "SingleCopy" | "SINGLE_COPY" => spine_cluster::durability::DurabilityPolicy::SingleCopy,
+                "TwoCopies" | "TWO_COPIES" => spine_cluster::durability::DurabilityPolicy::TwoCopies,
+                _ => spine_cluster::durability::DurabilityPolicy::ThreeCopies,
+            };
+            let status_str: String = r.get(11);
+            list.push(ForgeRepository {
+                id: r.get(0),
+                owner_user_id: r.get(1),
+                owner_username: r.get(2),
+                owner_org_id: r.get(3),
+                name: r.get(4),
+                normalized_name: r.get(5),
+                description: r.get(6),
+                is_private: r.get(7),
+                default_branch: r.get(8),
+                native_repo_id: r.get(9),
+                durability_policy: policy,
+                provisioning_status: ProvisioningStatus::from_str_lossy(&status_str),
+                created_at_nanos: r.get(12),
+                updated_at_nanos: r.get(13),
+                archived: r.get(14),
+            });
+        }
+        Ok(list)
+    }
+
+    async fn set_repository_languages(&self, repo_id: &str, langs: &[RepositoryLanguage]) -> Result<Vec<RepositoryLanguage>, ForgeError> {
+        sqlx::query("DELETE FROM repository_languages WHERE repo_id = $1")
+            .bind(repo_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        for l in langs {
+            sqlx::query("INSERT INTO repository_languages (id, repo_id, language, bytes, percentage, updated_at_nanos) VALUES ($1, $2, $3, $4, $5, $6)")
+                .bind(&l.id)
+                .bind(&l.repo_id)
+                .bind(&l.language)
+                .bind(l.bytes)
+                .bind(l.percentage)
+                .bind(l.updated_at_nanos)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        }
+        Ok(langs.to_vec())
+    }
+
+    async fn list_repository_languages(&self, repo_id: &str) -> Result<Vec<RepositoryLanguage>, ForgeError> {
+        let query = "SELECT id, repo_id, language, bytes, percentage, updated_at_nanos FROM repository_languages WHERE repo_id = $1 ORDER BY bytes DESC";
+        let rows = sqlx::query(query)
+            .bind(repo_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(rows.into_iter().map(|r| RepositoryLanguage {
+            id: r.get(0),
+            repo_id: r.get(1),
+            language: r.get(2),
+            bytes: r.get(3),
+            percentage: r.get(4),
+            updated_at_nanos: r.get(5),
+        }).collect())
+    }
+
+    async fn get_extended_user_profile(&self, user_id: &str) -> Result<Option<ExtendedUserProfile>, ForgeError> {
+        let query = "SELECT user_id, bio, company, location, website_url, twitter_username, profile_readme, pinned_repo_ids, updated_at_nanos FROM user_profiles WHERE user_id = $1";
+        let row = sqlx::query(query)
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(row.map(|r| {
+            let pinned_raw: serde_json::Value = r.get(7);
+            let pinned_repo_ids: Vec<String> = serde_json::from_value(pinned_raw).unwrap_or_default();
+            ExtendedUserProfile {
+                user_id: r.get(0),
+                bio: r.get(1),
+                company: r.get(2),
+                location: r.get(3),
+                website_url: r.get(4),
+                twitter_username: r.get(5),
+                profile_readme: r.get(6),
+                pinned_repo_ids,
+                updated_at_nanos: r.get(8),
+            }
+        }))
+    }
+
+    async fn upsert_extended_user_profile(&self, profile: ExtendedUserProfile) -> Result<ExtendedUserProfile, ForgeError> {
+        let pinned_val = serde_json::to_value(&profile.pinned_repo_ids).unwrap_or(serde_json::json!([]));
+        let query = "INSERT INTO user_profiles (user_id, bio, company, location, website_url, twitter_username, profile_readme, pinned_repo_ids, updated_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (user_id) DO UPDATE SET bio = EXCLUDED.bio, company = EXCLUDED.company, location = EXCLUDED.location, website_url = EXCLUDED.website_url, twitter_username = EXCLUDED.twitter_username, profile_readme = EXCLUDED.profile_readme, pinned_repo_ids = EXCLUDED.pinned_repo_ids, updated_at_nanos = EXCLUDED.updated_at_nanos";
+        sqlx::query(query)
+            .bind(&profile.user_id)
+            .bind(&profile.bio)
+            .bind(&profile.company)
+            .bind(&profile.location)
+            .bind(&profile.website_url)
+            .bind(&profile.twitter_username)
+            .bind(&profile.profile_readme)
+            .bind(pinned_val)
+            .bind(profile.updated_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(profile)
+    }
+
+    // -------------------------------------------------------------------------
+    // Security Center (Batch 13)
+    // -------------------------------------------------------------------------
+    async fn create_security_scan(&self, scan: SecurityScan) -> Result<SecurityScan, ForgeError> {
+        let query = "INSERT INTO security_scans (id, repo_id, commit_oid, scan_type, status, findings_count, started_at_nanos, completed_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)";
+        sqlx::query(query)
+            .bind(&scan.id)
+            .bind(&scan.repo_id)
+            .bind(&scan.commit_oid)
+            .bind(&scan.scan_type)
+            .bind(&scan.status)
+            .bind(scan.findings_count)
+            .bind(scan.started_at_nanos)
+            .bind(scan.completed_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(scan)
+    }
+
+    async fn list_security_scans(&self, repo_id: &str) -> Result<Vec<SecurityScan>, ForgeError> {
+        let query = "SELECT id, repo_id, commit_oid, scan_type, status, findings_count, started_at_nanos, completed_at_nanos FROM security_scans WHERE repo_id = $1 ORDER BY started_at_nanos DESC";
+        let rows = sqlx::query(query)
+            .bind(repo_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(rows.into_iter().map(|r| SecurityScan {
+            id: r.get(0),
+            repo_id: r.get(1),
+            commit_oid: r.get(2),
+            scan_type: r.get(3),
+            status: r.get(4),
+            findings_count: r.get(5),
+            started_at_nanos: r.get(6),
+            completed_at_nanos: r.get(7),
+        }).collect())
+    }
+
+    async fn create_secret_scan_finding(&self, finding: SecretScanFinding) -> Result<SecretScanFinding, ForgeError> {
+        let query = "INSERT INTO secret_scan_findings (id, repo_id, commit_oid, file_path, line_number, rule_id, rule_name, severity, safe_fingerprint, status, created_at_nanos, resolved_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)";
+        sqlx::query(query)
+            .bind(&finding.id)
+            .bind(&finding.repo_id)
+            .bind(&finding.commit_oid)
+            .bind(&finding.file_path)
+            .bind(finding.line_number)
+            .bind(&finding.rule_id)
+            .bind(&finding.rule_name)
+            .bind(&finding.severity)
+            .bind(&finding.safe_fingerprint)
+            .bind(&finding.status)
+            .bind(finding.created_at_nanos)
+            .bind(finding.resolved_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(finding)
+    }
+
+    async fn list_secret_scan_findings(&self, repo_id: &str, status_filter: Option<&str>) -> Result<Vec<SecretScanFinding>, ForgeError> {
+        let query = if let Some(st) = status_filter {
+            sqlx::query("SELECT id, repo_id, commit_oid, file_path, line_number, rule_id, rule_name, severity, safe_fingerprint, status, created_at_nanos, resolved_at_nanos FROM secret_scan_findings WHERE repo_id = $1 AND status = $2 ORDER BY created_at_nanos DESC")
+                .bind(repo_id)
+                .bind(st)
+        } else {
+            sqlx::query("SELECT id, repo_id, commit_oid, file_path, line_number, rule_id, rule_name, severity, safe_fingerprint, status, created_at_nanos, resolved_at_nanos FROM secret_scan_findings WHERE repo_id = $1 ORDER BY created_at_nanos DESC")
+                .bind(repo_id)
+        };
+        let rows = query.fetch_all(&self.pool).await.map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(rows.into_iter().map(|r| SecretScanFinding {
+            id: r.get(0),
+            repo_id: r.get(1),
+            commit_oid: r.get(2),
+            file_path: r.get(3),
+            line_number: r.get(4),
+            rule_id: r.get(5),
+            rule_name: r.get(6),
+            severity: r.get(7),
+            safe_fingerprint: r.get(8),
+            status: r.get(9),
+            created_at_nanos: r.get(10),
+            resolved_at_nanos: r.get(11),
+        }).collect())
+    }
+
+    async fn update_secret_scan_finding_status(&self, id: &str, status: &str, now_nanos: i64) -> Result<(), ForgeError> {
+        let query = "UPDATE secret_scan_findings SET status = $1, resolved_at_nanos = $2 WHERE id = $3";
+        sqlx::query(query)
+            .bind(status)
+            .bind(now_nanos)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn upsert_dependency_inventory(&self, items: &[DependencyInventory]) -> Result<(), ForgeError> {
+        for item in items {
+            let query = "INSERT INTO dependency_inventories (id, repo_id, ecosystem, package_name, version, is_direct, created_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (repo_id, ecosystem, package_name, version) DO NOTHING";
+            sqlx::query(query)
+                .bind(&item.id)
+                .bind(&item.repo_id)
+                .bind(&item.ecosystem)
+                .bind(&item.package_name)
+                .bind(&item.version)
+                .bind(item.is_direct)
+                .bind(item.created_at_nanos)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn list_dependency_inventory(&self, repo_id: &str) -> Result<Vec<DependencyInventory>, ForgeError> {
+        let query = "SELECT id, repo_id, ecosystem, package_name, version, is_direct, created_at_nanos FROM dependency_inventories WHERE repo_id = $1 ORDER BY package_name ASC";
+        let rows = sqlx::query(query)
+            .bind(repo_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(rows.into_iter().map(|r| DependencyInventory {
+            id: r.get(0),
+            repo_id: r.get(1),
+            ecosystem: r.get(2),
+            package_name: r.get(3),
+            version: r.get(4),
+            is_direct: r.get(5),
+            created_at_nanos: r.get(6),
+        }).collect())
+    }
+
+    async fn upsert_security_advisory(&self, advisory: SecurityAdvisory) -> Result<SecurityAdvisory, ForgeError> {
+        let query = "INSERT INTO security_advisories (id, advisory_id, ecosystem, package_name, vulnerable_version_range, patched_version, severity, title, description, published_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (advisory_id) DO UPDATE SET title = EXCLUDED.title, description = EXCLUDED.description, vulnerable_version_range = EXCLUDED.vulnerable_version_range, patched_version = EXCLUDED.patched_version, severity = EXCLUDED.severity";
+        sqlx::query(query)
+            .bind(&advisory.id)
+            .bind(&advisory.advisory_id)
+            .bind(&advisory.ecosystem)
+            .bind(&advisory.package_name)
+            .bind(&advisory.vulnerable_version_range)
+            .bind(&advisory.patched_version)
+            .bind(&advisory.severity)
+            .bind(&advisory.title)
+            .bind(&advisory.description)
+            .bind(advisory.published_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(advisory)
+    }
+
+    async fn list_security_advisories(&self, ecosystem: &str) -> Result<Vec<SecurityAdvisory>, ForgeError> {
+        let query = "SELECT id, advisory_id, ecosystem, package_name, vulnerable_version_range, patched_version, severity, title, description, published_at_nanos FROM security_advisories WHERE ecosystem = $1 ORDER BY published_at_nanos DESC";
+        let rows = sqlx::query(query)
+            .bind(ecosystem)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(rows.into_iter().map(|r| SecurityAdvisory {
+            id: r.get(0),
+            advisory_id: r.get(1),
+            ecosystem: r.get(2),
+            package_name: r.get(3),
+            vulnerable_version_range: r.get(4),
+            patched_version: r.get(5),
+            severity: r.get(6),
+            title: r.get(7),
+            description: r.get(8),
+            published_at_nanos: r.get(9),
+        }).collect())
+    }
+
+    async fn create_dependency_vulnerability(&self, vuln: DependencyVulnerability) -> Result<DependencyVulnerability, ForgeError> {
+        let query = "INSERT INTO dependency_vulnerabilities (id, repo_id, dependency_id, advisory_id, package_name, affected_version, severity, patched_version, status, created_at_nanos, resolved_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (repo_id, dependency_id, advisory_id) DO NOTHING";
+        sqlx::query(query)
+            .bind(&vuln.id)
+            .bind(&vuln.repo_id)
+            .bind(&vuln.dependency_id)
+            .bind(&vuln.advisory_id)
+            .bind(&vuln.package_name)
+            .bind(&vuln.affected_version)
+            .bind(&vuln.severity)
+            .bind(&vuln.patched_version)
+            .bind(&vuln.status)
+            .bind(vuln.created_at_nanos)
+            .bind(vuln.resolved_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(vuln)
+    }
+
+    async fn list_dependency_vulnerabilities(&self, repo_id: &str, status_filter: Option<&str>) -> Result<Vec<DependencyVulnerability>, ForgeError> {
+        let query = if let Some(st) = status_filter {
+            sqlx::query("SELECT id, repo_id, dependency_id, advisory_id, package_name, affected_version, severity, patched_version, status, created_at_nanos, resolved_at_nanos FROM dependency_vulnerabilities WHERE repo_id = $1 AND status = $2 ORDER BY created_at_nanos DESC")
+                .bind(repo_id)
+                .bind(st)
+        } else {
+            sqlx::query("SELECT id, repo_id, dependency_id, advisory_id, package_name, affected_version, severity, patched_version, status, created_at_nanos, resolved_at_nanos FROM dependency_vulnerabilities WHERE repo_id = $1 ORDER BY created_at_nanos DESC")
+                .bind(repo_id)
+        };
+        let rows = query.fetch_all(&self.pool).await.map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(rows.into_iter().map(|r| DependencyVulnerability {
+            id: r.get(0),
+            repo_id: r.get(1),
+            dependency_id: r.get(2),
+            advisory_id: r.get(3),
+            package_name: r.get(4),
+            affected_version: r.get(5),
+            severity: r.get(6),
+            patched_version: r.get(7),
+            status: r.get(8),
+            created_at_nanos: r.get(9),
+            resolved_at_nanos: r.get(10),
+        }).collect())
+    }
+
+    async fn update_dependency_vulnerability_status(&self, id: &str, status: &str, now_nanos: i64) -> Result<(), ForgeError> {
+        let query = "UPDATE dependency_vulnerabilities SET status = $1, resolved_at_nanos = $2 WHERE id = $3";
+        sqlx::query(query)
+            .bind(status)
+            .bind(now_nanos)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
 }

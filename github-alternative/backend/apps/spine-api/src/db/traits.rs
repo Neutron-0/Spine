@@ -434,4 +434,65 @@ pub trait Database: Send + Sync {
     async fn upsert_workflow_check_result(&self, check: WorkflowCheckResult) -> Result<WorkflowCheckResult, ForgeError>;
     async fn get_workflow_check_result(&self, repo_id: &str, commit_oid: &str, check_name: &str) -> Result<Option<WorkflowCheckResult>, ForgeError>;
     async fn list_workflow_check_results(&self, repo_id: &str, commit_oid: &str) -> Result<Vec<WorkflowCheckResult>, ForgeError>;
+
+    // -------------------------------------------------------------------------
+    // Discussions (Batch 13)
+    // -------------------------------------------------------------------------
+    async fn create_discussion_category(&self, cat: DiscussionCategory) -> Result<DiscussionCategory, ForgeError>;
+    async fn get_discussion_category(&self, id: &str) -> Result<Option<DiscussionCategory>, ForgeError>;
+    async fn list_discussion_categories(&self, repo_id: &str) -> Result<Vec<DiscussionCategory>, ForgeError>;
+
+    async fn create_discussion(&self, disc: Discussion) -> Result<Discussion, ForgeError>;
+    async fn get_discussion(&self, id: &str) -> Result<Option<Discussion>, ForgeError>;
+    async fn get_discussion_by_number(&self, repo_id: &str, number: i32) -> Result<Option<Discussion>, ForgeError>;
+    async fn list_discussions(&self, repo_id: &str, category_id: Option<&str>) -> Result<Vec<Discussion>, ForgeError>;
+    async fn update_discussion(&self, disc: Discussion) -> Result<Discussion, ForgeError>;
+    async fn delete_discussion(&self, id: &str) -> Result<(), ForgeError>;
+
+    async fn create_discussion_comment(&self, comment: DiscussionComment) -> Result<DiscussionComment, ForgeError>;
+    async fn get_discussion_comment(&self, id: &str) -> Result<Option<DiscussionComment>, ForgeError>;
+    async fn list_discussion_comments(&self, discussion_id: &str) -> Result<Vec<DiscussionComment>, ForgeError>;
+    async fn update_discussion_comment(&self, comment: DiscussionComment) -> Result<DiscussionComment, ForgeError>;
+    async fn delete_discussion_comment(&self, id: &str) -> Result<(), ForgeError>;
+
+    async fn add_discussion_reaction(&self, reaction: DiscussionReaction) -> Result<DiscussionReaction, ForgeError>;
+    async fn remove_discussion_reaction(&self, subject_type: &str, subject_id: &str, user_id: &str, reaction: &str) -> Result<(), ForgeError>;
+    async fn list_discussion_reactions(&self, subject_type: &str, subject_id: &str) -> Result<Vec<DiscussionReaction>, ForgeError>;
+
+    async fn set_discussion_subscription(&self, sub: DiscussionSubscription) -> Result<DiscussionSubscription, ForgeError>;
+    async fn get_discussion_subscription(&self, user_id: &str, discussion_id: &str) -> Result<Option<DiscussionSubscription>, ForgeError>;
+
+    // -------------------------------------------------------------------------
+    // Discovery, Topics, Languages, Profiles (Batch 13)
+    // -------------------------------------------------------------------------
+    async fn set_repository_topics(&self, repo_id: &str, topics: &[String]) -> Result<Vec<RepositoryTopic>, ForgeError>;
+    async fn list_repository_topics(&self, repo_id: &str) -> Result<Vec<RepositoryTopic>, ForgeError>;
+    async fn list_popular_topics(&self, limit: usize) -> Result<Vec<PopularTopicDto>, ForgeError>;
+    async fn list_repositories_by_topic(&self, topic: &str) -> Result<Vec<ForgeRepository>, ForgeError>;
+
+    async fn set_repository_languages(&self, repo_id: &str, langs: &[RepositoryLanguage]) -> Result<Vec<RepositoryLanguage>, ForgeError>;
+    async fn list_repository_languages(&self, repo_id: &str) -> Result<Vec<RepositoryLanguage>, ForgeError>;
+
+    async fn get_extended_user_profile(&self, user_id: &str) -> Result<Option<ExtendedUserProfile>, ForgeError>;
+    async fn upsert_extended_user_profile(&self, profile: ExtendedUserProfile) -> Result<ExtendedUserProfile, ForgeError>;
+
+    // -------------------------------------------------------------------------
+    // Security Center (Batch 13)
+    // -------------------------------------------------------------------------
+    async fn create_security_scan(&self, scan: SecurityScan) -> Result<SecurityScan, ForgeError>;
+    async fn list_security_scans(&self, repo_id: &str) -> Result<Vec<SecurityScan>, ForgeError>;
+
+    async fn create_secret_scan_finding(&self, finding: SecretScanFinding) -> Result<SecretScanFinding, ForgeError>;
+    async fn list_secret_scan_findings(&self, repo_id: &str, status_filter: Option<&str>) -> Result<Vec<SecretScanFinding>, ForgeError>;
+    async fn update_secret_scan_finding_status(&self, id: &str, status: &str, now_nanos: i64) -> Result<(), ForgeError>;
+
+    async fn upsert_dependency_inventory(&self, items: &[DependencyInventory]) -> Result<(), ForgeError>;
+    async fn list_dependency_inventory(&self, repo_id: &str) -> Result<Vec<DependencyInventory>, ForgeError>;
+
+    async fn upsert_security_advisory(&self, advisory: SecurityAdvisory) -> Result<SecurityAdvisory, ForgeError>;
+    async fn list_security_advisories(&self, ecosystem: &str) -> Result<Vec<SecurityAdvisory>, ForgeError>;
+
+    async fn create_dependency_vulnerability(&self, vuln: DependencyVulnerability) -> Result<DependencyVulnerability, ForgeError>;
+    async fn list_dependency_vulnerabilities(&self, repo_id: &str, status_filter: Option<&str>) -> Result<Vec<DependencyVulnerability>, ForgeError>;
+    async fn update_dependency_vulnerability_status(&self, id: &str, status: &str, now_nanos: i64) -> Result<(), ForgeError>;
 }

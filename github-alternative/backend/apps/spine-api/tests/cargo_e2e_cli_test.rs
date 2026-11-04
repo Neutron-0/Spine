@@ -68,19 +68,7 @@ async fn test_live_cargo_cli_publish_against_spine_api() {
     };
     db.create_pat(pat).await.unwrap();
 
-    let state = AppState {
-        db: db.clone(),
-        permissions: perms,
-        repositories: repos,
-        vcs,
-        rate_limiter,
-        mail,
-        coordinator: None,
-        artifacts,
-        releases,
-        packages: packages.clone(),
-        cargo: cargo.clone(),
-    };
+    let state = AppState::new_with_defaults(db.clone(), &storage_root, None).unwrap();
 
     let router = build_router(state);
 

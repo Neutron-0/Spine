@@ -140,6 +140,7 @@ async fn test_branch_protection_and_atomic_merge() {
         require_changes_addressed: true,
         dismiss_stale_reviews_on_push: true,
         restrict_merges_to_admins: false,
+        required_status_checks: vec![],
         created_at_nanos: 100,
         updated_at_nanos: 100,
     };

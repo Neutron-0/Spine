@@ -352,4 +352,59 @@ impl PermissionService {
 
         Ok(())
     }
+
+    pub async fn can_read_repo(&self, user_id: Option<&str>, repo_id: &str) -> Result<bool, ForgeError> {
+        let repo = match self.db.get_repository_by_id(repo_id).await? {
+            Some(r) => r,
+            None => return Ok(false),
+        };
+        let caller = if let Some(uid) = user_id {
+            self.db.get_user_by_id(uid).await?
+        } else {
+            None
+        };
+        Ok(self.check_read_access(caller.as_ref(), &repo).await.is_ok())
+    }
+
+    pub async fn require_repo_read(&self, user_id: Option<&str>, repo_id: &str) -> Result<(), ForgeError> {
+        let repo = self
+            .db
+            .get_repository_by_id(repo_id)
+            .await?
+            .ok_or_else(|| ForgeError::NotFound("Repository not found".into()))?;
+        let caller = if let Some(uid) = user_id {
+            self.db.get_user_by_id(uid).await?
+        } else {
+            None
+        };
+        self.check_read_access(caller.as_ref(), &repo).await?;
+        Ok(())
+    }
+
+    pub async fn require_repo_write(&self, user_id: &str, repo_id: &str) -> Result<(), ForgeError> {
+        let repo = self
+            .db
+            .get_repository_by_id(repo_id)
+            .await?
+            .ok_or_else(|| ForgeError::NotFound("Repository not found".into()))?;
+        let caller = self
+            .db
+            .get_user_by_id(user_id)
+            .await?
+            .ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+        self.check_write_access(Some(&caller), &repo).await?;
+        Ok(())
+    }
+
+    pub async fn can_admin_repo(&self, user_id: &str, repo_id: &str) -> Result<bool, ForgeError> {
+        let repo = match self.db.get_repository_by_id(repo_id).await? {
+            Some(r) => r,
+            None => return Ok(false),
+        };
+        let caller = match self.db.get_user_by_id(user_id).await? {
+            Some(u) => u,
+            None => return Ok(false),
+        };
+        Ok(self.check_admin_access(Some(&caller), &repo).await.is_ok())
+    }
 }

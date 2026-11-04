@@ -29,19 +29,7 @@ async fn test_forge_e2e_full_lifecycle() {
     let packages = Arc::new(spine_api::packages::PackageService::new(db.clone(), artifacts.clone()));
     let cargo = Arc::new(spine_api::packages::CargoRegistryAdapter::new(packages.clone()));
 
-    let state = AppState {
-        db: db.clone(),
-        permissions: permissions.clone(),
-        repositories: repo_service.clone(),
-        vcs: vcs_service.clone(),
-        rate_limiter,
-        mail: mailer.clone(),
-        coordinator: None,
-        artifacts,
-        releases,
-        packages,
-        cargo,
-    };
+    let state = AppState::new_with_defaults(db.clone(), storage_root, None).unwrap();
 
     let router = build_router(state);
     let worker = ProvisioningWorker::new(db.clone(), None, storage_root);
