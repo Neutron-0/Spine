@@ -92,13 +92,26 @@
 
 ## Next Milestones
 
-### Batch 11: Real-time Collaboration, Webhooks, CI/CD Pipeline Gateway, and Large Object Storage (LFS)
-- Real-time updates via WebSockets for collaborative review and notification feeds.
-- Webhook dispatch system with HMAC-SHA256 payload signing and retry queues.
-- Spine LFS: Content-addressed external binary asset store with chunked streaming and content-hash verification.
-- Partial and sparse worktree support for monorepo development.
+### Batch 11: Distributed Large Object Storage, Spine LFS, Releases, Artifact Management, and Package Registries
+- Unified Content-Addressed Storage Crate (`spine-artifact`): Deterministic 4 MiB bounded streaming chunker (`StreamChunker`), whole-object and per-chunk BLAKE3 digests, cryptographic manifests (`ArtifactManifest`), and memory-bounded reconstructor (`ObjectReconstructor`).
+- Spine LFS Engine: Text pointer format (`spine-lfs-v1 <manifest_oid> <size_bytes> <object_hash>`), `.spinelfs` tracking rules file, worktree interception in `spine add` staging compact pointers instead of multi-gigabyte blobs, and full CLI commands (`spine lfs track`, `untrack`, `status`, `ls-files`, `verify`, `prune`).
+- Distributed Cluster Protocol Extension: Generalized `spine-cluster` and `spine-storage-node` with atomic chunk (`StoreChunk`, `GetChunk`) and manifest (`StoreManifest`, `GetManifest`) operations, orchestrated across storage nodes by `DistributedArtifactStore` with quorum-based durability policies (`SingleCopy`, `TwoCopies`, `ThreeCopies`).
+- Resumable Transfer Protocol: High-throughput chunk streaming with session state machine (`Created` -> `Uploading` -> `Finalizing` -> `Completed`), TTL timeouts, and pre-allocation quota validation.
+- Capacity Accounting & Mark-and-Sweep GC: Dual logical vs physical deduplicated disk accounting (`artifact_quotas`), tenant limits (default 10 GiB), reachability tracing from active commit LFS pointers, releases, packages, and namespaces, with a 24-hour retention grace period.
+- Forge Releases & Assets: Draft and published release lifecycles, immutable tag and commit bindings, binary release asset distribution with atomic download counters, and bounded streaming reassembly.
+- Forge Generic Artifacts: Hierarchical namespace categorization (`<namespace>/<artifact>/<version>`), immutable versioning, and download streaming.
+- Native Cargo Registry Support: Official RFC 2789 Cargo sparse index layout (`1`, `2`, `3/a`, `sp/in`), `config.json` endpoint, binary publish wire protocol unpacker (4-byte LE JSON length + metadata + 4-byte LE crate length + `.crate` tarball), SHA-256 crate checksums (`cksum`), download streaming, and version yanking/unyanking.
+- Developer Experience & UI: Live `cargo publish` verified with official Cargo CLI; React 18 frontend expanded with Releases and Package Registry tabs, binary download triggers, and storage quota progress bar.
+- Windows 11 Native Stability: Bounded memory footprints (< 12 MiB per streaming operation) preventing system paging exhaustion, atomic temporary file replacement, and 100% test pass rate across all crates.
 
-### Batch 12: Enterprise Audit Logging, SAML/OIDC SSO, and Global Federation
+---
+
+## Next Milestones
+
+### Batch 12: Real-time Collaboration, Webhooks, CI/CD Pipeline Gateway, and Enterprise Federation
+- Real-time updates via WebSockets for collaborative review, diff comments, and notification feeds.
+- Webhook dispatch system with HMAC-SHA256 payload signing, delivery logs, and exponential backoff retry queues.
+- CI/CD Pipeline Gateway: Native runner execution protocols, secret masking, build status checks reporting to pull requests.
 - Enterprise Single Sign-On (SAML 2.0 and OIDC).
 - Comprehensive immutable audit log exports and compliance reporting.
 - Global repository replication and geo-distributed caching mirrors.

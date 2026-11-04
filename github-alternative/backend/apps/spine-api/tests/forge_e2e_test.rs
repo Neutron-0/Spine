@@ -23,6 +23,12 @@ async fn test_forge_e2e_full_lifecycle() {
     let vcs_service = Arc::new(NativeVcsService::new(storage_root.clone()));
     let rate_limiter = Arc::new(RateLimiter::new());
 
+    let artifact_store = Arc::new(spine_artifact::LocalArtifactStore::new(storage_root.join("artifacts")).unwrap());
+    let artifacts = Arc::new(spine_api::artifact::ArtifactService::new(db.clone(), artifact_store));
+    let releases = Arc::new(spine_api::releases::ReleaseService::new(db.clone(), artifacts.clone()));
+    let packages = Arc::new(spine_api::packages::PackageService::new(db.clone(), artifacts.clone()));
+    let cargo = Arc::new(spine_api::packages::CargoRegistryAdapter::new(packages.clone()));
+
     let state = AppState {
         db: db.clone(),
         permissions: permissions.clone(),
@@ -31,6 +37,10 @@ async fn test_forge_e2e_full_lifecycle() {
         rate_limiter,
         mail: mailer.clone(),
         coordinator: None,
+        artifacts,
+        releases,
+        packages,
+        cargo,
     };
 
     let router = build_router(state);

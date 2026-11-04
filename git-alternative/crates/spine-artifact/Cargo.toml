@@ -1,0 +1,25 @@
+[package]
+name = "spine-artifact"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+spine-core.workspace = true
+spine-cluster.workspace = true
+spine-object-store.workspace = true
+
+tokio = { workspace = true, features = ["full"] }
+blake3.workspace = true
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+hex.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

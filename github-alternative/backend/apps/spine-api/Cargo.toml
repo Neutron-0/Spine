@@ -5,6 +5,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[lib]
+name = "spine_api"
+path = "src/lib.rs"
+
 [[bin]]
 name = "spine-api"
 path = "src/main.rs"
@@ -19,6 +23,7 @@ spine-merge.workspace = true
 spine-cluster.workspace = true
 spine-net.workspace = true
 spine-config.workspace = true
+spine-artifact.workspace = true
 
 tokio.workspace = true
 axum.workspace = true
@@ -33,6 +38,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 blake3.workspace = true
+sha2.workspace = true
 hex.workspace = true
 rand.workspace = true
 subtle.workspace = true

@@ -1,3 +1,4 @@
+use crate::artifact::ArtifactService;
 use crate::auth::mail::MailDelivery;
 use crate::auth::pat::hash_pat;
 use crate::auth::rate_limit::RateLimiter;
@@ -5,7 +6,9 @@ use crate::auth::session::hash_session_token;
 use crate::coordinator::CoordinatorClient;
 use crate::core::types::*;
 use crate::db::Database;
+use crate::packages::{CargoRegistryAdapter, PackageService};
 use crate::permissions::PermissionService;
+use crate::releases::ReleaseService;
 use crate::repository::service::RepositoryService;
 use crate::storage::vcs::NativeVcsService;
 use axum::{
@@ -25,6 +28,10 @@ pub struct AppState {
     pub rate_limiter: Arc<RateLimiter>,
     pub mail: Arc<dyn MailDelivery>,
     pub coordinator: Option<CoordinatorClient>,
+    pub artifacts: Arc<ArtifactService>,
+    pub releases: Arc<ReleaseService>,
+    pub packages: Arc<PackageService>,
+    pub cargo: Arc<CargoRegistryAdapter>,
 }
 
 pub async fn auth_middleware(
@@ -67,26 +74,24 @@ pub async fn auth_middleware(
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
     if let Some(raw_auth) = auth_header {
-        if let Some(token) = raw_auth.strip_prefix("Bearer ") {
-            let token_str = token.trim();
-            if token_str.starts_with("sp_pat_") {
-                let p_hash = hash_pat(token_str);
-                if let Ok(Some(pat)) = state.db.get_pat_by_hash(&p_hash).await {
-                    if !pat.revoked && pat.expires_at_nanos >= now {
-                        let _ = state.db.update_pat_last_used(&pat.id, now).await;
-                        if let Ok(Some(u)) = state.db.get_user_by_id(&pat.user_id).await {
-                            resolved_user = Some(u);
-                        }
+        let token_str = raw_auth.strip_prefix("Bearer ").unwrap_or(raw_auth).trim();
+        if token_str.starts_with("sp_pat_") || token_str.starts_with("spine_pat_") {
+            let p_hash = hash_pat(token_str);
+            if let Ok(Some(pat)) = state.db.get_pat_by_hash(&p_hash).await {
+                if !pat.revoked && pat.expires_at_nanos >= now {
+                    let _ = state.db.update_pat_last_used(&pat.id, now).await;
+                    if let Ok(Some(u)) = state.db.get_user_by_id(&pat.user_id).await {
+                        resolved_user = Some(u);
                     }
                 }
-            } else {
-                let s_hash = hash_session_token(token_str);
-                if let Ok(Some(sess)) = state.db.get_session_by_hash(&s_hash).await {
-                    if !sess.revoked && sess.expires_at_nanos >= now {
-                        if let Ok(Some(u)) = state.db.get_user_by_id(&sess.user_id).await {
-                            resolved_user = Some(u);
-                            resolved_session = Some(sess);
-                        }
+            }
+        } else {
+            let s_hash = hash_session_token(token_str);
+            if let Ok(Some(sess)) = state.db.get_session_by_hash(&s_hash).await {
+                if !sess.revoked && sess.expires_at_nanos >= now {
+                    if let Ok(Some(u)) = state.db.get_user_by_id(&sess.user_id).await {
+                        resolved_user = Some(u);
+                        resolved_session = Some(sess);
                     }
                 }
             }

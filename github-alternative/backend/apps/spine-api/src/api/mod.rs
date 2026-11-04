@@ -1,12 +1,16 @@
 pub mod middleware;
 pub mod routes_activity;
+pub mod routes_artifacts;
 pub mod routes_auth;
 pub mod routes_health;
 pub mod routes_issues;
+pub mod routes_lfs;
 pub mod routes_notifications;
 pub mod routes_orgs;
+pub mod routes_packages;
 pub mod routes_protection;
 pub mod routes_pulls;
+pub mod routes_releases;
 pub mod routes_repos;
 pub mod routes_reviews;
 pub mod routes_teams;
@@ -276,6 +280,82 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/notifications/read-all",
             post(routes_notifications::mark_all_notifications_read),
         )
+        // Spine LFS (Batch 11)
+        .route(
+            "/api/v1/repos/:owner/:name/lfs/objects/batch",
+            post(routes_lfs::lfs_batch),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/lfs/sessions/:session_id/chunks/:index/:hash",
+            put(routes_lfs::lfs_upload_chunk),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/lfs/sessions/:session_id/finalize",
+            post(routes_lfs::lfs_finalize),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/lfs/objects/:manifest_id/download",
+            get(routes_lfs::lfs_download_object),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/lfs/chunks/:chunk_hash",
+            get(routes_lfs::lfs_download_chunk),
+        )
+        // Releases & Assets (Batch 11)
+        .route(
+            "/api/v1/repos/:owner/:name/releases",
+            get(routes_releases::list_releases).post(routes_releases::create_release),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/releases/:release_id",
+            get(routes_releases::get_release)
+                .patch(routes_releases::update_release)
+                .delete(routes_releases::delete_release),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/releases/tags/:tag",
+            get(routes_releases::get_release_by_tag),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/releases/:release_id/assets",
+            post(routes_releases::upload_release_asset),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/releases/:release_id/assets/:asset_id/download",
+            get(routes_releases::download_release_asset),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/releases/:release_id/assets/:asset_id",
+            delete(routes_releases::delete_release_asset),
+        )
+        // Generic Artifacts & Quotas (Batch 11)
+        .route("/api/v1/artifacts/quota", get(routes_artifacts::get_quota))
+        .route(
+            "/api/v1/artifacts/namespaces",
+            get(routes_artifacts::list_namespaces).post(routes_artifacts::create_namespace),
+        )
+        .route(
+            "/api/v1/artifacts/:namespace/:artifact/versions",
+            get(routes_artifacts::list_artifact_versions),
+        )
+        .route(
+            "/api/v1/artifacts/:namespace/:artifact/versions/:version",
+            post(routes_artifacts::upload_artifact_version),
+        )
+        .route(
+            "/api/v1/artifacts/:namespace/:artifact/versions/:version/download",
+            get(routes_artifacts::download_artifact_version),
+        )
+        // Package Registry & Cargo (Batch 11)
+        .route("/index/config.json", get(routes_packages::cargo_index_config))
+        .route("/index/:p1/:crate_name", get(routes_packages::cargo_index_entry_single))
+        .route("/index/:p1/:p2/:crate_name", get(routes_packages::cargo_index_entry_double))
+        .route("/api/v1/crates/new", put(routes_packages::cargo_publish))
+        .route("/api/v1/crates/:crate_name/:version/download", get(routes_packages::cargo_download))
+        .route("/api/v1/crates/:crate_name/:version/yank", delete(routes_packages::cargo_yank))
+        .route("/api/v1/crates/:crate_name/:version/unyank", put(routes_packages::cargo_unyank))
+        .route("/api/v1/packages", get(routes_packages::list_packages))
+        .route("/api/v1/packages/:ecosystem/:name", get(routes_packages::get_package))
         // Layers
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),

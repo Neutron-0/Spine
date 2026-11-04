@@ -2341,4 +2341,677 @@ impl Database for PgDatabase {
         }).collect();
         Ok(list)
     }
+
+    // -------------------------------------------------------------
+    // Batch 11: Artifact Storage, Releases, Namespaces, Packages
+    // -------------------------------------------------------------
+
+    async fn get_or_create_quota(&self, owner_type: &str, owner_id: &str) -> Result<ArtifactQuota, ForgeError> {
+        let query = "SELECT id, owner_type, owner_id, logical_quota_bytes, used_logical_bytes, used_physical_bytes, created_at_nanos, updated_at_nanos FROM artifact_quotas WHERE owner_id = $1";
+        let row = sqlx::query(query)
+            .bind(owner_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        if let Some(r) = row {
+            return Ok(ArtifactQuota {
+                id: r.get(0),
+                owner_type: r.get(1),
+                owner_id: r.get(2),
+                logical_quota_bytes: r.get(3),
+                used_logical_bytes: r.get(4),
+                used_physical_bytes: r.get(5),
+                created_at_nanos: r.get(6),
+                updated_at_nanos: r.get(7),
+            });
+        }
+
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as i64;
+        let quota = ArtifactQuota {
+            id: uuid::Uuid::new_v4().to_string(),
+            owner_type: owner_type.to_string(),
+            owner_id: owner_id.to_string(),
+            logical_quota_bytes: 53_687_091_200, // 50 GB default
+            used_logical_bytes: 0,
+            used_physical_bytes: 0,
+            created_at_nanos: now,
+            updated_at_nanos: now,
+        };
+
+        let insert_q = r#"
+            INSERT INTO artifact_quotas (id, owner_type, owner_id, logical_quota_bytes, used_logical_bytes, used_physical_bytes, created_at_nanos, updated_at_nanos)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (owner_id) DO UPDATE SET updated_at_nanos = EXCLUDED.updated_at_nanos
+            RETURNING id, owner_type, owner_id, logical_quota_bytes, used_logical_bytes, used_physical_bytes, created_at_nanos, updated_at_nanos
+        "#;
+        let r = sqlx::query(insert_q)
+            .bind(&quota.id)
+            .bind(&quota.owner_type)
+            .bind(&quota.owner_id)
+            .bind(quota.logical_quota_bytes)
+            .bind(quota.used_logical_bytes)
+            .bind(quota.used_physical_bytes)
+            .bind(quota.created_at_nanos)
+            .bind(quota.updated_at_nanos)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        Ok(ArtifactQuota {
+            id: r.get(0),
+            owner_type: r.get(1),
+            owner_id: r.get(2),
+            logical_quota_bytes: r.get(3),
+            used_logical_bytes: r.get(4),
+            used_physical_bytes: r.get(5),
+            created_at_nanos: r.get(6),
+            updated_at_nanos: r.get(7),
+        })
+    }
+
+    async fn update_quota_usage(&self, owner_id: &str, delta_logical: i64, delta_physical: i64) -> Result<(), ForgeError> {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as i64;
+        let query = r#"
+            UPDATE artifact_quotas
+            SET used_logical_bytes = GREATEST(0, used_logical_bytes + $1),
+                used_physical_bytes = GREATEST(0, used_physical_bytes + $2),
+                updated_at_nanos = $3
+            WHERE owner_id = $4
+        "#;
+        sqlx::query(query)
+            .bind(delta_logical)
+            .bind(delta_physical)
+            .bind(now)
+            .bind(owner_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn create_upload_session(&self, session: ArtifactUploadSession) -> Result<ArtifactUploadSession, ForgeError> {
+        let query = r#"
+            INSERT INTO artifact_upload_sessions (id, artifact_id, owner_type, owner_id, state, total_size, chunk_size, expected_chunks, durability_policy, created_at_nanos, expires_at_nanos)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        "#;
+        sqlx::query(query)
+            .bind(&session.id)
+            .bind(&session.artifact_id)
+            .bind(&session.owner_type)
+            .bind(&session.owner_id)
+            .bind(&session.state)
+            .bind(session.total_size)
+            .bind(session.chunk_size)
+            .bind(session.expected_chunks)
+            .bind(&session.durability_policy)
+            .bind(session.created_at_nanos)
+            .bind(session.expires_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(session)
+    }
+
+    async fn get_upload_session(&self, session_id: &str) -> Result<Option<ArtifactUploadSession>, ForgeError> {
+        let query = "SELECT id, artifact_id, owner_type, owner_id, state, total_size, chunk_size, expected_chunks, durability_policy, created_at_nanos, expires_at_nanos FROM artifact_upload_sessions WHERE id = $1";
+        let row = sqlx::query(query)
+            .bind(session_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        Ok(row.map(|r| ArtifactUploadSession {
+            id: r.get(0),
+            artifact_id: r.get(1),
+            owner_type: r.get(2),
+            owner_id: r.get(3),
+            state: r.get(4),
+            total_size: r.get(5),
+            chunk_size: r.get(6),
+            expected_chunks: r.get(7),
+            durability_policy: r.get(8),
+            created_at_nanos: r.get(9),
+            expires_at_nanos: r.get(10),
+        }))
+    }
+
+    async fn update_upload_session_state(&self, session_id: &str, state: &str) -> Result<(), ForgeError> {
+        let query = "UPDATE artifact_upload_sessions SET state = $1 WHERE id = $2";
+        sqlx::query(query)
+            .bind(state)
+            .bind(session_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn save_artifact_manifest(&self, manifest: StoredArtifactManifest) -> Result<(), ForgeError> {
+        let query = r#"
+            INSERT INTO artifact_manifests (id, artifact_id, whole_object_hash, total_size, chunk_size, chunk_count, content_type, manifest_json, created_at_nanos)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (id) DO NOTHING
+        "#;
+        sqlx::query(query)
+            .bind(&manifest.id)
+            .bind(&manifest.artifact_id)
+            .bind(&manifest.whole_object_hash)
+            .bind(manifest.total_size)
+            .bind(manifest.chunk_size)
+            .bind(manifest.chunk_count)
+            .bind(&manifest.content_type)
+            .bind(&manifest.manifest_json)
+            .bind(manifest.created_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_artifact_manifest(&self, manifest_id: &str) -> Result<Option<StoredArtifactManifest>, ForgeError> {
+        let query = "SELECT id, artifact_id, whole_object_hash, total_size, chunk_size, chunk_count, content_type, manifest_json, created_at_nanos FROM artifact_manifests WHERE id = $1";
+        let row = sqlx::query(query)
+            .bind(manifest_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        Ok(row.map(|r| StoredArtifactManifest {
+            id: r.get(0),
+            artifact_id: r.get(1),
+            whole_object_hash: r.get(2),
+            total_size: r.get(3),
+            chunk_size: r.get(4),
+            chunk_count: r.get(5),
+            content_type: r.get(6),
+            manifest_json: r.get(7),
+            created_at_nanos: r.get(8),
+        }))
+    }
+
+    async fn create_release(&self, release: Release) -> Result<Release, ForgeError> {
+        let query = r#"
+            INSERT INTO releases (id, repo_id, tag_name, target_commit_id, title, body, is_draft, is_prerelease, author_id, created_at_nanos, published_at_nanos, updated_at_nanos)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        "#;
+        sqlx::query(query)
+            .bind(&release.id)
+            .bind(&release.repo_id)
+            .bind(&release.tag_name)
+            .bind(&release.target_commit_id)
+            .bind(&release.title)
+            .bind(&release.body)
+            .bind(release.is_draft)
+            .bind(release.is_prerelease)
+            .bind(&release.author_id)
+            .bind(release.created_at_nanos)
+            .bind(release.published_at_nanos)
+            .bind(release.updated_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(release)
+    }
+
+    async fn get_release_by_id(&self, id: &str) -> Result<Option<Release>, ForgeError> {
+        let query = "SELECT id, repo_id, tag_name, target_commit_id, title, body, is_draft, is_prerelease, author_id, created_at_nanos, published_at_nanos, updated_at_nanos FROM releases WHERE id = $1";
+        let row = sqlx::query(query)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        Ok(row.map(|r| Release {
+            id: r.get(0),
+            repo_id: r.get(1),
+            tag_name: r.get(2),
+            target_commit_id: r.get(3),
+            title: r.get(4),
+            body: r.get(5),
+            is_draft: r.get(6),
+            is_prerelease: r.get(7),
+            author_id: r.get(8),
+            created_at_nanos: r.get(9),
+            published_at_nanos: r.get(10),
+            updated_at_nanos: r.get(11),
+        }))
+    }
+
+    async fn get_release_by_tag(&self, repo_id: &str, tag_name: &str) -> Result<Option<Release>, ForgeError> {
+        let query = "SELECT id, repo_id, tag_name, target_commit_id, title, body, is_draft, is_prerelease, author_id, created_at_nanos, published_at_nanos, updated_at_nanos FROM releases WHERE repo_id = $1 AND tag_name = $2";
+        let row = sqlx::query(query)
+            .bind(repo_id)
+            .bind(tag_name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        Ok(row.map(|r| Release {
+            id: r.get(0),
+            repo_id: r.get(1),
+            tag_name: r.get(2),
+            target_commit_id: r.get(3),
+            title: r.get(4),
+            body: r.get(5),
+            is_draft: r.get(6),
+            is_prerelease: r.get(7),
+            author_id: r.get(8),
+            created_at_nanos: r.get(9),
+            published_at_nanos: r.get(10),
+            updated_at_nanos: r.get(11),
+        }))
+    }
+
+    async fn list_releases_for_repo(&self, repo_id: &str, include_drafts: bool) -> Result<Vec<Release>, ForgeError> {
+        let query = "SELECT id, repo_id, tag_name, target_commit_id, title, body, is_draft, is_prerelease, author_id, created_at_nanos, published_at_nanos, updated_at_nanos FROM releases WHERE repo_id = $1 AND ($2 = true OR is_draft = false) ORDER BY created_at_nanos DESC";
+        let rows = sqlx::query(query)
+            .bind(repo_id)
+            .bind(include_drafts)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| Release {
+            id: r.get(0),
+            repo_id: r.get(1),
+            tag_name: r.get(2),
+            target_commit_id: r.get(3),
+            title: r.get(4),
+            body: r.get(5),
+            is_draft: r.get(6),
+            is_prerelease: r.get(7),
+            author_id: r.get(8),
+            created_at_nanos: r.get(9),
+            published_at_nanos: r.get(10),
+            updated_at_nanos: r.get(11),
+        }).collect();
+        Ok(list)
+    }
+
+    async fn update_release(&self, release: Release) -> Result<Release, ForgeError> {
+        let query = r#"
+            UPDATE releases
+            SET title = $1, body = $2, is_draft = $3, is_prerelease = $4, published_at_nanos = $5, updated_at_nanos = $6
+            WHERE id = $7
+        "#;
+        sqlx::query(query)
+            .bind(&release.title)
+            .bind(&release.body)
+            .bind(release.is_draft)
+            .bind(release.is_prerelease)
+            .bind(release.published_at_nanos)
+            .bind(release.updated_at_nanos)
+            .bind(&release.id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(release)
+    }
+
+    async fn delete_release(&self, id: &str) -> Result<(), ForgeError> {
+        let query = "DELETE FROM releases WHERE id = $1";
+        sqlx::query(query)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn create_release_asset(&self, asset: ReleaseAsset) -> Result<ReleaseAsset, ForgeError> {
+        let query = r#"
+            INSERT INTO release_assets (id, release_id, name, content_type, size_bytes, manifest_id, whole_hash, downloads_count, created_at_nanos)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        "#;
+        sqlx::query(query)
+            .bind(&asset.id)
+            .bind(&asset.release_id)
+            .bind(&asset.name)
+            .bind(&asset.content_type)
+            .bind(asset.size_bytes)
+            .bind(&asset.manifest_id)
+            .bind(&asset.whole_hash)
+            .bind(asset.downloads_count)
+            .bind(asset.created_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(asset)
+    }
+
+    async fn get_release_asset(&self, id: &str) -> Result<Option<ReleaseAsset>, ForgeError> {
+        let query = "SELECT id, release_id, name, content_type, size_bytes, manifest_id, whole_hash, downloads_count, created_at_nanos FROM release_assets WHERE id = $1";
+        let row = sqlx::query(query)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        Ok(row.map(|r| ReleaseAsset {
+            id: r.get(0),
+            release_id: r.get(1),
+            name: r.get(2),
+            content_type: r.get(3),
+            size_bytes: r.get(4),
+            manifest_id: r.get(5),
+            whole_hash: r.get(6),
+            downloads_count: r.get(7),
+            created_at_nanos: r.get(8),
+        }))
+    }
+
+    async fn list_assets_for_release(&self, release_id: &str) -> Result<Vec<ReleaseAsset>, ForgeError> {
+        let query = "SELECT id, release_id, name, content_type, size_bytes, manifest_id, whole_hash, downloads_count, created_at_nanos FROM release_assets WHERE release_id = $1 ORDER BY created_at_nanos ASC";
+        let rows = sqlx::query(query)
+            .bind(release_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| ReleaseAsset {
+            id: r.get(0),
+            release_id: r.get(1),
+            name: r.get(2),
+            content_type: r.get(3),
+            size_bytes: r.get(4),
+            manifest_id: r.get(5),
+            whole_hash: r.get(6),
+            downloads_count: r.get(7),
+            created_at_nanos: r.get(8),
+        }).collect();
+        Ok(list)
+    }
+
+    async fn delete_release_asset(&self, id: &str) -> Result<(), ForgeError> {
+        let query = "DELETE FROM release_assets WHERE id = $1";
+        sqlx::query(query)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn increment_asset_downloads(&self, id: &str) -> Result<(), ForgeError> {
+        let query = "UPDATE release_assets SET downloads_count = downloads_count + 1 WHERE id = $1";
+        sqlx::query(query)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn create_artifact_namespace(&self, ns: ArtifactNamespace) -> Result<ArtifactNamespace, ForgeError> {
+        let query = r#"
+            INSERT INTO artifact_namespaces (id, name, owner_type, owner_id, is_private, description, created_at_nanos, updated_at_nanos)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        "#;
+        sqlx::query(query)
+            .bind(&ns.id)
+            .bind(&ns.name)
+            .bind(&ns.owner_type)
+            .bind(&ns.owner_id)
+            .bind(ns.is_private)
+            .bind(&ns.description)
+            .bind(ns.created_at_nanos)
+            .bind(ns.updated_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(ns)
+    }
+
+    async fn get_artifact_namespace_by_name(&self, name: &str) -> Result<Option<ArtifactNamespace>, ForgeError> {
+        let query = "SELECT id, name, owner_type, owner_id, is_private, description, created_at_nanos, updated_at_nanos FROM artifact_namespaces WHERE name = $1";
+        let row = sqlx::query(query)
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        Ok(row.map(|r| ArtifactNamespace {
+            id: r.get(0),
+            name: r.get(1),
+            owner_type: r.get(2),
+            owner_id: r.get(3),
+            is_private: r.get(4),
+            description: r.get(5),
+            created_at_nanos: r.get(6),
+            updated_at_nanos: r.get(7),
+        }))
+    }
+
+    async fn list_artifact_namespaces(&self) -> Result<Vec<ArtifactNamespace>, ForgeError> {
+        let query = "SELECT id, name, owner_type, owner_id, is_private, description, created_at_nanos, updated_at_nanos FROM artifact_namespaces ORDER BY name ASC";
+        let rows = sqlx::query(query)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| ArtifactNamespace {
+            id: r.get(0),
+            name: r.get(1),
+            owner_type: r.get(2),
+            owner_id: r.get(3),
+            is_private: r.get(4),
+            description: r.get(5),
+            created_at_nanos: r.get(6),
+            updated_at_nanos: r.get(7),
+        }).collect();
+        Ok(list)
+    }
+
+    async fn create_artifact_version(&self, ver: ArtifactVersion) -> Result<ArtifactVersion, ForgeError> {
+        let query = r#"
+            INSERT INTO artifact_versions (id, namespace_id, artifact_name, version, manifest_id, whole_hash, size_bytes, created_by_user_id, created_at_nanos)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        "#;
+        sqlx::query(query)
+            .bind(&ver.id)
+            .bind(&ver.namespace_id)
+            .bind(&ver.artifact_name)
+            .bind(&ver.version)
+            .bind(&ver.manifest_id)
+            .bind(&ver.whole_hash)
+            .bind(ver.size_bytes)
+            .bind(&ver.created_by_user_id)
+            .bind(ver.created_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(ver)
+    }
+
+    async fn get_artifact_version(&self, namespace_id: &str, artifact_name: &str, version: &str) -> Result<Option<ArtifactVersion>, ForgeError> {
+        let query = "SELECT id, namespace_id, artifact_name, version, manifest_id, whole_hash, size_bytes, created_by_user_id, created_at_nanos FROM artifact_versions WHERE namespace_id = $1 AND artifact_name = $2 AND version = $3";
+        let row = sqlx::query(query)
+            .bind(namespace_id)
+            .bind(artifact_name)
+            .bind(version)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        Ok(row.map(|r| ArtifactVersion {
+            id: r.get(0),
+            namespace_id: r.get(1),
+            artifact_name: r.get(2),
+            version: r.get(3),
+            manifest_id: r.get(4),
+            whole_hash: r.get(5),
+            size_bytes: r.get(6),
+            created_by_user_id: r.get(7),
+            created_at_nanos: r.get(8),
+        }))
+    }
+
+    async fn list_artifact_versions(&self, namespace_id: &str, artifact_name: &str) -> Result<Vec<ArtifactVersion>, ForgeError> {
+        let query = "SELECT id, namespace_id, artifact_name, version, manifest_id, whole_hash, size_bytes, created_by_user_id, created_at_nanos FROM artifact_versions WHERE namespace_id = $1 AND artifact_name = $2 ORDER BY created_at_nanos DESC";
+        let rows = sqlx::query(query)
+            .bind(namespace_id)
+            .bind(artifact_name)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| ArtifactVersion {
+            id: r.get(0),
+            namespace_id: r.get(1),
+            artifact_name: r.get(2),
+            version: r.get(3),
+            manifest_id: r.get(4),
+            whole_hash: r.get(5),
+            size_bytes: r.get(6),
+            created_by_user_id: r.get(7),
+            created_at_nanos: r.get(8),
+        }).collect();
+        Ok(list)
+    }
+
+    async fn create_package(&self, pkg: Package) -> Result<Package, ForgeError> {
+        let query = r#"
+            INSERT INTO packages (id, ecosystem, name, owner_type, owner_id, is_private, description, created_at_nanos, updated_at_nanos)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        "#;
+        sqlx::query(query)
+            .bind(&pkg.id)
+            .bind(&pkg.ecosystem)
+            .bind(&pkg.name)
+            .bind(&pkg.owner_type)
+            .bind(&pkg.owner_id)
+            .bind(pkg.is_private)
+            .bind(&pkg.description)
+            .bind(pkg.created_at_nanos)
+            .bind(pkg.updated_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(pkg)
+    }
+
+    async fn get_package_by_name(&self, ecosystem: &str, name: &str) -> Result<Option<Package>, ForgeError> {
+        let query = "SELECT id, ecosystem, name, owner_type, owner_id, is_private, description, created_at_nanos, updated_at_nanos FROM packages WHERE ecosystem = $1 AND name = $2";
+        let row = sqlx::query(query)
+            .bind(ecosystem)
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        Ok(row.map(|r| Package {
+            id: r.get(0),
+            ecosystem: r.get(1),
+            name: r.get(2),
+            owner_type: r.get(3),
+            owner_id: r.get(4),
+            is_private: r.get(5),
+            description: r.get(6),
+            created_at_nanos: r.get(7),
+            updated_at_nanos: r.get(8),
+        }))
+    }
+
+    async fn list_packages(&self, ecosystem: &str) -> Result<Vec<Package>, ForgeError> {
+        let query = "SELECT id, ecosystem, name, owner_type, owner_id, is_private, description, created_at_nanos, updated_at_nanos FROM packages WHERE ecosystem = $1 ORDER BY name ASC";
+        let rows = sqlx::query(query)
+            .bind(ecosystem)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| Package {
+            id: r.get(0),
+            ecosystem: r.get(1),
+            name: r.get(2),
+            owner_type: r.get(3),
+            owner_id: r.get(4),
+            is_private: r.get(5),
+            description: r.get(6),
+            created_at_nanos: r.get(7),
+            updated_at_nanos: r.get(8),
+        }).collect();
+        Ok(list)
+    }
+
+    async fn create_package_version(&self, ver: PackageVersion) -> Result<PackageVersion, ForgeError> {
+        let query = r#"
+            INSERT INTO package_versions (id, package_id, version, manifest_id, cksum, size_bytes, metadata_json, is_yanked, created_by_user_id, created_at_nanos)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        "#;
+        sqlx::query(query)
+            .bind(&ver.id)
+            .bind(&ver.package_id)
+            .bind(&ver.version)
+            .bind(&ver.manifest_id)
+            .bind(&ver.cksum)
+            .bind(ver.size_bytes)
+            .bind(&ver.metadata_json)
+            .bind(ver.is_yanked)
+            .bind(&ver.created_by_user_id)
+            .bind(ver.created_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(ver)
+    }
+
+    async fn get_package_version(&self, package_id: &str, version: &str) -> Result<Option<PackageVersion>, ForgeError> {
+        let query = "SELECT id, package_id, version, manifest_id, cksum, size_bytes, metadata_json, is_yanked, created_by_user_id, created_at_nanos FROM package_versions WHERE package_id = $1 AND version = $2";
+        let row = sqlx::query(query)
+            .bind(package_id)
+            .bind(version)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        Ok(row.map(|r| PackageVersion {
+            id: r.get(0),
+            package_id: r.get(1),
+            version: r.get(2),
+            manifest_id: r.get(3),
+            cksum: r.get(4),
+            size_bytes: r.get(5),
+            metadata_json: r.get(6),
+            is_yanked: r.get(7),
+            created_by_user_id: r.get(8),
+            created_at_nanos: r.get(9),
+        }))
+    }
+
+    async fn list_package_versions(&self, package_id: &str) -> Result<Vec<PackageVersion>, ForgeError> {
+        let query = "SELECT id, package_id, version, manifest_id, cksum, size_bytes, metadata_json, is_yanked, created_by_user_id, created_at_nanos FROM package_versions WHERE package_id = $1 ORDER BY created_at_nanos ASC";
+        let rows = sqlx::query(query)
+            .bind(package_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| PackageVersion {
+            id: r.get(0),
+            package_id: r.get(1),
+            version: r.get(2),
+            manifest_id: r.get(3),
+            cksum: r.get(4),
+            size_bytes: r.get(5),
+            metadata_json: r.get(6),
+            is_yanked: r.get(7),
+            created_by_user_id: r.get(8),
+            created_at_nanos: r.get(9),
+        }).collect();
+        Ok(list)
+    }
+
+    async fn set_package_version_yanked(&self, package_id: &str, version: &str, yanked: bool) -> Result<(), ForgeError> {
+        let query = "UPDATE package_versions SET is_yanked = $1 WHERE package_id = $2 AND version = $3";
+        sqlx::query(query)
+            .bind(yanked)
+            .bind(package_id)
+            .bind(version)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
 }

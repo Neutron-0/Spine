@@ -20,6 +20,7 @@ spine-merge = { path = "../../git-alternative/crates/spine-merge" }
 spine-cluster = { path = "../../git-alternative/crates/spine-cluster" }
 spine-net = { path = "../../git-alternative/crates/spine-net" }
 spine-config = { path = "../../git-alternative/crates/spine-config" }
+spine-artifact = { path = "../../git-alternative/crates/spine-artifact" }
 
 tokio = { version = "1.38", features = ["full"] }
 axum = { version = "0.7", features = ["json"] }
@@ -34,6 +35,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.8", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 blake3 = "1.5"
+sha2 = "0.10"
 hex = "0.4"
 rand = "0.8"
 subtle = "2.5"

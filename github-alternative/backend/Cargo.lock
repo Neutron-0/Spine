@@ -1872,6 +1872,8 @@ dependencies = [
  "rand 0.8.8",
  "serde",
  "serde_json",
+ "sha2",
+ "spine-artifact",
  "spine-cluster",
  "spine-config",
  "spine-core",
@@ -1890,6 +1892,25 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "spine-artifact"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "chrono",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "spine-cluster",
+ "spine-core",
+ "spine-object-store",
+ "thiserror",
+ "tokio",
  "uuid",
 ]
 

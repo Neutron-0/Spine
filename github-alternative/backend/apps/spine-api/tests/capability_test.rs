@@ -73,6 +73,12 @@ async fn test_issue_capability_ticket_api_route() {
     let rate_limiter = Arc::new(RateLimiter::new());
     let mail = Arc::new(DevMailCatcher::new());
 
+    let artifact_store = Arc::new(spine_artifact::LocalArtifactStore::new(tmp.path().join("artifacts")).unwrap());
+    let artifacts = Arc::new(spine_api::artifact::ArtifactService::new(db.clone(), artifact_store));
+    let releases = Arc::new(spine_api::releases::ReleaseService::new(db.clone(), artifacts.clone()));
+    let packages = Arc::new(spine_api::packages::PackageService::new(db.clone(), artifacts.clone()));
+    let cargo = Arc::new(spine_api::packages::CargoRegistryAdapter::new(packages.clone()));
+
     let state = AppState {
         db: db.clone(),
         permissions: perms,
@@ -81,6 +87,10 @@ async fn test_issue_capability_ticket_api_route() {
         rate_limiter,
         mail,
         coordinator: None,
+        artifacts,
+        releases,
+        packages,
+        cargo,
     };
 
     let router = build_router(state);

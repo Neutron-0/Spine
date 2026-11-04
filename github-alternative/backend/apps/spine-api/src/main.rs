@@ -1,8 +1,9 @@
 use clap::Parser;
 use spine_api::{
     auth::{DevMailCatcher, RateLimiter},
-    build_router, AppState, CoordinatorClient, Database, InMemoryDatabase, NativeVcsService,
-    PermissionService, PgDatabase, ProvisioningWorker, RepositoryService,
+    build_router, AppState, ArtifactService, CargoRegistryAdapter, CoordinatorClient, Database,
+    InMemoryDatabase, NativeVcsService, PackageService, PermissionService, PgDatabase,
+    ProvisioningWorker, ReleaseService, RepositoryService,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -91,6 +92,13 @@ async fn main() -> anyhow::Result<()> {
     let rate_limiter = Arc::new(RateLimiter::new());
     let mail = Arc::new(DevMailCatcher::new());
 
+    let artifact_store_path = storage_root_canonical.join("artifacts");
+    let artifact_store = Arc::new(spine_artifact::LocalArtifactStore::new(artifact_store_path)?);
+    let artifacts = Arc::new(ArtifactService::new(Arc::clone(&db), artifact_store));
+    let releases = Arc::new(ReleaseService::new(Arc::clone(&db), Arc::clone(&artifacts)));
+    let packages = Arc::new(PackageService::new(Arc::clone(&db), Arc::clone(&artifacts)));
+    let cargo = Arc::new(CargoRegistryAdapter::new(Arc::clone(&packages)));
+
     let state = AppState {
         db: Arc::clone(&db),
         permissions: Arc::clone(&permissions),
@@ -99,6 +107,10 @@ async fn main() -> anyhow::Result<()> {
         rate_limiter,
         mail,
         coordinator: coordinator.clone(),
+        artifacts,
+        releases,
+        packages,
+        cargo,
     };
 
     // 4. Spawn background provisioning worker

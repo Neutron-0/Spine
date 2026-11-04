@@ -275,3 +275,83 @@ export interface RepositoryActivityEvent {
   payload: any;
   created_at_nanos: number;
 }
+
+// -------------------------------------------------------------
+// Batch 11: Releases, Assets, Packages, Artifacts & Quota
+// -------------------------------------------------------------
+
+export interface ReleaseAssetDto {
+  id: string;
+  release_id: string;
+  name: string;
+  content_type: string;
+  size_bytes: number;
+  manifest_id: string;
+  whole_hash: string;
+  downloads_count: number;
+  created_at_nanos: number;
+}
+
+export interface ReleaseDto {
+  id: string;
+  repo_id: string;
+  tag_name: string;
+  target_commit_id: string;
+  title: string;
+  body: string;
+  is_draft: boolean;
+  is_prerelease: boolean;
+  author: UserDto;
+  assets: ReleaseAssetDto[];
+  created_at_nanos: number;
+  published_at_nanos?: number | null;
+}
+
+export interface PackageVersionDto {
+  id: string;
+  package_id: string;
+  version: string;
+  manifest_id: string;
+  cksum: string;
+  size_bytes: number;
+  metadata_json: string;
+  is_yanked: boolean;
+  created_by_user_id: string;
+  created_at_nanos: number;
+}
+
+export interface PackageDto {
+  id: string;
+  ecosystem: string;
+  name: string;
+  owner_type: string;
+  owner_id: string;
+  is_private: boolean;
+  description: string;
+  versions: PackageVersionDto[];
+  versions_count: number;
+  created_at_nanos: number;
+  updated_at_nanos: number;
+}
+
+export interface ArtifactQuota {
+  id: string;
+  owner_type: string;
+  owner_id: string;
+  logical_quota_bytes: number;
+  used_logical_bytes: number;
+  used_physical_bytes: number;
+  created_at_nanos: number;
+  updated_at_nanos: number;
+}
+
+export interface ArtifactNamespaceDto {
+  id: string;
+  name: string;
+  owner_type: string;
+  owner_id: string;
+  is_private: boolean;
+  description: string;
+  created_at_nanos: number;
+  updated_at_nanos: number;
+}

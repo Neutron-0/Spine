@@ -75,6 +75,20 @@ pub enum ClusterRpcRequest {
     RetireNode {
         node_id: String,
     },
+    StoreChunk {
+        chunk_hash: String,
+        chunk_bytes: Vec<u8>,
+    },
+    GetChunk {
+        chunk_hash: String,
+    },
+    StoreManifest {
+        manifest_id: String,
+        manifest_bytes: Vec<u8>,
+    },
+    GetManifest {
+        manifest_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -116,6 +130,22 @@ pub enum ClusterRpcResponse {
     RepairAck {
         pack_id: String,
         success: bool,
+    },
+    StoreChunkAck {
+        chunk_hash: String,
+        success: bool,
+    },
+    GetChunkAck {
+        chunk_hash: String,
+        chunk_bytes: Option<Vec<u8>>,
+    },
+    StoreManifestAck {
+        manifest_id: String,
+        success: bool,
+    },
+    GetManifestAck {
+        manifest_id: String,
+        manifest_bytes: Option<Vec<u8>>,
     },
     NodeStatusUpdated {
         node_id: String,

@@ -66,6 +66,20 @@ struct MemoryState {
     // Notifications & Activity (Batch 09)
     notifications: HashMap<String, UserNotification>,
     activity_events: Vec<RepositoryActivityEvent>,
+
+    // Artifacts, Releases & Packages (Batch 11)
+    quotas: HashMap<String, ArtifactQuota>,
+    upload_sessions: HashMap<String, ArtifactUploadSession>,
+    manifests: HashMap<String, StoredArtifactManifest>,
+    releases: HashMap<String, Release>,
+    release_by_repo_tag: HashMap<(String, String), String>,
+    release_assets: HashMap<String, ReleaseAsset>,
+    artifact_namespaces: HashMap<String, ArtifactNamespace>,
+    artifact_ns_by_name: HashMap<String, String>,
+    artifact_versions: HashMap<String, ArtifactVersion>,
+    packages: HashMap<String, Package>,
+    pkg_by_eco_name: HashMap<(String, String), String>,
+    package_versions: HashMap<String, PackageVersion>,
 }
 
 pub struct InMemoryDatabase {
@@ -1292,5 +1306,296 @@ impl Database for InMemoryDatabase {
 
     async fn record_audit_event(&self, _event: AuditEvent) -> Result<(), ForgeError> {
         Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Batch 11: Artifacts, Releases & Packages
+    // -------------------------------------------------------------------------
+
+    async fn get_or_create_quota(&self, owner_type: &str, owner_id: &str) -> Result<ArtifactQuota, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(quota) = state.quotas.get(owner_id) {
+            return Ok(quota.clone());
+        }
+
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let quota = ArtifactQuota {
+            id: format!("quota_{}", uuid::Uuid::new_v4().simple()),
+            owner_type: owner_type.to_string(),
+            owner_id: owner_id.to_string(),
+            logical_quota_bytes: 53687091200, // 50 GB
+            used_logical_bytes: 0,
+            used_physical_bytes: 0,
+            created_at_nanos: now,
+            updated_at_nanos: now,
+        };
+        state.quotas.insert(owner_id.to_string(), quota.clone());
+        Ok(quota)
+    }
+
+    async fn update_quota_usage(&self, owner_id: &str, delta_logical: i64, delta_physical: i64) -> Result<(), ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(quota) = state.quotas.get_mut(owner_id) {
+            quota.used_logical_bytes = (quota.used_logical_bytes + delta_logical).max(0);
+            quota.used_physical_bytes = (quota.used_physical_bytes + delta_physical).max(0);
+            quota.updated_at_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        }
+        Ok(())
+    }
+
+    async fn create_upload_session(&self, session: ArtifactUploadSession) -> Result<ArtifactUploadSession, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.upload_sessions.insert(session.id.clone(), session.clone());
+        Ok(session)
+    }
+
+    async fn get_upload_session(&self, session_id: &str) -> Result<Option<ArtifactUploadSession>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(state.upload_sessions.get(session_id).cloned())
+    }
+
+    async fn update_upload_session_state(&self, session_id: &str, new_state: &str) -> Result<(), ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(session) = state.upload_sessions.get_mut(session_id) {
+            session.state = new_state.to_string();
+        }
+        Ok(())
+    }
+
+    async fn save_artifact_manifest(&self, manifest: StoredArtifactManifest) -> Result<(), ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.manifests.insert(manifest.id.clone(), manifest);
+        Ok(())
+    }
+
+    async fn get_artifact_manifest(&self, manifest_id: &str) -> Result<Option<StoredArtifactManifest>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(state.manifests.get(manifest_id).cloned())
+    }
+
+    async fn create_release(&self, release: Release) -> Result<Release, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let key = (release.repo_id.clone(), release.tag_name.clone());
+        if state.release_by_repo_tag.contains_key(&key) {
+            return Err(ForgeError::Conflict(format!("Release with tag '{}' already exists", release.tag_name)));
+        }
+        state.release_by_repo_tag.insert(key, release.id.clone());
+        state.releases.insert(release.id.clone(), release.clone());
+        Ok(release)
+    }
+
+    async fn get_release_by_id(&self, id: &str) -> Result<Option<Release>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(state.releases.get(id).cloned())
+    }
+
+    async fn get_release_by_tag(&self, repo_id: &str, tag_name: &str) -> Result<Option<Release>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(id) = state.release_by_repo_tag.get(&(repo_id.to_string(), tag_name.to_string())) {
+            Ok(state.releases.get(id).cloned())
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn list_releases_for_repo(&self, repo_id: &str, include_drafts: bool) -> Result<Vec<Release>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut rels: Vec<Release> = state
+            .releases
+            .values()
+            .filter(|r| r.repo_id == repo_id && (include_drafts || !r.is_draft))
+            .cloned()
+            .collect();
+        rels.sort_by_key(|r| std::cmp::Reverse(r.created_at_nanos));
+        Ok(rels)
+    }
+
+    async fn update_release(&self, release: Release) -> Result<Release, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.releases.insert(release.id.clone(), release.clone());
+        Ok(release)
+    }
+
+    async fn delete_release(&self, id: &str) -> Result<(), ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(r) = state.releases.remove(id) {
+            state.release_by_repo_tag.remove(&(r.repo_id, r.tag_name));
+            state.release_assets.retain(|_, a| a.release_id != id);
+        }
+        Ok(())
+    }
+
+    async fn create_release_asset(&self, asset: ReleaseAsset) -> Result<ReleaseAsset, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.release_assets.insert(asset.id.clone(), asset.clone());
+        Ok(asset)
+    }
+
+    async fn get_release_asset(&self, id: &str) -> Result<Option<ReleaseAsset>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(state.release_assets.get(id).cloned())
+    }
+
+    async fn list_assets_for_release(&self, release_id: &str) -> Result<Vec<ReleaseAsset>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut assets: Vec<ReleaseAsset> = state
+            .release_assets
+            .values()
+            .filter(|a| a.release_id == release_id)
+            .cloned()
+            .collect();
+        assets.sort_by_key(|a| a.name.clone());
+        Ok(assets)
+    }
+
+    async fn delete_release_asset(&self, id: &str) -> Result<(), ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.release_assets.remove(id);
+        Ok(())
+    }
+
+    async fn increment_asset_downloads(&self, id: &str) -> Result<(), ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(asset) = state.release_assets.get_mut(id) {
+            asset.downloads_count += 1;
+        }
+        Ok(())
+    }
+
+    async fn create_artifact_namespace(&self, ns: ArtifactNamespace) -> Result<ArtifactNamespace, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let norm = ns.name.to_lowercase();
+        if state.artifact_ns_by_name.contains_key(&norm) {
+            return Err(ForgeError::Conflict(format!("Namespace '{}' already exists", ns.name)));
+        }
+        state.artifact_ns_by_name.insert(norm, ns.id.clone());
+        state.artifact_namespaces.insert(ns.id.clone(), ns.clone());
+        Ok(ns)
+    }
+
+    async fn get_artifact_namespace_by_name(&self, name: &str) -> Result<Option<ArtifactNamespace>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(id) = state.artifact_ns_by_name.get(&name.to_lowercase()) {
+            Ok(state.artifact_namespaces.get(id).cloned())
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn list_artifact_namespaces(&self) -> Result<Vec<ArtifactNamespace>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut list: Vec<ArtifactNamespace> = state.artifact_namespaces.values().cloned().collect();
+        list.sort_by_key(|n| n.name.clone());
+        Ok(list)
+    }
+
+    async fn create_artifact_version(&self, ver: ArtifactVersion) -> Result<ArtifactVersion, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let exists = state.artifact_versions.values().any(|v| {
+            v.namespace_id == ver.namespace_id
+                && v.artifact_name == ver.artifact_name
+                && v.version == ver.version
+        });
+        if exists {
+            return Err(ForgeError::Conflict(format!(
+                "Artifact version '{}:{}' already exists in namespace",
+                ver.artifact_name, ver.version
+            )));
+        }
+        state.artifact_versions.insert(ver.id.clone(), ver.clone());
+        Ok(ver)
+    }
+
+    async fn get_artifact_version(&self, namespace_id: &str, artifact_name: &str, version: &str) -> Result<Option<ArtifactVersion>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(state.artifact_versions.values().find(|v| {
+            v.namespace_id == namespace_id && v.artifact_name == artifact_name && v.version == version
+        }).cloned())
+    }
+
+    async fn list_artifact_versions(&self, namespace_id: &str, artifact_name: &str) -> Result<Vec<ArtifactVersion>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut list: Vec<ArtifactVersion> = state.artifact_versions.values()
+            .filter(|v| v.namespace_id == namespace_id && v.artifact_name == artifact_name)
+            .cloned()
+            .collect();
+        list.sort_by_key(|v| std::cmp::Reverse(v.created_at_nanos));
+        Ok(list)
+    }
+
+    async fn create_package(&self, pkg: Package) -> Result<Package, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let key = (pkg.ecosystem.clone(), pkg.name.to_lowercase());
+        if state.pkg_by_eco_name.contains_key(&key) {
+            return Err(ForgeError::Conflict(format!("Package '{}' already exists in ecosystem '{}'", pkg.name, pkg.ecosystem)));
+        }
+        state.pkg_by_eco_name.insert(key, pkg.id.clone());
+        state.packages.insert(pkg.id.clone(), pkg.clone());
+        Ok(pkg)
+    }
+
+    async fn get_package_by_name(&self, ecosystem: &str, name: &str) -> Result<Option<Package>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(id) = state.pkg_by_eco_name.get(&(ecosystem.to_string(), name.to_lowercase())) {
+            Ok(state.packages.get(id).cloned())
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn list_packages(&self, ecosystem: &str) -> Result<Vec<Package>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut list: Vec<Package> = state
+            .packages
+            .values()
+            .filter(|p| p.ecosystem == ecosystem)
+            .cloned()
+            .collect();
+        list.sort_by_key(|p| p.name.clone());
+        Ok(list)
+    }
+
+    async fn create_package_version(&self, ver: PackageVersion) -> Result<PackageVersion, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let exists = state.package_versions.values().any(|v| {
+            v.package_id == ver.package_id && v.version == ver.version
+        });
+        if exists {
+            return Err(ForgeError::Conflict(format!(
+                "Package version '{}' already exists",
+                ver.version
+            )));
+        }
+        state.package_versions.insert(ver.id.clone(), ver.clone());
+        Ok(ver)
+    }
+
+    async fn get_package_version(&self, package_id: &str, version: &str) -> Result<Option<PackageVersion>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(state.package_versions.values().find(|v| {
+            v.package_id == package_id && v.version == version
+        }).cloned())
+    }
+
+    async fn list_package_versions(&self, package_id: &str) -> Result<Vec<PackageVersion>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut list: Vec<PackageVersion> = state
+            .package_versions
+            .values()
+            .filter(|v| v.package_id == package_id)
+            .cloned()
+            .collect();
+        list.sort_by_key(|v| v.version.clone());
+        Ok(list)
+    }
+
+    async fn set_package_version_yanked(&self, package_id: &str, version: &str, yanked: bool) -> Result<(), ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(v) = state.package_versions.values_mut().find(|v| v.package_id == package_id && v.version == version) {
+            v.is_yanked = yanked;
+            Ok(())
+        } else {
+            Err(ForgeError::NotFound(format!("Version '{}' not found", version)))
+        }
     }
 }

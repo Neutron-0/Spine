@@ -222,6 +222,40 @@ async fn handle_connection(
                 Err(e) => ClusterRpcResponse::Error(e.to_string()),
             }
         }
+        ClusterRpcRequest::StoreChunk {
+            chunk_hash,
+            chunk_bytes,
+        } => match backend.store_chunk(&chunk_hash, &chunk_bytes) {
+            Ok(_) => ClusterRpcResponse::StoreChunkAck {
+                chunk_hash,
+                success: true,
+            },
+            Err(e) => ClusterRpcResponse::Error(e.to_string()),
+        },
+        ClusterRpcRequest::GetChunk { chunk_hash } => match backend.get_chunk(&chunk_hash) {
+            Ok(bytes) => ClusterRpcResponse::GetChunkAck {
+                chunk_hash,
+                chunk_bytes: bytes,
+            },
+            Err(e) => ClusterRpcResponse::Error(e.to_string()),
+        },
+        ClusterRpcRequest::StoreManifest {
+            manifest_id,
+            manifest_bytes,
+        } => match backend.store_manifest(&manifest_id, &manifest_bytes) {
+            Ok(_) => ClusterRpcResponse::StoreManifestAck {
+                manifest_id,
+                success: true,
+            },
+            Err(e) => ClusterRpcResponse::Error(e.to_string()),
+        },
+        ClusterRpcRequest::GetManifest { manifest_id } => match backend.get_manifest(&manifest_id) {
+            Ok(bytes) => ClusterRpcResponse::GetManifestAck {
+                manifest_id,
+                manifest_bytes: bytes,
+            },
+            Err(e) => ClusterRpcResponse::Error(e.to_string()),
+        },
         _ => ClusterRpcResponse::Error("Unhandled storage node request".into()),
     };
 

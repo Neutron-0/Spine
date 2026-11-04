@@ -329,4 +329,45 @@ pub trait Database: Send + Sync {
     ) -> Result<Vec<RepositoryActivityEvent>, ForgeError>;
 
     async fn record_audit_event(&self, event: AuditEvent) -> Result<(), ForgeError>;
+
+    // -------------------------------------------------------------------------
+    // Batch 11: Artifacts, Releases & Packages
+    // -------------------------------------------------------------------------
+    async fn get_or_create_quota(&self, owner_type: &str, owner_id: &str) -> Result<ArtifactQuota, ForgeError>;
+    async fn update_quota_usage(&self, owner_id: &str, delta_logical: i64, delta_physical: i64) -> Result<(), ForgeError>;
+
+    async fn create_upload_session(&self, session: ArtifactUploadSession) -> Result<ArtifactUploadSession, ForgeError>;
+    async fn get_upload_session(&self, session_id: &str) -> Result<Option<ArtifactUploadSession>, ForgeError>;
+    async fn update_upload_session_state(&self, session_id: &str, state: &str) -> Result<(), ForgeError>;
+
+    async fn save_artifact_manifest(&self, manifest: StoredArtifactManifest) -> Result<(), ForgeError>;
+    async fn get_artifact_manifest(&self, manifest_id: &str) -> Result<Option<StoredArtifactManifest>, ForgeError>;
+
+    async fn create_release(&self, release: Release) -> Result<Release, ForgeError>;
+    async fn get_release_by_id(&self, id: &str) -> Result<Option<Release>, ForgeError>;
+    async fn get_release_by_tag(&self, repo_id: &str, tag_name: &str) -> Result<Option<Release>, ForgeError>;
+    async fn list_releases_for_repo(&self, repo_id: &str, include_drafts: bool) -> Result<Vec<Release>, ForgeError>;
+    async fn update_release(&self, release: Release) -> Result<Release, ForgeError>;
+    async fn delete_release(&self, id: &str) -> Result<(), ForgeError>;
+
+    async fn create_release_asset(&self, asset: ReleaseAsset) -> Result<ReleaseAsset, ForgeError>;
+    async fn get_release_asset(&self, id: &str) -> Result<Option<ReleaseAsset>, ForgeError>;
+    async fn list_assets_for_release(&self, release_id: &str) -> Result<Vec<ReleaseAsset>, ForgeError>;
+    async fn delete_release_asset(&self, id: &str) -> Result<(), ForgeError>;
+    async fn increment_asset_downloads(&self, id: &str) -> Result<(), ForgeError>;
+
+    async fn create_artifact_namespace(&self, ns: ArtifactNamespace) -> Result<ArtifactNamespace, ForgeError>;
+    async fn get_artifact_namespace_by_name(&self, name: &str) -> Result<Option<ArtifactNamespace>, ForgeError>;
+    async fn list_artifact_namespaces(&self) -> Result<Vec<ArtifactNamespace>, ForgeError>;
+    async fn create_artifact_version(&self, ver: ArtifactVersion) -> Result<ArtifactVersion, ForgeError>;
+    async fn get_artifact_version(&self, namespace_id: &str, artifact_name: &str, version: &str) -> Result<Option<ArtifactVersion>, ForgeError>;
+    async fn list_artifact_versions(&self, namespace_id: &str, artifact_name: &str) -> Result<Vec<ArtifactVersion>, ForgeError>;
+
+    async fn create_package(&self, pkg: Package) -> Result<Package, ForgeError>;
+    async fn get_package_by_name(&self, ecosystem: &str, name: &str) -> Result<Option<Package>, ForgeError>;
+    async fn list_packages(&self, ecosystem: &str) -> Result<Vec<Package>, ForgeError>;
+    async fn create_package_version(&self, ver: PackageVersion) -> Result<PackageVersion, ForgeError>;
+    async fn get_package_version(&self, package_id: &str, version: &str) -> Result<Option<PackageVersion>, ForgeError>;
+    async fn list_package_versions(&self, package_id: &str) -> Result<Vec<PackageVersion>, ForgeError>;
+    async fn set_package_version_yanked(&self, package_id: &str, version: &str, yanked: bool) -> Result<(), ForgeError>;
 }

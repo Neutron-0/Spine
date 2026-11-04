@@ -1,17 +1,23 @@
 pub mod api;
+pub mod artifact;
 pub mod auth;
 pub mod coordinator;
 pub mod core;
 pub mod db;
+pub mod packages;
 pub mod permissions;
+pub mod releases;
 pub mod repository;
 pub mod storage;
 
 pub use api::{build_router, AppState};
+pub use artifact::ArtifactService;
 pub use auth::DevMailCatcher;
 pub use coordinator::CoordinatorClient;
 pub use core::types::*;
 pub use db::{Database, InMemoryDatabase, PgDatabase};
+pub use packages::{CargoRegistryAdapter, PackageService};
 pub use permissions::PermissionService;
+pub use releases::ReleaseService;
 pub use repository::{ProvisioningWorker, RepositoryService};
 pub use storage::NativeVcsService;

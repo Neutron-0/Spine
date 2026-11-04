@@ -797,3 +797,260 @@ pub struct MergeResultDto {
     pub merge_commit_id: Option<String>,
     pub message: String,
 }
+
+// -----------------------------------------------------------------------------
+// Batch 11: Artifacts, Releases & Packages
+// -----------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactQuota {
+    pub id: String,
+    pub owner_type: String, // "user" or "organization"
+    pub owner_id: String,
+    pub logical_quota_bytes: i64,
+    pub used_logical_bytes: i64,
+    pub used_physical_bytes: i64,
+    pub created_at_nanos: i64,
+    pub updated_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactUploadSession {
+    pub id: String,
+    pub artifact_id: String,
+    pub owner_type: String,
+    pub owner_id: String,
+    pub state: String,
+    pub total_size: i64,
+    pub chunk_size: i32,
+    pub expected_chunks: i32,
+    pub durability_policy: String,
+    pub created_at_nanos: i64,
+    pub expires_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredArtifactManifest {
+    pub id: String,
+    pub artifact_id: String,
+    pub whole_object_hash: String,
+    pub total_size: i64,
+    pub chunk_size: i32,
+    pub chunk_count: i32,
+    pub content_type: Option<String>,
+    pub manifest_json: String,
+    pub created_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateReleaseRequest {
+    pub tag_name: String,
+    pub target_commit_id: String,
+    pub title: String,
+    pub body: String,
+    pub is_draft: Option<bool>,
+    pub is_prerelease: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateReleaseRequest {
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub is_draft: Option<bool>,
+    pub is_prerelease: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Release {
+    pub id: String,
+    pub repo_id: String,
+    pub tag_name: String,
+    pub target_commit_id: String,
+    pub title: String,
+    pub body: String,
+    pub is_draft: bool,
+    pub is_prerelease: bool,
+    pub author_id: String,
+    pub created_at_nanos: i64,
+    pub published_at_nanos: Option<i64>,
+    pub updated_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseDto {
+    pub id: String,
+    pub repo_id: String,
+    pub tag_name: String,
+    pub target_commit_id: String,
+    pub title: String,
+    pub body: String,
+    pub is_draft: bool,
+    pub is_prerelease: bool,
+    pub author: UserDto,
+    pub assets: Vec<ReleaseAssetDto>,
+    pub created_at_nanos: i64,
+    pub published_at_nanos: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseAsset {
+    pub id: String,
+    pub release_id: String,
+    pub name: String,
+    pub content_type: String,
+    pub size_bytes: i64,
+    pub manifest_id: String,
+    pub whole_hash: String,
+    pub downloads_count: i32,
+    pub created_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseAssetDto {
+    pub id: String,
+    pub release_id: String,
+    pub name: String,
+    pub content_type: String,
+    pub size_bytes: i64,
+    pub manifest_id: String,
+    pub whole_hash: String,
+    pub downloads_count: i32,
+    pub created_at_nanos: i64,
+}
+
+impl From<&ReleaseAsset> for ReleaseAssetDto {
+    fn from(a: &ReleaseAsset) -> Self {
+        Self {
+            id: a.id.clone(),
+            release_id: a.release_id.clone(),
+            name: a.name.clone(),
+            content_type: a.content_type.clone(),
+            size_bytes: a.size_bytes,
+            manifest_id: a.manifest_id.clone(),
+            whole_hash: a.whole_hash.clone(),
+            downloads_count: a.downloads_count,
+            created_at_nanos: a.created_at_nanos,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactNamespace {
+    pub id: String,
+    pub name: String,
+    pub owner_type: String,
+    pub owner_id: String,
+    pub is_private: bool,
+    pub description: String,
+    pub created_at_nanos: i64,
+    pub updated_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactNamespaceDto {
+    pub id: String,
+    pub name: String,
+    pub owner_type: String,
+    pub owner_id: String,
+    pub is_private: bool,
+    pub description: String,
+    pub created_at_nanos: i64,
+    pub updated_at_nanos: i64,
+}
+
+impl From<&ArtifactNamespace> for ArtifactNamespaceDto {
+    fn from(n: &ArtifactNamespace) -> Self {
+        Self {
+            id: n.id.clone(),
+            name: n.name.clone(),
+            owner_type: n.owner_type.clone(),
+            owner_id: n.owner_id.clone(),
+            is_private: n.is_private,
+            description: n.description.clone(),
+            created_at_nanos: n.created_at_nanos,
+            updated_at_nanos: n.updated_at_nanos,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactVersion {
+    pub id: String,
+    pub namespace_id: String,
+    pub artifact_name: String,
+    pub version: String,
+    pub manifest_id: String,
+    pub whole_hash: String,
+    pub size_bytes: i64,
+    pub created_by_user_id: String,
+    pub created_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactVersionDto {
+    pub id: String,
+    pub namespace_id: String,
+    pub artifact_name: String,
+    pub version: String,
+    pub manifest_id: String,
+    pub whole_hash: String,
+    pub size_bytes: i64,
+    pub created_by_user_id: String,
+    pub created_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Package {
+    pub id: String,
+    pub ecosystem: String,
+    pub name: String,
+    pub owner_type: String,
+    pub owner_id: String,
+    pub is_private: bool,
+    pub description: String,
+    pub created_at_nanos: i64,
+    pub updated_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageDto {
+    pub id: String,
+    pub ecosystem: String,
+    pub name: String,
+    pub owner_type: String,
+    pub owner_id: String,
+    pub is_private: bool,
+    pub description: String,
+    pub versions: Vec<PackageVersionDto>,
+    pub versions_count: usize,
+    pub created_at_nanos: i64,
+    pub updated_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageVersion {
+    pub id: String,
+    pub package_id: String,
+    pub version: String,
+    pub manifest_id: String,
+    pub cksum: String,
+    pub size_bytes: i64,
+    pub metadata_json: String,
+    pub is_yanked: bool,
+    pub created_by_user_id: String,
+    pub created_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageVersionDto {
+    pub id: String,
+    pub package_id: String,
+    pub version: String,
+    pub manifest_id: String,
+    pub cksum: String,
+    pub size_bytes: i64,
+    pub metadata_json: String,
+    pub is_yanked: bool,
+    pub created_by_user_id: String,
+    pub created_at_nanos: i64,
+}

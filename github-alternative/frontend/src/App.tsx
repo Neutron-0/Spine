@@ -19,6 +19,9 @@ import {
   TeamDto,
   BranchProtectionRule,
   NotificationDto,
+  ReleaseDto,
+  PackageDto,
+  ArtifactQuota,
 } from './types';
 
 export const App: React.FC = () => {
@@ -36,7 +39,7 @@ export const App: React.FC = () => {
   const [branches, setBranches] = useState<BranchDto[]>([]);
   const [currentBranch, setCurrentBranch] = useState<string>('main');
   const [commits, setCommits] = useState<CommitDto[]>([]);
-  const [activeTab, setActiveTab] = useState<'code' | 'issues' | 'pulls' | 'orgs' | 'protection'>('code');
+  const [activeTab, setActiveTab] = useState<'code' | 'issues' | 'pulls' | 'orgs' | 'protection' | 'releases' | 'packages'>('code');
   const [codeSubTab, setCodeSubTab] = useState<'files' | 'commits'>('files');
   const [treeEntries, setTreeEntries] = useState<TreeEntryDto[]>([]);
   const [selectedBlob, setSelectedBlob] = useState<BlobContentDto | null>(null);
@@ -67,6 +70,15 @@ export const App: React.FC = () => {
   const [reviewBody, setReviewBody] = useState<string>('');
   const [inlineCommentForm, setInlineCommentForm] = useState<{ path: string; line: number; body: string } | null>(null);
   const [mergeStatusMsg, setMergeStatusMsg] = useState<string | null>(null);
+
+  // Releases State (Batch 11)
+  const [releases, setReleases] = useState<ReleaseDto[]>([]);
+  const [showNewReleaseModal, setShowNewReleaseModal] = useState<boolean>(false);
+  const [newReleaseForm, setNewReleaseForm] = useState({ tag_name: '', title: '', body: '', is_draft: false, is_prerelease: false });
+
+  // Packages & Quota State (Batch 11)
+  const [packages, setPackages] = useState<PackageDto[]>([]);
+  const [artifactQuota, setArtifactQuota] = useState<ArtifactQuota | null>(null);
 
   // Organizations & Teams
   const [orgs, setOrgs] = useState<OrganizationDto[]>([]);
@@ -229,7 +241,71 @@ export const App: React.FC = () => {
       .then((res) => (res.ok ? res.json() : []))
       .then((rules: BranchProtectionRule[]) => setProtectionRules(rules))
       .catch(() => {});
+
+    // 7. Releases (Batch 11)
+    fetchReleases(selectedRepo.owner, selectedRepo.name);
   }, [selectedRepo]);
+
+  const fetchReleases = (owner: string, name: string) => {
+    fetch(`/api/v1/repos/${owner}/${name}/releases?include_drafts=true`, { headers: getAuthHeaders() })
+      .then((res) => (res.ok ? res.json() : []))
+      .then((data: ReleaseDto[]) => setReleases(Array.isArray(data) ? data : []))
+      .catch(() => setReleases([]));
+  };
+
+  const fetchPackages = () => {
+    fetch('/api/v1/packages', { headers: getAuthHeaders() })
+      .then((res) => (res.ok ? res.json() : []))
+      .then((data: PackageDto[]) => setPackages(Array.isArray(data) ? data : []))
+      .catch(() => setPackages([]));
+
+    if (authToken) {
+      fetch('/api/v1/artifacts/quota', { headers: getAuthHeaders() })
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data: ArtifactQuota | null) => setArtifactQuota(data))
+        .catch(() => {});
+    }
+  };
+
+  useEffect(() => {
+    if (activeTab === 'packages') {
+      fetchPackages();
+    }
+  }, [activeTab]);
+
+  const handleCreateRelease = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedRepo || !newReleaseForm.tag_name.trim() || !newReleaseForm.title.trim()) return;
+
+    try {
+      const res = await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/releases`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(),
+        },
+        body: JSON.stringify({
+          tag_name: newReleaseForm.tag_name.trim(),
+          target_commit_id: commits[0]?.id || 'main',
+          title: newReleaseForm.title.trim(),
+          body: newReleaseForm.body,
+          is_draft: newReleaseForm.is_draft,
+          is_prerelease: newReleaseForm.is_prerelease,
+        }),
+      });
+
+      if (res.ok) {
+        setShowNewReleaseModal(false);
+        setNewReleaseForm({ tag_name: '', title: '', body: '', is_draft: false, is_prerelease: false });
+        fetchReleases(selectedRepo.owner, selectedRepo.name);
+      } else {
+        const err = await res.json();
+        alert(err.error?.message || 'Failed to create release');
+      }
+    } catch (err: any) {
+      alert(err.message || 'Error creating release');
+    }
+  };
 
   const fetchTree = (owner: string, name: string, ref: string, path: string) => {
     const url = `/api/v1/repos/${owner}/${name}/tree/${encodeURIComponent(ref)}${path ? `?path=${encodeURIComponent(path)}` : ''}`;
@@ -696,6 +772,18 @@ export const App: React.FC = () => {
               onClick={() => setActiveTab('protection')}
             >
               🛡️ Protection
+            </button>
+            <button
+              className={`btn ${activeTab === 'releases' ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setActiveTab('releases')}
+            >
+              🏷️ Releases {releases.length > 0 && <span className="badge badge-open" style={{ marginLeft: '4px' }}>{releases.length}</span>}
+            </button>
+            <button
+              className={`btn ${activeTab === 'packages' ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setActiveTab('packages')}
+            >
+              📦 Packages {packages.length > 0 && <span className="badge badge-open" style={{ marginLeft: '4px' }}>{packages.length}</span>}
             </button>
           </div>
         </div>
@@ -1493,6 +1581,171 @@ export const App: React.FC = () => {
       )}
 
       {/* ---------------------------------------------------------------------- */}
+      {/* RELEASES TAB (Batch 11)                                                */}
+      {/* ---------------------------------------------------------------------- */}
+      {activeTab === 'releases' && selectedRepo && (
+        <div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+            <div>
+              <h3 style={{ margin: 0 }}>Releases</h3>
+              <p style={{ margin: 0, fontSize: '0.85rem', color: '#8b949e' }}>
+                Immutable releases bound to tags and commits with distributed binary asset storage.
+              </p>
+            </div>
+            <button className="btn btn-primary" onClick={() => setShowNewReleaseModal(true)}>
+              + Draft a new release
+            </button>
+          </div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+            {releases.map((rel) => (
+              <div key={rel.id} className="diff-container" style={{ padding: '1rem' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                  <div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                      <span className="badge badge-open" style={{ fontSize: '0.9rem' }}>🏷️ {rel.tag_name}</span>
+                      <h4 style={{ margin: 0, color: '#e6edf3' }}>{rel.title}</h4>
+                      {rel.is_draft && <span className="badge badge-closed">Draft</span>}
+                      {rel.is_prerelease && <span className="badge" style={{ backgroundColor: '#d29922' }}>Pre-release</span>}
+                    </div>
+                    <div style={{ fontSize: '0.8rem', color: '#8b949e', marginTop: '0.25rem' }}>
+                      Released by @{rel.author.username} · Target: <code>{rel.target_commit_id.slice(0, 8)}</code>
+                    </div>
+                  </div>
+                </div>
+
+                <div style={{ margin: '1rem 0', whiteSpace: 'pre-wrap', color: '#c9d1d9' }}>
+                  {rel.body || <span style={{ color: '#8b949e' }}>No description provided.</span>}
+                </div>
+
+                {/* Release Assets */}
+                <div style={{ borderTop: '1px solid #30363d', paddingTop: '0.75rem' }}>
+                  <div style={{ fontSize: '0.85rem', fontWeight: 600, color: '#8b949e', marginBottom: '0.5rem' }}>
+                    📦 Assets ({rel.assets.length})
+                  </div>
+                  {rel.assets.map((asset) => (
+                    <div
+                      key={asset.id}
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        padding: '0.4rem 0',
+                        fontSize: '0.85rem',
+                      }}
+                    >
+                      <a
+                        href={`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/releases/${rel.id}/assets/${asset.id}/download`}
+                        style={{ color: '#58a6ff', textDecoration: 'none', fontWeight: 500 }}
+                        download
+                      >
+                        📥 {asset.name}
+                      </a>
+                      <span style={{ color: '#8b949e' }}>
+                        {(asset.size_bytes / (1024 * 1024)).toFixed(2)} MB · {asset.downloads_count} download(s)
+                      </span>
+                    </div>
+                  ))}
+                  {rel.assets.length === 0 && (
+                    <div style={{ fontSize: '0.8rem', color: '#8b949e' }}>No binary assets attached.</div>
+                  )}
+                </div>
+              </div>
+            ))}
+
+            {releases.length === 0 && (
+              <div style={{ textAlign: 'center', padding: '3rem', color: '#8b949e' }}>
+                There aren't any releases for {selectedRepo.owner}/{selectedRepo.name} yet.
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ---------------------------------------------------------------------- */}
+      {/* PACKAGES & REGISTRY TAB (Batch 11)                                     */}
+      {/* ---------------------------------------------------------------------- */}
+      {activeTab === 'packages' && (
+        <div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+            <div>
+              <h3 style={{ margin: 0 }}>Package Registry & Quotas</h3>
+              <p style={{ margin: 0, fontSize: '0.85rem', color: '#8b949e' }}>
+                Cargo-compatible sparse package registry and distributed large object storage accounting.
+              </p>
+            </div>
+            {artifactQuota && (
+              <div style={{ backgroundColor: '#161b22', padding: '0.5rem 1rem', borderRadius: '6px', border: '1px solid #30363d', fontSize: '0.85rem' }}>
+                <span style={{ color: '#8b949e' }}>Quota: </span>
+                <span style={{ color: '#58a6ff', fontWeight: 600 }}>
+                  {(artifactQuota.used_logical_bytes / (1024 * 1024)).toFixed(2)} MB
+                </span>
+                <span style={{ color: '#8b949e' }}> / {(artifactQuota.logical_quota_bytes / (1024 * 1024 * 1024)).toFixed(0)} GB</span>
+              </div>
+            )}
+          </div>
+
+          {/* Cargo Configuration Guide Box */}
+          <div className="diff-container" style={{ padding: '1rem', marginBottom: '1.5rem', backgroundColor: '#0d1117' }}>
+            <h4 style={{ margin: '0 0 0.5rem 0', color: '#e6edf3' }}>🦀 Cargo Sparse Registry Configuration</h4>
+            <p style={{ margin: '0 0 0.5rem 0', fontSize: '0.85rem', color: '#8b949e' }}>
+              Publish and download Rust crates directly to Spine Forge using the standard Cargo CLI:
+            </p>
+            <pre style={{ margin: 0, padding: '0.75rem', backgroundColor: '#161b22', borderRadius: '6px', fontSize: '0.8rem', color: '#58a6ff' }}>
+{`# Add to your project's .cargo/config.toml or ~/.cargo/config.toml:
+[registries.spine]
+index = "sparse+http://127.0.0.1:3000/index/"
+
+# To publish:
+# cargo publish --registry spine
+
+# To depend on a crate:
+# my-crate = { version = "0.1.0", registry = "spine" }`}
+            </pre>
+          </div>
+
+          {/* Packages List */}
+          <div className="diff-container">
+            <div className="diff-header">
+              <span>Published Packages ({packages.length})</span>
+            </div>
+            <div style={{ padding: '0.75rem' }}>
+              {packages.map((pkg) => (
+                <div
+                  key={pkg.id}
+                  style={{
+                    padding: '0.75rem',
+                    borderBottom: '1px solid #30363d',
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                  }}
+                >
+                  <div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                      <span className="badge badge-open">📦 {pkg.name}</span>
+                      <span style={{ fontSize: '0.85rem', color: '#8b949e' }}>v{pkg.versions[pkg.versions.length - 1]?.version || '0.1.0'}</span>
+                    </div>
+                    <div style={{ fontSize: '0.85rem', color: '#c9d1d9', marginTop: '0.25rem' }}>
+                      {pkg.description || 'Rust crate published to Spine Forge'}
+                    </div>
+                  </div>
+                  <div style={{ fontSize: '0.8rem', color: '#8b949e' }}>
+                    {pkg.versions_count} version(s)
+                  </div>
+                </div>
+              ))}
+              {packages.length === 0 && (
+                <div style={{ textAlign: 'center', padding: '2rem', color: '#8b949e' }}>
+                  No packages published to this registry yet. Run <code>cargo publish --registry spine</code> to publish your first crate.
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ---------------------------------------------------------------------- */}
       {/* MODAL: Notifications Drawer                                            */}
       {/* ---------------------------------------------------------------------- */}
       {showNotificationsModal && (
@@ -1935,6 +2188,76 @@ export const App: React.FC = () => {
                 </span>
                 <button type="submit" className="btn btn-primary">
                   {authMode === 'login' ? 'Sign in' : 'Create account'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+      {/* ---------------------------------------------------------------------- */}
+      {/* MODAL: New Release (Batch 11)                                          */}
+      {/* ---------------------------------------------------------------------- */}
+      {showNewReleaseModal && selectedRepo && (
+        <div className="modal-backdrop" onClick={() => setShowNewReleaseModal(false)}>
+          <div className="modal-box" onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ margin: '0 0 1rem 0' }}>Draft a new release for {selectedRepo.name}</h3>
+            <form onSubmit={handleCreateRelease}>
+              <div className="form-group">
+                <label className="form-label">Tag version *</label>
+                <input
+                  type="text"
+                  className="form-input"
+                  placeholder="e.g. v1.0.0"
+                  value={newReleaseForm.tag_name}
+                  onChange={(e) => setNewReleaseForm({ ...newReleaseForm, tag_name: e.target.value })}
+                  required
+                />
+              </div>
+              <div className="form-group">
+                <label className="form-label">Release title *</label>
+                <input
+                  type="text"
+                  className="form-input"
+                  placeholder="Release title"
+                  value={newReleaseForm.title}
+                  onChange={(e) => setNewReleaseForm({ ...newReleaseForm, title: e.target.value })}
+                  required
+                />
+              </div>
+              <div className="form-group">
+                <label className="form-label">Release notes</label>
+                <textarea
+                  className="form-input"
+                  rows={4}
+                  placeholder="Describe this release..."
+                  value={newReleaseForm.body}
+                  onChange={(e) => setNewReleaseForm({ ...newReleaseForm, body: e.target.value })}
+                />
+              </div>
+              <div style={{ display: 'flex', gap: '1rem', marginBottom: '1rem' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem' }}>
+                  <input
+                    type="checkbox"
+                    checked={newReleaseForm.is_prerelease}
+                    onChange={(e) => setNewReleaseForm({ ...newReleaseForm, is_prerelease: e.target.checked })}
+                  />
+                  Pre-release
+                </label>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem' }}>
+                  <input
+                    type="checkbox"
+                    checked={newReleaseForm.is_draft}
+                    onChange={(e) => setNewReleaseForm({ ...newReleaseForm, is_draft: e.target.checked })}
+                  />
+                  Draft
+                </label>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5rem' }}>
+                <button type="button" className="btn btn-secondary" onClick={() => setShowNewReleaseModal(false)}>
+                  Cancel
+                </button>
+                <button type="submit" className="btn btn-primary">
+                  Publish release
                 </button>
               </div>
             </form>

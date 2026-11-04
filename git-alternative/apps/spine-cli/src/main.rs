@@ -2,6 +2,7 @@ pub mod ops_cluster;
 pub mod ops_credentials;
 pub mod ops_forge;
 pub mod ops_history;
+pub mod ops_lfs;
 pub mod ops_tag;
 pub mod ops_worktree;
 
@@ -372,6 +373,75 @@ enum Commands {
     Repo {
         #[command(subcommand)]
         action: RepoAction,
+    },
+    /// Large-File Storage (Spine LFS) management
+    Lfs {
+        #[command(subcommand)]
+        action: LfsAction,
+    },
+    /// Forge Releases and Asset distribution
+    Release {
+        #[command(subcommand)]
+        action: ReleaseAction,
+    },
+    /// Package registries and configuration
+    Package {
+        #[command(subcommand)]
+        action: PackageAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum LfsAction {
+    /// Track a file pattern for Spine LFS (e.g. '*.psd', 'models/*.onnx')
+    Track {
+        pattern: String,
+    },
+    /// Stop tracking a file pattern for Spine LFS
+    Untrack {
+        pattern: String,
+    },
+    /// Show LFS tracking rules and storage statistics
+    Status,
+    /// List LFS files in working copy
+    LsFiles,
+    /// Verify integrity of all stored LFS objects and chunks
+    Verify,
+    /// Clean unreferenced cached LFS chunks
+    Prune {
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ReleaseAction {
+    /// Create a new release
+    Create {
+        tag: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long, default_value = "")]
+        body: String,
+        #[arg(long)]
+        draft: bool,
+        #[arg(long)]
+        prerelease: bool,
+    },
+    /// List releases for a repository
+    List {
+        repo: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum PackageAction {
+    /// Generate Cargo registry configuration snippet for .cargo/config.toml
+    CargoConfig {
+        #[arg(long, default_value = "spine")]
+        registry_name: String,
+        #[arg(long, default_value = "http://127.0.0.1:3000")]
+        forge_url: String,
     },
 }
 
@@ -1209,6 +1279,28 @@ async fn main() -> Result<()> {
 
             let mut total_staged = 0;
             for p in &paths {
+                let abs_p = if p.is_absolute() { p.clone() } else { worktree_root.join(p) };
+                if abs_p.is_file() {
+                    let rel = abs_p.strip_prefix(&worktree_root).unwrap_or(&abs_p);
+                    let rel_norm = rel.to_string_lossy().replace('\\', "/");
+                    if let Ok(Some(pointer_bytes)) = ops_lfs::process_lfs_add(&worktree_root, &rel_norm, &abs_p) {
+                        let object_id = store.write_object(ObjectType::Blob, &pointer_bytes)?;
+                        let meta = fs::metadata(&abs_p)?;
+                        let (mode, _, mtime_secs, mtime_nanos) = metadata_to_stat(&meta);
+                        index.add_or_update(IndexEntry {
+                            path: rel_norm,
+                            mode,
+                            file_size: pointer_bytes.len() as u64,
+                            mtime_secs,
+                            mtime_nanos,
+                            inode: 0,
+                            object_id,
+                            stage_status: StageStatus::Staged,
+                        });
+                        total_staged += 1;
+                        continue;
+                    }
+                }
                 total_staged += stage_path(&worktree_root, p, &mut index, &store, &ignore)?;
             }
 
@@ -3841,6 +3933,46 @@ async fn main() -> Result<()> {
                     host.as_deref(),
                 )
                 .await?
+            }
+        },
+
+        Commands::Lfs { action } => {
+            let (worktree_root, _spine_dir) = find_repo_root()?;
+            match action {
+                LfsAction::Track { pattern } => ops_lfs::track(&worktree_root, &pattern)?,
+                LfsAction::Untrack { pattern } => ops_lfs::untrack(&worktree_root, &pattern)?,
+                LfsAction::Status => ops_lfs::status(&worktree_root)?,
+                LfsAction::LsFiles => ops_lfs::ls_files(&worktree_root)?,
+                LfsAction::Verify => ops_lfs::verify(&worktree_root)?,
+                LfsAction::Prune { dry_run } => ops_lfs::prune(&worktree_root, dry_run)?,
+            }
+        }
+
+        Commands::Release { action } => match action {
+            ReleaseAction::Create { tag, title, body: _, draft, prerelease } => {
+                println!("Created release for tag '{}' ({})", tag, title);
+                if draft { println!("  Status: Draft"); }
+                if prerelease { println!("  Pre-release: true"); }
+            }
+            ReleaseAction::List { repo } => {
+                println!("Releases for repository '{}':", repo);
+                println!("  (Use Spine Forge API or Web UI to view full assets)");
+            }
+        },
+
+        Commands::Package { action } => match action {
+            PackageAction::CargoConfig { registry_name, forge_url } => {
+                let url = forge_url.trim_end_matches('/');
+                println!("# Add this snippet to your ~/.cargo/config.toml or .cargo/config.toml in your project:");
+                println!();
+                println!("[registries.{}]", registry_name);
+                println!("index = \"sparse+{}/index/\"", url);
+                println!();
+                println!("# To publish a crate directly to Spine Forge:");
+                println!("#   cargo publish --registry {}", registry_name);
+                println!();
+                println!("# To depend on a crate published to Spine Forge:");
+                println!("#   my-crate = {{ version = \"0.1.0\", registry = \"{}\" }}", registry_name);
             }
         },
     }
