@@ -4,7 +4,7 @@ use crate::core::error::ForgeError;
 use crate::core::types::*;
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Extension, Json,
@@ -18,7 +18,7 @@ use std::io::Cursor;
 use subtle::ConstantTimeEq;
 
 type HmacSha256 = Hmac<Sha256>;
-const LFS_SECRET_SALT: &[u8] = b"spine-lfs-transfer-token-salt-v1";
+pub const LFS_SECRET_SALT: &[u8] = b"spine-lfs-transfer-token-salt-v1";
 
 pub const LFS_MEDIA_TYPE: &str = "application/vnd.git-lfs+json";
 
@@ -155,6 +155,56 @@ pub fn verify_scoped_token(
     }
 
     Ok(token.max_size)
+}
+
+/// Generates a signed, short-lived RemoteAuth token for SSH LFS authentication.
+pub fn generate_remote_auth_token(
+    secret: &[u8],
+    user_id: &str,
+    repo_id: &str,
+    op: &str,
+    exp: i64,
+) -> String {
+    let payload = LfsRemoteAuthToken {
+        user_id: user_id.to_string(),
+        repo_id: repo_id.to_string(),
+        op: op.to_string(),
+        exp,
+    };
+    let json_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    let payload_hex = hex::encode(&json_bytes);
+
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC slice valid");
+    mac.update(b"spine-lfs-remote-auth-v1");
+    mac.update(payload_hex.as_bytes());
+    let sig_hex = hex::encode(mac.finalize().into_bytes());
+
+    format!("{}.{}", payload_hex, sig_hex)
+}
+
+/// Verifies a RemoteAuth token in constant time.
+pub fn verify_remote_auth_token(secret: &[u8], token_str: &str) -> Option<LfsRemoteAuthToken> {
+    let (payload_hex, sig_hex) = token_str.split_once('.')?;
+    let expected_sig = {
+        let mut mac = HmacSha256::new_from_slice(secret).ok()?;
+        mac.update(b"spine-lfs-remote-auth-v1");
+        mac.update(payload_hex.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    };
+
+    if expected_sig.as_bytes().ct_eq(sig_hex.as_bytes()).unwrap_u8() != 1 {
+        return None;
+    }
+
+    let json_bytes = hex::decode(payload_hex).ok()?;
+    let token: LfsRemoteAuthToken = serde_json::from_slice(&json_bytes).ok()?;
+
+    let now = chrono::Utc::now().timestamp();
+    if token.exp < now {
+        return None;
+    }
+
+    Some(token)
 }
 
 /// Helper to enforce HTTPS outside local loopback environments.
@@ -884,4 +934,406 @@ pub async fn lfs_download_chunk(
         .body(axum::body::Body::from(bytes))
         .map_err(|e| ForgeError::Internal(e.to_string()))?;
     Ok(res)
+}
+
+// -----------------------------------------------------------------------------
+// Git LFS File Locking Endpoints (Batch 18)
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Default)]
+pub struct LfsListLocksQuery {
+    pub path: Option<String>,
+    pub id: Option<String>,
+    pub cursor: Option<String>,
+    pub limit: Option<usize>,
+}
+
+/// POST `/:owner/:repo_git/info/lfs/locks`
+pub async fn git_lfs_create_lock(
+    State(state): State<AppState>,
+    Path((owner, repo_git)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(payload): Json<LfsCreateLockRequest>,
+) -> Response {
+    if let Err(resp) = check_transport_security(&state, &headers) {
+        return resp;
+    }
+
+    let repo_name = repo_git.strip_suffix(".git").unwrap_or(&repo_git);
+    let repo = match state.db.get_repository_by_owner_name(&owner, repo_name).await {
+        Ok(Some(r)) => r,
+        _ => return (StatusCode::NOT_FOUND, "Repository not found\n").into_response(),
+    };
+
+    let user = match authenticate_git_user(&state, &headers).await {
+        Some(u) => u,
+        None => return unauthorized_response(),
+    };
+
+    if let Err(e) = state.permissions.check_write_access(Some(&user), &repo).await {
+        return (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+            format!("{{\"message\":\"Write permission denied: {}\"}}\n", e),
+        )
+            .into_response();
+    }
+
+    let normalized_path = payload.path.trim().trim_start_matches('/').to_string();
+    if normalized_path.is_empty() || normalized_path.contains("..") {
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+            "{\"message\":\"Invalid path for locking\"}\n",
+        )
+            .into_response();
+    }
+
+    if let Ok(Some(existing)) = state.db.get_lfs_lock_by_path(&repo.id, &normalized_path).await {
+        return (
+            StatusCode::CONFLICT,
+            [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+            serde_json::to_string(&LfsCreateLockResponse {
+                lock: LfsLockDto::from(&existing),
+                message: Some("already locked".to_string()),
+            })
+            .unwrap_or_default(),
+        )
+            .into_response();
+    }
+
+    let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let new_lock = LfsLock {
+        id: uuid::Uuid::new_v4().to_string(),
+        repository_id: repo.id.clone(),
+        path: normalized_path.clone(),
+        owner_id: user.id.clone(),
+        owner_username: user.username.clone(),
+        locked_at_nanos: now_nanos,
+    };
+
+    let created = match state.db.create_lfs_lock(new_lock).await {
+        Ok(l) => l,
+        Err(ForgeError::Conflict(_)) => {
+            if let Ok(Some(existing)) = state.db.get_lfs_lock_by_path(&repo.id, &normalized_path).await {
+                return (
+                    StatusCode::CONFLICT,
+                    [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+                    serde_json::to_string(&LfsCreateLockResponse {
+                        lock: LfsLockDto::from(&existing),
+                        message: Some("already locked".to_string()),
+                    })
+                    .unwrap_or_default(),
+                )
+                    .into_response();
+            }
+            return (
+                StatusCode::CONFLICT,
+                [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+                "{\"message\":\"Conflict locking file\"}\n",
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+                format!("{{\"message\":\"Failed to create lock: {}\"}}\n", e),
+            )
+                .into_response();
+        }
+    };
+
+    let _ = state
+        .db
+        .create_lfs_lock_audit(LfsLockAudit {
+            id: uuid::Uuid::new_v4().to_string(),
+            repository_id: repo.id.clone(),
+            path: normalized_path,
+            actor_user_id: user.id,
+            action: "LOCK".to_string(),
+            created_at_nanos: now_nanos,
+        })
+        .await;
+
+    (
+        StatusCode::CREATED,
+        [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+        serde_json::to_string(&LfsCreateLockResponse {
+            lock: LfsLockDto::from(&created),
+            message: None,
+        })
+        .unwrap_or_default(),
+    )
+        .into_response()
+}
+
+/// GET `/:owner/:repo_git/info/lfs/locks`
+pub async fn git_lfs_list_locks(
+    State(state): State<AppState>,
+    Path((owner, repo_git)): Path<(String, String)>,
+    Query(query): Query<LfsListLocksQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = check_transport_security(&state, &headers) {
+        return resp;
+    }
+
+    let repo_name = repo_git.strip_suffix(".git").unwrap_or(&repo_git);
+    let repo = match state.db.get_repository_by_owner_name(&owner, repo_name).await {
+        Ok(Some(r)) => r,
+        _ => return (StatusCode::NOT_FOUND, "Repository not found\n").into_response(),
+    };
+
+    let caller = authenticate_git_user(&state, &headers).await;
+    if let Err(e) = state.permissions.check_read_access(caller.as_ref(), &repo).await {
+        return (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+            format!("{{\"message\":\"Read permission denied: {}\"}}\n", e),
+        )
+            .into_response();
+    }
+
+    if let Some(ref lock_id) = query.id {
+        if let Ok(Some(lock)) = state.db.get_lfs_lock_by_id(lock_id).await {
+            if lock.repository_id == repo.id {
+                let resp = LfsListLocksResponse {
+                    locks: vec![LfsLockDto::from(&lock)],
+                    next_cursor: None,
+                };
+                return (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+                    serde_json::to_string(&resp).unwrap_or_default(),
+                )
+                    .into_response();
+            }
+        }
+        let resp = LfsListLocksResponse {
+            locks: vec![],
+            next_cursor: None,
+        };
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+            serde_json::to_string(&resp).unwrap_or_default(),
+        )
+            .into_response();
+    }
+
+    let norm_path = query.path.as_deref().map(|p| p.trim().trim_start_matches('/'));
+    match state
+        .db
+        .list_lfs_locks(&repo.id, norm_path, query.cursor.as_deref(), query.limit)
+        .await
+    {
+        Ok((locks, next_cursor)) => {
+            let dtos: Vec<LfsLockDto> = locks.iter().map(LfsLockDto::from).collect();
+            let resp = LfsListLocksResponse {
+                locks: dtos,
+                next_cursor,
+            };
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+                serde_json::to_string(&resp).unwrap_or_default(),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+            format!("{{\"message\":\"Failed to list locks: {}\"}}\n", e),
+        )
+            .into_response(),
+    }
+}
+
+/// POST `/:owner/:repo_git/info/lfs/locks/verify`
+pub async fn git_lfs_verify_locks(
+    State(state): State<AppState>,
+    Path((owner, repo_git)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(resp) = check_transport_security(&state, &headers) {
+        return resp;
+    }
+
+    let repo_name = repo_git.strip_suffix(".git").unwrap_or(&repo_git);
+    let repo = match state.db.get_repository_by_owner_name(&owner, repo_name).await {
+        Ok(Some(r)) => r,
+        _ => return (StatusCode::NOT_FOUND, "Repository not found\n").into_response(),
+    };
+
+    let user = match authenticate_git_user(&state, &headers).await {
+        Some(u) => u,
+        None => return unauthorized_response(),
+    };
+
+    if let Err(e) = state.permissions.check_write_access(Some(&user), &repo).await {
+        return (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+            format!("{{\"message\":\"Write permission denied: {}\"}}\n", e),
+        )
+            .into_response();
+    }
+
+    let req: LfsVerifyLocksRequest = serde_json::from_slice(&body).unwrap_or_default();
+    match state
+        .db
+        .list_lfs_locks(&repo.id, None, req.cursor.as_deref(), req.limit)
+        .await
+    {
+        Ok((locks, next_cursor)) => {
+            let mut ours = Vec::new();
+            let mut theirs = Vec::new();
+            for lock in locks {
+                let dto = LfsLockDto::from(&lock);
+                if lock.owner_id == user.id {
+                    ours.push(dto);
+                } else {
+                    theirs.push(dto);
+                }
+            }
+            let resp = LfsVerifyLocksResponse {
+                ours,
+                theirs,
+                next_cursor,
+            };
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+                serde_json::to_string(&resp).unwrap_or_default(),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+            format!("{{\"message\":\"Failed to verify locks: {}\"}}\n", e),
+        )
+            .into_response(),
+    }
+}
+
+/// POST `/:owner/:repo_git/info/lfs/locks/:id/unlock`
+pub async fn git_lfs_unlock(
+    State(state): State<AppState>,
+    Path((owner, repo_git, lock_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(resp) = check_transport_security(&state, &headers) {
+        return resp;
+    }
+
+    let repo_name = repo_git.strip_suffix(".git").unwrap_or(&repo_git);
+    let repo = match state.db.get_repository_by_owner_name(&owner, repo_name).await {
+        Ok(Some(r)) => r,
+        _ => return (StatusCode::NOT_FOUND, "Repository not found\n").into_response(),
+    };
+
+    let user = match authenticate_git_user(&state, &headers).await {
+        Some(u) => u,
+        None => return unauthorized_response(),
+    };
+
+    if let Err(e) = state.permissions.check_write_access(Some(&user), &repo).await {
+        return (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+            format!("{{\"message\":\"Write permission denied: {}\"}}\n", e),
+        )
+            .into_response();
+    }
+
+    let req: LfsUnlockRequest = serde_json::from_slice(&body).unwrap_or_default();
+    let force = req.force.unwrap_or(false);
+
+    let lock = match state.db.get_lfs_lock_by_id(&lock_id).await {
+        Ok(Some(l)) => {
+            if l.repository_id != repo.id {
+                return (
+                    StatusCode::NOT_FOUND,
+                    [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+                    "{\"message\":\"Lock not found in repository\"}\n",
+                )
+                    .into_response();
+            }
+            l
+        }
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+                "{\"message\":\"Lock not found\"}\n",
+            )
+                .into_response();
+        }
+    };
+
+    let action_str;
+    if lock.owner_id != user.id {
+        if !force {
+            return (
+                StatusCode::FORBIDDEN,
+                [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+                format!(
+                    "{{\"message\":\"Lock belongs to '{}'; cannot unlock without force\"}}\n",
+                    lock.owner_username
+                ),
+            )
+                .into_response();
+        }
+        if let Err(_) = state.permissions.check_admin_access(Some(&user), &repo).await {
+            return (
+                StatusCode::FORBIDDEN,
+                [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+                "{\"message\":\"Only repository administrators may force unlock files\"}\n",
+            )
+                .into_response();
+        }
+        action_str = "FORCE_UNLOCK";
+    } else {
+        action_str = "UNLOCK";
+    }
+
+    let deleted = match state.db.delete_lfs_lock(&lock_id).await {
+        Ok(Some(l)) => l,
+        _ => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+                "{\"message\":\"Failed to delete lock\"}\n",
+            )
+                .into_response();
+        }
+    };
+
+    let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let _ = state
+        .db
+        .create_lfs_lock_audit(LfsLockAudit {
+            id: uuid::Uuid::new_v4().to_string(),
+            repository_id: repo.id.clone(),
+            path: deleted.path.clone(),
+            actor_user_id: user.id,
+            action: action_str.to_string(),
+            created_at_nanos: now_nanos,
+        })
+        .await;
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+        serde_json::to_string(&LfsUnlockResponse {
+            lock: LfsLockDto::from(&deleted),
+            message: None,
+        })
+        .unwrap_or_default(),
+    )
+        .into_response()
 }

@@ -1,4 +1,5 @@
 use super::middleware::AppState;
+use crate::core::types::*;
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
@@ -137,6 +138,15 @@ pub async fn authenticate_git_user(
                     }
                 }
             }
+        } else if let Some(remote_token) = auth_str.strip_prefix("RemoteAuth ") {
+            if let Some(tok) = crate::api::routes_lfs::verify_remote_auth_token(
+                crate::api::routes_lfs::LFS_SECRET_SALT,
+                remote_token.trim(),
+            ) {
+                if let Ok(Some(u)) = state.db.get_user_by_id(&tok.user_id).await {
+                    return Some(u);
+                }
+            }
         }
     }
 
@@ -155,7 +165,7 @@ pub async fn authenticate_git_user(
     None
 }
 
-fn ensure_repo_spine_dir(storage_root: &std::path::Path, native_repo_id: &str) -> PathBuf {
+pub fn ensure_repo_spine_dir(storage_root: &std::path::Path, native_repo_id: &str) -> PathBuf {
     let spine_dir = storage_root
         .join("repos")
         .join(native_repo_id)
@@ -417,22 +427,102 @@ pub async fn git_receive_pack(
             .into_response();
     }
 
+    let resp_bytes = match process_git_receive_pack(&state, &repo, &user.id, &body).await {
+        Ok(b) => b,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+
+    let mut resp_headers = HeaderMap::new();
+    resp_headers.insert(
+        header::CONTENT_TYPE,
+        "application/x-git-receive-pack-result".parse().unwrap(),
+    );
+    resp_headers.insert(
+        header::CACHE_CONTROL,
+        "no-cache, max-age=0, must-revalidate".parse().unwrap(),
+    );
+
+    (StatusCode::OK, resp_headers, resp_bytes).into_response()
+}
+
+pub fn flatten_tree_recursive<S: spine_object_store::ObjectStore>(
+    store: &S,
+    tree_id: &ObjectId,
+    prefix: &str,
+    out: &mut std::collections::BTreeMap<String, (spine_core::FileMode, ObjectId)>,
+) -> anyhow::Result<()> {
+    let (obj_type, payload) = store.read_object(tree_id)?;
+    if obj_type != spine_core::ObjectType::Tree {
+        return Ok(());
+    }
+    let entries = spine_format::deserialize_tree(&payload)?;
+    for entry in entries {
+        let full_path = if prefix.is_empty() {
+            entry.name.clone()
+        } else {
+            format!("{}/{}", prefix, entry.name)
+        };
+        if entry.mode == spine_core::FileMode::Directory {
+            flatten_tree_recursive(store, &entry.object_id, &full_path, out)?;
+        } else {
+            out.insert(full_path, (entry.mode, entry.object_id));
+        }
+    }
+    Ok(())
+}
+
+pub fn collect_changed_paths_from_commits<S: spine_object_store::ObjectStore>(
+    store: &S,
+    new_commits: &[(GitOid, ObjectId, spine_core::Commit)],
+) -> Vec<String> {
+    let mut paths = std::collections::HashSet::new();
+    for (_goid, _sid, commit) in new_commits {
+        let mut commit_tree_files = std::collections::BTreeMap::new();
+        let _ = flatten_tree_recursive(store, &commit.root_tree, "", &mut commit_tree_files);
+
+        if commit.parents.is_empty() {
+            for path in commit_tree_files.keys() {
+                paths.insert(path.clone());
+            }
+        } else {
+            for parent_id in &commit.parents {
+                if let Ok((spine_core::ObjectType::Commit, payload)) = store.read_object(parent_id) {
+                    if let Ok(parent_commit) = spine_format::deserialize_commit(&payload) {
+                        let mut parent_tree_files = std::collections::BTreeMap::new();
+                        let _ = flatten_tree_recursive(store, &parent_commit.root_tree, "", &mut parent_tree_files);
+                        let diff = spine_diff::compare_trees(&parent_tree_files, &commit_tree_files);
+                        for change in diff {
+                            paths.insert(change.path().to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    paths.into_iter().collect()
+}
+
+pub async fn process_git_receive_pack(
+    state: &AppState,
+    repo: &ForgeRepository,
+    actor_user_id: &str,
+    body: &[u8],
+) -> Result<Vec<u8>, (StatusCode, String)> {
     let spine_dir = ensure_repo_spine_dir(state.vcs.storage_root(), &repo.native_repo_id);
 
     // Parse commands and packfile payload
-    let (commands, _capabilities, pack_bytes) = match parse_receive_pack_request(&body) {
+    let (commands, _capabilities, pack_bytes) = match parse_receive_pack_request(body) {
         Ok(res) => res,
         Err(e) => {
-            return (
+            return Err((
                 StatusCode::BAD_REQUEST,
                 format!("Failed to parse receive-pack request: {}\n", e),
-            )
-                .into_response();
+            ));
         }
     };
 
     if commands.is_empty() {
-        return (StatusCode::OK, spine_migration::encode_flush().to_vec()).into_response();
+        return Ok(spine_migration::encode_flush().to_vec());
     }
 
     // Ingest packfile into native Spine repository
@@ -442,15 +532,7 @@ pub async fn git_receive_pack(
             let err_str = e.to_string();
             let resp_bytes = format_receive_pack_response(false, Some(&err_str), &[])
                 .unwrap_or_else(|_| spine_migration::encode_flush().to_vec());
-            return (
-                StatusCode::OK,
-                [(
-                    header::CONTENT_TYPE,
-                    "application/x-git-receive-pack-result",
-                )],
-                resp_bytes,
-            )
-                .into_response();
+            return Ok(resp_bytes);
         }
     };
 
@@ -491,13 +573,35 @@ pub async fn git_receive_pack(
     let store = match CompositeObjectStore::new(&spine_dir, HashAlgorithm::Blake3, 3) {
         Ok(s) => s,
         Err(e) => {
-            return (
+            return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to open object store: {}\n", e),
-            )
-                .into_response()
+            ));
         }
     };
+
+    // 1c. LFS Lock Conflict Verification: Check modified paths in incoming commits
+    let changed_paths = collect_changed_paths_from_commits(&store, &ingest_res.new_commits);
+    let mut detected_lock_conflict: Option<(String, String)> = None;
+    for path in &changed_paths {
+        if let Ok(Some(lock)) = state.db.get_lfs_lock_by_path(&repo.id, path).await {
+            if lock.owner_id != actor_user_id {
+                let _ = state
+                    .db
+                    .create_lfs_lock_audit(LfsLockAudit {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        repository_id: repo.id.clone(),
+                        path: path.clone(),
+                        actor_user_id: actor_user_id.to_string(),
+                        action: "CONFLICT".to_string(),
+                        created_at_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                    })
+                    .await;
+                detected_lock_conflict = Some((path.clone(), lock.owner_username.clone()));
+                break;
+            }
+        }
+    }
 
     let mut ref_results: Vec<(String, Result<(), String>)> = Vec::new();
 
@@ -523,6 +627,18 @@ pub async fn git_receive_pack(
                 Err(format!(
                     "push rejected: referenced LFS object '{}' ({} bytes) is missing; upload via git-lfs before pushing",
                     lfs_oid, lfs_sz
+                )),
+            ));
+            continue;
+        }
+
+        // If LFS lock conflict was detected, reject all ref updates
+        if let Some((ref locked_path, ref lock_owner)) = detected_lock_conflict {
+            ref_results.push((
+                ref_name.clone(),
+                Err(format!(
+                    "push rejected: file '{}' is locked by {}",
+                    locked_path, lock_owner
                 )),
             ));
             continue;
@@ -646,26 +762,12 @@ pub async fn git_receive_pack(
         }
     }
 
-    let resp_bytes = match format_receive_pack_response(true, None, &ref_results) {
-        Ok(b) => b,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to format receive-pack response: {}\n", e),
-            )
-                .into_response();
-        }
-    };
+    let resp_bytes = format_receive_pack_response(true, None, &ref_results).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to format receive-pack response: {}\n", e),
+        )
+    })?;
 
-    let mut resp_headers = HeaderMap::new();
-    resp_headers.insert(
-        header::CONTENT_TYPE,
-        "application/x-git-receive-pack-result".parse().unwrap(),
-    );
-    resp_headers.insert(
-        header::CACHE_CONTROL,
-        "no-cache, max-age=0, must-revalidate".parse().unwrap(),
-    );
-
-    (StatusCode::OK, resp_headers, resp_bytes).into_response()
+    Ok(resp_bytes)
 }

@@ -48,6 +48,9 @@ import {
   MigrationPlanDto,
   MigrationReportDto,
   ExportStatsSummaryDto,
+  UserSshKeyDto,
+  DeployKeyDto,
+  LfsLockDto,
 } from './types';
 
 export const App: React.FC = () => {
@@ -65,7 +68,7 @@ export const App: React.FC = () => {
   const [branches, setBranches] = useState<BranchDto[]>([]);
   const [currentBranch, setCurrentBranch] = useState<string>('main');
   const [commits, setCommits] = useState<CommitDto[]>([]);
-  const [activeTab, setActiveTab] = useState<'code' | 'issues' | 'pulls' | 'orgs' | 'protection' | 'releases' | 'packages' | 'actions' | 'webhooks' | 'runners' | 'secrets' | 'search' | 'discussions' | 'discovery' | 'security' | 'migration'>('code');
+  const [activeTab, setActiveTab] = useState<'code' | 'issues' | 'pulls' | 'orgs' | 'protection' | 'releases' | 'packages' | 'actions' | 'webhooks' | 'runners' | 'secrets' | 'search' | 'discussions' | 'discovery' | 'security' | 'migration' | 'deploy-keys' | 'lfs-locks'>('code');
   const [codeSubTab, setCodeSubTab] = useState<'files' | 'commits'>('files');
   const [treeEntries, setTreeEntries] = useState<TreeEntryDto[]>([]);
   const [selectedBlob, setSelectedBlob] = useState<BlobContentDto | null>(null);
@@ -73,6 +76,24 @@ export const App: React.FC = () => {
   const [loading, setLoading] = useState<boolean>(true);
   const [showCloneDropdown, setShowCloneDropdown] = useState<boolean>(false);
   const [copiedClone, setCopiedClone] = useState<boolean>(false);
+  // Batch 18: SSH & Git LFS Locks State
+  const [cloneProtocol, setCloneProtocol] = useState<'https' | 'ssh'>('https');
+  const [showSshKeysModal, setShowSshKeysModal] = useState<boolean>(false);
+  const [userSshKeys, setUserSshKeys] = useState<UserSshKeyDto[]>([]);
+  const [newSshKeyTitle, setNewSshKeyTitle] = useState<string>('');
+  const [newSshKeyBody, setNewSshKeyBody] = useState<string>('');
+  const [sshKeyError, setSshKeyError] = useState<string | null>(null);
+
+  const [deployKeys, setDeployKeys] = useState<DeployKeyDto[]>([]);
+  const [newDeployKeyTitle, setNewDeployKeyTitle] = useState<string>('');
+  const [newDeployKeyBody, setNewDeployKeyBody] = useState<string>('');
+  const [newDeployKeyWrite, setNewDeployKeyWrite] = useState<boolean>(false);
+  const [deployKeyError, setDeployKeyError] = useState<string | null>(null);
+
+  const [lfsLocks, setLfsLocks] = useState<LfsLockDto[]>([]);
+  const [newLfsLockPath, setNewLfsLockPath] = useState<string>('');
+  const [lfsLockError, setLfsLockError] = useState<string | null>(null);
+
 
   // Issues State
   const [issues, setIssues] = useState<IssueDto[]>([]);
@@ -327,6 +348,10 @@ export const App: React.FC = () => {
       if (currentUser) fetchUserProfile();
     } else if (activeTab === 'security') {
       fetchSecurityData();
+    } else if (activeTab === 'deploy-keys') {
+      fetchDeployKeys();
+    } else if (activeTab === 'lfs-locks') {
+      fetchLfsLocks();
     }
   }, [activeTab, selectedRepo]);
 
@@ -1047,6 +1072,166 @@ export const App: React.FC = () => {
   };
 
   // Auth Submit
+
+  // Batch 18: SSH Keys Handlers
+  const fetchUserSshKeys = async () => {
+    if (!authToken) return;
+    try {
+      const res = await fetch('/api/v1/user/keys', { headers: getAuthHeaders() });
+      if (res.ok) {
+        const data = await res.json();
+        setUserSshKeys(data);
+      }
+    } catch (err) {
+      console.error('Failed to fetch user ssh keys', err);
+    }
+  };
+
+  const handleAddSshKey = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSshKeyError(null);
+    try {
+      const res = await fetch('/api/v1/user/keys', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+        body: JSON.stringify({ title: newSshKeyTitle, key: newSshKeyBody }),
+      });
+      if (res.ok) {
+        setNewSshKeyTitle('');
+        setNewSshKeyBody('');
+        fetchUserSshKeys();
+      } else {
+        const err = await res.json().catch(() => ({}));
+        setSshKeyError(err.error || 'Failed to add SSH key');
+      }
+    } catch (err: any) {
+      setSshKeyError(err.message || 'Failed to add SSH key');
+    }
+  };
+
+  const handleDeleteSshKey = async (id: string) => {
+    if (!window.confirm('Are you sure you want to revoke this SSH key?')) return;
+    try {
+      const res = await fetch(`/api/v1/user/keys/${id}`, {
+        method: 'DELETE',
+        headers: getAuthHeaders(),
+      });
+      if (res.ok) {
+        fetchUserSshKeys();
+      }
+    } catch (err) {
+      console.error('Failed to revoke SSH key', err);
+    }
+  };
+
+  // Batch 18: Deploy Keys Handlers
+  const fetchDeployKeys = async () => {
+    if (!selectedRepo) return;
+    try {
+      const res = await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/keys`, { headers: getAuthHeaders() });
+      if (res.ok) {
+        const data = await res.json();
+        setDeployKeys(data);
+      }
+    } catch (err) {
+      console.error('Failed to fetch deploy keys', err);
+    }
+  };
+
+  const handleAddDeployKey = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedRepo) return;
+    setDeployKeyError(null);
+    try {
+      const res = await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/keys`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+        body: JSON.stringify({ title: newDeployKeyTitle, key: newDeployKeyBody, write_enabled: newDeployKeyWrite }),
+      });
+      if (res.ok) {
+        setNewDeployKeyTitle('');
+        setNewDeployKeyBody('');
+        setNewDeployKeyWrite(false);
+        fetchDeployKeys();
+      } else {
+        const err = await res.json().catch(() => ({}));
+        setDeployKeyError(err.error || 'Failed to add deploy key');
+      }
+    } catch (err: any) {
+      setDeployKeyError(err.message || 'Failed to add deploy key');
+    }
+  };
+
+  const handleDeleteDeployKey = async (id: string) => {
+    if (!selectedRepo || !window.confirm('Are you sure you want to revoke this deploy key?')) return;
+    try {
+      const res = await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/keys/${id}`, {
+        method: 'DELETE',
+        headers: getAuthHeaders(),
+      });
+      if (res.ok) {
+        fetchDeployKeys();
+      }
+    } catch (err) {
+      console.error('Failed to revoke deploy key', err);
+    }
+  };
+
+  // Batch 18: Git LFS Locks Handlers
+  const fetchLfsLocks = async () => {
+    if (!selectedRepo) return;
+    try {
+      const res = await fetch(`/${selectedRepo.owner}/${selectedRepo.name}.git/info/lfs/locks`, { headers: getAuthHeaders() });
+      if (res.ok) {
+        const data = await res.json();
+        setLfsLocks(data.locks || []);
+      }
+    } catch (err) {
+      console.error('Failed to fetch LFS locks', err);
+    }
+  };
+
+  const handleCreateLfsLock = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedRepo) return;
+    setLfsLockError(null);
+    try {
+      const res = await fetch(`/${selectedRepo.owner}/${selectedRepo.name}.git/info/lfs/locks`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+        body: JSON.stringify({ path: newLfsLockPath }),
+      });
+      if (res.ok) {
+        setNewLfsLockPath('');
+        fetchLfsLocks();
+      } else {
+        const err = await res.json().catch(() => ({}));
+        setLfsLockError(err.message || 'Failed to acquire file lock');
+      }
+    } catch (err: any) {
+      setLfsLockError(err.message || 'Failed to acquire file lock');
+    }
+  };
+
+  const handleUnlockLfs = async (lockId: string, force = false) => {
+    if (!selectedRepo) return;
+    try {
+      const res = await fetch(`/${selectedRepo.owner}/${selectedRepo.name}.git/info/lfs/locks/${lockId}/unlock`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+        body: JSON.stringify({ force }),
+      });
+      if (res.ok) {
+        fetchLfsLocks();
+      } else {
+        const err = await res.json().catch(() => ({}));
+        alert(err.message || 'Failed to unlock file');
+      }
+    } catch (err: any) {
+      alert(err.message || 'Failed to unlock file');
+    }
+  };
+
   const handleAuthSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError(null);
@@ -1340,6 +1525,9 @@ export const App: React.FC = () => {
               <span style={{ fontSize: '0.9rem', color: '#c9d1d9' }}>
                 Signed in as <strong>{currentUser.display_name || currentUser.username}</strong>
               </span>
+              <button className="btn btn-secondary" onClick={() => { setShowSshKeysModal(true); fetchUserSshKeys(); }}>
+                🔑 SSH Keys
+              </button>
               <button className="btn btn-secondary" onClick={handleLogout}>
                 Log out
               </button>
@@ -1488,6 +1676,18 @@ export const App: React.FC = () => {
             >
               🔄 Migration
             </button>
+            <button
+              className={`btn ${activeTab === 'deploy-keys' ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setActiveTab('deploy-keys')}
+            >
+              🔑 Deploy Keys
+            </button>
+            <button
+              className={`btn ${activeTab === 'lfs-locks' ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setActiveTab('lfs-locks')}
+            >
+              🔒 LFS Locks
+            </button>
           </div>
         </div>
 
@@ -1559,8 +1759,24 @@ export const App: React.FC = () => {
                       zIndex: 100,
                     }}
                   >
+                    <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '0.75rem', borderBottom: '1px solid #30363d', paddingBottom: '0.5rem' }}>
+                      <button
+                        className={`btn ${cloneProtocol === 'https' ? 'btn-primary' : 'btn-secondary'}`}
+                        style={{ fontSize: '0.75rem', padding: '0.2rem 0.6rem' }}
+                        onClick={() => setCloneProtocol('https')}
+                      >
+                        HTTPS
+                      </button>
+                      <button
+                        className={`btn ${cloneProtocol === 'ssh' ? 'btn-primary' : 'btn-secondary'}`}
+                        style={{ fontSize: '0.75rem', padding: '0.2rem 0.6rem' }}
+                        onClick={() => setCloneProtocol('ssh')}
+                      >
+                        SSH
+                      </button>
+                    </div>
                     <div style={{ fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.5rem', color: '#c9d1d9' }}>
-                      HTTPS Git Clone URL
+                      {cloneProtocol === 'https' ? 'HTTPS Git Clone URL' : 'SSH Git Clone URL (Port 2222)'}
                     </div>
                     <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '0.75rem' }}>
                       <input
@@ -1568,13 +1784,18 @@ export const App: React.FC = () => {
                         readOnly
                         className="form-input"
                         style={{ fontSize: '0.8rem', padding: '0.3rem 0.5rem', flex: 1 }}
-                        value={`${window.location.origin}/${selectedRepo.owner}/${selectedRepo.name}.git`}
+                        value={cloneProtocol === 'https'
+                          ? `${window.location.origin}/${selectedRepo.owner}/${selectedRepo.name}.git`
+                          : `ssh://git@${window.location.hostname || '127.0.0.1'}:2222/${selectedRepo.owner}/${selectedRepo.name}.git`}
                       />
                       <button
                         className="btn btn-secondary"
                         style={{ whiteSpace: 'nowrap', fontSize: '0.8rem' }}
                         onClick={() => {
-                          navigator.clipboard.writeText(`${window.location.origin}/${selectedRepo.owner}/${selectedRepo.name}.git`);
+                          const url = cloneProtocol === 'https'
+                            ? `${window.location.origin}/${selectedRepo.owner}/${selectedRepo.name}.git`
+                            : `ssh://git@${window.location.hostname || '127.0.0.1'}:2222/${selectedRepo.owner}/${selectedRepo.name}.git`;
+                          navigator.clipboard.writeText(url);
                           setCopiedClone(true);
                           setTimeout(() => setCopiedClone(false), 2000);
                         }}
@@ -3910,6 +4131,202 @@ index = "sparse+http://127.0.0.1:3000/index/"
       {/* ---------------------------------------------------------------------- */}
       {/* TAB 16: MIGRATION & NATIVE GIT INTEROPERABILITY                        */}
       {/* ---------------------------------------------------------------------- */}
+      {/* TAB: DEPLOY KEYS */}
+      {activeTab === 'deploy-keys' && selectedRepo && (
+        <div style={{ padding: '1rem', maxWidth: '1000px', margin: '0 auto' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem', borderBottom: '1px solid #30363d', paddingBottom: '1rem' }}>
+            <div>
+              <h2 style={{ fontSize: '1.4rem', color: '#58a6ff', marginBottom: '0.25rem' }}>🔑 Repository Deploy Keys</h2>
+              <p style={{ color: '#8b949e', fontSize: '0.9rem' }}>
+                Deploy keys grant read or write access to this repository over Git-over-SSH.
+              </p>
+            </div>
+          </div>
+
+          <div style={{ background: '#161b22', border: '1px solid #30363d', borderRadius: '6px', padding: '1.25rem', marginBottom: '1.5rem' }}>
+            <h3 style={{ fontSize: '1.1rem', marginBottom: '1rem', color: '#c9d1d9' }}>Add Deploy Key</h3>
+            {deployKeyError && <div style={{ color: '#f85149', marginBottom: '1rem', fontSize: '0.85rem' }}>{deployKeyError}</div>}
+            <form onSubmit={handleAddDeployKey} style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+              <div>
+                <label className="form-label">Title</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g. Production CI Runner"
+                  className="form-input"
+                  value={newDeployKeyTitle}
+                  onChange={(e) => setNewDeployKeyTitle(e.target.value)}
+                />
+              </div>
+              <div>
+                <label className="form-label">Public Key</label>
+                <textarea
+                  required
+                  rows={4}
+                  placeholder="Begins with 'ssh-ed25519', 'ssh-rsa', etc."
+                  className="form-input"
+                  style={{ fontFamily: 'monospace', fontSize: '0.85rem' }}
+                  value={newDeployKeyBody}
+                  onChange={(e) => setNewDeployKeyBody(e.target.value)}
+                />
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <input
+                  type="checkbox"
+                  id="deployKeyWrite"
+                  checked={newDeployKeyWrite}
+                  onChange={(e) => setNewDeployKeyWrite(e.target.checked)}
+                />
+                <label htmlFor="deployKeyWrite" style={{ fontSize: '0.9rem', color: '#c9d1d9', cursor: 'pointer' }}>
+                  Allow write access (push permissions)
+                </label>
+              </div>
+              <div>
+                <button type="submit" className="btn btn-primary">Add Deploy Key</button>
+              </div>
+            </form>
+          </div>
+
+          <div style={{ background: '#161b22', border: '1px solid #30363d', borderRadius: '6px', overflow: 'hidden' }}>
+            <div style={{ padding: '0.75rem 1rem', background: '#21262d', borderBottom: '1px solid #30363d', fontWeight: 600 }}>
+              Active Deploy Keys ({deployKeys.length})
+            </div>
+            {deployKeys.length === 0 ? (
+              <div style={{ padding: '2rem', textAlign: 'center', color: '#8b949e' }}>
+                No deploy keys configured for this repository.
+              </div>
+            ) : (
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.9rem' }}>
+                <thead>
+                  <tr style={{ textAlign: 'left', borderBottom: '1px solid #30363d', color: '#8b949e' }}>
+                    <th style={{ padding: '0.75rem 1rem' }}>Title</th>
+                    <th style={{ padding: '0.75rem 1rem' }}>Type & Fingerprint</th>
+                    <th style={{ padding: '0.75rem 1rem' }}>Access</th>
+                    <th style={{ padding: '0.75rem 1rem' }}>Created</th>
+                    <th style={{ padding: '0.75rem 1rem', textAlign: 'right' }}>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {deployKeys.map((k) => (
+                    <tr key={k.id} style={{ borderBottom: '1px solid #21262d' }}>
+                      <td style={{ padding: '0.75rem 1rem', fontWeight: 600, color: '#c9d1d9' }}>{k.title}</td>
+                      <td style={{ padding: '0.75rem 1rem', fontFamily: 'monospace', fontSize: '0.8rem' }}>
+                        <span className="badge badge-secondary" style={{ marginRight: '0.5rem' }}>{k.key_type}</span>
+                        {k.fingerprint}
+                      </td>
+                      <td style={{ padding: '0.75rem 1rem' }}>
+                        <span className={`badge ${k.write_enabled ? 'badge-open' : 'badge-secondary'}`}>
+                          {k.write_enabled ? 'Read / Write' : 'Read-only'}
+                        </span>
+                      </td>
+                      <td style={{ padding: '0.75rem 1rem', color: '#8b949e', fontSize: '0.8rem' }}>
+                        {new Date(k.created_at_nanos / 1000000).toLocaleDateString()}
+                      </td>
+                      <td style={{ padding: '0.75rem 1rem', textAlign: 'right' }}>
+                        <button className="btn btn-secondary btn-sm" onClick={() => handleDeleteDeployKey(k.id)}>
+                          Revoke
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* TAB: GIT LFS LOCKS */}
+      {activeTab === 'lfs-locks' && selectedRepo && (
+        <div style={{ padding: '1rem', maxWidth: '1000px', margin: '0 auto' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem', borderBottom: '1px solid #30363d', paddingBottom: '1rem' }}>
+            <div>
+              <h2 style={{ fontSize: '1.4rem', color: '#58a6ff', marginBottom: '0.25rem' }}>🔒 Git LFS File Locks</h2>
+              <p style={{ color: '#8b949e', fontSize: '0.9rem' }}>
+                Exclusive file locks prevent binary merge conflicts in Git and Spine VCS.
+              </p>
+            </div>
+            <button className="btn btn-secondary" onClick={fetchLfsLocks}>
+              🔄 Refresh Locks
+            </button>
+          </div>
+
+          <div style={{ background: '#161b22', border: '1px solid #30363d', borderRadius: '6px', padding: '1.25rem', marginBottom: '1.5rem' }}>
+            <h3 style={{ fontSize: '1.1rem', marginBottom: '1rem', color: '#c9d1d9' }}>Acquire File Lock</h3>
+            {lfsLockError && <div style={{ color: '#f85149', marginBottom: '1rem', fontSize: '0.85rem' }}>{lfsLockError}</div>}
+            <form onSubmit={handleCreateLfsLock} style={{ display: 'flex', gap: '0.75rem', alignItems: 'flex-end' }}>
+              <div style={{ flex: 1 }}>
+                <label className="form-label">File Path</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g. assets/textures/character.psd"
+                  className="form-input"
+                  value={newLfsLockPath}
+                  onChange={(e) => setNewLfsLockPath(e.target.value)}
+                />
+              </div>
+              <button type="submit" className="btn btn-primary" style={{ height: '35px' }}>
+                Lock File
+              </button>
+            </form>
+          </div>
+
+          <div style={{ background: '#161b22', border: '1px solid #30363d', borderRadius: '6px', overflow: 'hidden' }}>
+            <div style={{ padding: '0.75rem 1rem', background: '#21262d', borderBottom: '1px solid #30363d', fontWeight: 600 }}>
+              Active File Locks ({lfsLocks.length})
+            </div>
+            {lfsLocks.length === 0 ? (
+              <div style={{ padding: '2rem', textAlign: 'center', color: '#8b949e' }}>
+                No active file locks found on this repository.
+              </div>
+            ) : (
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.9rem' }}>
+                <thead>
+                  <tr style={{ textAlign: 'left', borderBottom: '1px solid #30363d', color: '#8b949e' }}>
+                    <th style={{ padding: '0.75rem 1rem' }}>Locked Path</th>
+                    <th style={{ padding: '0.75rem 1rem' }}>Owner</th>
+                    <th style={{ padding: '0.75rem 1rem' }}>Locked At</th>
+                    <th style={{ padding: '0.75rem 1rem', textAlign: 'right' }}>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {lfsLocks.map((l) => (
+                    <tr key={l.id} style={{ borderBottom: '1px solid #21262d' }}>
+                      <td style={{ padding: '0.75rem 1rem', fontFamily: 'monospace', fontWeight: 600, color: '#58a6ff' }}>
+                        {l.path}
+                      </td>
+                      <td style={{ padding: '0.75rem 1rem', color: '#c9d1d9' }}>
+                        👤 {l.owner?.name || 'Unknown'}
+                      </td>
+                      <td style={{ padding: '0.75rem 1rem', color: '#8b949e', fontSize: '0.8rem' }}>
+                        {new Date(l.locked_at).toLocaleString()}
+                      </td>
+                      <td style={{ padding: '0.75rem 1rem', textAlign: 'right' }}>
+                        <button
+                          className="btn btn-secondary btn-sm"
+                          style={{ marginRight: '0.5rem' }}
+                          onClick={() => handleUnlockLfs(l.id, false)}
+                        >
+                          Unlock
+                        </button>
+                        <button
+                          className="btn btn-secondary btn-sm"
+                          style={{ color: '#f85149' }}
+                          onClick={() => handleUnlockLfs(l.id, true)}
+                        >
+                          Force Unlock
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </div>
+      )}
+
       {activeTab === 'migration' && (
         <div style={{ padding: '1rem', maxWidth: '1200px', margin: '0 auto' }}>
           <div style={{ marginBottom: '1.5rem', borderBottom: '1px solid #30363d', paddingBottom: '1rem' }}>
@@ -4618,6 +5035,75 @@ index = "sparse+http://127.0.0.1:3000/index/"
       {/* ---------------------------------------------------------------------- */}
       {/* MODAL: Sign in / Sign up                                               */}
       {/* ---------------------------------------------------------------------- */}
+      {/* MODAL: USER SSH KEYS */}
+      {showSshKeysModal && (
+        <div className="modal-backdrop" onClick={() => setShowSshKeysModal(false)}>
+          <div className="modal-box" style={{ maxWidth: '750px', width: '90%' }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.25rem' }}>
+              <h3 style={{ margin: 0, color: '#58a6ff' }}>🔑 Account SSH Public Keys</h3>
+              <button className="btn btn-secondary btn-sm" onClick={() => setShowSshKeysModal(false)}>✕</button>
+            </div>
+
+            <div style={{ background: '#161b22', border: '1px solid #30363d', borderRadius: '6px', padding: '1rem', marginBottom: '1.5rem' }}>
+              <h4 style={{ margin: '0 0 0.75rem 0', fontSize: '0.95rem', color: '#c9d1d9' }}>Add SSH Key</h4>
+              {sshKeyError && <div style={{ color: '#f85149', marginBottom: '0.75rem', fontSize: '0.85rem' }}>{sshKeyError}</div>}
+              <form onSubmit={handleAddSshKey} style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                <div>
+                  <label className="form-label">Title</label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="e.g. Work Laptop (Ed25519)"
+                    className="form-input"
+                    value={newSshKeyTitle}
+                    onChange={(e) => setNewSshKeyTitle(e.target.value)}
+                  />
+                </div>
+                <div>
+                  <label className="form-label">Key (OpenSSH Public Key)</label>
+                  <textarea
+                    required
+                    rows={3}
+                    placeholder="Begins with 'ssh-ed25519', 'ssh-rsa', etc."
+                    className="form-input"
+                    style={{ fontFamily: 'monospace', fontSize: '0.85rem' }}
+                    value={newSshKeyBody}
+                    onChange={(e) => setNewSshKeyBody(e.target.value)}
+                  />
+                </div>
+                <div>
+                  <button type="submit" className="btn btn-primary btn-sm">Add SSH Key</button>
+                </div>
+              </form>
+            </div>
+
+            <h4 style={{ margin: '0 0 0.75rem 0', fontSize: '0.95rem', color: '#c9d1d9' }}>Active Public Keys ({userSshKeys.length})</h4>
+            {userSshKeys.length === 0 ? (
+              <div style={{ padding: '1.5rem', textAlign: 'center', color: '#8b949e', border: '1px solid #30363d', borderRadius: '6px' }}>
+                No SSH keys associated with your account.
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', maxHeight: '250px', overflowY: 'auto' }}>
+                {userSshKeys.map((k) => (
+                  <div key={k.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#161b22', border: '1px solid #30363d', borderRadius: '6px', padding: '0.75rem 1rem' }}>
+                    <div>
+                      <div style={{ fontWeight: 600, color: '#c9d1d9' }}>{k.title}</div>
+                      <div style={{ fontFamily: 'monospace', fontSize: '0.75rem', color: '#8b949e', marginTop: '0.2rem' }}>
+                        <span className="badge badge-secondary" style={{ marginRight: '0.4rem' }}>{k.key_type}</span>
+                        {k.fingerprint}
+                      </div>
+                    </div>
+                    <button className="btn btn-secondary btn-sm" onClick={() => handleDeleteSshKey(k.id)}>
+                      Revoke
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {showAuthModal && (
         <div className="modal-backdrop" onClick={() => setShowAuthModal(false)}>
           <div className="modal-box" onClick={(e) => e.stopPropagation()}>

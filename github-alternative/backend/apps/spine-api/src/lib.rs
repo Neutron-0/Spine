@@ -16,6 +16,7 @@ pub mod security;
 pub mod storage;
 pub mod webhook;
 pub mod workflow;
+pub mod ssh;
 
 pub use api::{build_router, AppState};
 pub use artifact::ArtifactService;
@@ -33,5 +34,6 @@ pub use runner::{IsolatedRunnerExecutor, RunnerService};
 pub use search::SearchService;
 pub use security::SecurityService;
 pub use storage::NativeVcsService;
+pub use ssh::start_ssh_server;
 pub use webhook::{SsrfValidator, WebhookOutboxWorker, WebhookService};
 pub use workflow::{WorkflowScheduler, WorkflowService};

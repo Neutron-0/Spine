@@ -141,3 +141,65 @@ pub async fn revoke_pat(
     state.db.revoke_pat(&pat_id, &user.id).await?;
     Ok((StatusCode::NO_CONTENT, ()))
 }
+
+// -----------------------------------------------------------------------------
+// SSH Key Management (Batch 18)
+// -----------------------------------------------------------------------------
+
+pub async fn list_ssh_keys(
+    State(state): State<AppState>,
+    Extension(user): Extension<User>,
+) -> Result<impl IntoResponse, ForgeError> {
+    let keys = state.db.list_user_ssh_keys(&user.id).await?;
+    let dtos: Vec<UserSshKeyDto> = keys.iter().map(UserSshKeyDto::from).collect();
+    Ok(Json(dtos))
+}
+
+pub async fn create_ssh_key(
+    State(state): State<AppState>,
+    Extension(user): Extension<User>,
+    Json(payload): Json<CreateSshKeyRequest>,
+) -> Result<impl IntoResponse, ForgeError> {
+    let title = payload.title.trim();
+    if title.is_empty() || title.len() > 100 {
+        return Err(ForgeError::BadRequest(
+            "Key title must be between 1 and 100 characters".into(),
+        ));
+    }
+
+    let parsed = russh::keys::ssh_key::PublicKey::from_openssh(payload.key.trim())
+        .map_err(|e| ForgeError::BadRequest(format!("Invalid OpenSSH public key: {}", e)))?;
+
+    let fingerprint = parsed
+        .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
+        .to_string();
+    let key_type = parsed.algorithm().to_string();
+    let public_key = parsed
+        .to_openssh()
+        .map_err(|e| ForgeError::BadRequest(format!("Failed to format public key: {}", e)))?;
+
+    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let key = UserSshKey {
+        id: format!("ssh_{}", uuid::Uuid::new_v4().simple()),
+        user_id: user.id.clone(),
+        title: title.to_string(),
+        fingerprint,
+        public_key,
+        key_type,
+        created_at_nanos: now,
+        last_used_at_nanos: None,
+        revoked: false,
+    };
+
+    let created = state.db.create_user_ssh_key(key).await?;
+    Ok((StatusCode::CREATED, Json(UserSshKeyDto::from(&created))))
+}
+
+pub async fn delete_ssh_key(
+    State(state): State<AppState>,
+    Extension(user): Extension<User>,
+    Path(key_id): Path<String>,
+) -> Result<impl IntoResponse, ForgeError> {
+    state.db.revoke_user_ssh_key(&key_id, &user.id).await?;
+    Ok((StatusCode::NO_CONTENT, ()))
+}

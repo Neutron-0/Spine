@@ -1509,3 +1509,215 @@ pub struct SecuritySummaryDto {
     pub medium_count: usize,
     pub low_count: usize,
 }
+
+// -----------------------------------------------------------------------------
+// SSH Keys & Deploy Keys (Batch 18)
+// -----------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserSshKey {
+    pub id: String,
+    pub user_id: String,
+    pub title: String,
+    pub fingerprint: String, // SHA256:<base64>
+    pub public_key: String,  // OpenSSH formatted public key
+    pub key_type: String,    // "ssh-ed25519", "ssh-rsa", etc.
+    pub created_at_nanos: i64,
+    pub last_used_at_nanos: Option<i64>,
+    pub revoked: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserSshKeyDto {
+    pub id: String,
+    pub user_id: String,
+    pub title: String,
+    pub fingerprint: String,
+    pub key_type: String,
+    pub created_at_nanos: i64,
+    pub last_used_at_nanos: Option<i64>,
+    pub revoked: bool,
+}
+
+impl From<&UserSshKey> for UserSshKeyDto {
+    fn from(k: &UserSshKey) -> Self {
+        Self {
+            id: k.id.clone(),
+            user_id: k.user_id.clone(),
+            title: k.title.clone(),
+            fingerprint: k.fingerprint.clone(),
+            key_type: k.key_type.clone(),
+            created_at_nanos: k.created_at_nanos,
+            last_used_at_nanos: k.last_used_at_nanos,
+            revoked: k.revoked,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CreateSshKeyRequest {
+    pub title: String,
+    pub key: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeployKey {
+    pub id: String,
+    pub repository_id: String,
+    pub title: String,
+    pub fingerprint: String,
+    pub public_key: String,
+    pub key_type: String,
+    pub write_enabled: bool,
+    pub created_at_nanos: i64,
+    pub last_used_at_nanos: Option<i64>,
+    pub revoked: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeployKeyDto {
+    pub id: String,
+    pub repository_id: String,
+    pub title: String,
+    pub fingerprint: String,
+    pub key_type: String,
+    pub write_enabled: bool,
+    pub created_at_nanos: i64,
+    pub last_used_at_nanos: Option<i64>,
+    pub revoked: bool,
+}
+
+impl From<&DeployKey> for DeployKeyDto {
+    fn from(k: &DeployKey) -> Self {
+        Self {
+            id: k.id.clone(),
+            repository_id: k.repository_id.clone(),
+            title: k.title.clone(),
+            fingerprint: k.fingerprint.clone(),
+            key_type: k.key_type.clone(),
+            write_enabled: k.write_enabled,
+            created_at_nanos: k.created_at_nanos,
+            last_used_at_nanos: k.last_used_at_nanos,
+            revoked: k.revoked,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CreateDeployKeyRequest {
+    pub title: String,
+    pub key: String,
+    #[serde(default)]
+    pub write_enabled: bool,
+}
+
+// -----------------------------------------------------------------------------
+// Git LFS File Locking & SSH Auth (Batch 18)
+// -----------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LfsLock {
+    pub id: String,
+    pub repository_id: String,
+    pub path: String, // Normalized repository-relative path (e.g. "assets/model.bin")
+    pub owner_id: String,
+    pub owner_username: String,
+    pub locked_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LfsLockOwnerDto {
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LfsLockDto {
+    pub id: String,
+    pub path: String,
+    pub locked_at: String, // RFC 3339 formatted string
+    pub owner: LfsLockOwnerDto,
+}
+
+impl From<&LfsLock> for LfsLockDto {
+    fn from(l: &LfsLock) -> Self {
+        let dt = chrono::DateTime::from_timestamp(
+            l.locked_at_nanos / 1_000_000_000,
+            (l.locked_at_nanos % 1_000_000_000) as u32,
+        )
+        .unwrap_or_default();
+        Self {
+            id: l.id.clone(),
+            path: l.path.clone(),
+            locked_at: dt.to_rfc3339(),
+            owner: LfsLockOwnerDto {
+                name: l.owner_username.clone(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct LfsCreateLockRequest {
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LfsCreateLockResponse {
+    pub lock: LfsLockDto,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LfsListLocksResponse {
+    pub locks: Vec<LfsLockDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+pub struct LfsVerifyLocksRequest {
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LfsVerifyLocksResponse {
+    pub ours: Vec<LfsLockDto>,
+    pub theirs: Vec<LfsLockDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+pub struct LfsUnlockRequest {
+    #[serde(default)]
+    pub force: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LfsUnlockResponse {
+    pub lock: LfsLockDto,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LfsLockAudit {
+    pub id: String,
+    pub repository_id: String,
+    pub path: String,
+    pub actor_user_id: String,
+    pub action: String, // "LOCK", "UNLOCK", "FORCE_UNLOCK", "CONFLICT"
+    pub created_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LfsRemoteAuthToken {
+    pub user_id: String,
+    pub repo_id: String,
+    pub op: String, // "upload" | "download" | "*"
+    pub exp: i64,
+}

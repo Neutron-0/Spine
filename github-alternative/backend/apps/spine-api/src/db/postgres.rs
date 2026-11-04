@@ -5187,4 +5187,370 @@ impl Database for PgDatabase {
             .map_err(|e| ForgeError::Internal(e.to_string()))?;
         Ok(())
     }
+
+    // -------------------------------------------------------------------------
+    // SSH Keys & Deploy Keys (Batch 18)
+    // -------------------------------------------------------------------------
+    async fn create_user_ssh_key(&self, key: UserSshKey) -> Result<UserSshKey, ForgeError> {
+        let query = "INSERT INTO user_ssh_keys (id, user_id, title, fingerprint, public_key, key_type, created_at_nanos, last_used_at_nanos, revoked) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)";
+        sqlx::query(query)
+            .bind(&key.id)
+            .bind(&key.user_id)
+            .bind(&key.title)
+            .bind(&key.fingerprint)
+            .bind(&key.public_key)
+            .bind(&key.key_type)
+            .bind(key.created_at_nanos)
+            .bind(key.last_used_at_nanos)
+            .bind(key.revoked)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(key)
+    }
+
+    async fn get_user_ssh_key_by_id(&self, id: &str) -> Result<Option<UserSshKey>, ForgeError> {
+        let query = "SELECT id, user_id, title, fingerprint, public_key, key_type, created_at_nanos, last_used_at_nanos, revoked FROM user_ssh_keys WHERE id = $1";
+        let row = sqlx::query(query)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(row.map(|r| UserSshKey {
+            id: r.get(0),
+            user_id: r.get(1),
+            title: r.get(2),
+            fingerprint: r.get(3),
+            public_key: r.get(4),
+            key_type: r.get(5),
+            created_at_nanos: r.get(6),
+            last_used_at_nanos: r.get(7),
+            revoked: r.get(8),
+        }))
+    }
+
+    async fn get_user_ssh_key_by_fingerprint(
+        &self,
+        fingerprint: &str,
+    ) -> Result<Option<UserSshKey>, ForgeError> {
+        let query = "SELECT id, user_id, title, fingerprint, public_key, key_type, created_at_nanos, last_used_at_nanos, revoked FROM user_ssh_keys WHERE fingerprint = $1 AND NOT revoked";
+        let row = sqlx::query(query)
+            .bind(fingerprint)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(row.map(|r| UserSshKey {
+            id: r.get(0),
+            user_id: r.get(1),
+            title: r.get(2),
+            fingerprint: r.get(3),
+            public_key: r.get(4),
+            key_type: r.get(5),
+            created_at_nanos: r.get(6),
+            last_used_at_nanos: r.get(7),
+            revoked: r.get(8),
+        }))
+    }
+
+    async fn list_user_ssh_keys(&self, user_id: &str) -> Result<Vec<UserSshKey>, ForgeError> {
+        let query = "SELECT id, user_id, title, fingerprint, public_key, key_type, created_at_nanos, last_used_at_nanos, revoked FROM user_ssh_keys WHERE user_id = $1 AND NOT revoked ORDER BY created_at_nanos DESC";
+        let rows = sqlx::query(query)
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| UserSshKey {
+                id: r.get(0),
+                user_id: r.get(1),
+                title: r.get(2),
+                fingerprint: r.get(3),
+                public_key: r.get(4),
+                key_type: r.get(5),
+                created_at_nanos: r.get(6),
+                last_used_at_nanos: r.get(7),
+                revoked: r.get(8),
+            })
+            .collect())
+    }
+
+    async fn update_user_ssh_key_last_used(
+        &self,
+        id: &str,
+        now_nanos: i64,
+    ) -> Result<(), ForgeError> {
+        let query = "UPDATE user_ssh_keys SET last_used_at_nanos = $1 WHERE id = $2";
+        sqlx::query(query)
+            .bind(now_nanos)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn revoke_user_ssh_key(&self, id: &str, user_id: &str) -> Result<(), ForgeError> {
+        let query = "UPDATE user_ssh_keys SET revoked = true WHERE id = $1 AND user_id = $2";
+        sqlx::query(query)
+            .bind(id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn create_deploy_key(&self, key: DeployKey) -> Result<DeployKey, ForgeError> {
+        let query = "INSERT INTO deploy_keys (id, repository_id, title, fingerprint, public_key, key_type, write_enabled, created_at_nanos, last_used_at_nanos, revoked) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
+        sqlx::query(query)
+            .bind(&key.id)
+            .bind(&key.repository_id)
+            .bind(&key.title)
+            .bind(&key.fingerprint)
+            .bind(&key.public_key)
+            .bind(&key.key_type)
+            .bind(key.write_enabled)
+            .bind(key.created_at_nanos)
+            .bind(key.last_used_at_nanos)
+            .bind(key.revoked)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(key)
+    }
+
+    async fn get_deploy_key_by_id(&self, id: &str) -> Result<Option<DeployKey>, ForgeError> {
+        let query = "SELECT id, repository_id, title, fingerprint, public_key, key_type, write_enabled, created_at_nanos, last_used_at_nanos, revoked FROM deploy_keys WHERE id = $1";
+        let row = sqlx::query(query)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(row.map(|r| DeployKey {
+            id: r.get(0),
+            repository_id: r.get(1),
+            title: r.get(2),
+            fingerprint: r.get(3),
+            public_key: r.get(4),
+            key_type: r.get(5),
+            write_enabled: r.get(6),
+            created_at_nanos: r.get(7),
+            last_used_at_nanos: r.get(8),
+            revoked: r.get(9),
+        }))
+    }
+
+    async fn get_deploy_key_by_fingerprint(
+        &self,
+        fingerprint: &str,
+    ) -> Result<Option<DeployKey>, ForgeError> {
+        let query = "SELECT id, repository_id, title, fingerprint, public_key, key_type, write_enabled, created_at_nanos, last_used_at_nanos, revoked FROM deploy_keys WHERE fingerprint = $1 AND NOT revoked";
+        let row = sqlx::query(query)
+            .bind(fingerprint)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(row.map(|r| DeployKey {
+            id: r.get(0),
+            repository_id: r.get(1),
+            title: r.get(2),
+            fingerprint: r.get(3),
+            public_key: r.get(4),
+            key_type: r.get(5),
+            write_enabled: r.get(6),
+            created_at_nanos: r.get(7),
+            last_used_at_nanos: r.get(8),
+            revoked: r.get(9),
+        }))
+    }
+
+    async fn list_deploy_keys(&self, repo_id: &str) -> Result<Vec<DeployKey>, ForgeError> {
+        let query = "SELECT id, repository_id, title, fingerprint, public_key, key_type, write_enabled, created_at_nanos, last_used_at_nanos, revoked FROM deploy_keys WHERE repository_id = $1 AND NOT revoked ORDER BY created_at_nanos DESC";
+        let rows = sqlx::query(query)
+            .bind(repo_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| DeployKey {
+                id: r.get(0),
+                repository_id: r.get(1),
+                title: r.get(2),
+                fingerprint: r.get(3),
+                public_key: r.get(4),
+                key_type: r.get(5),
+                write_enabled: r.get(6),
+                created_at_nanos: r.get(7),
+                last_used_at_nanos: r.get(8),
+                revoked: r.get(9),
+            })
+            .collect())
+    }
+
+    async fn update_deploy_key_last_used(
+        &self,
+        id: &str,
+        now_nanos: i64,
+    ) -> Result<(), ForgeError> {
+        let query = "UPDATE deploy_keys SET last_used_at_nanos = $1 WHERE id = $2";
+        sqlx::query(query)
+            .bind(now_nanos)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn revoke_deploy_key(&self, id: &str, repo_id: &str) -> Result<(), ForgeError> {
+        let query = "UPDATE deploy_keys SET revoked = true WHERE id = $1 AND repository_id = $2";
+        sqlx::query(query)
+            .bind(id)
+            .bind(repo_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Git LFS File Locks (Batch 18)
+    // -------------------------------------------------------------------------
+    async fn create_lfs_lock(&self, lock: LfsLock) -> Result<LfsLock, ForgeError> {
+        let query = "INSERT INTO lfs_locks (id, repository_id, path, owner_id, owner_username, locked_at_nanos) VALUES ($1, $2, $3, $4, $5, $6)";
+        sqlx::query(query)
+            .bind(&lock.id)
+            .bind(&lock.repository_id)
+            .bind(&lock.path)
+            .bind(&lock.owner_id)
+            .bind(&lock.owner_username)
+            .bind(lock.locked_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(lock)
+    }
+
+    async fn get_lfs_lock_by_id(&self, id: &str) -> Result<Option<LfsLock>, ForgeError> {
+        let query = "SELECT id, repository_id, path, owner_id, owner_username, locked_at_nanos FROM lfs_locks WHERE id = $1";
+        let row = sqlx::query(query)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(row.map(|r| LfsLock {
+            id: r.get(0),
+            repository_id: r.get(1),
+            path: r.get(2),
+            owner_id: r.get(3),
+            owner_username: r.get(4),
+            locked_at_nanos: r.get(5),
+        }))
+    }
+
+    async fn get_lfs_lock_by_path(
+        &self,
+        repo_id: &str,
+        path: &str,
+    ) -> Result<Option<LfsLock>, ForgeError> {
+        let query = "SELECT id, repository_id, path, owner_id, owner_username, locked_at_nanos FROM lfs_locks WHERE repository_id = $1 AND path = $2";
+        let row = sqlx::query(query)
+            .bind(repo_id)
+            .bind(path)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(row.map(|r| LfsLock {
+            id: r.get(0),
+            repository_id: r.get(1),
+            path: r.get(2),
+            owner_id: r.get(3),
+            owner_username: r.get(4),
+            locked_at_nanos: r.get(5),
+        }))
+    }
+
+    async fn list_lfs_locks(
+        &self,
+        repo_id: &str,
+        path: Option<&str>,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<(Vec<LfsLock>, Option<String>), ForgeError> {
+        let offset = cursor.and_then(|c| c.parse::<i64>().ok()).unwrap_or(0);
+        let max_items = (limit.unwrap_or(100).min(1000)) as i64;
+
+        let rows = if let Some(p) = path {
+            let query = "SELECT id, repository_id, path, owner_id, owner_username, locked_at_nanos FROM lfs_locks WHERE repository_id = $1 AND path = $2 ORDER BY path ASC LIMIT $3 OFFSET $4";
+            sqlx::query(query)
+                .bind(repo_id)
+                .bind(p)
+                .bind(max_items + 1)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| ForgeError::Internal(e.to_string()))?
+        } else {
+            let query = "SELECT id, repository_id, path, owner_id, owner_username, locked_at_nanos FROM lfs_locks WHERE repository_id = $1 ORDER BY path ASC LIMIT $2 OFFSET $3";
+            sqlx::query(query)
+                .bind(repo_id)
+                .bind(max_items + 1)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| ForgeError::Internal(e.to_string()))?
+        };
+
+        let mut locks: Vec<LfsLock> = rows
+            .into_iter()
+            .map(|r| LfsLock {
+                id: r.get(0),
+                repository_id: r.get(1),
+                path: r.get(2),
+                owner_id: r.get(3),
+                owner_username: r.get(4),
+                locked_at_nanos: r.get(5),
+            })
+            .collect();
+
+        let next_cursor = if locks.len() > max_items as usize {
+            locks.truncate(max_items as usize);
+            Some((offset + max_items).to_string())
+        } else {
+            None
+        };
+
+        Ok((locks, next_cursor))
+    }
+
+    async fn delete_lfs_lock(&self, id: &str) -> Result<Option<LfsLock>, ForgeError> {
+        if let Some(lock) = self.get_lfs_lock_by_id(id).await? {
+            let query = "DELETE FROM lfs_locks WHERE id = $1";
+            sqlx::query(query)
+                .bind(id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+            Ok(Some(lock))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn create_lfs_lock_audit(&self, audit: LfsLockAudit) -> Result<(), ForgeError> {
+        let query = "INSERT INTO lfs_lock_audits (id, repository_id, path, actor_user_id, action, created_at_nanos) VALUES ($1, $2, $3, $4, $5, $6)";
+        sqlx::query(query)
+            .bind(&audit.id)
+            .bind(&audit.repository_id)
+            .bind(&audit.path)
+            .bind(&audit.actor_user_id)
+            .bind(&audit.action)
+            .bind(audit.created_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
 }

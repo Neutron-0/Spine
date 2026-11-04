@@ -27,6 +27,10 @@ struct ServerArgs {
     #[arg(short, long, default_value_t = 3000)]
     port: u16,
 
+    /// SSH Listening port (e.g. 2222)
+    #[arg(long, default_value_t = 2222)]
+    ssh_port: u16,
+
     /// PostgreSQL Database URL (e.g. postgres://spine:spine@127.0.0.1:5432/spine_forge)
     #[arg(long)]
     database_url: Option<String>,
@@ -178,7 +182,11 @@ async fn main() -> anyhow::Result<()> {
         worker_clone.run().await;
     });
 
-    // 5. Start HTTP server
+    // 5. Start HTTP and SSH servers
+    let ssh_addr_str = std::env::var("SSH_ADDR").unwrap_or_else(|_| format!("{}:{}", args.bind, args.ssh_port));
+    let ssh_addr: SocketAddr = ssh_addr_str.parse()?;
+    let (_bound_ssh, _ssh_handle) = spine_api::start_ssh_server(state.clone(), ssh_addr).await?;
+
     let app = build_router(state);
     let addr: SocketAddr = format!("{}:{}", args.bind, args.port).parse()?;
     tracing::info!("Spine Forge API listening on http://{}", addr);

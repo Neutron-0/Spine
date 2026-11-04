@@ -95,6 +95,32 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/users/me/pats/:pat_id",
             delete(routes_users::revoke_pat),
         )
+        // User SSH Keys (Batch 18)
+        .route(
+            "/api/v1/user/keys",
+            get(routes_users::list_ssh_keys).post(routes_users::create_ssh_key),
+        )
+        .route(
+            "/api/v1/users/me/keys",
+            get(routes_users::list_ssh_keys).post(routes_users::create_ssh_key),
+        )
+        .route(
+            "/api/v1/user/keys/:id",
+            delete(routes_users::delete_ssh_key),
+        )
+        .route(
+            "/api/v1/users/me/keys/:id",
+            delete(routes_users::delete_ssh_key),
+        )
+        // Repository Deploy Keys (Batch 18)
+        .route(
+            "/api/v1/repos/:owner/:name/keys",
+            get(routes_repos::list_deploy_keys).post(routes_repos::create_deploy_key),
+        )
+        .route(
+            "/api/v1/repos/:owner/:name/keys/:key_id",
+            delete(routes_repos::delete_deploy_key),
+        )
         // Organization endpoints (Batch 09)
         .route(
             "/api/v1/orgs",
@@ -599,6 +625,19 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/:owner/:repo_git/info/lfs/verify",
             post(routes_lfs::git_lfs_verify_object),
+        )
+        // Native Git LFS File Locking (Batch 18)
+        .route(
+            "/:owner/:repo_git/info/lfs/locks",
+            post(routes_lfs::git_lfs_create_lock).get(routes_lfs::git_lfs_list_locks),
+        )
+        .route(
+            "/:owner/:repo_git/info/lfs/locks/verify",
+            post(routes_lfs::git_lfs_verify_locks),
+        )
+        .route(
+            "/:owner/:repo_git/info/lfs/locks/:id/unlock",
+            post(routes_lfs::git_lfs_unlock),
         )
         // Layers
         .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))

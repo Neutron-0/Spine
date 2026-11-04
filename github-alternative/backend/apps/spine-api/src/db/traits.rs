@@ -831,4 +831,55 @@ pub trait Database: Send + Sync {
         status: &str,
         now_nanos: i64,
     ) -> Result<(), ForgeError>;
+
+    // -------------------------------------------------------------------------
+    // SSH Keys & Deploy Keys (Batch 18)
+    // -------------------------------------------------------------------------
+    async fn create_user_ssh_key(&self, key: UserSshKey) -> Result<UserSshKey, ForgeError>;
+    async fn get_user_ssh_key_by_id(&self, id: &str) -> Result<Option<UserSshKey>, ForgeError>;
+    async fn get_user_ssh_key_by_fingerprint(
+        &self,
+        fingerprint: &str,
+    ) -> Result<Option<UserSshKey>, ForgeError>;
+    async fn list_user_ssh_keys(&self, user_id: &str) -> Result<Vec<UserSshKey>, ForgeError>;
+    async fn update_user_ssh_key_last_used(
+        &self,
+        id: &str,
+        now_nanos: i64,
+    ) -> Result<(), ForgeError>;
+    async fn revoke_user_ssh_key(&self, id: &str, user_id: &str) -> Result<(), ForgeError>;
+
+    async fn create_deploy_key(&self, key: DeployKey) -> Result<DeployKey, ForgeError>;
+    async fn get_deploy_key_by_id(&self, id: &str) -> Result<Option<DeployKey>, ForgeError>;
+    async fn get_deploy_key_by_fingerprint(
+        &self,
+        fingerprint: &str,
+    ) -> Result<Option<DeployKey>, ForgeError>;
+    async fn list_deploy_keys(&self, repo_id: &str) -> Result<Vec<DeployKey>, ForgeError>;
+    async fn update_deploy_key_last_used(
+        &self,
+        id: &str,
+        now_nanos: i64,
+    ) -> Result<(), ForgeError>;
+    async fn revoke_deploy_key(&self, id: &str, repo_id: &str) -> Result<(), ForgeError>;
+
+    // -------------------------------------------------------------------------
+    // Git LFS File Locks (Batch 18)
+    // -------------------------------------------------------------------------
+    async fn create_lfs_lock(&self, lock: LfsLock) -> Result<LfsLock, ForgeError>;
+    async fn get_lfs_lock_by_id(&self, id: &str) -> Result<Option<LfsLock>, ForgeError>;
+    async fn get_lfs_lock_by_path(
+        &self,
+        repo_id: &str,
+        path: &str,
+    ) -> Result<Option<LfsLock>, ForgeError>;
+    async fn list_lfs_locks(
+        &self,
+        repo_id: &str,
+        path: Option<&str>,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<(Vec<LfsLock>, Option<String>), ForgeError>;
+    async fn delete_lfs_lock(&self, id: &str) -> Result<Option<LfsLock>, ForgeError>;
+    async fn create_lfs_lock_audit(&self, audit: LfsLockAudit) -> Result<(), ForgeError>;
 }

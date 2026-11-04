@@ -118,6 +118,15 @@ struct MemoryState {
     dependency_inventories: HashMap<String, DependencyInventory>,
     security_advisories: HashMap<String, SecurityAdvisory>,
     dependency_vulnerabilities: HashMap<String, DependencyVulnerability>,
+
+    // SSH Keys, Deploy Keys, and LFS Locks (Batch 18)
+    user_ssh_keys: HashMap<String, UserSshKey>,
+    user_ssh_by_fingerprint: HashMap<String, String>,
+    deploy_keys: HashMap<String, DeployKey>,
+    deploy_by_fingerprint: HashMap<String, String>,
+    lfs_locks: HashMap<String, LfsLock>,
+    lfs_locks_by_repo_path: HashMap<(String, String), String>,
+    lfs_lock_audits: Vec<LfsLockAudit>,
 }
 
 pub struct InMemoryDatabase {
@@ -3563,6 +3572,294 @@ impl Database for InMemoryDatabase {
             v.status = status.to_string();
             v.resolved_at_nanos = Some(now_nanos);
         }
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // SSH Keys & Deploy Keys (Batch 18)
+    // -------------------------------------------------------------------------
+    async fn create_user_ssh_key(&self, key: UserSshKey) -> Result<UserSshKey, ForgeError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if state.user_ssh_by_fingerprint.contains_key(&key.fingerprint) {
+            return Err(ForgeError::Conflict(
+                "An SSH key with this fingerprint already exists".to_string(),
+            ));
+        }
+        state
+            .user_ssh_by_fingerprint
+            .insert(key.fingerprint.clone(), key.id.clone());
+        state.user_ssh_keys.insert(key.id.clone(), key.clone());
+        Ok(key)
+    }
+
+    async fn get_user_ssh_key_by_id(&self, id: &str) -> Result<Option<UserSshKey>, ForgeError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(state.user_ssh_keys.get(id).cloned())
+    }
+
+    async fn get_user_ssh_key_by_fingerprint(
+        &self,
+        fingerprint: &str,
+    ) -> Result<Option<UserSshKey>, ForgeError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(id) = state.user_ssh_by_fingerprint.get(fingerprint) {
+            Ok(state.user_ssh_keys.get(id).cloned())
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn list_user_ssh_keys(&self, user_id: &str) -> Result<Vec<UserSshKey>, ForgeError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut keys: Vec<UserSshKey> = state
+            .user_ssh_keys
+            .values()
+            .filter(|k| k.user_id == user_id && !k.revoked)
+            .cloned()
+            .collect();
+        keys.sort_by(|a, b| b.created_at_nanos.cmp(&a.created_at_nanos));
+        Ok(keys)
+    }
+
+    async fn update_user_ssh_key_last_used(
+        &self,
+        id: &str,
+        now_nanos: i64,
+    ) -> Result<(), ForgeError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(k) = state.user_ssh_keys.get_mut(id) {
+            k.last_used_at_nanos = Some(now_nanos);
+        }
+        Ok(())
+    }
+
+    async fn revoke_user_ssh_key(&self, id: &str, user_id: &str) -> Result<(), ForgeError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let fingerprint = if let Some(k) = state.user_ssh_keys.get_mut(id) {
+            if k.user_id == user_id {
+                k.revoked = true;
+                Some(k.fingerprint.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(fp) = fingerprint {
+            state.user_ssh_by_fingerprint.remove(&fp);
+        }
+        Ok(())
+    }
+
+    async fn create_deploy_key(&self, key: DeployKey) -> Result<DeployKey, ForgeError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if state.deploy_by_fingerprint.contains_key(&key.fingerprint) {
+            return Err(ForgeError::Conflict(
+                "A deploy key with this fingerprint already exists".to_string(),
+            ));
+        }
+        state
+            .deploy_by_fingerprint
+            .insert(key.fingerprint.clone(), key.id.clone());
+        state.deploy_keys.insert(key.id.clone(), key.clone());
+        Ok(key)
+    }
+
+    async fn get_deploy_key_by_id(&self, id: &str) -> Result<Option<DeployKey>, ForgeError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(state.deploy_keys.get(id).cloned())
+    }
+
+    async fn get_deploy_key_by_fingerprint(
+        &self,
+        fingerprint: &str,
+    ) -> Result<Option<DeployKey>, ForgeError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(id) = state.deploy_by_fingerprint.get(fingerprint) {
+            Ok(state.deploy_keys.get(id).cloned())
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn list_deploy_keys(&self, repo_id: &str) -> Result<Vec<DeployKey>, ForgeError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut keys: Vec<DeployKey> = state
+            .deploy_keys
+            .values()
+            .filter(|k| k.repository_id == repo_id && !k.revoked)
+            .cloned()
+            .collect();
+        keys.sort_by(|a, b| b.created_at_nanos.cmp(&a.created_at_nanos));
+        Ok(keys)
+    }
+
+    async fn update_deploy_key_last_used(
+        &self,
+        id: &str,
+        now_nanos: i64,
+    ) -> Result<(), ForgeError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(k) = state.deploy_keys.get_mut(id) {
+            k.last_used_at_nanos = Some(now_nanos);
+        }
+        Ok(())
+    }
+
+    async fn revoke_deploy_key(&self, id: &str, repo_id: &str) -> Result<(), ForgeError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let fingerprint = if let Some(k) = state.deploy_keys.get_mut(id) {
+            if k.repository_id == repo_id {
+                k.revoked = true;
+                Some(k.fingerprint.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(fp) = fingerprint {
+            state.deploy_by_fingerprint.remove(&fp);
+        }
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Git LFS File Locks (Batch 18)
+    // -------------------------------------------------------------------------
+    async fn create_lfs_lock(&self, lock: LfsLock) -> Result<LfsLock, ForgeError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let key = (lock.repository_id.clone(), lock.path.clone());
+        if let Some(existing_id) = state.lfs_locks_by_repo_path.get(&key) {
+            if let Some(existing_lock) = state.lfs_locks.get(existing_id) {
+                return Err(ForgeError::Conflict(format!(
+                    "Path '{}' is already locked by {}",
+                    lock.path, existing_lock.owner_username
+                )));
+            }
+        }
+        state.lfs_locks_by_repo_path.insert(key, lock.id.clone());
+        state.lfs_locks.insert(lock.id.clone(), lock.clone());
+        Ok(lock)
+    }
+
+    async fn get_lfs_lock_by_id(&self, id: &str) -> Result<Option<LfsLock>, ForgeError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(state.lfs_locks.get(id).cloned())
+    }
+
+    async fn get_lfs_lock_by_path(
+        &self,
+        repo_id: &str,
+        path: &str,
+    ) -> Result<Option<LfsLock>, ForgeError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let key = (repo_id.to_string(), path.to_string());
+        if let Some(id) = state.lfs_locks_by_repo_path.get(&key) {
+            Ok(state.lfs_locks.get(id).cloned())
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn list_lfs_locks(
+        &self,
+        repo_id: &str,
+        path: Option<&str>,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<(Vec<LfsLock>, Option<String>), ForgeError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut locks: Vec<LfsLock> = state
+            .lfs_locks
+            .values()
+            .filter(|l| l.repository_id == repo_id && path.map_or(true, |p| l.path == p))
+            .cloned()
+            .collect();
+        locks.sort_by(|a, b| a.path.cmp(&b.path));
+
+        let offset = cursor.and_then(|c| c.parse::<usize>().ok()).unwrap_or(0);
+        let max_items = limit.unwrap_or(100).min(1000);
+
+        let sliced: Vec<LfsLock> = locks.iter().skip(offset).take(max_items).cloned().collect();
+        let next_cursor = if offset + max_items < locks.len() {
+            Some((offset + max_items).to_string())
+        } else {
+            None
+        };
+
+        Ok((sliced, next_cursor))
+    }
+
+    async fn delete_lfs_lock(&self, id: &str) -> Result<Option<LfsLock>, ForgeError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(lock) = state.lfs_locks.remove(id) {
+            state
+                .lfs_locks_by_repo_path
+                .remove(&(lock.repository_id.clone(), lock.path.clone()));
+            Ok(Some(lock))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn create_lfs_lock_audit(&self, audit: LfsLockAudit) -> Result<(), ForgeError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.lfs_lock_audits.push(audit);
         Ok(())
     }
 }

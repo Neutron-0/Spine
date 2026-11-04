@@ -115,8 +115,46 @@
 
 ## Next Milestones
 
-### Batch 13: Real-time Collaboration, Enterprise Federation, and Global Edge Mirrors
-- Real-time updates via WebSockets for collaborative review, diff comments, and notification feeds.
+### Batch 13: Search, Code Discovery, Discussions, Security Center, and Developer Discovery
+- Trigram and AST-aware code search and symbol indexing.
+- Forge Discussions with category channels, threaded answers, and voting.
+- Security Center with dependency vulnerability tracking, automated SBOM generation (SPDX/CycloneDX), and pre-receive secret scanning.
+- Developer discovery and trending repositories feed.
+
+### Batch 14: Full-System Integration, Security Hardening, Reliability, Recovery, and Performance
+- End-to-end integration across native VCS, cluster nodes, and Forge web endpoints.
+- Transactional reconciliation, crash consistency checks, and failover validation.
+- Hardened rate-limiting, authentication barriers, and audit trail validation.
+
+### Batch 15: Native Git Interoperability, Repository Import/Export, and Platform Migration
+- Bidirectional Git importer and exporter (`spine-migration`).
+- Full round-trip preservation of commit history, tree graphs, tags, author metadata, and branch topologies.
+- Archive sanitization and path traversal defenses for zip/tar imports.
+
+### Batch 16: Native Git Smart HTTP, Remote Operations, and Transport Integration
+- Pure-Rust Git Smart HTTP protocol support (`git-upload-pack`, `git-receive-pack`).
+- Streaming pkt-line protocol parser and packfile generation.
+- Full compatibility with official Git CLI (`git clone`, `git push`, `git fetch`) without external Git dependencies.
+- Authoritative CAS push verification, branch protection enforcement, and secret scanning on HTTP pushes.
+
+### Batch 17: Native Git LFS HTTP API, Smart HTTP Hardening, and Large-File Remote Compatibility
+- Official Git LFS v1 Batch API and Basic Transfer Adapter.
+- Bidirectional identity mapping between Git LFS SHA-256 OIDs and `spine-artifact` BLAKE3 manifests.
+- Pre-receive LFS pointer integrity fencing preventing pushes with un-uploaded binary blobs.
+- Streaming verification and HMAC capability token security.
+
+### Batch 18: Native Git-over-SSH, Key Management, Git LFS Auth, and File Locking
+- Pure-Rust native SSH daemon (`russh 0.65`, `ssh-key 0.7`) with Ed25519 host key generation and zero shell access.
+- User SSH public key management and repository deploy keys with read-only vs write-enabled enforcement.
+- Git LFS SSH authentication (`git-lfs-authenticate`) issuing scoped `RemoteAuth` HMAC tokens for HTTPS transfer.
+- Standard Git LFS File Locking API (`locks`, `verify`, `unlock`) with pre-receive lock conflict checks in HTTP and SSH receive-pack pipelines.
+- Modern React/TypeScript frontend controls for SSH keys, deploy keys, clone protocol switching, and LFS locks.
+
+---
+
+## Next Milestones
+
+### Batch 19: Enterprise Federation, SAML/OIDC, Multi-Region Replication, and High-Availability Clustering
 - Enterprise Single Sign-On (SAML 2.0 and OIDC).
-- Comprehensive immutable audit log exports and compliance reporting.
-- Global repository replication and geo-distributed caching mirrors.
+- Multi-region distributed storage replication and geo-distributed caching mirrors.
+- Real-time collaborative review feeds with WebSockets.

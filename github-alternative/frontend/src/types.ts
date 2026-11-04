@@ -729,3 +729,37 @@ export interface MigrationReportDto {
   verification_passed: boolean;
 }
 
+export interface UserSshKeyDto {
+  id: string;
+  user_id: string;
+  title: string;
+  fingerprint: string;
+  public_key: string;
+  key_type: string;
+  created_at_nanos: number;
+  last_used_at_nanos?: number | null;
+  revoked: boolean;
+}
+
+export interface DeployKeyDto {
+  id: string;
+  repository_id: string;
+  title: string;
+  fingerprint: string;
+  key_type: string;
+  write_enabled: boolean;
+  created_at_nanos: number;
+  last_used_at_nanos?: number | null;
+  revoked: boolean;
+}
+
+export interface LfsLockDto {
+  id: string;
+  path: string;
+  owner: {
+    name: string;
+  };
+  locked_at: string;
+}
+
+

@@ -58,12 +58,17 @@ pub struct IngestPackResult {
 /// Generates the reference advertisement payload for `GET /info/refs?service=git-upload-pack`.
 pub fn advertise_refs_upload_pack(spine_dir: &Path) -> Result<Vec<u8>, GitTransportError> {
     let mut out = Vec::new();
-
-    // 1. Service announcement packet
     out.extend_from_slice(&encode_pkt_line_str("# service=git-upload-pack\n")?);
     out.extend_from_slice(encode_flush());
+    out.extend_from_slice(&advertise_refs_upload_pack_raw(spine_dir)?);
+    Ok(out)
+}
 
-    // 2. Discover refs and convert to Git OIDs
+/// Generates the reference advertisement payload without the Smart HTTP service header (used for SSH/daemon).
+pub fn advertise_refs_upload_pack_raw(spine_dir: &Path) -> Result<Vec<u8>, GitTransportError> {
+    let mut out = Vec::new();
+
+    // 1. Discover refs and convert to Git OIDs
     let (ref_map, default_branch) = resolve_repository_git_refs(spine_dir)?;
 
     let capabilities = format!(
@@ -82,7 +87,7 @@ pub fn advertise_refs_upload_pack(spine_dir: &Path) -> Result<Vec<u8>, GitTransp
         return Ok(out);
     }
 
-    // 3. First line MUST advertise HEAD (or first ref) with capabilities separated by NUL \0
+    // 2. First line MUST advertise HEAD (or first ref) with capabilities separated by NUL \0
     let head_oid = match ref_map.head {
         Some(GitHead::Detached(oid)) => Some(oid),
         Some(GitHead::Symbolic(ref target)) => {
@@ -101,7 +106,7 @@ pub fn advertise_refs_upload_pack(spine_dir: &Path) -> Result<Vec<u8>, GitTransp
     let head_line = format!("{} HEAD\0{}\n", head_oid, capabilities);
     out.extend_from_slice(&encode_pkt_line(head_line.as_bytes())?);
 
-    // 4. Remaining branches and tags sorted lexicographically
+    // 3. Remaining branches and tags sorted lexicographically
     let mut sorted_refs: Vec<(String, GitOid, Option<GitOid>)> = Vec::new();
     for (branch, &oid) in &ref_map.branches {
         sorted_refs.push((format!("refs/heads/{}", branch), oid, None));
@@ -131,12 +136,17 @@ pub fn advertise_refs_upload_pack(spine_dir: &Path) -> Result<Vec<u8>, GitTransp
 /// Generates the reference advertisement payload for `GET /info/refs?service=git-receive-pack`.
 pub fn advertise_refs_receive_pack(spine_dir: &Path) -> Result<Vec<u8>, GitTransportError> {
     let mut out = Vec::new();
-
-    // 1. Service announcement packet
     out.extend_from_slice(&encode_pkt_line_str("# service=git-receive-pack\n")?);
     out.extend_from_slice(encode_flush());
+    out.extend_from_slice(&advertise_refs_receive_pack_raw(spine_dir)?);
+    Ok(out)
+}
 
-    // 2. Discover refs and convert to Git OIDs
+/// Generates the reference advertisement payload without the Smart HTTP service header (used for SSH/daemon).
+pub fn advertise_refs_receive_pack_raw(spine_dir: &Path) -> Result<Vec<u8>, GitTransportError> {
+    let mut out = Vec::new();
+
+    // 1. Discover refs and convert to Git OIDs
     let (ref_map, _) = resolve_repository_git_refs(spine_dir)?;
     let capabilities = "report-status delete-refs ofs-delta agent=spine/0.1.0";
 

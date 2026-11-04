@@ -296,3 +296,100 @@ pub async fn get_repo_durability_status(
     let report = state.vcs.verify_durability(&repo.native_repo_id).await?;
     Ok(Json(report))
 }
+
+// -----------------------------------------------------------------------------
+// Repository Deploy Keys (Batch 18)
+// -----------------------------------------------------------------------------
+
+pub async fn list_deploy_keys(
+    State(state): State<AppState>,
+    user: Option<Extension<User>>,
+    Path((owner, name)): Path<(String, String)>,
+) -> Result<impl IntoResponse, ForgeError> {
+    let caller = user.map(|Extension(u)| u);
+    let repo = state
+        .repositories
+        .get_repository(caller.as_ref(), &owner, &name)
+        .await?;
+
+    state
+        .permissions
+        .check_write_access(caller.as_ref(), &repo)
+        .await?;
+
+    let keys = state.db.list_deploy_keys(&repo.id).await?;
+    let dtos: Vec<DeployKeyDto> = keys.iter().map(DeployKeyDto::from).collect();
+    Ok(Json(dtos))
+}
+
+pub async fn create_deploy_key(
+    State(state): State<AppState>,
+    user: Option<Extension<User>>,
+    Path((owner, name)): Path<(String, String)>,
+    Json(payload): Json<CreateDeployKeyRequest>,
+) -> Result<impl IntoResponse, ForgeError> {
+    let caller = user.map(|Extension(u)| u);
+    let repo = state
+        .repositories
+        .get_repository(caller.as_ref(), &owner, &name)
+        .await?;
+
+    state
+        .permissions
+        .check_admin_access(caller.as_ref(), &repo)
+        .await?;
+
+    let title = payload.title.trim();
+    if title.is_empty() || title.len() > 100 {
+        return Err(ForgeError::BadRequest(
+            "Deploy key title must be between 1 and 100 characters".into(),
+        ));
+    }
+
+    let parsed = russh::keys::ssh_key::PublicKey::from_openssh(payload.key.trim())
+        .map_err(|e| ForgeError::BadRequest(format!("Invalid OpenSSH public key: {}", e)))?;
+
+    let fingerprint = parsed
+        .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
+        .to_string();
+    let key_type = parsed.algorithm().to_string();
+    let public_key = parsed
+        .to_openssh()
+        .map_err(|e| ForgeError::BadRequest(format!("Failed to format public key: {}", e)))?;
+
+    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let key = DeployKey {
+        id: format!("deploy_key_{}", uuid::Uuid::new_v4().simple()),
+        repository_id: repo.id.clone(),
+        title: title.to_string(),
+        fingerprint,
+        public_key,
+        key_type,
+        write_enabled: payload.write_enabled,
+        created_at_nanos: now,
+        last_used_at_nanos: None,
+        revoked: false,
+    };
+
+    let created = state.db.create_deploy_key(key).await?;
+    Ok((StatusCode::CREATED, Json(DeployKeyDto::from(&created))))
+}
+
+pub async fn delete_deploy_key(
+    State(state): State<AppState>,
+    user: Option<Extension<User>>,
+    Path((owner, name, key_id)): Path<(String, String, String)>,
+) -> Result<impl IntoResponse, ForgeError> {
+    let caller = user.map(|Extension(u)| u);
+    let repo = state
+        .repositories
+        .get_repository(caller.as_ref(), &owner, &name)
+        .await?;
+
+    state
+        .permissions
+        .check_admin_access(caller.as_ref(), &repo)
+        .await?;
+    state.db.revoke_deploy_key(&key_id, &repo.id).await?;
+    Ok((StatusCode::NO_CONTENT, ()))
+}
