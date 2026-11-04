@@ -116,10 +116,10 @@
 ## Next Milestones
 
 ### Batch 13: Search, Code Discovery, Discussions, Security Center, and Developer Discovery
-- Trigram and AST-aware code search and symbol indexing.
-- Forge Discussions with category channels, threaded answers, and voting.
-- Security Center with dependency vulnerability tracking, automated SBOM generation (SPDX/CycloneDX), and pre-receive secret scanning.
-- Developer discovery and trending repositories feed.
+- Trigram and AST-aware code search, symbol indexing, and file path filtering.
+- Forge Discussions with category channels, threaded answers, mark as answer, and reactions.
+- Security Center with dependency vulnerability tracking, automated SBOM generation (SPDX / CycloneDX), and pre-receive secret scanning.
+- Developer discovery, explore feeds, and trending repositories.
 
 ### Batch 14: Full-System Integration, Security Hardening, Reliability, Recovery, and Performance
 - End-to-end integration across native VCS, cluster nodes, and Forge web endpoints.
@@ -129,12 +129,12 @@
 ### Batch 15: Native Git Interoperability, Repository Import/Export, and Platform Migration
 - Bidirectional Git importer and exporter (`spine-migration`).
 - Full round-trip preservation of commit history, tree graphs, tags, author metadata, and branch topologies.
-- Archive sanitization and path traversal defenses for zip/tar imports.
+- Archive sanitization, zip bomb defenses, and path traversal mitigation for platform migrations.
 
 ### Batch 16: Native Git Smart HTTP, Remote Operations, and Transport Integration
 - Pure-Rust Git Smart HTTP protocol support (`git-upload-pack`, `git-receive-pack`).
 - Streaming pkt-line protocol parser and packfile generation.
-- Full compatibility with official Git CLI (`git clone`, `git push`, `git fetch`) without external Git dependencies.
+- Full compatibility with official Git CLI (`git clone`, `git push`, `git fetch`) without external Git or libgit2 dependencies.
 - Authoritative CAS push verification, branch protection enforcement, and secret scanning on HTTP pushes.
 
 ### Batch 17: Native Git LFS HTTP API, Smart HTTP Hardening, and Large-File Remote Compatibility
@@ -150,11 +150,22 @@
 - Standard Git LFS File Locking API (`locks`, `verify`, `unlock`) with pre-receive lock conflict checks in HTTP and SSH receive-pack pipelines.
 - Modern React/TypeScript frontend controls for SSH keys, deploy keys, clone protocol switching, and LFS locks.
 
+### Batch 19: Production Packaging, PostgreSQL Readiness, Deployment Architecture, Backup/Recovery, and Operational Rehearsal
+- System inventory across 35 subsystems and deployment blocker register.
+- Strict host key checking verification with official OpenSSH 9.5p2 client (`StrictHostKeyChecking=yes`, isolated `known_hosts`).
+- SSH host key persistence across server restarts and public key revocation enforcement.
+- 11 sequential, idempotent PostgreSQL migration files (`0001` to `0011`) covering 60+ tables and embedded transactional runner.
+- Coordinated backup and disaster recovery subsystem (`spine-api backup create/restore`) generating and verifying SHA-256 `.tar.gz` archives.
+- One-time cryptographically secure admin bootstrap CLI (`spine-api bootstrap-admin`) with single-execution lockout and audit logging.
+- Hardened multi-stage container packaging (`Dockerfile.production`, `docker-compose.yml`, `docker-compose.dev.yml`) with unprivileged `spine` user (UID 10001).
+- Hardened Linux systemd units (`spine-api.service`, `spine-coordinator.service`, `spine-storage-node.service`).
+- Comprehensive operations documentation, incident runbooks, storage economics model (200 GB+ dataset), and final deployment audit handoff.
+
 ---
 
-## Next Milestones
+## Future Milestones
 
-### Batch 19: Enterprise Federation, SAML/OIDC, Multi-Region Replication, and High-Availability Clustering
+### Batch 20: Enterprise Federation, SAML/OIDC, Multi-Region Replication, and High-Availability Clustering
 - Enterprise Single Sign-On (SAML 2.0 and OIDC).
 - Multi-region distributed storage replication and geo-distributed caching mirrors.
 - Real-time collaborative review feeds with WebSockets.

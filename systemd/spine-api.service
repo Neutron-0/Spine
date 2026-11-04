@@ -1,0 +1,37 @@
+[Unit]
+Description=Spine Forge Control Plane, HTTP API and SSH Git Server
+Documentation=https://github.com/spine-vcs/spine
+After=network.target postgresql.service spine-coordinator.service
+Wants=postgresql.service spine-coordinator.service
+
+[Service]
+Type=simple
+User=spine
+Group=spine
+WorkingDirectory=/var/lib/spine
+EnvironmentFile=-/etc/spine/spine-api.env
+ExecStart=/usr/local/bin/spine-api serve \
+    --bind 0.0.0.0 \
+    --port 3000 \
+    --ssh-port 2222 \
+    --storage-root /var/lib/spine/storage
+
+Restart=always
+RestartSec=5s
+LimitNOFILE=65536
+
+# Security Hardening Directives
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/spine
+
+[Install]
+WantedBy=multi-user.target

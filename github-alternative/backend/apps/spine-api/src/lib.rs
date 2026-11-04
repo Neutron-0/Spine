@@ -17,10 +17,12 @@ pub mod storage;
 pub mod webhook;
 pub mod workflow;
 pub mod ssh;
+pub mod backup;
 
 pub use api::{build_router, AppState};
 pub use artifact::ArtifactService;
 pub use auth::DevMailCatcher;
+pub use backup::{BackupManager, BackupManifest, RestoreReport};
 pub use coordinator::CoordinatorClient;
 pub use core::types::*;
 pub use db::{Database, InMemoryDatabase, PgDatabase};

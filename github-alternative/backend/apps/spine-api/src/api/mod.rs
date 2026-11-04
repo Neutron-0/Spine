@@ -46,8 +46,10 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         // Health endpoints
         .route("/health", get(routes_health::health_liveness))
+        .route("/healthz", get(routes_health::health_liveness))
         .route("/health/live", get(routes_health::health_liveness))
         .route("/health/ready", get(routes_health::health_readiness))
+        .route("/readyz", get(routes_health::health_readiness))
         .route(
             "/health/diagnostics",
             get(routes_health::health_diagnostics),

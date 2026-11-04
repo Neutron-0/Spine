@@ -1,0 +1,39 @@
+[Unit]
+Description=Spine Native Repository & Object Storage Node
+Documentation=https://github.com/spine-vcs/spine
+After=network.target spine-coordinator.service
+Wants=spine-coordinator.service
+
+[Service]
+Type=simple
+User=spine
+Group=spine
+WorkingDirectory=/var/lib/spine
+EnvironmentFile=-/etc/spine/spine-storage-node.env
+ExecStart=/usr/local/bin/spine-storage-node \
+    --bind 0.0.0.0:9101 \
+    --node-id node-1 \
+    --zone zone-a \
+    --capacity-bytes 107374182400 \
+    --coordinator-addr 127.0.0.1:8400 \
+    --data-dir /var/lib/spine/storage
+
+Restart=always
+RestartSec=5s
+LimitNOFILE=1048576
+
+# Security Hardening Directives
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/spine
+
+[Install]
+WantedBy=multi-user.target

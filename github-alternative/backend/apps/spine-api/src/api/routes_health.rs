@@ -13,6 +13,7 @@ pub struct HealthStatusResponse {
 pub struct ReadinessResponse {
     pub status: &'static str,
     pub database: bool,
+    pub storage: bool,
     pub coordinator: bool,
 }
 
@@ -26,12 +27,13 @@ pub async fn health_liveness() -> impl IntoResponse {
 
 pub async fn health_readiness(State(state): State<AppState>) -> impl IntoResponse {
     let db_ok = state.db.get_user_by_id("readiness_check").await.is_ok();
+    let storage_ok = state.vcs.storage_root().exists();
     let coord_ok = match &state.coordinator {
         Some(c) => c.check_health().await,
         None => true, // Standalone mode without external coordinator
     };
 
-    let overall = db_ok && coord_ok;
+    let overall = db_ok && storage_ok && coord_ok;
     let status_code = if overall {
         StatusCode::OK
     } else {
@@ -41,6 +43,7 @@ pub async fn health_readiness(State(state): State<AppState>) -> impl IntoRespons
     let resp = ReadinessResponse {
         status: if overall { "ready" } else { "not_ready" },
         database: db_ok,
+        storage: storage_ok,
         coordinator: coord_ok,
     };
 

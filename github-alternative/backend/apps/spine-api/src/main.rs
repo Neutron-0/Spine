@@ -1,7 +1,10 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
+use rand::Rng;
 use spine_api::{
-    auth::{DevMailCatcher, RateLimiter},
-    build_router, AppState, ArtifactService, CargoRegistryAdapter, CoordinatorClient, Database,
+    auth::{hash_password, DevMailCatcher, RateLimiter},
+    build_router,
+    core::types::{AuditEvent, User},
+    AppState, ArtifactService, CargoRegistryAdapter, CoordinatorClient, Database,
     InMemoryDatabase, IsolatedRunnerExecutor, NativeVcsService, PackageService, PermissionService,
     PgDatabase, ProvisioningWorker, ReleaseService, RepositoryService, RunnerService,
     SsrfValidator, WebhookOutboxWorker, WebhookService, WorkflowScheduler, WorkflowService,
@@ -18,7 +21,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
     version = "0.1.0",
     about = "Spine Forge User-Facing Application & Control Plane Server"
 )]
-struct ServerArgs {
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
     /// Bind IP address
     #[arg(short, long, default_value = "127.0.0.1")]
     bind: String,
@@ -48,8 +54,234 @@ struct ServerArgs {
     storage_root: PathBuf,
 }
 
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Start the Spine Forge API and SSH server (default)
+    Serve,
+
+    /// Run pending database migrations against PostgreSQL
+    Migrate {
+        /// PostgreSQL Database URL
+        #[arg(long)]
+        database_url: Option<String>,
+    },
+
+    /// One-time bootstrap of the initial system administrator
+    BootstrapAdmin {
+        /// Administrator username
+        #[arg(short, long)]
+        username: String,
+
+        /// Administrator email
+        #[arg(short, long)]
+        email: String,
+
+        /// PostgreSQL Database URL
+        #[arg(long)]
+        database_url: Option<String>,
+
+        /// Use in-memory database (for testing)
+        #[arg(long, default_value_t = false)]
+        in_memory_db: bool,
+    },
+
+    /// Coordinated backup and disaster recovery commands
+    Backup {
+        #[command(subcommand)]
+        action: BackupCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum BackupCommands {
+    /// Create a full SHA-256 verified backup archive (.tar.gz)
+    Create {
+        /// Destination archive file path (.tar.gz)
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Storage root containing native repositories and metadata
+        #[arg(long, default_value = "./.spine-dev-cluster/node-1")]
+        storage_root: PathBuf,
+
+        /// Optional PostgreSQL Database URL
+        #[arg(long)]
+        database_url: Option<String>,
+    },
+
+    /// Restore and verify a backup archive into target directory
+    Restore {
+        /// Input archive file path (.tar.gz)
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Target storage root directory to restore into
+        #[arg(long, default_value = "./.spine-dev-cluster/node-1")]
+        target_storage: PathBuf,
+    },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Commands::Migrate { database_url }) => {
+            let db_url = database_url
+                .or_else(|| std::env::var("DATABASE_URL").ok())
+                .ok_or_else(|| anyhow::anyhow!("DATABASE_URL must be provided for migration"))?;
+            println!("Connecting to PostgreSQL database: {}", db_url);
+            let _pg = PgDatabase::connect_and_migrate(&db_url).await?;
+            println!("PostgreSQL schema migrations executed and verified successfully.");
+            Ok(())
+        }
+        Some(Commands::BootstrapAdmin {
+            username,
+            email,
+            database_url,
+            in_memory_db,
+        }) => {
+            let db_url = database_url.or_else(|| std::env::var("DATABASE_URL").ok());
+            let db: Arc<dyn Database> = if in_memory_db || db_url.is_none() {
+                println!("Initializing bootstrap with in-memory database...");
+                Arc::new(InMemoryDatabase::new())
+            } else {
+                let url = db_url.unwrap();
+                println!("Connecting to PostgreSQL database for admin bootstrap...");
+                Arc::new(PgDatabase::connect_and_migrate(&url).await?)
+            };
+
+            // Single execution lockout check
+            if let Some(_) = db.get_user_by_username(&username).await? {
+                anyhow::bail!(
+                    "User '{}' already exists. Admin bootstrap can only be executed once.",
+                    username
+                );
+            }
+            if let Some(_) = db.get_user_by_email(&email).await? {
+                anyhow::bail!(
+                    "Email '{}' is already in use. Admin bootstrap can only be executed once.",
+                    email
+                );
+            }
+
+            // Generate cryptographically secure random password (32 alphanumeric chars)
+            let raw_password: String = rand::thread_rng()
+                .sample_iter(&rand::distributions::Alphanumeric)
+                .take(32)
+                .map(char::from)
+                .collect();
+
+            let password_hash = hash_password(&raw_password)
+                .map_err(|e| anyhow::anyhow!("Password hashing failed: {}", e))?;
+
+            let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+            let user_id = uuid::Uuid::new_v4().to_string();
+
+            let admin_user = User {
+                id: user_id.clone(),
+                username: username.clone(),
+                normalized_username: username.to_lowercase(),
+                email: email.clone(),
+                normalized_email: email.to_lowercase(),
+                display_name: format!("{} (Administrator)", username),
+                password_hash,
+                account_status: "active".to_string(),
+                avatar_url: None,
+                created_at_nanos: now,
+                updated_at_nanos: now,
+                last_login_nanos: None,
+            };
+
+            db.create_user(admin_user).await?;
+
+            let audit = AuditEvent {
+                id: 0,
+                user_id: Some(user_id.clone()),
+                action: "system.bootstrap_admin".to_string(),
+                resource_type: "user".to_string(),
+                resource_id: user_id.clone(),
+                ip_address: Some("127.0.0.1".to_string()),
+                metadata: serde_json::json!({
+                    "username": username,
+                    "email": email,
+                    "source": "cli_bootstrap_admin"
+                }),
+                timestamp_nanos: now,
+            };
+            let _ = db.record_audit_event(audit).await;
+
+            println!("================================================================================");
+            println!("                    SPINE FORGE INITIAL ADMIN BOOTSTRAP                         ");
+            println!("================================================================================");
+            println!("Administrator account bootstrapped successfully.");
+            println!();
+            println!("  User ID:   {}", user_id);
+            println!("  Username:  {}", username);
+            println!("  Email:     {}", email);
+            println!("  Password:  {}", raw_password);
+            println!();
+            println!("CRITICAL: Save this temporary generated password securely now.");
+            println!("It will NOT be displayed again and bootstrap cannot be re-executed.");
+            println!("================================================================================");
+            Ok(())
+        }
+        Some(Commands::Backup { action }) => match action {
+            BackupCommands::Create {
+                output,
+                storage_root,
+                database_url: _,
+            } => {
+                println!(
+                    "Creating coordinated backup from {} to {}",
+                    storage_root.display(),
+                    output.display()
+                );
+                let manifest = spine_api::backup::BackupManager::create_backup(
+                    &storage_root,
+                    None,
+                    &output,
+                )?;
+                println!("Backup archive created successfully:");
+                println!("  Backup ID:     {}", manifest.backup_id);
+                println!("  Total files:   {}", manifest.total_files);
+                println!("  Total bytes:   {}", manifest.total_bytes);
+                println!("  Status:        {}", manifest.integrity_status);
+                Ok(())
+            }
+            BackupCommands::Restore {
+                input,
+                target_storage,
+            } => {
+                println!(
+                    "Restoring backup archive from {} into {}",
+                    input.display(),
+                    target_storage.display()
+                );
+                let (manifest, report, _) = spine_api::backup::BackupManager::restore_backup(
+                    &input,
+                    &target_storage,
+                )?;
+                println!("Backup restoration completed:");
+                println!("  Backup ID:     {}", manifest.backup_id);
+                println!("  Files restored:{}", report.files_restored);
+                println!("  Bytes restored:{}", report.bytes_restored);
+                println!(
+                    "  Integrity:     {}",
+                    if report.integrity_verified {
+                        "VERIFIED (SHA-256 matched)"
+                    } else {
+                        "FAILED"
+                    }
+                );
+                Ok(())
+            }
+        },
+        Some(Commands::Serve) | None => run_server(cli).await,
+    }
+}
+
+async fn run_server(args: Cli) -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -57,8 +289,6 @@ async fn main() -> anyhow::Result<()> {
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
-
-    let args = ServerArgs::parse();
 
     let database_url = args
         .database_url
@@ -73,8 +303,8 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(InMemoryDatabase::new())
     } else {
         let db_url = database_url.unwrap();
-        tracing::info!("Connecting to PostgreSQL database...");
-        Arc::new(PgDatabase::connect(&db_url).await?)
+        tracing::info!("Connecting to PostgreSQL database and applying migrations...");
+        Arc::new(PgDatabase::connect_and_migrate(&db_url).await?)
     };
 
     // 2. Initialize Coordinator Client

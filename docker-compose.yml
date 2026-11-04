@@ -6,16 +6,15 @@ services:
     container_name: spine-forge-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_DB: spine_forge
-      POSTGRES_USER: spine_app
-      POSTGRES_PASSWORD: spine_dev_password
+      POSTGRES_DB: ${POSTGRES_DB:-spine_forge}
+      POSTGRES_USER: ${POSTGRES_USER:-spine_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-spine_secure_db_password_change_me}
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./migrations/20261103000001_forge_metadata.sql:/docker-entrypoint-initdb.d/01_forge_metadata.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U spine_app -d spine_forge"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-spine_app} -d ${POSTGRES_DB:-spine_forge}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -99,14 +98,24 @@ services:
     restart: unless-stopped
     ports:
       - "3000:3000"
+      - "2222:2222"
     environment:
+      BIND: "0.0.0.0"
       PORT: "3000"
-      DATABASE_URL: "postgres://spine_app:spine_dev_password@postgres:5432/spine_forge"
+      SSH_PORT: "2222"
+      DATABASE_URL: "postgres://${POSTGRES_USER:-spine_app}:${POSTGRES_PASSWORD:-spine_secure_db_password_change_me}@postgres:5432/${POSTGRES_DB:-spine_forge}"
       COORDINATOR_ADDR: "coordinator:8400"
       STORAGE_ROOT: "/var/lib/spine/storage"
-      RUST_LOG: "info,spine_api=debug"
+      FORGE_PUBLIC_ORIGIN: "${FORGE_PUBLIC_ORIGIN:-http://localhost:3000}"
+      RUST_LOG: "info,spine_api=info"
     volumes:
       - spine_storage:/var/lib/spine/storage
+      - spine_ssh:/var/lib/spine/ssh
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:3000/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
     depends_on:
       postgres:
         condition: service_healthy
@@ -131,3 +140,4 @@ volumes:
   storage_2_data:
   storage_3_data:
   spine_storage:
+  spine_ssh:

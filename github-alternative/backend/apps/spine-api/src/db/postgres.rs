@@ -19,6 +19,20 @@ impl PgDatabase {
         })?;
         Ok(Self { pool })
     }
+
+    pub async fn connect_and_migrate(url: &str) -> Result<Self, ForgeError> {
+        let db = Self::connect(url).await?;
+        db.migrate().await?;
+        Ok(db)
+    }
+
+    pub async fn migrate(&self) -> Result<(), ForgeError> {
+        super::migrations::run_migrations(&self.pool).await
+    }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
 }
 
 #[async_trait]

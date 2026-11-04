@@ -94,6 +94,40 @@ fn run_git_ssh_cmd(cwd: &Path, key_path: &Path, args: &[&str]) -> (bool, String,
     (output.status.success(), stdout, stderr)
 }
 
+fn run_git_ssh_cmd_strict(
+    cwd: &Path,
+    key_path: &Path,
+    known_hosts_path: &Path,
+    args: &[&str],
+) -> (bool, String, String) {
+    let key_str = key_path.display().to_string().replace('\\', "/");
+    let known_hosts_str = known_hosts_path.display().to_string().replace('\\', "/");
+    let ssh_command = format!(
+        "ssh -i \"{}\" -o UserKnownHostsFile=\"{}\" -o StrictHostKeyChecking=yes -o LogLevel=ERROR",
+        key_str, known_hosts_str
+    );
+    let ssh_cmd_config = format!("core.sshCommand={}", ssh_command);
+
+    let mut cmd_args = vec!["-c", "core.autocrlf=false", "-c", &ssh_cmd_config];
+    cmd_args.extend_from_slice(args);
+
+    let output = Command::new("git")
+        .args(&cmd_args)
+        .current_dir(cwd)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSH_COMMAND", &ssh_command)
+        .env("GIT_AUTHOR_NAME", "Spine SSH Strict Tester")
+        .env("GIT_AUTHOR_EMAIL", "strict_tester@spine.build")
+        .env("GIT_COMMITTER_NAME", "Spine SSH Strict Tester")
+        .env("GIT_COMMITTER_EMAIL", "strict_tester@spine.build")
+        .output()
+        .expect("Failed to execute git over SSH");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    (output.status.success(), stdout, stderr)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_git_ssh_key_auth_and_push_clone_roundtrip() {
     let (_http_url, ssh_port, db, state, tmp) = setup_test_server().await;
@@ -667,4 +701,211 @@ async fn test_git_lfs_file_locking_api_and_push_conflict() {
         .unwrap();
     let res = router.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_git_ssh_strict_host_key_and_advanced_ops() {
+    let (_http_url, ssh_port, db, state, tmp) = setup_test_server().await;
+    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+    // 1. Create User
+    let user = User {
+        id: "usr_carol".to_string(),
+        username: "carol".to_string(),
+        normalized_username: "carol".to_string(),
+        email: "carol@spine.build".to_string(),
+        normalized_email: "carol@spine.build".to_string(),
+        display_name: "Carol Strict".to_string(),
+        password_hash: "hash".to_string(),
+        account_status: "ACTIVE".to_string(),
+        avatar_url: None,
+        created_at_nanos: now,
+        updated_at_nanos: now,
+        last_login_nanos: None,
+    };
+    db.create_user(user.clone()).await.unwrap();
+
+    let key_path = tmp.path().join("id_carol");
+    let (carol_pub, carol_fp) = generate_client_ssh_key(&key_path);
+    db.create_user_ssh_key(UserSshKey {
+        id: "key_carol".to_string(),
+        user_id: user.id.clone(),
+        title: "Carol Key".to_string(),
+        fingerprint: carol_fp,
+        public_key: carol_pub,
+        key_type: "ssh-ed25519".to_string(),
+        created_at_nanos: now,
+        last_used_at_nanos: None,
+        revoked: false,
+    }).await.unwrap();
+
+    // 2. Read server's public host key and populate strict known_hosts
+    let host_pub_path = tmp.path().join("storage/ssh/host_key_ed25519.pub");
+    assert!(host_pub_path.exists(), "Host public key must exist on disk");
+    let host_pub_key = fs::read_to_string(&host_pub_path).unwrap();
+
+    let known_hosts_path = tmp.path().join("known_hosts_strict");
+    let known_hosts_entry = format!("[127.0.0.1]:{} {}\n", ssh_port, host_pub_key.trim());
+    fs::write(&known_hosts_path, &known_hosts_entry).unwrap();
+
+    // 3. Create Public Repository and Initial Push over Strict SSH
+    let _repo = state
+        .repositories
+        .create_repository(&user, "strict-repo", Some("Strict host key test".into()), false, None)
+        .await
+        .unwrap();
+
+    let client_dir = tmp.path().join("carol_repo");
+    fs::create_dir_all(&client_dir).unwrap();
+    run_git_ssh_cmd_strict(&client_dir, &key_path, &known_hosts_path, &["init", "-b", "main"]);
+    fs::write(client_dir.join("main.rs"), b"fn main() {}\n").unwrap();
+    run_git_ssh_cmd_strict(&client_dir, &key_path, &known_hosts_path, &["add", "."]);
+    run_git_ssh_cmd_strict(&client_dir, &key_path, &known_hosts_path, &["commit", "-m", "Initial commit"]);
+
+    let remote_url = format!("ssh://git@127.0.0.1:{}/carol/strict-repo.git", ssh_port);
+    run_git_ssh_cmd_strict(&client_dir, &key_path, &known_hosts_path, &["remote", "add", "origin", &remote_url]);
+
+    // Push main branch with StrictHostKeyChecking=yes
+    let (ok, out, err) = run_git_ssh_cmd_strict(&client_dir, &key_path, &known_hosts_path, &["push", "-u", "origin", "main"]);
+    assert!(ok, "Strict SSH push failed:\nSTDOUT: {}\nSTDERR: {}", out, err);
+
+    // 4. Branch Push
+    run_git_ssh_cmd_strict(&client_dir, &key_path, &known_hosts_path, &["checkout", "-b", "feature-x"]);
+    fs::write(client_dir.join("feature.txt"), b"feature content\n").unwrap();
+    run_git_ssh_cmd_strict(&client_dir, &key_path, &known_hosts_path, &["add", "."]);
+    run_git_ssh_cmd_strict(&client_dir, &key_path, &known_hosts_path, &["commit", "-m", "Feature commit"]);
+    let (ok, out, err) = run_git_ssh_cmd_strict(&client_dir, &key_path, &known_hosts_path, &["push", "origin", "feature-x"]);
+    assert!(ok, "Branch push failed:\nSTDOUT: {}\nSTDERR: {}", out, err);
+
+    // 5. Tag Push
+    run_git_ssh_cmd_strict(&client_dir, &key_path, &known_hosts_path, &["tag", "v1.0.0"]);
+    let (ok, out, err) = run_git_ssh_cmd_strict(&client_dir, &key_path, &known_hosts_path, &["push", "origin", "v1.0.0"]);
+    assert!(ok, "Tag push failed:\nSTDOUT: {}\nSTDERR: {}", out, err);
+
+    // 6. Strict Clone into New Directory
+    let clone_dir = tmp.path().join("carol_clone");
+    let (ok, out, err) = run_git_ssh_cmd_strict(tmp.path(), &key_path, &known_hosts_path, &["clone", &remote_url, clone_dir.to_str().unwrap()]);
+    assert!(ok, "Strict SSH clone failed:\nSTDOUT: {}\nSTDERR: {}", out, err);
+    assert!(clone_dir.join("main.rs").exists());
+
+    // 7. Fetch and Pull
+    let (ok, out, err) = run_git_ssh_cmd_strict(&clone_dir, &key_path, &known_hosts_path, &["fetch", "origin"]);
+    assert!(ok, "Strict SSH fetch failed:\nSTDOUT: {}\nSTDERR: {}", out, err);
+
+    let (ok, out, err) = run_git_ssh_cmd_strict(&clone_dir, &key_path, &known_hosts_path, &["pull", "origin", "main"]);
+    assert!(ok, "Strict SSH pull failed:\nSTDOUT: {}\nSTDERR: {}", out, err);
+
+    // 8. Strict Host Key Verification Failure Test (Tampered Host Key)
+    let bad_known_hosts = tmp.path().join("known_hosts_bad");
+    fs::write(&bad_known_hosts, format!("[127.0.0.1]:{} ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeHostKeyThatDoesNotMatchServerFingerprintXX\n", ssh_port)).unwrap();
+    let (ok, out, err) = run_git_ssh_cmd_strict(&clone_dir, &key_path, &bad_known_hosts, &["fetch", "origin"]);
+    assert!(!ok, "Connection with mismatched host key MUST fail strict verification");
+    assert!(err.contains("Host key verification failed") || err.contains("REMOTE HOST IDENTIFICATION HAS CHANGED") || err.contains("fatal: Could not read"),
+        "Expected host key verification error:\nSTDOUT: {}\nSTDERR: {}", out, err);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_git_ssh_persistence_and_restart() {
+    let tmp = tempdir().unwrap();
+    let storage_root = tmp.path().join("storage");
+    fs::create_dir_all(&storage_root).unwrap();
+
+    let db = Arc::new(InMemoryDatabase::new());
+    let state = AppState::new_with_defaults(db.clone(), &storage_root, None).unwrap();
+
+    // 1. First Server Boot: Generates host key
+    let (addr1, _handle1) = spine_api::start_ssh_server(state.clone(), "127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("Server 1 boot");
+    let port1 = addr1.port();
+
+    let host_pub_path = storage_root.join("ssh/host_key_ed25519.pub");
+    assert!(host_pub_path.exists());
+    let pub1 = fs::read_to_string(&host_pub_path).unwrap();
+
+    // Register User & Key
+    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let user = User {
+        id: "usr_restart".to_string(),
+        username: "restart_user".to_string(),
+        normalized_username: "restart_user".to_string(),
+        email: "restart@spine.build".to_string(),
+        normalized_email: "restart@spine.build".to_string(),
+        display_name: "Restart User".to_string(),
+        password_hash: "hash".to_string(),
+        account_status: "ACTIVE".to_string(),
+        avatar_url: None,
+        created_at_nanos: now,
+        updated_at_nanos: now,
+        last_login_nanos: None,
+    };
+    db.create_user(user.clone()).await.unwrap();
+
+    let key_path = tmp.path().join("id_restart");
+    let (pub_key_str, fingerprint) = generate_client_ssh_key(&key_path);
+    db.create_user_ssh_key(UserSshKey {
+        id: "key_restart".to_string(),
+        user_id: user.id.clone(),
+        title: "Restart Key".to_string(),
+        fingerprint,
+        public_key: pub_key_str,
+        key_type: "ssh-ed25519".to_string(),
+        created_at_nanos: now,
+        last_used_at_nanos: None,
+        revoked: false,
+    }).await.unwrap();
+
+    let _repo = state
+        .repositories
+        .create_repository(&user, "restart-repo", Some("Restart persistence test".into()), false, None)
+        .await
+        .unwrap();
+
+    // Push initial commit to server 1
+    let init_dir = tmp.path().join("init_client");
+    fs::create_dir_all(&init_dir).unwrap();
+    let known_hosts_1 = tmp.path().join("known_hosts_1");
+    fs::write(&known_hosts_1, format!("[127.0.0.1]:{} {}\n", port1, pub1.trim())).unwrap();
+
+    run_git_ssh_cmd_strict(&init_dir, &key_path, &known_hosts_1, &["init", "-b", "main"]);
+    fs::write(init_dir.join("init.txt"), b"initial commit").unwrap();
+    run_git_ssh_cmd_strict(&init_dir, &key_path, &known_hosts_1, &["add", "."]);
+    run_git_ssh_cmd_strict(&init_dir, &key_path, &known_hosts_1, &["commit", "-m", "Initial commit"]);
+    let repo_url_1 = format!("ssh://git@127.0.0.1:{}/restart_user/restart-repo.git", port1);
+    run_git_ssh_cmd_strict(&init_dir, &key_path, &known_hosts_1, &["remote", "add", "origin", &repo_url_1]);
+    let (ok, out, err) = run_git_ssh_cmd_strict(&init_dir, &key_path, &known_hosts_1, &["push", "-u", "origin", "main"]);
+    assert!(ok, "Initial push failed: STDOUT: {}\nSTDERR: {}", out, err);
+
+    // 2. Second Server Boot pointing to the EXACT same storage root and database
+    let (addr2, _handle2) = spine_api::start_ssh_server(state.clone(), "127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("Server 2 boot");
+    let port2 = addr2.port();
+
+    let pub2 = fs::read_to_string(&host_pub_path).unwrap();
+    // Host key identity MUST be identical across restart (no accidental regeneration)
+    assert_eq!(pub1, pub2, "SSH host key MUST persist stably across server restarts");
+
+    // Known hosts with server 2's port
+    let known_hosts_2 = tmp.path().join("known_hosts_2");
+    fs::write(&known_hosts_2, format!("[127.0.0.1]:{} {}\n", port2, pub2.trim())).unwrap();
+
+    // Client clones from server 2 using existing persisted key
+    let repo_url_2 = format!("ssh://git@127.0.0.1:{}/restart_user/restart-repo.git", port2);
+    let clone_dir = tmp.path().join("restart_clone");
+    let (ok, out, err) = run_git_ssh_cmd_strict(tmp.path(), &key_path, &known_hosts_2, &["clone", &repo_url_2, clone_dir.to_str().unwrap()]);
+    assert!(ok, "Clone from server 2 failed:\nSTDOUT: {}\nSTDERR: {}", out, err);
+    assert_eq!(fs::read_to_string(clone_dir.join("init.txt")).unwrap(), "initial commit");
+
+    // 3. Key Revocation Test
+    db.revoke_user_ssh_key("key_restart", &user.id).await.unwrap();
+
+    // Now push attempt MUST be rejected due to revoked key
+    fs::write(clone_dir.join("file.txt"), b"revocation edit").unwrap();
+    run_git_ssh_cmd_strict(&clone_dir, &key_path, &known_hosts_2, &["add", "."]);
+    run_git_ssh_cmd_strict(&clone_dir, &key_path, &known_hosts_2, &["commit", "-m", "Revoked key commit"]);
+    let (ok, out, err) = run_git_ssh_cmd_strict(&clone_dir, &key_path, &known_hosts_2, &["push", "origin", "main"]);
+    assert!(!ok, "Push using revoked SSH key must be rejected");
+    assert!(err.contains("Permission denied") || err.contains("Could not read") || out.contains("Permission denied"),
+        "Expected permission denied on revoked key: STDOUT: {}\nSTDERR: {}", out, err);
 }

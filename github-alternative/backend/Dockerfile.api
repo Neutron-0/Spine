@@ -1,0 +1,47 @@
+# Multi-stage build for Spine Forge API & SSH Service
+FROM rust:1.80-bullseye AS builder
+
+WORKDIR /usr/src/spine
+
+# Copy workspaces
+COPY git-alternative ./git-alternative
+COPY github-alternative/backend ./github-alternative/backend
+
+# Build release binary for spine-api
+RUN cargo build --release --manifest-path github-alternative/backend/Cargo.toml -p spine-api
+
+# Minimal unprivileged runtime image
+FROM debian:bullseye-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create unprivileged service user and group (UID 10001, GID 10001)
+RUN groupadd -g 10001 spine && \
+    useradd -u 10001 -g spine -s /bin/false -m spine
+
+# Setup persistent application directories
+RUN mkdir -p /var/lib/spine/storage /var/lib/spine/ssh && \
+    chown -R spine:spine /var/lib/spine
+
+WORKDIR /var/lib/spine
+
+COPY --from=builder /usr/src/spine/github-alternative/backend/target/release/spine-api /usr/local/bin/spine-api
+
+USER spine:spine
+
+EXPOSE 3000
+EXPOSE 2222
+
+ENV BIND="0.0.0.0"
+ENV PORT="3000"
+ENV SSH_PORT="2222"
+ENV STORAGE_ROOT="/var/lib/spine/storage"
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://127.0.0.1:3000/healthz || exit 1
+
+ENTRYPOINT ["/usr/local/bin/spine-api"]
+CMD ["serve", "--bind", "0.0.0.0", "--port", "3000", "--ssh-port", "2222", "--storage-root", "/var/lib/spine/storage"]
