@@ -486,3 +486,150 @@ async fn test_git_smart_http_url_without_dot_git_and_tags() {
     );
     assert!(clone_dir.join("version.txt").exists());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_git_smart_http_fetch_pull_lifecycle() {
+    let (base_url, db, state, _tmp) = setup_test_server().await;
+
+    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let user = User {
+        id: "usr_frank".to_string(),
+        username: "frank".to_string(),
+        normalized_username: "frank".to_string(),
+        email: "frank@spine.build".to_string(),
+        normalized_email: "frank@spine.build".to_string(),
+        display_name: "Frank Developer".to_string(),
+        password_hash: "hash".to_string(),
+        account_status: "ACTIVE".to_string(),
+        avatar_url: None,
+        created_at_nanos: now,
+        updated_at_nanos: now,
+        last_login_nanos: None,
+    };
+    db.create_user(user.clone()).await.unwrap();
+
+    let pat_secret = "sp_pat_frank_token_1234567890abcdef12345678";
+    let pat = PersonalAccessToken {
+        id: "pat_frank".to_string(),
+        user_id: user.id.clone(),
+        name: "Frank PAT".to_string(),
+        token_hash: hash_pat(pat_secret),
+        scopes: vec!["repo".to_string()],
+        expires_at_nanos: i64::MAX,
+        created_at_nanos: now,
+        last_used_at_nanos: None,
+        revoked: false,
+    };
+    db.create_pat(pat).await.unwrap();
+
+    // 1. Create public repository
+    let repo = state
+        .repositories
+        .create_repository(&user, "lifecycle-repo", Some("Lifecycle".into()), false, None)
+        .await
+        .unwrap();
+
+    let port = url::Url::parse(&base_url).unwrap().port().unwrap();
+    let auth_remote = format!(
+        "http://frank:{}@127.0.0.1:{}/frank/{}.git",
+        pat_secret, port, repo.name
+    );
+
+    let client_tmp = tempdir().unwrap();
+
+    // Setup initial repo seed and push
+    let seed_dir = client_tmp.path().join("seed_repo");
+    fs::create_dir_all(&seed_dir).unwrap();
+    run_git_cmd(&seed_dir, &["init", "-b", "main"]);
+    fs::write(seed_dir.join("README.md"), "# Lifecycle Test\n").unwrap();
+    run_git_cmd(&seed_dir, &["add", "README.md"]);
+    run_git_cmd(&seed_dir, &["commit", "-m", "Initial seed commit"]);
+    let (ok, stdout, stderr) = run_git_cmd(&seed_dir, &["push", &auth_remote, "main"]);
+    assert!(ok, "Initial push failed: {} {}", stdout, stderr);
+
+    // 2. Clone it using official Git as Client 1
+    let client1_dir = client_tmp.path().join("client1");
+    let (ok, stdout, stderr) = run_git_cmd(
+        client_tmp.path(),
+        &["clone", &auth_remote, client1_dir.to_str().unwrap()],
+    );
+    assert!(ok, "Client 1 clone failed: {} {}", stdout, stderr);
+    assert!(client1_dir.join("README.md").exists());
+
+    // 3. Clone it as Client 2 and push a new commit to main
+    let client2_dir = client_tmp.path().join("client2");
+    let (ok, stdout, stderr) = run_git_cmd(
+        client_tmp.path(),
+        &["clone", &auth_remote, client2_dir.to_str().unwrap()],
+    );
+    assert!(ok, "Client 2 clone failed: {} {}", stdout, stderr);
+
+    fs::write(client2_dir.join("feature.txt"), "Feature from client 2\n").unwrap();
+    run_git_cmd(&client2_dir, &["add", "feature.txt"]);
+    run_git_cmd(&client2_dir, &["commit", "-m", "Add feature from client 2"]);
+    let (ok, _, _) = run_git_cmd(&client2_dir, &["rev-parse", "HEAD"]);
+    assert!(ok);
+    let (ok, stdout, stderr) = run_git_cmd(&client2_dir, &["push", "origin", "main"]);
+    assert!(ok, "Client 2 push failed: {} {}", stdout, stderr);
+
+    // 4. Run `git fetch` in Client 1
+    let (ok, stdout, stderr) = run_git_cmd(&client1_dir, &["fetch", "origin"]);
+    assert!(ok, "Client 1 git fetch failed: {} {}", stdout, stderr);
+
+    // 5. Verify the newly fetched branch/commit in Client 1
+    let (ok, client1_fetch_head, _) = run_git_cmd(&client1_dir, &["rev-parse", "origin/main"]);
+    assert!(ok);
+    let (ok, client2_head, _) = run_git_cmd(&client2_dir, &["rev-parse", "HEAD"]);
+    assert!(ok);
+    assert_eq!(
+        client1_fetch_head.trim(),
+        client2_head.trim(),
+        "origin/main in client1 should match client2 HEAD after fetch"
+    );
+
+    // 6. Run `git pull` in Client 1
+    let (ok, stdout, stderr) = run_git_cmd(&client1_dir, &["pull", "origin", "main"]);
+    assert!(ok, "Client 1 git pull failed: {} {}", stdout, stderr);
+
+    // 7. Verify the working tree and commit ancestry
+    assert!(client1_dir.join("feature.txt").exists());
+    let content = fs::read_to_string(client1_dir.join("feature.txt")).unwrap();
+    assert_eq!(content.replace("\r\n", "\n"), "Feature from client 2\n");
+
+    let (ok, client1_head, _) = run_git_cmd(&client1_dir, &["rev-parse", "HEAD"]);
+    assert!(ok);
+    assert_eq!(client1_head.trim(), client2_head.trim());
+
+    // 8. Fetch newly added tags
+    run_git_cmd(&client2_dir, &["tag", "-a", "v2.0.0", "-m", "Release v2.0.0"]);
+    let (ok, stdout, stderr) = run_git_cmd(&client2_dir, &["push", "origin", "v2.0.0"]);
+    assert!(ok, "Push tag failed: {} {}", stdout, stderr);
+
+    let (ok, stdout, stderr) = run_git_cmd(&client1_dir, &["fetch", "--tags", "origin"]);
+    assert!(ok, "Fetch tags failed: {} {}", stdout, stderr);
+    let (ok, tag_list, _) = run_git_cmd(&client1_dir, &["tag", "-l"]);
+    assert!(ok);
+    assert!(tag_list.contains("v2.0.0"), "Client 1 should see tag v2.0.0");
+
+    // 9. Fetch an additional branch
+    run_git_cmd(&client2_dir, &["checkout", "-b", "dev"]);
+    fs::write(client2_dir.join("dev.txt"), "Development branch file\n").unwrap();
+    run_git_cmd(&client2_dir, &["add", "dev.txt"]);
+    run_git_cmd(&client2_dir, &["commit", "-m", "Commit on dev branch"]);
+    let (ok, stdout, stderr) = run_git_cmd(&client2_dir, &["push", "origin", "dev"]);
+    assert!(ok, "Push dev branch failed: {} {}", stdout, stderr);
+
+    let (ok, stdout, stderr) = run_git_cmd(&client1_dir, &["fetch", "origin", "dev:dev"]);
+    assert!(ok, "Fetch dev branch failed: {} {}", stdout, stderr);
+    let (ok, branch_list, _) = run_git_cmd(&client1_dir, &["branch", "-l"]);
+    assert!(ok);
+    assert!(branch_list.contains("dev"), "Client 1 should have local dev branch");
+
+    // 10. Repeat fetch without new changes
+    let (ok, stdout, stderr) = run_git_cmd(&client1_dir, &["fetch", "origin"]);
+    assert!(ok, "Repeated fetch without changes failed: {} {}", stdout, stderr);
+
+    // 11. Verify that no unnecessary ref corruption or duplicate commits occur
+    let (ok, fsck_out, fsck_err) = run_git_cmd(&client1_dir, &["fsck", "--full"]);
+    assert!(ok, "git fsck on client 1 failed: {} {}", fsck_out, fsck_err);
+}

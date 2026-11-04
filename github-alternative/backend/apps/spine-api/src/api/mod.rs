@@ -29,6 +29,7 @@ pub mod routes_git_http;
 pub use middleware::AppState;
 
 use axum::{
+    extract::DefaultBodyLimit,
     middleware as axum_middleware,
     routing::{delete, get, patch, post, put},
     Router,
@@ -586,7 +587,21 @@ pub fn build_router(state: AppState) -> Router {
         .route("/:owner/:repo_git/info/refs", get(routes_git_http::git_info_refs))
         .route("/:owner/:repo_git/git-upload-pack", post(routes_git_http::git_upload_pack))
         .route("/:owner/:repo_git/git-receive-pack", post(routes_git_http::git_receive_pack))
+        // Native Git LFS HTTP endpoints (Batch 17)
+        .route(
+            "/:owner/:repo_git/info/lfs/objects/batch",
+            post(routes_lfs::git_lfs_batch),
+        )
+        .route(
+            "/:owner/:repo_git/info/lfs/objects/:oid",
+            put(routes_lfs::git_lfs_upload_object).get(routes_lfs::git_lfs_download_object),
+        )
+        .route(
+            "/:owner/:repo_git/info/lfs/verify",
+            post(routes_lfs::git_lfs_verify_object),
+        )
         // Layers
+        .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
             middleware::auth_middleware,

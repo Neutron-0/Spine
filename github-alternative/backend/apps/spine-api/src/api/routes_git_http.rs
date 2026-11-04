@@ -22,7 +22,7 @@ pub struct InfoRefsQuery {
     pub service: Option<String>,
 }
 
-fn unauthorized_response() -> Response {
+pub fn unauthorized_response() -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(
         header::WWW_AUTHENTICATE,
@@ -217,6 +217,10 @@ pub async fn git_info_refs(
     Query(query): Query<InfoRefsQuery>,
     headers: HeaderMap,
 ) -> Response {
+    if let Err(resp) = crate::api::routes_lfs::check_transport_security(&state, &headers) {
+        return resp;
+    }
+
     let service = match query.service.as_deref() {
         Some("git-upload-pack") => "git-upload-pack",
         Some("git-receive-pack") => "git-receive-pack",
@@ -334,6 +338,10 @@ pub async fn git_upload_pack(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Err(resp) = crate::api::routes_lfs::check_transport_security(&state, &headers) {
+        return resp;
+    }
+
     let repo_name = repo_git.strip_suffix(".git").unwrap_or(&repo_git);
     let caller = authenticate_git_user(&state, &headers).await;
 
@@ -382,6 +390,10 @@ pub async fn git_receive_pack(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Err(resp) = crate::api::routes_lfs::check_transport_security(&state, &headers) {
+        return resp;
+    }
+
     let repo_name = repo_git.strip_suffix(".git").unwrap_or(&repo_git);
     let user = match authenticate_git_user(&state, &headers).await {
         Some(u) => u,
@@ -451,6 +463,25 @@ pub async fn git_receive_pack(
         }
     }
 
+    // 1b. LFS Object Presence Verification: Check newly introduced LFS pointer blobs
+    let mut detected_missing_lfs: Option<(String, u64)> = None;
+    for (_oid, payload) in &ingest_res.new_blobs {
+        if spine_migration::GitLfsPointer::is_lfs_pointer(payload) {
+            if let Ok(ptr) = spine_migration::GitLfsPointer::parse(payload) {
+                let exists = state
+                    .db
+                    .get_artifact_manifest(&ptr.oid_sha256)
+                    .await
+                    .map(|opt| opt.is_some())
+                    .unwrap_or(false);
+                if !exists {
+                    detected_missing_lfs = Some((ptr.oid_sha256, ptr.size_bytes));
+                    break;
+                }
+            }
+        }
+    }
+
     let protection_rules = state
         .db
         .list_branch_protection_rules(&repo.id)
@@ -480,6 +511,18 @@ pub async fn git_receive_pack(
                 Err(format!(
                     "push rejected: secret scanning detected sensitive credentials ({})",
                     sec
+                )),
+            ));
+            continue;
+        }
+
+        // If referenced LFS object is missing, reject all ref updates
+        if let Some((ref lfs_oid, lfs_sz)) = detected_missing_lfs {
+            ref_results.push((
+                ref_name.clone(),
+                Err(format!(
+                    "push rejected: referenced LFS object '{}' ({} bytes) is missing; upload via git-lfs before pushing",
+                    lfs_oid, lfs_sz
                 )),
             ));
             continue;

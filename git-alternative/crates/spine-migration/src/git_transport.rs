@@ -518,9 +518,50 @@ fn save_git_map(spine_dir: &Path, git_to_spine: &HashMap<GitOid, ObjectId>) {
     for (goid, soid) in git_to_spine {
         map.insert(goid.to_hex(), soid.to_hex());
     }
-    if let Ok(json) = serde_json::to_string(&map) {
-        let _ = fs::write(map_file, json);
+    if let Ok(json) = serde_json::to_string_pretty(&map) {
+        let tmp_file = map_file.with_extension("tmp");
+        if fs::write(&tmp_file, json).is_ok() {
+            let _ = fs::rename(&tmp_file, &map_file);
+        }
     }
+}
+
+/// Scans repository refs and commits, reconciles any missing Git OIDs for native Spine commits,
+/// and atomically persists the updated bidirectional map to `git_map.json`.
+pub fn reconcile_git_map(
+    spine_dir: &Path,
+) -> Result<(HashMap<GitOid, ObjectId>, HashMap<ObjectId, GitOid>), GitTransportError> {
+    let (mut git_to_spine, mut spine_to_git) = load_git_map(spine_dir);
+
+    let heads_dir = spine_dir.join("refs").join("heads");
+    if heads_dir.exists() {
+        let store = FileSystemObjectStore::new(spine_dir, HashAlgorithm::Blake3, 3)?;
+        let tmp_git = spine_dir.join("tmp_git_reconcile");
+        let mut stats = ExportStats::default();
+        let mut exporter = GitExporter::new(spine_dir, &tmp_git, true)
+            .map_err(|e| GitTransportError::Protocol(e.to_string()))?;
+
+        for entry in fs::read_dir(&heads_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() {
+                let content = fs::read_to_string(&path)?;
+                if let Ok(spine_id) = ObjectId::from_hex(content.trim()) {
+                    if !spine_to_git.contains_key(&spine_id) {
+                        if let Ok(git_oid) =
+                            exporter.export_commit_recursive_pub(&store, &spine_id, &mut stats)
+                        {
+                            git_to_spine.insert(git_oid, spine_id);
+                            spine_to_git.insert(spine_id, git_oid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    save_git_map(spine_dir, &git_to_spine);
+    Ok((git_to_spine, spine_to_git))
 }
 
 fn save_raw_git_object(spine_dir: &Path, oid: &GitOid, obj_type: GitObjectType, payload: &[u8]) {

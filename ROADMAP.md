@@ -202,3 +202,49 @@
   - Verified pre-receive secret scanning rejection of credential leakage.
   - Verified clone and push via bare repository URLs (omitting `.git`).
 - [x] Architecture, protocol, authentication, push security, pack transfer, and operational runbook documentation in `docs/`.
+
+---
+
+## Milestone 17: Native Git LFS HTTP API, Smart HTTP Hardening, and Complete Large-File Remote Compatibility (Batch 17 - Completed)
+- [x] Phase Zero audit and gap register (`BATCH_17_PHASE_ZERO_GAP_REGISTER.md`):
+  - Multi-step `git fetch` and `git pull` lifecycle verification under official Git CLI oracle (`test_git_smart_http_fetch_pull_lifecycle`).
+  - Hardened Git object mapping durability with atomic temporary file writes and filesystem renames (`save_git_map`).
+  - Dynamic mapping reconciliation engine (`reconcile_git_map`) synthesizing valid Git OIDs for Spine-native commits.
+  - Smart HTTP capability audit verifying strict compliance (protocol v2 explicitly unadvertised where not implemented).
+  - Configurable canonical public origin (`public_origin`, `FORGE_PUBLIC_ORIGIN`, `APP_URL`) and plaintext Basic Auth rejection outside loopback.
+- [x] Standard Git LFS HTTP Architecture (`routes_lfs.rs`):
+  - Repository-scoped endpoints mounted at `/:owner/:repo_git/info/lfs/objects/batch`, `/:owner/:repo_git/info/lfs/objects/:oid`, and `/:owner/:repo_git/info/lfs/verify`.
+  - Media type compliance: `application/vnd.git-lfs+json`.
+  - Full Batch API supporting `upload` and `download` operations with `basic` transfer adapter.
+  - Automatic deduplication: upload batch responses omit `actions` for already-present objects so Git LFS skips re-uploading them.
+  - Per-object error reporting (HTTP 404 for missing download objects) without aborting entire batch operations.
+- [x] Basic Transfer Implementation:
+  - Streamed `PUT` upload endpoint streaming incoming binaries into `spine-artifact` content-addressed storage (4 MiB FastCDC chunks), verifying running SHA-256 and byte length.
+  - Idempotent `POST` verification endpoint confirming persisted object existence and exact size.
+  - Streamed `GET` download endpoint reconstructing raw binary bytes directly from `spine-artifact` chunk blocks with `Content-Type: application/octet-stream`.
+  - Support for 1 GiB payload transfers via Axum `DefaultBodyLimit::max(1024 * 1024 * 1024)`.
+- [x] Short-Lived Scoped Transfer Capabilities:
+  - HMAC-SHA256 token generation and constant-time verification (`subtle::ConstantTimeEq`).
+  - Scoped tokens strictly bound to repository ID, object SHA-256, operation, max size, and 1-hour expiration.
+  - Prevention of cross-repository capability reuse, operation substitution, and OID tampering.
+- [x] Smart HTTP & LFS Integration (Pre-Receive Hook Fencing):
+  - Pre-receive inspection in `git_receive_pack` scanning newly introduced blobs for `GitLfsPointer`.
+  - Automatic rejection of commits that introduce LFS pointers without the backing binary objects having been uploaded and verified.
+- [x] Frontend UI Integration (`App.tsx`):
+  - Clone dropdown updated with HTTPS Git Clone URL, Git LFS support details, and quickstart commands (`git lfs install`, `git lfs track "*.bin"`, `git add .gitattributes`).
+  - Clean production build verified via Vite (`npm run build`).
+- [x] Official Git and Git LFS End-to-End Test Suite (`git_lfs_http_test.rs`):
+  - Batch API conformance testing across 10 discrete cases (`test_git_lfs_batch_api_conformance`).
+  - Pre-receive missing LFS object push rejection test (`test_git_lfs_receive_pack_pre_receive_rejection`).
+  - End-to-end official client integration test (`test_official_git_lfs_workflow`) using host `git 2.53.0.windows.1` and `git-lfs/3.7.1` tracking, committing, pushing, cloning, modifying, and pulling a 5 MiB binary asset with byte-for-byte verification.
+- [x] Comprehensive documentation suite authored in `docs/`:
+  - `BATCH_17_PHASE_ZERO_GAP_REGISTER.md`
+  - `GIT_LFS_HTTP_ARCHITECTURE.md`
+  - `GIT_LFS_BATCH_API_SUPPORT.md`
+  - `GIT_LFS_BASIC_TRANSFER.md`
+  - `GIT_LFS_AUTHORIZATION.md`
+  - `GIT_LFS_STORAGE_MAPPING.md`
+  - `GIT_SMART_HTTP_SECURITY.md`
+  - `GIT_OBJECT_MAPPING_DURABILITY.md`
+  - `GIT_REMOTE_HTTPS_CONFIGURATION.md`
+  - `GIT_REMOTE_TEST_MATRIX.md`

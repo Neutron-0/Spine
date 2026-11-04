@@ -1560,7 +1560,7 @@ export const App: React.FC = () => {
                     }}
                   >
                     <div style={{ fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.5rem', color: '#c9d1d9' }}>
-                      Git Smart HTTP URL
+                      HTTPS Git Clone URL
                     </div>
                     <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '0.75rem' }}>
                       <input
@@ -1584,7 +1584,15 @@ export const App: React.FC = () => {
                     </div>
                     <div style={{ fontSize: '0.75rem', color: '#8b949e', lineHeight: 1.4 }}>
                       <div style={{ marginBottom: '0.25rem' }}>
-                        🌐 <strong>Standard Git Remote:</strong> Works with native <code>git clone</code>, <code>fetch</code>, and <code>push</code>.
+                        🌐 <strong>Standard Git Remote:</strong> Works with official <code>git clone</code>, <code>fetch</code>, and <code>push</code> over Smart HTTP.
+                      </div>
+                      <div style={{ marginBottom: '0.35rem' }}>
+                        📦 <strong>Git LFS Supported:</strong> Large files are stored in native artifact storage and verified via Git LFS Basic Transfer.
+                      </div>
+                      <div style={{ marginBottom: '0.35rem', backgroundColor: '#0d1117', padding: '0.4rem', borderRadius: '4px', fontFamily: 'monospace' }}>
+                        git lfs install<br/>
+                        git lfs track "*.bin"<br/>
+                        git add .gitattributes
                       </div>
                       <div>
                         🔒 <strong>Authentication:</strong> Use your Forge username and Personal Access Token (<code>sp_pat_...</code>) as password.

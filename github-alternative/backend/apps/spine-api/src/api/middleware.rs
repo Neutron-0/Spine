@@ -42,11 +42,17 @@ pub struct AppState {
     pub discussions: Arc<crate::discussions::DiscussionService>,
     pub discovery: Arc<crate::discovery::DiscoveryService>,
     pub security: Arc<crate::security::SecurityService>,
+    pub public_origin: String,
 }
 
 impl AppState {
     pub fn storage_root(&self) -> &std::path::Path {
         self.vcs.storage_root()
+    }
+
+    pub fn with_public_origin(mut self, origin: impl Into<String>) -> Self {
+        self.public_origin = origin.into();
+        self
     }
 
     pub fn new_with_defaults(
@@ -118,6 +124,10 @@ impl AppState {
             storage_root.to_path_buf(),
         ));
 
+        let public_origin = std::env::var("FORGE_PUBLIC_ORIGIN")
+            .or_else(|_| std::env::var("APP_URL"))
+            .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
+
         Ok(Self {
             db,
             permissions,
@@ -140,6 +150,7 @@ impl AppState {
             discussions,
             discovery,
             security,
+            public_origin,
         })
     }
 }

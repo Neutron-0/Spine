@@ -137,6 +137,10 @@ async fn main() -> anyhow::Result<()> {
         storage_root_canonical.clone(),
     ));
 
+    let public_origin = std::env::var("FORGE_PUBLIC_ORIGIN")
+        .or_else(|_| std::env::var("APP_URL"))
+        .unwrap_or_else(|_| format!("http://{}:{}", args.bind, args.port));
+
     let state = AppState {
         db: Arc::clone(&db),
         permissions: Arc::clone(&permissions),
@@ -159,6 +163,7 @@ async fn main() -> anyhow::Result<()> {
         discussions,
         discovery,
         security,
+        public_origin,
     };
 
     // 4. Spawn background provisioning worker
