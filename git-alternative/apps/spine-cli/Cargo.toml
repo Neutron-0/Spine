@@ -33,6 +33,7 @@ spine-protocol.workspace = true
 spine-net.workspace = true
 spine-cluster.workspace = true
 spine-artifact.workspace = true
+spine-migration.workspace = true
 blake3.workspace = true
 
 tokio = { workspace = true, features = ["full"] }

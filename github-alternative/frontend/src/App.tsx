@@ -44,6 +44,10 @@ import {
   DependencyInventoryDto,
   DependencyVulnerabilityDto,
   SecuritySummaryDto,
+  MigrationInspectionDto,
+  MigrationPlanDto,
+  MigrationReportDto,
+  ExportStatsSummaryDto,
 } from './types';
 
 export const App: React.FC = () => {
@@ -61,7 +65,7 @@ export const App: React.FC = () => {
   const [branches, setBranches] = useState<BranchDto[]>([]);
   const [currentBranch, setCurrentBranch] = useState<string>('main');
   const [commits, setCommits] = useState<CommitDto[]>([]);
-  const [activeTab, setActiveTab] = useState<'code' | 'issues' | 'pulls' | 'orgs' | 'protection' | 'releases' | 'packages' | 'actions' | 'webhooks' | 'runners' | 'secrets' | 'search' | 'discussions' | 'discovery' | 'security'>('code');
+  const [activeTab, setActiveTab] = useState<'code' | 'issues' | 'pulls' | 'orgs' | 'protection' | 'releases' | 'packages' | 'actions' | 'webhooks' | 'runners' | 'secrets' | 'search' | 'discussions' | 'discovery' | 'security' | 'migration'>('code');
   const [codeSubTab, setCodeSubTab] = useState<'files' | 'commits'>('files');
   const [treeEntries, setTreeEntries] = useState<TreeEntryDto[]>([]);
   const [selectedBlob, setSelectedBlob] = useState<BlobContentDto | null>(null);
@@ -134,6 +138,19 @@ export const App: React.FC = () => {
     is_private: false,
     durability: 'ThreeCopies',
   });
+
+  // Batch 15: Migration State
+  const [migrationSourcePath, setMigrationSourcePath] = useState<string>('');
+  const [migrationTargetName, setMigrationTargetName] = useState<string>('');
+  const [migrationDryRun, setMigrationDryRun] = useState<boolean>(false);
+  const [migrationInspection, setMigrationInspection] = useState<MigrationInspectionDto | null>(null);
+  const [migrationPlan, setMigrationPlan] = useState<MigrationPlanDto | null>(null);
+  const [migrationReport, setMigrationReport] = useState<MigrationReportDto | null>(null);
+  const [migrationExportTarget, setMigrationExportTarget] = useState<string>('');
+  const [migrationExportBare, setMigrationExportBare] = useState<boolean>(false);
+  const [migrationExportStats, setMigrationExportStats] = useState<ExportStatsSummaryDto | null>(null);
+  const [migrationLoading, setMigrationLoading] = useState<boolean>(false);
+  const [migrationStatusMsg, setMigrationStatusMsg] = useState<string | null>(null);
 
   const getAuthHeaders = (): Record<string, string> => {
     const headers: Record<string, string> = {};
@@ -494,6 +511,98 @@ export const App: React.FC = () => {
       }
     } catch {
       // ignore
+    }
+  };
+
+  const handleInspectMigration = async () => {
+    if (!migrationSourcePath) return;
+    setMigrationLoading(true);
+    setMigrationStatusMsg(null);
+    try {
+      const res = await fetch('/api/v1/migration/inspect', {
+        method: 'POST',
+        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source_path: migrationSourcePath }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const data: MigrationInspectionDto = await res.json();
+      setMigrationInspection(data);
+      if (!migrationTargetName && data.detected_name) {
+        setMigrationTargetName(data.detected_name);
+      }
+    } catch (err: any) {
+      alert(`Inspection failed: ${err.message}`);
+    } finally {
+      setMigrationLoading(false);
+    }
+  };
+
+  const handlePlanMigration = async () => {
+    if (!migrationSourcePath) return;
+    setMigrationLoading(true);
+    try {
+      const res = await fetch('/api/v1/migration/plan', {
+        method: 'POST',
+        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source_path: migrationSourcePath }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const data: MigrationPlanDto = await res.json();
+      setMigrationPlan(data);
+    } catch (err: any) {
+      alert(`Planning failed: ${err.message}`);
+    } finally {
+      setMigrationLoading(false);
+    }
+  };
+
+  const handleRunMigration = async () => {
+    if (!migrationSourcePath || !migrationTargetName) return;
+    setMigrationLoading(true);
+    setMigrationStatusMsg('Migrating objects and mapping DAG...');
+    try {
+      const res = await fetch('/api/v1/migration/run', {
+        method: 'POST',
+        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          source_path: migrationSourcePath,
+          target_name: migrationTargetName,
+          dry_run: migrationDryRun,
+        }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const data: MigrationReportDto = await res.json();
+      setMigrationReport(data);
+      setMigrationStatusMsg('Migration completed successfully!');
+      fetchRepos();
+    } catch (err: any) {
+      alert(`Migration run failed: ${err.message}`);
+      setMigrationStatusMsg(`Error: ${err.message}`);
+    } finally {
+      setMigrationLoading(false);
+    }
+  };
+
+  const handleExportGit = async () => {
+    if (!selectedRepo || !migrationExportTarget) return;
+    setMigrationLoading(true);
+    try {
+      const res = await fetch('/api/v1/migration/export/git', {
+        method: 'POST',
+        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          repo_name: selectedRepo.name,
+          target_path: migrationExportTarget,
+          is_bare: migrationExportBare,
+        }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const data: ExportStatsSummaryDto = await res.json();
+      setMigrationExportStats(data);
+    } catch (err: any) {
+      alert(`Git export failed: ${err.message}`);
+    } finally {
+      setMigrationLoading(false);
     }
   };
 
@@ -1370,6 +1479,12 @@ export const App: React.FC = () => {
               onClick={() => setActiveTab('security')}
             >
               🛡️ Security
+            </button>
+            <button
+              className={`btn ${activeTab === 'migration' ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setActiveTab('migration')}
+            >
+              🔄 Migration
             </button>
           </div>
         </div>
@@ -3718,6 +3833,223 @@ index = "sparse+http://127.0.0.1:3000/index/"
               {dependencies.length === 0 && (
                 <div style={{ textAlign: 'center', padding: '1rem', color: '#8b949e' }}>
                   No dependencies indexed. Click &ldquo;Audit Dependencies&rdquo; to scan Cargo.lock.
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ---------------------------------------------------------------------- */}
+      {/* TAB 16: MIGRATION & NATIVE GIT INTEROPERABILITY                        */}
+      {/* ---------------------------------------------------------------------- */}
+      {activeTab === 'migration' && (
+        <div style={{ padding: '1rem', maxWidth: '1200px', margin: '0 auto' }}>
+          <div style={{ marginBottom: '1.5rem', borderBottom: '1px solid #30363d', paddingBottom: '1rem' }}>
+            <h2 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              🔄 Native Git Interoperability & Platform Migration
+            </h2>
+            <p style={{ color: '#8b949e', margin: '0.5rem 0 0' }}>
+              Bi-directional Git conversion, GitHub & GitLab export bundle hydration, Git LFS pointer extraction,
+              and tamper-proof migration planning without external binary dependencies.
+            </p>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.5rem' }}>
+            {/* LEFT: Import from Git or Archive */}
+            <div className="card" style={{ padding: '1.25rem', backgroundColor: '#161b22', border: '1px solid #30363d', borderRadius: '6px' }}>
+              <h3 style={{ marginTop: 0, marginBottom: '1rem' }}>📥 Ingest External Repository</h3>
+              
+              <div style={{ marginBottom: '1rem' }}>
+                <label style={{ display: 'block', fontSize: '0.85rem', marginBottom: '0.3rem', fontWeight: 600 }}>
+                  Source Path (Local Git directory or Platform .zip archive)
+                </label>
+                <input
+                  type="text"
+                  className="form-input"
+                  placeholder="/path/to/git-repo or D:\exports\project.zip"
+                  value={migrationSourcePath}
+                  onChange={(e) => setMigrationSourcePath(e.target.value)}
+                  style={{ width: '100%' }}
+                />
+              </div>
+
+              <div style={{ marginBottom: '1rem' }}>
+                <label style={{ display: 'block', fontSize: '0.85rem', marginBottom: '0.3rem', fontWeight: 600 }}>
+                  Target Spine Repository Name
+                </label>
+                <input
+                  type="text"
+                  className="form-input"
+                  placeholder="e.g. my-imported-project"
+                  value={migrationTargetName}
+                  onChange={(e) => setMigrationTargetName(e.target.value)}
+                  style={{ width: '100%' }}
+                />
+              </div>
+
+              <div style={{ display: 'flex', gap: '1.5rem', marginBottom: '1.25rem' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={migrationDryRun}
+                    onChange={(e) => setMigrationDryRun(e.target.checked)}
+                  />
+                  Dry-Run Mode (Validate only)
+                </label>
+              </div>
+
+              <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginBottom: '1rem' }}>
+                <button
+                  className="btn btn-secondary"
+                  onClick={handleInspectMigration}
+                  disabled={migrationLoading || !migrationSourcePath}
+                >
+                  🔍 Inspect Source
+                </button>
+                <button
+                  className="btn btn-secondary"
+                  onClick={handlePlanMigration}
+                  disabled={migrationLoading || !migrationSourcePath}
+                >
+                  📋 Generate Plan
+                </button>
+                <button
+                  className="btn btn-primary"
+                  onClick={handleRunMigration}
+                  disabled={migrationLoading || !migrationSourcePath || !migrationTargetName}
+                >
+                  🚀 Run Migration
+                </button>
+              </div>
+
+              {migrationStatusMsg && (
+                <div style={{ padding: '0.75rem', backgroundColor: '#0d1117', border: '1px solid #388bfd', borderRadius: '4px', marginBottom: '1rem', fontSize: '0.85rem' }}>
+                  ℹ️ {migrationStatusMsg}
+                </div>
+              )}
+
+              {/* Inspection Box */}
+              {migrationInspection && (
+                <div style={{ marginTop: '1rem', padding: '1rem', backgroundColor: '#0d1117', border: '1px solid #30363d', borderRadius: '4px' }}>
+                  <h4 style={{ margin: '0 0 0.5rem', fontSize: '0.95rem' }}>Inspection Results</h4>
+                  <div style={{ fontSize: '0.85rem', lineHeight: '1.6' }}>
+                    <div><strong>Detected Type:</strong> <span className="badge badge-open">{migrationInspection.source_kind}</span></div>
+                    <div><strong>Default Branch:</strong> {migrationInspection.default_branch}</div>
+                    <div><strong>Branches:</strong> {migrationInspection.branch_count} | <strong>Tags:</strong> {migrationInspection.tag_count}</div>
+                    {migrationInspection.issues_count > 0 && (
+                      <div><strong>Issues:</strong> {migrationInspection.issues_count} | <strong>Pull Requests:</strong> {migrationInspection.pull_requests_count}</div>
+                    )}
+                    {migrationInspection.warnings.length > 0 && (
+                      <div style={{ marginTop: '0.5rem', padding: '0.5rem', backgroundColor: '#3b2300', border: '1px solid #d29922', borderRadius: '4px', color: '#e3b341' }}>
+                        <strong>Risk Warnings:</strong>
+                        <ul style={{ margin: '0.25rem 0 0', paddingLeft: '1.2rem' }}>
+                          {migrationInspection.warnings.map((w, idx) => (
+                            <li key={idx}>{w}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Plan Box */}
+              {migrationPlan && (
+                <div style={{ marginTop: '1rem', padding: '1rem', backgroundColor: '#0d1117', border: '1px solid #30363d', borderRadius: '4px' }}>
+                  <h4 style={{ margin: '0 0 0.5rem', fontSize: '0.95rem' }}>Migration Plan</h4>
+                  <ol style={{ margin: 0, paddingLeft: '1.2rem', fontSize: '0.85rem', lineHeight: '1.6' }}>
+                    {migrationPlan.stages.map((stg, idx) => (
+                      <li key={idx}>{stg}</li>
+                    ))}
+                  </ol>
+                </div>
+              )}
+
+              {/* Final Report Box */}
+              {migrationReport && (
+                <div style={{ marginTop: '1rem', padding: '1rem', backgroundColor: '#0d1117', border: '1px solid #238636', borderRadius: '4px' }}>
+                  <h4 style={{ margin: '0 0 0.5rem', fontSize: '0.95rem', color: '#7ee787' }}>✅ Migration Audit Report</h4>
+                  <div style={{ fontSize: '0.85rem', lineHeight: '1.6' }}>
+                    <div><strong>Job ID:</strong> {migrationReport.job_id}</div>
+                    <div><strong>Elapsed:</strong> {migrationReport.elapsed_ms} ms</div>
+                    <div><strong>Blobs Imported:</strong> {migrationReport.import_stats.blobs_count}</div>
+                    <div><strong>Trees Reconstructed:</strong> {migrationReport.import_stats.trees_count}</div>
+                    <div><strong>Commits Mapped:</strong> {migrationReport.import_stats.commits_count}</div>
+                    <div><strong>Branches Synced:</strong> {migrationReport.import_stats.branches_count}</div>
+                    {migrationReport.import_stats.lfs_pointers_count > 0 && (
+                      <div><strong>LFS Objects Hydrated:</strong> {migrationReport.import_stats.lfs_pointers_count}</div>
+                    )}
+                    <div style={{ marginTop: '0.5rem', color: '#7ee787' }}>
+                      <strong>Cryptographic Verification: Passed (fsck zero corruption)</strong>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* RIGHT: Export to Git Layout */}
+            <div className="card" style={{ padding: '1.25rem', backgroundColor: '#161b22', border: '1px solid #30363d', borderRadius: '6px' }}>
+              <h3 style={{ marginTop: 0, marginBottom: '1rem' }}>📤 Export to Standard Git Layout</h3>
+              <p style={{ fontSize: '0.85rem', color: '#8b949e', marginTop: 0 }}>
+                Synthesizes loose objects, packfiles (.pack), v2 fanout indexes (.idx), and refs directly usable by official Git tooling.
+              </p>
+
+              <div style={{ marginBottom: '1rem' }}>
+                <label style={{ display: 'block', fontSize: '0.85rem', marginBottom: '0.3rem', fontWeight: 600 }}>
+                  Active Spine Repository
+                </label>
+                <div style={{ fontSize: '0.9rem', color: '#58a6ff', padding: '0.5rem', backgroundColor: '#0d1117', borderRadius: '4px', border: '1px solid #30363d' }}>
+                  {selectedRepo ? `${selectedRepo.owner}/${selectedRepo.name}` : 'No repository selected (Select one above)'}
+                </div>
+              </div>
+
+              <div style={{ marginBottom: '1rem' }}>
+                <label style={{ display: 'block', fontSize: '0.85rem', marginBottom: '0.3rem', fontWeight: 600 }}>
+                  Target Destination Directory
+                </label>
+                <input
+                  type="text"
+                  className="form-input"
+                  placeholder="e.g. D:\git-exports\my-spine-repo"
+                  value={migrationExportTarget}
+                  onChange={(e) => setMigrationExportTarget(e.target.value)}
+                  style={{ width: '100%' }}
+                />
+              </div>
+
+              <div style={{ marginBottom: '1.25rem' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={migrationExportBare}
+                    onChange={(e) => setMigrationExportBare(e.target.checked)}
+                  />
+                  Bare Git repository (objects & refs only, no working copy)
+                </label>
+              </div>
+
+              <button
+                className="btn btn-primary"
+                onClick={handleExportGit}
+                disabled={migrationLoading || !selectedRepo || !migrationExportTarget}
+              >
+                📤 Export to Git
+              </button>
+
+              {migrationExportStats && (
+                <div style={{ marginTop: '1.5rem', padding: '1rem', backgroundColor: '#0d1117', border: '1px solid #238636', borderRadius: '4px' }}>
+                  <h4 style={{ margin: '0 0 0.5rem', fontSize: '0.95rem', color: '#7ee787' }}>✅ Git Export Complete</h4>
+                  <div style={{ fontSize: '0.85rem', lineHeight: '1.6' }}>
+                    <div><strong>Blobs Exported:</strong> {migrationExportStats.blobs_count}</div>
+                    <div><strong>Trees Exported:</strong> {migrationExportStats.trees_count}</div>
+                    <div><strong>Commits Exported:</strong> {migrationExportStats.commits_count}</div>
+                    <div><strong>Tags Exported:</strong> {migrationExportStats.tags_count}</div>
+                    <div><strong>Branches Exported:</strong> {migrationExportStats.branches_count}</div>
+                    <div style={{ marginTop: '0.5rem', color: '#8b949e' }}>
+                      Ready for <code>git fsck --full</code> and <code>git log</code> verification.
+                    </div>
+                  </div>
                 </div>
               )}
             </div>

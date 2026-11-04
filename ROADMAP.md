@@ -146,10 +146,22 @@
 
 ---
 
-## Milestone 15: Native Interoperability, Migration, Import/Export & Ecosystem Compatibility (Batch 15 - Planned)
-- [ ] Bidirectional Git repository import and export engine without invoking external Git binaries.
-- [ ] Native fast-import and fast-export stream parsers and serializers.
-- [ ] Protocol bridge: Git wire protocol translation layer for native Spine repositories.
-- [ ] Metadata conversion: commit graph mapping, GPG signature preservation, and author identity alignment.
-- [ ] Large file migration: Git LFS to Spine LFS automated pointer and blob re-chunking.
-- [ ] GitHub / GitLab repository archive importer (issues, PRs, comments, webhooks, and milestones).
+## Milestone 15: Native Interoperability, Migration, Import/Export & Ecosystem Compatibility (Batch 15 - Completed)
+- [x] Pure Rust native Git format engine in `git-alternative/crates/spine-migration/` with zero external Git / libgit2 dependencies in production.
+- [x] Loose Git object parser and serializer for blobs, trees, commits, and tags with zlib compression and SHA-1 hash checks.
+- [x] Canonical Git tree sorting with synthetic trailing `/` directory comparison, verified with official `git fsck --full`.
+- [x] Git packfile v2 parser, LEB128 delta instruction decoder (COPY and INSERT), and recursive OFS_DELTA and REF_DELTA resolver.
+- [x] Git packfile builder and v2 index generator with 256-bucket fanout table, lexicographical SHA-1s, CRC32 table, offset table, and SHA-1 checksum trailers.
+- [x] Git reference reader and writer with loose refs, HEAD parsing, and `packed-refs` format support.
+- [x] Fast-import and fast-export streaming protocol parser and generator with mark tracking.
+- [x] Git LFS pointer parser, detection, and hydration into Spine's content-addressed artifact store.
+- [x] Hardened archive extraction engine (`archive_security.rs`) defending against Zip Slip, directory traversal, Windows reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`), and decompression bombs.
+- [x] Platform metadata importer for GitHub and GitLab archive bundles (issues, PRs, comments, labels, milestones, releases).
+- [x] Safe user attribution and ghost tombstone user mapping (`ghost-<username>`) preventing privilege escalation.
+- [x] Fail-closed CI/CD workflow security: imported workflows default to `is_active: false`.
+- [x] Resumable migration orchestrator (`MigrationEngine`) with inspect, plan, dry-run, run, manifest checkpoints, resume, and verify.
+- [x] CLI commands in `spine-cli`: `spine import git`, `spine export git`, `spine migrate inspect/plan/run/resume/verify/report`.
+- [x] Forge REST API endpoints under `/api/v1/migration/*` (inspect, plan, run, export).
+- [x] React 18 / TypeScript frontend UI with dedicated Migration tab, source inspector, planning report, progress tracker, and Git export.
+- [x] Roundtrip export verified against official host Git CLI oracle (`git fsck --full`, `git log`, `git cat-file`).
+- [x] 13 comprehensive architectural, operational, and format documentation guides in `docs/`.

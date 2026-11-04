@@ -45,6 +45,10 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub fn storage_root(&self) -> &std::path::Path {
+        self.vcs.storage_root()
+    }
+
     pub fn new_with_defaults(
         db: Arc<dyn Database>,
         storage_root: &std::path::Path,

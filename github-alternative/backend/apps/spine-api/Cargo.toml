@@ -25,6 +25,7 @@ spine-net.workspace = true
 spine-config.workspace = true
 spine-artifact.workspace = true
 spine-workflow.workspace = true
+spine-migration.workspace = true
 
 tokio.workspace = true
 axum.workspace = true

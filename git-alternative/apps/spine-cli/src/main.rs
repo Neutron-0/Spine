@@ -5,6 +5,7 @@ pub mod ops_history;
 pub mod ops_lfs;
 pub mod ops_tag;
 pub mod ops_worktree;
+pub mod ops_migration;
 
 use anyhow::{bail, Context, Result};
 use chrono::{TimeZone, Utc};
@@ -388,6 +389,21 @@ enum Commands {
     Package {
         #[command(subcommand)]
         action: PackageAction,
+    },
+    /// Import repositories from external version control formats
+    Import {
+        #[command(subcommand)]
+        action: ops_migration::ImportAction,
+    },
+    /// Export native Spine repository into external version control formats
+    Export {
+        #[command(subcommand)]
+        action: ops_migration::ExportAction,
+    },
+    /// Enterprise migration engine: inspect, plan, run, resume, verify, report
+    Migrate {
+        #[command(subcommand)]
+        action: ops_migration::MigrateAction,
     },
 }
 
@@ -4012,6 +4028,9 @@ async fn main() -> Result<()> {
                 );
             }
         },
+        Commands::Import { action } => ops_migration::handle_import(action)?,
+        Commands::Export { action } => ops_migration::handle_export(action)?,
+        Commands::Migrate { action } => ops_migration::handle_migrate(action)?,
     }
 
     Ok(())

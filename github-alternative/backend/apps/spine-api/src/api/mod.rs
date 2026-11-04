@@ -23,6 +23,7 @@ pub mod routes_teams;
 pub mod routes_users;
 pub mod routes_webhooks;
 pub mod routes_workflows;
+pub mod routes_migration;
 
 pub use middleware::AppState;
 
@@ -562,6 +563,23 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/security/advisories/provenance",
             get(routes_security::get_advisory_provenance),
+        )
+        // Migration endpoints (Batch 15)
+        .route(
+            "/api/v1/migration/inspect",
+            post(routes_migration::inspect_source),
+        )
+        .route(
+            "/api/v1/migration/plan",
+            post(routes_migration::plan_migration),
+        )
+        .route(
+            "/api/v1/migration/run",
+            post(routes_migration::run_migration),
+        )
+        .route(
+            "/api/v1/migration/export/git",
+            post(routes_migration::export_git),
         )
         // Layers
         .layer(axum_middleware::from_fn_with_state(

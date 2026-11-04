@@ -121,6 +121,10 @@ impl NativeVcsService {
         }
     }
 
+    pub fn storage_root(&self) -> &Path {
+        &self.storage_root
+    }
+
     pub fn writer(&self) -> &Arc<AuthoritativeRepositoryWriter> {
         &self.writer
     }

@@ -665,3 +665,67 @@ export interface SecuritySummaryDto {
   medium_count: number;
   low_count: number;
 }
+
+// -------------------------------------------------------------
+// Batch 15: Migration, Git Interoperability & Platform Adapters
+// -------------------------------------------------------------
+
+export interface MigrationInspectionDto {
+  source_kind: string;
+  detected_name: string;
+  default_branch: string;
+  commit_count: number;
+  branch_count: number;
+  tag_count: number;
+  issues_count: number;
+  pull_requests_count: number;
+  releases_count: number;
+  warnings: string[];
+  workflow_files: string[];
+}
+
+export interface MigrationPlanDto {
+  source_path: string;
+  detected_kind: string;
+  stages: string[];
+  estimated_blobs: number;
+  estimated_commits: number;
+}
+
+export interface ImportStatsSummaryDto {
+  blobs_count: number;
+  trees_count: number;
+  commits_count: number;
+  tags_count: number;
+  branches_count: number;
+  lfs_pointers_count: number;
+}
+
+export interface ExportStatsSummaryDto {
+  blobs_count: number;
+  trees_count: number;
+  commits_count: number;
+  tags_count: number;
+  branches_count: number;
+  packfile_bytes: number;
+}
+
+export interface SanitizationReportSummaryDto {
+  deactivated_workflows: string[];
+  detected_secrets_count: number;
+}
+
+export interface MigrationReportDto {
+  job_id: string;
+  source_path: string;
+  target_path: string;
+  source_kind: string;
+  started_at: string;
+  completed_at: string;
+  elapsed_ms: number;
+  stage: string | { [key: string]: any };
+  import_stats: ImportStatsSummaryDto;
+  sanitization: SanitizationReportSummaryDto;
+  verification_passed: boolean;
+}
+

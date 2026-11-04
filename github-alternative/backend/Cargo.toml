@@ -22,6 +22,7 @@ spine-net = { path = "../../git-alternative/crates/spine-net" }
 spine-config = { path = "../../git-alternative/crates/spine-config" }
 spine-artifact = { path = "../../git-alternative/crates/spine-artifact" }
 spine-workflow = { path = "../../git-alternative/crates/spine-workflow" }
+spine-migration = { path = "../../git-alternative/crates/spine-migration" }
 
 tokio = { version = "1.38", features = ["full"] }
 axum = { version = "0.7", features = ["json"] }
