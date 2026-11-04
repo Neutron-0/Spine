@@ -22,7 +22,9 @@ pub async fn get_quota(
     State(state): State<AppState>,
     user: Option<Extension<User>>,
 ) -> Result<Json<ArtifactQuota>, ForgeError> {
-    let current_user = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".to_string()))?.0;
+    let current_user = user
+        .ok_or_else(|| ForgeError::Unauthorized("Authentication required".to_string()))?
+        .0;
     let quota = state
         .db
         .get_or_create_quota("user", &current_user.id)
@@ -36,7 +38,9 @@ pub async fn create_namespace(
     user: Option<Extension<User>>,
     Json(payload): Json<CreateNamespaceRequest>,
 ) -> Result<(StatusCode, Json<ArtifactNamespaceDto>), ForgeError> {
-    let current_user = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".to_string()))?.0;
+    let current_user = user
+        .ok_or_else(|| ForgeError::Unauthorized("Authentication required".to_string()))?
+        .0;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -65,10 +69,7 @@ pub async fn list_namespaces(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ArtifactNamespaceDto>>, ForgeError> {
     let list = state.db.list_artifact_namespaces().await?;
-    let dtos = list
-        .iter()
-        .map(ArtifactNamespaceDto::from)
-        .collect();
+    let dtos = list.iter().map(ArtifactNamespaceDto::from).collect();
     Ok(Json(dtos))
 }
 
@@ -79,7 +80,9 @@ pub async fn upload_artifact_version(
     user: Option<Extension<User>>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<ArtifactVersionDto>), ForgeError> {
-    let current_user = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".to_string()))?.0;
+    let current_user = user
+        .ok_or_else(|| ForgeError::Unauthorized("Authentication required".to_string()))?
+        .0;
 
     let ns = state
         .db

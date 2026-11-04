@@ -22,7 +22,9 @@ fn setup_repo(tmp: &TempDir, repo_name: &str) -> (Arc<CompositeObjectStore>, Obj
     let store = Arc::new(CompositeObjectStore::new(&spine_dir, HashAlgorithm::Blake3, 3).unwrap());
 
     // Create initial commit
-    let b1 = store.write_object(ObjectType::Blob, b"hello world\n").unwrap();
+    let b1 = store
+        .write_object(ObjectType::Blob, b"hello world\n")
+        .unwrap();
     let t1 = store
         .write_object(
             ObjectType::Tree,
@@ -44,13 +46,22 @@ fn setup_repo(tmp: &TempDir, repo_name: &str) -> (Arc<CompositeObjectStore>, Obj
         1000,
         "Initial commit".into(),
     );
-    let c1_id = store.write_object(ObjectType::Commit, &serialize_commit(&c1)).unwrap();
-    fs::write(spine_dir.join("refs").join("heads").join("main"), format!("{}\n", c1_id.to_hex())).unwrap();
+    let c1_id = store
+        .write_object(ObjectType::Commit, &serialize_commit(&c1))
+        .unwrap();
+    fs::write(
+        spine_dir.join("refs").join("heads").join("main"),
+        format!("{}\n", c1_id.to_hex()),
+    )
+    .unwrap();
 
     (store, c1_id)
 }
 
-fn build_dummy_pack_bytes(store: &CompositeObjectStore, oids: &[ObjectId]) -> (String, Vec<u8>, Vec<u8>) {
+fn build_dummy_pack_bytes(
+    store: &CompositeObjectStore,
+    oids: &[ObjectId],
+) -> (String, Vec<u8>, Vec<u8>) {
     let tmp = tempfile::tempdir().unwrap();
     let pack_id = format!("pack_{}", uuid::Uuid::new_v4().simple());
     let spk_path = tmp.path().join(format!("{}.spk", pack_id));
@@ -131,7 +142,9 @@ async fn test_authoritative_write_single_copy_durability() {
         2000,
         "Update file".into(),
     );
-    let c2_id = store.write_object(ObjectType::Commit, &serialize_commit(&c2)).unwrap();
+    let c2_id = store
+        .write_object(ObjectType::Commit, &serialize_commit(&c2))
+        .unwrap();
 
     let (pack_id, pack_bytes, index_bytes) = build_dummy_pack_bytes(&store, &[c2_id, t2, b2]);
 
@@ -169,7 +182,8 @@ async fn test_authoritative_write_single_copy_durability() {
     assert_eq!(result.durability_policy, DurabilityPolicy::SingleCopy);
 
     // Verify main ref is updated on disk
-    let current_ref = fs::read_to_string(spine_dir.join("refs").join("heads").join("main")).unwrap();
+    let current_ref =
+        fs::read_to_string(spine_dir.join("refs").join("heads").join("main")).unwrap();
     assert_eq!(current_ref.trim(), c2_id.to_hex());
 }
 
@@ -219,7 +233,9 @@ async fn test_authoritative_write_cas_failure() {
     };
 
     // Stale expected_old_oid (mismatched)
-    let stale_old = ObjectId::from_hex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap();
+    let stale_old =
+        ObjectId::from_hex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .unwrap();
     let update = AuthoritativeRefUpdate {
         ref_name: "refs/heads/main".to_string(),
         expected_old_oid: Some(stale_old),
@@ -245,7 +261,10 @@ async fn test_authoritative_write_cas_failure() {
 
     assert!(result.is_err(), "Mismatched CAS old OID must be rejected");
     let err_str = result.err().unwrap().to_string();
-    assert!(err_str.contains("Expected old reference value does not match") || err_str.contains("Stale reference"));
+    assert!(
+        err_str.contains("Expected old reference value does not match")
+            || err_str.contains("Stale reference")
+    );
 }
 
 #[tokio::test]
@@ -327,7 +346,10 @@ async fn test_authoritative_write_branch_protection_enforcement() {
         )
         .await;
 
-    assert!(direct_push_result.is_err(), "Direct push must be rejected on protected branch");
+    assert!(
+        direct_push_result.is_err(),
+        "Direct push must be rejected on protected branch"
+    );
 
     // PR merge with only 1 approval should fail when 2 are required
     let pr_insufficient = PrProtectionContext {
@@ -353,7 +375,10 @@ async fn test_authoritative_write_branch_protection_enforcement() {
         )
         .await;
 
-    assert!(pr_fail_result.is_err(), "PR merge with insufficient approvals must be rejected");
+    assert!(
+        pr_fail_result.is_err(),
+        "PR merge with insufficient approvals must be rejected"
+    );
 
     // PR merge with 2 approvals should succeed
     let pr_sufficient = PrProtectionContext {
@@ -379,5 +404,8 @@ async fn test_authoritative_write_branch_protection_enforcement() {
         )
         .await;
 
-    assert!(pr_ok_result.is_ok(), "PR merge with required approvals must succeed");
+    assert!(
+        pr_ok_result.is_ok(),
+        "PR merge with required approvals must succeed"
+    );
 }

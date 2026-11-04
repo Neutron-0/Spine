@@ -54,7 +54,10 @@ jobs:
         assert_eq!(spec.name, "Continuous Integration");
         assert!(spec.on.push.is_some());
         assert!(spec.on.pull_request.is_some());
-        assert_eq!(spec.on.push.as_ref().unwrap().branches, vec!["main", "release/*"]);
+        assert_eq!(
+            spec.on.push.as_ref().unwrap().branches,
+            vec!["main", "release/*"]
+        );
         assert_eq!(spec.jobs.len(), 3);
 
         let dag = JobDag::build(&spec).expect("DAG build should succeed");

@@ -22,7 +22,10 @@ pub async fn list_notifications(
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let unread_only = query.unread_only.unwrap_or(false);
 
-    let notifs = state.db.list_user_notifications(&caller.id, unread_only).await?;
+    let notifs = state
+        .db
+        .list_user_notifications(&caller.id, unread_only)
+        .await?;
     let dtos: Vec<NotificationDto> = notifs.iter().map(NotificationDto::from).collect();
     Ok(Json(dtos))
 }
@@ -33,7 +36,10 @@ pub async fn mark_notification_read(
     Path(notif_id): Path<String>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
-    state.db.mark_notification_read(&notif_id, &caller.id).await?;
+    state
+        .db
+        .mark_notification_read(&notif_id, &caller.id)
+        .await?;
     Ok(StatusCode::OK)
 }
 

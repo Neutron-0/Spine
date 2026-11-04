@@ -71,15 +71,22 @@ async fn test_organization_and_team_lifecycle() {
         created_at_nanos: 1000,
         responded_at_nanos: None,
     };
-    db.create_organization_invitation(inv.clone()).await.unwrap();
+    db.create_organization_invitation(inv.clone())
+        .await
+        .unwrap();
 
     // Lookup invitation by token
-    let fetched_inv = db.get_organization_invitation_by_token("token_hash_123").await.unwrap();
+    let fetched_inv = db
+        .get_organization_invitation_by_token("token_hash_123")
+        .await
+        .unwrap();
     assert!(fetched_inv.is_some());
     assert_eq!(fetched_inv.unwrap().invitee_email, member.email);
 
     // Accept invitation
-    db.update_organization_invitation_status(&inv.id, "ACCEPTED", 1100).await.unwrap();
+    db.update_organization_invitation_status(&inv.id, "ACCEPTED", 1100)
+        .await
+        .unwrap();
     let member_mem = OrganizationMembership {
         id: "mem_member".into(),
         org_id: org.id.clone(),
@@ -92,9 +99,15 @@ async fn test_organization_and_team_lifecycle() {
     // 3. Permission checks on Org
     assert!(perms.check_org_admin(&owner, &org.id).await.is_ok());
     assert!(perms.check_org_admin(&member, &org.id).await.is_err());
-    assert!(perms.check_org_read_access(Some(&member), &org).await.is_ok());
+    assert!(perms
+        .check_org_read_access(Some(&member), &org)
+        .await
+        .is_ok());
     // Outsider cannot access private org (404)
-    assert!(perms.check_org_read_access(Some(&outsider), &org).await.is_err());
+    assert!(perms
+        .check_org_read_access(Some(&outsider), &org)
+        .await
+        .is_err());
 
     // 4. Teams & Team Repository Permissions
     let team = Team {
@@ -115,7 +128,9 @@ async fn test_organization_and_team_lifecycle() {
         user_id: member.id.clone(),
         is_maintainer: true,
         created_at_nanos: 1200,
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
     let team_members = db.list_team_members(&team.id).await.unwrap();
     assert_eq!(team_members.len(), 1);
@@ -148,10 +163,18 @@ async fn test_organization_and_team_lifecycle() {
         repo_id: org_repo.id.clone(),
         permission_level: TeamPermissionLevel::Write,
         created_at_nanos: 1350,
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
     // Check member write access to org repo (inherited via team!)
-    assert!(perms.check_write_access(Some(&member), &org_repo).await.is_ok());
+    assert!(perms
+        .check_write_access(Some(&member), &org_repo)
+        .await
+        .is_ok());
     // Outsider has no access
-    assert!(perms.check_read_access(Some(&outsider), &org_repo).await.is_err());
+    assert!(perms
+        .check_read_access(Some(&outsider), &org_repo)
+        .await
+        .is_err());
 }

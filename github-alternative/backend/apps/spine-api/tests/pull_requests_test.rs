@@ -17,13 +17,17 @@ fn setup_test_repo_on_disk(tmp: &TempDir, native_repo_id: &str) -> (ObjectId, Ob
     let store = CompositeObjectStore::new(&spine_dir, HashAlgorithm::Blake3, 3).unwrap();
 
     // 1. Initial commit (base): README.md
-    let b1 = store.write_object(ObjectType::Blob, b"# Test Project\nInitial line\n").unwrap();
+    let b1 = store
+        .write_object(ObjectType::Blob, b"# Test Project\nInitial line\n")
+        .unwrap();
     let tree_1_entries = vec![TreeEntry {
         mode: FileMode::Regular,
         name: "README.md".into(),
         object_id: b1,
     }];
-    let tree_1 = store.write_object(ObjectType::Tree, &serialize_tree(&tree_1_entries)).unwrap();
+    let tree_1 = store
+        .write_object(ObjectType::Tree, &serialize_tree(&tree_1_entries))
+        .unwrap();
 
     let c1 = Commit::new(
         tree_1,
@@ -35,16 +39,25 @@ fn setup_test_repo_on_disk(tmp: &TempDir, native_repo_id: &str) -> (ObjectId, Ob
         1000,
         "Initial commit".into(),
     );
-    let c1_id = store.write_object(ObjectType::Commit, &serialize_commit(&c1)).unwrap();
+    let c1_id = store
+        .write_object(ObjectType::Commit, &serialize_commit(&c1))
+        .unwrap();
 
     // 2. Commit on main branch: update README.md
-    let b2 = store.write_object(ObjectType::Blob, b"# Test Project\nInitial line\nMain feature line\n").unwrap();
+    let b2 = store
+        .write_object(
+            ObjectType::Blob,
+            b"# Test Project\nInitial line\nMain feature line\n",
+        )
+        .unwrap();
     let tree_2_entries = vec![TreeEntry {
         mode: FileMode::Regular,
         name: "README.md".into(),
         object_id: b2,
     }];
-    let tree_2 = store.write_object(ObjectType::Tree, &serialize_tree(&tree_2_entries)).unwrap();
+    let tree_2 = store
+        .write_object(ObjectType::Tree, &serialize_tree(&tree_2_entries))
+        .unwrap();
 
     let c2 = Commit::new(
         tree_2,
@@ -56,11 +69,22 @@ fn setup_test_repo_on_disk(tmp: &TempDir, native_repo_id: &str) -> (ObjectId, Ob
         2000,
         "Update on main".into(),
     );
-    let c2_id = store.write_object(ObjectType::Commit, &serialize_commit(&c2)).unwrap();
-    fs::write(spine_dir.join("refs").join("heads").join("main"), format!("{}\n", c2_id.to_hex())).unwrap();
+    let c2_id = store
+        .write_object(ObjectType::Commit, &serialize_commit(&c2))
+        .unwrap();
+    fs::write(
+        spine_dir.join("refs").join("heads").join("main"),
+        format!("{}\n", c2_id.to_hex()),
+    )
+    .unwrap();
 
     // 3. Commit on feature branch: add FEATURE.md
-    let b3 = store.write_object(ObjectType::Blob, b"# New Feature\nDocumentation of feature\n").unwrap();
+    let b3 = store
+        .write_object(
+            ObjectType::Blob,
+            b"# New Feature\nDocumentation of feature\n",
+        )
+        .unwrap();
     let tree_3_entries = vec![
         TreeEntry {
             mode: FileMode::Regular,
@@ -73,7 +97,9 @@ fn setup_test_repo_on_disk(tmp: &TempDir, native_repo_id: &str) -> (ObjectId, Ob
             object_id: b3,
         },
     ];
-    let tree_3 = store.write_object(ObjectType::Tree, &serialize_tree(&tree_3_entries)).unwrap();
+    let tree_3 = store
+        .write_object(ObjectType::Tree, &serialize_tree(&tree_3_entries))
+        .unwrap();
 
     let c3 = Commit::new(
         tree_3,
@@ -85,8 +111,14 @@ fn setup_test_repo_on_disk(tmp: &TempDir, native_repo_id: &str) -> (ObjectId, Ob
         3000,
         "Add feature branch".into(),
     );
-    let c3_id = store.write_object(ObjectType::Commit, &serialize_commit(&c3)).unwrap();
-    fs::write(spine_dir.join("refs").join("heads").join("feature"), format!("{}\n", c3_id.to_hex())).unwrap();
+    let c3_id = store
+        .write_object(ObjectType::Commit, &serialize_commit(&c3))
+        .unwrap();
+    fs::write(
+        spine_dir.join("refs").join("heads").join("feature"),
+        format!("{}\n", c3_id.to_hex()),
+    )
+    .unwrap();
 
     (c1_id, c2_id, c3_id)
 }
@@ -126,7 +158,9 @@ async fn test_pull_request_diff_and_mergeability() {
     assert_eq!(created.pr_number, 1);
 
     // 2. Native Diff Computation
-    let diff = vcs.compare_branches(native_repo_id, "main", "feature").unwrap();
+    let diff = vcs
+        .compare_branches(native_repo_id, "main", "feature")
+        .unwrap();
     assert_eq!(diff.files.len(), 1);
     assert_eq!(diff.files[0].path, "FEATURE.md");
     assert_eq!(diff.files[0].change_type, "ADDED");
@@ -135,7 +169,9 @@ async fn test_pull_request_diff_and_mergeability() {
     assert_eq!(diff.commits_count, 1);
 
     // 3. Native Mergeability Check
-    let report = vcs.check_mergeability(native_repo_id, "main", "feature").unwrap();
+    let report = vcs
+        .check_mergeability(native_repo_id, "main", "feature")
+        .unwrap();
     assert!(report.mergeable);
     assert_eq!(report.status, "CLEAN");
     assert!(report.conflict_files.is_empty());

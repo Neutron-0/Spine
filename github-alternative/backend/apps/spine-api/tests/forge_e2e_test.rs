@@ -23,13 +23,25 @@ async fn test_forge_e2e_full_lifecycle() {
     let vcs_service = Arc::new(NativeVcsService::new(storage_root.clone()));
     let rate_limiter = Arc::new(RateLimiter::new());
 
-    let artifact_store = Arc::new(spine_artifact::LocalArtifactStore::new(storage_root.join("artifacts")).unwrap());
-    let artifacts = Arc::new(spine_api::artifact::ArtifactService::new(db.clone(), artifact_store));
-    let releases = Arc::new(spine_api::releases::ReleaseService::new(db.clone(), artifacts.clone()));
-    let packages = Arc::new(spine_api::packages::PackageService::new(db.clone(), artifacts.clone()));
-    let cargo = Arc::new(spine_api::packages::CargoRegistryAdapter::new(packages.clone()));
+    let artifact_store =
+        Arc::new(spine_artifact::LocalArtifactStore::new(storage_root.join("artifacts")).unwrap());
+    let artifacts = Arc::new(spine_api::artifact::ArtifactService::new(
+        db.clone(),
+        artifact_store,
+    ));
+    let releases = Arc::new(spine_api::releases::ReleaseService::new(
+        db.clone(),
+        artifacts.clone(),
+    ));
+    let packages = Arc::new(spine_api::packages::PackageService::new(
+        db.clone(),
+        artifacts.clone(),
+    ));
+    let cargo = Arc::new(spine_api::packages::CargoRegistryAdapter::new(
+        packages.clone(),
+    ));
 
-    let state = AppState::new_with_defaults(db.clone(), storage_root, None).unwrap();
+    let state = AppState::new_with_defaults(db.clone(), &storage_root, None).unwrap();
 
     let router = build_router(state);
     let worker = ProvisioningWorker::new(db.clone(), None, storage_root);
@@ -80,7 +92,10 @@ async fn test_forge_e2e_full_lifecycle() {
     assert_eq!(res.status(), StatusCode::CREATED);
     let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
     let reg_json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let token = reg_json["token"].as_str().expect("Token returned on register").to_string();
+    let token = reg_json["token"]
+        .as_str()
+        .expect("Token returned on register")
+        .to_string();
 
     // 3. Verify session
     let res = router
@@ -122,7 +137,10 @@ async fn test_forge_e2e_full_lifecycle() {
     assert_eq!(res.status(), StatusCode::CREATED);
     let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
     let pat_json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let raw_pat = pat_json["token"].as_str().expect("PAT token returned").to_string();
+    let raw_pat = pat_json["token"]
+        .as_str()
+        .expect("PAT token returned")
+        .to_string();
     assert!(raw_pat.starts_with("sp_pat_"));
 
     // 5. Create a repository using PAT

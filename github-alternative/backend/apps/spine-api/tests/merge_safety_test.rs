@@ -35,15 +35,19 @@ fn setup_merge_repo(tmp: &TempDir, native_repo_id: &str) -> (ObjectId, ObjectId)
     let store = CompositeObjectStore::new(&spine_dir, HashAlgorithm::Blake3, 3).unwrap();
 
     // Base commit on main
-    let b_main = store.write_object(ObjectType::Blob, b"base content\n").unwrap();
-    let tree_main = store.write_object(
-        ObjectType::Tree,
-        &serialize_tree(&[TreeEntry {
-            mode: FileMode::Regular,
-            name: "file.txt".into(),
-            object_id: b_main,
-        }]),
-    ).unwrap();
+    let b_main = store
+        .write_object(ObjectType::Blob, b"base content\n")
+        .unwrap();
+    let tree_main = store
+        .write_object(
+            ObjectType::Tree,
+            &serialize_tree(&[TreeEntry {
+                mode: FileMode::Regular,
+                name: "file.txt".into(),
+                object_id: b_main,
+            }]),
+        )
+        .unwrap();
 
     let c_main = Commit::new(
         tree_main,
@@ -55,26 +59,36 @@ fn setup_merge_repo(tmp: &TempDir, native_repo_id: &str) -> (ObjectId, ObjectId)
         1000,
         "Base commit".into(),
     );
-    let c_main_id = store.write_object(ObjectType::Commit, &serialize_commit(&c_main)).unwrap();
-    fs::write(spine_dir.join("refs").join("heads").join("main"), format!("{}\n", c_main_id.to_hex())).unwrap();
+    let c_main_id = store
+        .write_object(ObjectType::Commit, &serialize_commit(&c_main))
+        .unwrap();
+    fs::write(
+        spine_dir.join("refs").join("heads").join("main"),
+        format!("{}\n", c_main_id.to_hex()),
+    )
+    .unwrap();
 
     // Branch commit on feature
-    let b_feature = store.write_object(ObjectType::Blob, b"feature new file\n").unwrap();
-    let tree_feature = store.write_object(
-        ObjectType::Tree,
-        &serialize_tree(&[
-            TreeEntry {
-                mode: FileMode::Regular,
-                name: "file.txt".into(),
-                object_id: b_main,
-            },
-            TreeEntry {
-                mode: FileMode::Regular,
-                name: "feature.txt".into(),
-                object_id: b_feature,
-            },
-        ]),
-    ).unwrap();
+    let b_feature = store
+        .write_object(ObjectType::Blob, b"feature new file\n")
+        .unwrap();
+    let tree_feature = store
+        .write_object(
+            ObjectType::Tree,
+            &serialize_tree(&[
+                TreeEntry {
+                    mode: FileMode::Regular,
+                    name: "file.txt".into(),
+                    object_id: b_main,
+                },
+                TreeEntry {
+                    mode: FileMode::Regular,
+                    name: "feature.txt".into(),
+                    object_id: b_feature,
+                },
+            ]),
+        )
+        .unwrap();
 
     let c_feature = Commit::new(
         tree_feature,
@@ -86,8 +100,14 @@ fn setup_merge_repo(tmp: &TempDir, native_repo_id: &str) -> (ObjectId, ObjectId)
         2000,
         "Feature commit".into(),
     );
-    let c_feature_id = store.write_object(ObjectType::Commit, &serialize_commit(&c_feature)).unwrap();
-    fs::write(spine_dir.join("refs").join("heads").join("feature"), format!("{}\n", c_feature_id.to_hex())).unwrap();
+    let c_feature_id = store
+        .write_object(ObjectType::Commit, &serialize_commit(&c_feature))
+        .unwrap();
+    fs::write(
+        spine_dir.join("refs").join("heads").join("feature"),
+        format!("{}\n", c_feature_id.to_hex()),
+    )
+    .unwrap();
 
     (c_main_id, c_feature_id)
 }
@@ -170,7 +190,10 @@ async fn test_branch_protection_and_atomic_merge() {
     db.create_pull_request(pr.clone()).await.unwrap();
 
     // 1. Verify merge rejected when no approvals
-    assert!(perms.check_merge_allowed(&admin, &repo, "main", &pr).await.is_err());
+    assert!(perms
+        .check_merge_allowed(&admin, &repo, "main", &pr)
+        .await
+        .is_err());
 
     // 2. Verify self-approval rejected
     let self_review = PullRequestReview {
@@ -185,7 +208,10 @@ async fn test_branch_protection_and_atomic_merge() {
         updated_at_nanos: 200,
     };
     db.create_pr_review(self_review).await.unwrap();
-    assert!(perms.check_merge_allowed(&admin, &repo, "main", &pr).await.is_err());
+    assert!(perms
+        .check_merge_allowed(&admin, &repo, "main", &pr)
+        .await
+        .is_err());
 
     // 3. Independent approval
     let peer_review = PullRequestReview {
@@ -202,26 +228,33 @@ async fn test_branch_protection_and_atomic_merge() {
     db.create_pr_review(peer_review).await.unwrap();
 
     // Now merge allowed!
-    assert!(perms.check_merge_allowed(&admin, &repo, "main", &pr).await.is_ok());
+    assert!(perms
+        .check_merge_allowed(&admin, &repo, "main", &pr)
+        .await
+        .is_ok());
 
     // 4. Execute atomic 3-way merge
-    let merge_res = vcs.execute_merge(
-        native_repo_id,
-        "main",
-        "feature",
-        &admin.id,
-        &admin.display_name,
-        &admin.email,
-        "Merge branch 'feature' into main",
-        None,
-    ).await.unwrap();
+    let merge_res = vcs
+        .execute_merge(
+            native_repo_id,
+            "main",
+            "feature",
+            &admin.id,
+            &admin.display_name,
+            &admin.email,
+            "Merge branch 'feature' into main",
+            None,
+        )
+        .await
+        .unwrap();
 
     assert!(merge_res.success);
     let merge_cid_hex = merge_res.merge_commit_id.unwrap();
 
     // Verify main ref updated on disk
     let spine_dir = tmp.path().join("repos").join(native_repo_id).join(".spine");
-    let ref_content = fs::read_to_string(spine_dir.join("refs").join("heads").join("main")).unwrap();
+    let ref_content =
+        fs::read_to_string(spine_dir.join("refs").join("heads").join("main")).unwrap();
     assert_eq!(ref_content.trim(), merge_cid_hex);
 
     // Verify merge commit has 2 parents

@@ -28,7 +28,11 @@ pub async fn create_release(
     user: Option<Extension<User>>,
     Json(payload): Json<CreateReleaseRequest>,
 ) -> Result<(StatusCode, Json<ReleaseDto>), ForgeError> {
-    let current_user = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required to create release".to_string()))?.0;
+    let current_user = user
+        .ok_or_else(|| {
+            ForgeError::Unauthorized("Authentication required to create release".to_string())
+        })?
+        .0;
     let repo = state
         .repositories
         .get_repository(Some(&current_user), &owner, &repo_name)
@@ -63,7 +67,10 @@ pub async fn list_releases(
     state.permissions.check_read_access(caller, &repo).await?;
 
     let include_drafts = query.include_drafts.unwrap_or(false);
-    let list = state.releases.list_releases(&repo.id, include_drafts).await?;
+    let list = state
+        .releases
+        .list_releases(&repo.id, include_drafts)
+        .await?;
     Ok(Json(list))
 }
 
@@ -101,7 +108,11 @@ pub async fn update_release(
     user: Option<Extension<User>>,
     Json(payload): Json<UpdateReleaseRequest>,
 ) -> Result<Json<ReleaseDto>, ForgeError> {
-    let current_user = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required to update release".to_string()))?.0;
+    let current_user = user
+        .ok_or_else(|| {
+            ForgeError::Unauthorized("Authentication required to update release".to_string())
+        })?
+        .0;
     let repo = state
         .repositories
         .get_repository(Some(&current_user), &owner, &repo_name)
@@ -122,7 +133,11 @@ pub async fn delete_release(
     Path((owner, repo_name, release_id)): Path<(String, String, String)>,
     user: Option<Extension<User>>,
 ) -> Result<StatusCode, ForgeError> {
-    let current_user = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required to delete release".to_string()))?.0;
+    let current_user = user
+        .ok_or_else(|| {
+            ForgeError::Unauthorized("Authentication required to delete release".to_string())
+        })?
+        .0;
     let repo = state
         .repositories
         .get_repository(Some(&current_user), &owner, &repo_name)
@@ -145,7 +160,11 @@ pub async fn upload_release_asset(
     user: Option<Extension<User>>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<ReleaseAssetDto>), ForgeError> {
-    let current_user = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required to upload asset".to_string()))?.0;
+    let current_user = user
+        .ok_or_else(|| {
+            ForgeError::Unauthorized("Authentication required to upload asset".to_string())
+        })?
+        .0;
     let repo = state
         .repositories
         .get_repository(Some(&current_user), &owner, &repo_name)
@@ -195,7 +214,11 @@ pub async fn delete_release_asset(
     Path((owner, repo_name, _release_id, asset_id)): Path<(String, String, String, String)>,
     user: Option<Extension<User>>,
 ) -> Result<StatusCode, ForgeError> {
-    let current_user = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required to delete asset".to_string()))?.0;
+    let current_user = user
+        .ok_or_else(|| {
+            ForgeError::Unauthorized("Authentication required to delete asset".to_string())
+        })?
+        .0;
     let repo = state
         .repositories
         .get_repository(Some(&current_user), &owner, &repo_name)

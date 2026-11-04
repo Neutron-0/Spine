@@ -69,9 +69,16 @@ async fn test_discussions_lifecycle_and_moderation() {
     db.create_repository(repo).await.unwrap();
 
     // 1. Verify default categories exist (e.g. Q&A, Announcements, General)
-    let categories = state.discussions.list_categories("repo-disc").await.unwrap();
+    let categories = state
+        .discussions
+        .list_categories("repo-disc")
+        .await
+        .unwrap();
     assert!(!categories.is_empty());
-    let qa_cat = categories.iter().find(|c| c.slug == "q-and-a").expect("Q&A category must exist");
+    let qa_cat = categories
+        .iter()
+        .find(|c| c.slug == "q-and-a")
+        .expect("Q&A category must exist");
     assert!(qa_cat.is_answerable);
 
     // 2. Bob creates a discussion in Q&A
@@ -115,7 +122,10 @@ async fn test_discussions_lifecycle_and_moderation() {
         .await
         .unwrap();
 
-    assert_eq!(answered_disc.answered_comment_id, Some(answer_comment.id.clone()));
+    assert_eq!(
+        answered_disc.answered_comment_id,
+        Some(answer_comment.id.clone())
+    );
 
     // 5. Test reaction toggle on the comment
     let added = state
@@ -125,7 +135,11 @@ async fn test_discussions_lifecycle_and_moderation() {
         .unwrap();
     assert!(added, "Reaction should be added");
 
-    let comments = state.discussions.list_comments(Some("user-bob"), "repo-disc", 1).await.unwrap();
+    let comments = state
+        .discussions
+        .list_comments(Some("user-bob"), "repo-disc", 1)
+        .await
+        .unwrap();
     assert_eq!(comments.len(), 1);
     assert_eq!(comments[0].reactions.len(), 1);
     assert_eq!(comments[0].reactions[0].reaction, "+1");
@@ -142,7 +156,16 @@ async fn test_discussions_lifecycle_and_moderation() {
     // 6. Moderation: Alice (admin) pins the discussion
     let pinned_disc = state
         .discussions
-        .update_discussion("user-alice", "repo-disc", 1, None, None, None, Some(true), None)
+        .update_discussion(
+            "user-alice",
+            "repo-disc",
+            1,
+            None,
+            None,
+            None,
+            Some(true),
+            None,
+        )
         .await
         .unwrap();
     assert!(pinned_disc.is_pinned);
@@ -150,7 +173,16 @@ async fn test_discussions_lifecycle_and_moderation() {
     // 7. Non-admin Bob attempts to lock the discussion (must fail)
     let lock_attempt = state
         .discussions
-        .update_discussion("user-bob", "repo-disc", 1, None, None, None, None, Some(true))
+        .update_discussion(
+            "user-bob",
+            "repo-disc",
+            1,
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+        )
         .await;
     assert!(lock_attempt.is_err(), "Non-admin cannot lock discussions");
 }

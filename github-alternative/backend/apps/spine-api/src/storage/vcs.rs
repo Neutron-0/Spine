@@ -2,13 +2,14 @@ use crate::core::error::ForgeError;
 use crate::core::types::{DiffFileDto, MergeResultDto, MergeabilityReport, PullRequestDiffDto};
 use serde::Serialize;
 use spine_cluster::{
-    AuthoritativeRefUpdate, AuthoritativeRepositoryWriter, BranchProtectionRule,
-    CoordinatorStore, DurabilityPolicy, DurabilityVerificationReport,
-    FileBackedCoordinatorStore, LocalBackendStorageDispatcher, PlacementPlan,
-    PrProtectionContext, RepositoryMeta, WriteActor,
+    AuthoritativeRefUpdate, AuthoritativeRepositoryWriter, BranchProtectionRule, CoordinatorStore,
+    DurabilityPolicy, DurabilityVerificationReport, FileBackedCoordinatorStore,
+    LocalBackendStorageDispatcher, PlacementPlan, PrProtectionContext, RepositoryMeta, WriteActor,
 };
 use spine_core::{Commit, FileMode, HashAlgorithm, ObjectId, ObjectType, TreeEntry};
-use spine_diff::{compare_trees, compute_line_diff, format_unified_diff, is_binary, DiffOp, TreeChange};
+use spine_diff::{
+    compare_trees, compute_line_diff, format_unified_diff, is_binary, DiffOp, TreeChange,
+};
 use spine_format::{deserialize_commit, deserialize_tree, serialize_commit, serialize_tree};
 use spine_history::{find_merge_bases, get_commit, is_ancestor};
 use spine_merge::{merge_3way_trees, ResolvedPath};
@@ -159,7 +160,10 @@ impl NativeVcsService {
     }
 
     pub fn list_branches(&self, native_repo_id: &str) -> Result<Vec<BranchDto>, ForgeError> {
-        let heads_dir = self.repo_spine_dir(native_repo_id)?.join("refs").join("heads");
+        let heads_dir = self
+            .repo_spine_dir(native_repo_id)?
+            .join("refs")
+            .join("heads");
         if !heads_dir.exists() {
             return Ok(Vec::new());
         }
@@ -184,7 +188,10 @@ impl NativeVcsService {
     }
 
     pub fn list_tags(&self, native_repo_id: &str) -> Result<Vec<TagDto>, ForgeError> {
-        let tags_dir = self.repo_spine_dir(native_repo_id)?.join("refs").join("tags");
+        let tags_dir = self
+            .repo_spine_dir(native_repo_id)?
+            .join("refs")
+            .join("tags");
         if !tags_dir.exists() {
             return Ok(Vec::new());
         }
@@ -208,7 +215,11 @@ impl NativeVcsService {
         Ok(tags)
     }
 
-    pub fn resolve_ref(&self, native_repo_id: &str, ref_name: &str) -> Result<ObjectId, ForgeError> {
+    pub fn resolve_ref(
+        &self,
+        native_repo_id: &str,
+        ref_name: &str,
+    ) -> Result<ObjectId, ForgeError> {
         let trimmed = ref_name.trim();
 
         // 1. Direct hex commit ID
@@ -232,8 +243,8 @@ impl NativeVcsService {
         // 3. Tag ref
         let tag_file = spine_dir.join("refs").join("tags").join(trimmed);
         if tag_file.exists() {
-            let content = fs::read_to_string(&tag_file)
-                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+            let content =
+                fs::read_to_string(&tag_file).map_err(|e| ForgeError::Internal(e.to_string()))?;
             return ObjectId::from_hex(content.trim())
                 .map_err(|e| ForgeError::Internal(format!("Invalid tag commit id: {}", e)));
         }
@@ -295,7 +306,11 @@ impl NativeVcsService {
         Ok(commits)
     }
 
-    pub fn get_commit(&self, native_repo_id: &str, commit_id: &str) -> Result<CommitDto, ForgeError> {
+    pub fn get_commit(
+        &self,
+        native_repo_id: &str,
+        commit_id: &str,
+    ) -> Result<CommitDto, ForgeError> {
         let oid = ObjectId::from_hex(commit_id)
             .map_err(|e| ForgeError::BadRequest(format!("Invalid commit id: {}", e)))?;
         let store = self.open_store(native_repo_id)?;
@@ -312,7 +327,10 @@ impl NativeVcsService {
                     message: commit.message,
                 })
             }
-            _ => Err(ForgeError::NotFound(format!("Commit '{}' not found", commit_id))),
+            _ => Err(ForgeError::NotFound(format!(
+                "Commit '{}' not found",
+                commit_id
+            ))),
         }
     }
 
@@ -339,9 +357,7 @@ impl NativeVcsService {
         let mut current_tree_oid = commit.root_tree;
 
         // Traverse subpath if provided
-        let norm_subpath = subpath
-            .map(|s| s.trim_matches('/'))
-            .unwrap_or("");
+        let norm_subpath = subpath.map(|s| s.trim_matches('/')).unwrap_or("");
 
         if !norm_subpath.is_empty() {
             let segments: Vec<&str> = norm_subpath.split('/').filter(|s| !s.is_empty()).collect();
@@ -367,7 +383,12 @@ impl NativeVcsService {
 
                 match match_entry {
                     Some(e) => current_tree_oid = e.object_id,
-                    None => return Err(ForgeError::NotFound(format!("Path '{}' not found", norm_subpath))),
+                    None => {
+                        return Err(ForgeError::NotFound(format!(
+                            "Path '{}' not found",
+                            norm_subpath
+                        )))
+                    }
                 }
             }
         }
@@ -428,8 +449,8 @@ impl NativeVcsService {
         let (_, commit_payload) = store
             .read_object(&commit_oid)
             .map_err(|e| ForgeError::NotFound(format!("Commit not found: {}", e)))?;
-        let commit = deserialize_commit(&commit_payload)
-            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let commit =
+            deserialize_commit(&commit_payload).map_err(|e| ForgeError::Internal(e.to_string()))?;
 
         let mut current_tree_oid = commit.root_tree;
 
@@ -441,8 +462,8 @@ impl NativeVcsService {
             let (_, t_payload) = store
                 .read_object(&current_tree_oid)
                 .map_err(|e| ForgeError::NotFound(format!("Tree not found: {}", e)))?;
-            let entries = deserialize_tree(&t_payload)
-                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+            let entries =
+                deserialize_tree(&t_payload).map_err(|e| ForgeError::Internal(e.to_string()))?;
 
             let is_last = i == segments.len() - 1;
 
@@ -451,7 +472,9 @@ impl NativeVcsService {
                 let blob_entry = entries
                     .into_iter()
                     .find(|e| e.name == *seg && e.mode != FileMode::Directory)
-                    .ok_or_else(|| ForgeError::NotFound(format!("File '{}' not found", norm_path)))?;
+                    .ok_or_else(|| {
+                        ForgeError::NotFound(format!("File '{}' not found", norm_path))
+                    })?;
 
                 let (b_type, b_payload) = store
                     .read_object(&blob_entry.object_id)
@@ -482,7 +505,9 @@ impl NativeVcsService {
                 let dir_entry = entries
                     .into_iter()
                     .find(|e| e.name == *seg && e.mode == FileMode::Directory)
-                    .ok_or_else(|| ForgeError::NotFound(format!("Directory '{}' not found", seg)))?;
+                    .ok_or_else(|| {
+                        ForgeError::NotFound(format!("Directory '{}' not found", seg))
+                    })?;
                 current_tree_oid = dir_entry.object_id;
             }
         }
@@ -763,8 +788,9 @@ impl NativeVcsService {
             .map_err(|e| ForgeError::Internal(format!("Failed to read base commit: {}", e)))?;
         let head_commit = get_commit(&store, &head_oid)
             .map_err(|e| ForgeError::Internal(format!("Failed to read head commit: {}", e)))?;
-        let mb_commit = get_commit(&store, &merge_base_oid)
-            .map_err(|e| ForgeError::Internal(format!("Failed to read merge base commit: {}", e)))?;
+        let mb_commit = get_commit(&store, &merge_base_oid).map_err(|e| {
+            ForgeError::Internal(format!("Failed to read merge base commit: {}", e))
+        })?;
 
         let mut base_map = BTreeMap::new();
         self.flatten_tree(&store, &base_commit.root_tree, "", &mut base_map)?;
@@ -818,12 +844,12 @@ impl NativeVcsService {
             .map_err(|e| ForgeError::Internal(format!("Merge base error: {}", e)))?;
         let merge_base_oid = merge_bases.first().cloned().unwrap_or(base_oid);
 
-        let base_commit = get_commit(&store, &base_oid)
-            .map_err(|e| ForgeError::Internal(e.to_string()))?;
-        let head_commit = get_commit(&store, &head_oid)
-            .map_err(|e| ForgeError::Internal(e.to_string()))?;
-        let mb_commit = get_commit(&store, &merge_base_oid)
-            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let base_commit =
+            get_commit(&store, &base_oid).map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let head_commit =
+            get_commit(&store, &head_oid).map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mb_commit =
+            get_commit(&store, &merge_base_oid).map_err(|e| ForgeError::Internal(e.to_string()))?;
 
         let mut base_map = BTreeMap::new();
         self.flatten_tree(&store, &base_commit.root_tree, "", &mut base_map)?;
@@ -935,9 +961,12 @@ impl NativeVcsService {
         spine_net::pack_transfer::create_pack_file(&store, &new_objects, &spk_path)
             .map_err(|e| ForgeError::Internal(format!("Failed to build merge packfile: {}", e)))?;
 
-        let mut pack_reader = spine_object_store::pack::PackReader::open(&spk_path)
-            .map_err(|e| ForgeError::Internal(format!("Failed to open packfile for indexing: {}", e)))?;
-        let entries = pack_reader.scan_index_entries()
+        let mut pack_reader =
+            spine_object_store::pack::PackReader::open(&spk_path).map_err(|e| {
+                ForgeError::Internal(format!("Failed to open packfile for indexing: {}", e))
+            })?;
+        let entries = pack_reader
+            .scan_index_entries()
             .map_err(|e| ForgeError::Internal(format!("Failed to scan packfile entries: {}", e)))?;
         spine_object_store::pack_index::PackIndexWriter::write_index(
             &spidx_path,
@@ -981,7 +1010,9 @@ impl NativeVcsService {
                 pr_context,
             )
             .await
-            .map_err(|e| ForgeError::Internal(format!("Authoritative distributed write rejected: {}", e)))?;
+            .map_err(|e| {
+                ForgeError::Internal(format!("Authoritative distributed write rejected: {}", e))
+            })?;
 
         Ok(MergeResultDto {
             success: true,

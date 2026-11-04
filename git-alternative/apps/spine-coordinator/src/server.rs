@@ -224,7 +224,13 @@ async fn handle_coordinator_connection(
             },
             _ => match store.list_nodes() {
                 Ok(nodes) => {
-                    match PlacementScheduler::schedule_placement(&repo_id, durability_policy, &nodes, 0, 1) {
+                    match PlacementScheduler::schedule_placement(
+                        &repo_id,
+                        durability_policy,
+                        &nodes,
+                        0,
+                        1,
+                    ) {
                         Ok(plan) => {
                             let meta = RepositoryMeta {
                                 repo_id: repo_id.clone(),
@@ -249,21 +255,15 @@ async fn handle_coordinator_connection(
                                 now,
                             );
                             for rep in &plan.replica_node_ids {
-                                let _ = store.update_replica_state(
-                                    &repo_id,
-                                    rep,
-                                    false,
-                                    0,
-                                    true,
-                                    now,
-                                );
+                                let _ =
+                                    store.update_replica_state(&repo_id, rep, false, 0, true, now);
                             }
-                            let _ = store.update_ownership_epoch(
-                                &repo_id,
-                                1,
-                                &plan.primary_node_id,
-                            );
-                            ClusterRpcResponse::AllocationResult { repo_id, placement: plan }
+                            let _ =
+                                store.update_ownership_epoch(&repo_id, 1, &plan.primary_node_id);
+                            ClusterRpcResponse::AllocationResult {
+                                repo_id,
+                                placement: plan,
+                            }
                         }
                         Err(e) => ClusterRpcResponse::Error(format!("Scheduling failed: {}", e)),
                     }
@@ -288,7 +288,7 @@ async fn handle_coordinator_connection(
                 },
                 Err(e) => ClusterRpcResponse::Error(e.to_string()),
             }
-        },
+        }
         ClusterRpcRequest::DrainNode { node_id } => {
             match store.update_node_status(&node_id, NodeStatus::Draining) {
                 Ok(_) => ClusterRpcResponse::NodeStatusUpdated {

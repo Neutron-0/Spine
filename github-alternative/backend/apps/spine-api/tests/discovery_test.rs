@@ -50,7 +50,10 @@ async fn test_developer_and_repository_discovery() {
         .await
         .unwrap();
 
-    assert_eq!(profile.bio.as_deref(), Some("Building distributed consensus algorithms"));
+    assert_eq!(
+        profile.bio.as_deref(),
+        Some("Building distributed consensus algorithms")
+    );
     assert_eq!(profile.company.as_deref(), Some("Spine Labs"));
     assert_eq!(profile.pinned_repo_ids, vec!["repo-1".to_string()]);
 
@@ -87,7 +90,11 @@ async fn test_developer_and_repository_discovery() {
     fs::write(repo_dir.join("web/index.ts"), "b".repeat(500)).unwrap();
 
     // 4. Run Language Analysis
-    let languages = state.discovery.analyze_repository_languages("repo-lang").await.unwrap();
+    let languages = state
+        .discovery
+        .analyze_repository_languages("repo-lang")
+        .await
+        .unwrap();
     assert_eq!(languages.len(), 2);
     assert_eq!(languages[0].language, "Rust");
     assert_eq!(languages[0].bytes, 1000);
@@ -119,10 +126,16 @@ async fn test_developer_and_repository_discovery() {
     // 6. Test Popular Topics
     let popular = state.discovery.list_popular_topics(10).await.unwrap();
     assert!(!popular.is_empty());
-    assert!(popular.iter().any(|p| p.topic == "rust" && p.repository_count >= 1));
+    assert!(popular
+        .iter()
+        .any(|p| p.topic == "rust" && p.repository_count >= 1));
 
     // 7. Test Explore Feed
-    let explore = state.discovery.list_explore_repositories(Some("rust")).await.unwrap();
+    let explore = state
+        .discovery
+        .list_explore_repositories(Some("rust"))
+        .await
+        .unwrap();
     assert_eq!(explore.len(), 1);
     assert_eq!(explore[0].name, "spine-hyperdrive");
     assert_eq!(explore[0].primary_language.as_deref(), Some("Rust"));

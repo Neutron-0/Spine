@@ -28,7 +28,11 @@ impl PermissionService {
             return Ok(OrganizationRole::Owner);
         }
 
-        if let Some(m) = self.db.get_organization_membership(org_id, &caller.id).await? {
+        if let Some(m) = self
+            .db
+            .get_organization_membership(org_id, &caller.id)
+            .await?
+        {
             if m.role == OrganizationRole::Owner || m.role == OrganizationRole::Admin {
                 return Ok(m.role);
             }
@@ -54,7 +58,11 @@ impl PermissionService {
                 if user.id == org.owner_user_id {
                     return Ok(Some(OrganizationRole::Owner));
                 }
-                if let Some(m) = self.db.get_organization_membership(&org.id, &user.id).await? {
+                if let Some(m) = self
+                    .db
+                    .get_organization_membership(&org.id, &user.id)
+                    .await?
+                {
                     return Ok(Some(m.role));
                 }
             }
@@ -66,7 +74,11 @@ impl PermissionService {
         if user.id == org.owner_user_id {
             return Ok(Some(OrganizationRole::Owner));
         }
-        if let Some(m) = self.db.get_organization_membership(&org.id, &user.id).await? {
+        if let Some(m) = self
+            .db
+            .get_organization_membership(&org.id, &user.id)
+            .await?
+        {
             return Ok(Some(m.role));
         }
 
@@ -127,12 +139,22 @@ impl PermissionService {
                 });
             }
             // Check team repository permissions in org
-            let teams = self.db.list_teams_for_user_in_org(org_id, &user.id).await.unwrap_or_default();
+            let teams = self
+                .db
+                .list_teams_for_user_in_org(org_id, &user.id)
+                .await
+                .unwrap_or_default();
             for t in teams {
-                if let Ok(Some(level)) = self.db.get_team_repository_permission(&t.id, &repo.id).await {
+                if let Ok(Some(level)) = self
+                    .db
+                    .get_team_repository_permission(&t.id, &repo.id)
+                    .await
+                {
                     return Ok(match level {
                         TeamPermissionLevel::Admin => PermissionRole::Owner,
-                        TeamPermissionLevel::Maintain | TeamPermissionLevel::Write => PermissionRole::Collaborator,
+                        TeamPermissionLevel::Maintain | TeamPermissionLevel::Write => {
+                            PermissionRole::Collaborator
+                        }
                         TeamPermissionLevel::Read => PermissionRole::Reader,
                     });
                 }
@@ -158,7 +180,8 @@ impl PermissionService {
         caller: Option<&User>,
         repo: &ForgeRepository,
     ) -> Result<PermissionRole, ForgeError> {
-        let user = caller.ok_or_else(|| ForgeError::Unauthorized("Authentication required to write".into()))?;
+        let user = caller
+            .ok_or_else(|| ForgeError::Unauthorized("Authentication required to write".into()))?;
         if repo.archived {
             return Err(ForgeError::NotFound("Repository not found".into()));
         }
@@ -174,11 +197,21 @@ impl PermissionService {
                     _ => PermissionRole::Collaborator,
                 });
             }
-            let teams = self.db.list_teams_for_user_in_org(org_id, &user.id).await.unwrap_or_default();
+            let teams = self
+                .db
+                .list_teams_for_user_in_org(org_id, &user.id)
+                .await
+                .unwrap_or_default();
             for t in teams {
-                if let Ok(Some(level)) = self.db.get_team_repository_permission(&t.id, &repo.id).await {
+                if let Ok(Some(level)) = self
+                    .db
+                    .get_team_repository_permission(&t.id, &repo.id)
+                    .await
+                {
                     match level {
-                        TeamPermissionLevel::Admin | TeamPermissionLevel::Maintain | TeamPermissionLevel::Write => {
+                        TeamPermissionLevel::Admin
+                        | TeamPermissionLevel::Maintain
+                        | TeamPermissionLevel::Write => {
                             return Ok(PermissionRole::Collaborator);
                         }
                         TeamPermissionLevel::Read => {}
@@ -208,7 +241,8 @@ impl PermissionService {
         caller: Option<&User>,
         repo: &ForgeRepository,
     ) -> Result<(), ForgeError> {
-        let user = caller.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+        let user =
+            caller.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
         if user.id == repo.owner_user_id {
             return Ok(());
         }
@@ -217,9 +251,17 @@ impl PermissionService {
             if let Ok(_) = self.check_org_admin(user, org_id).await {
                 return Ok(());
             }
-            let teams = self.db.list_teams_for_user_in_org(org_id, &user.id).await.unwrap_or_default();
+            let teams = self
+                .db
+                .list_teams_for_user_in_org(org_id, &user.id)
+                .await
+                .unwrap_or_default();
             for t in teams {
-                if let Ok(Some(TeamPermissionLevel::Admin)) = self.db.get_team_repository_permission(&t.id, &repo.id).await {
+                if let Ok(Some(TeamPermissionLevel::Admin)) = self
+                    .db
+                    .get_team_repository_permission(&t.id, &repo.id)
+                    .await
+                {
                     return Ok(());
                 }
             }
@@ -240,7 +282,8 @@ impl PermissionService {
         caller: Option<&User>,
         repo: &ForgeRepository,
     ) -> Result<(), ForgeError> {
-        let user = caller.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+        let user =
+            caller.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
         if user.id == repo.owner_user_id {
             return Ok(());
         }
@@ -271,7 +314,11 @@ impl PermissionService {
         // First ensure user has write access
         self.check_write_access(Some(caller), repo).await?;
 
-        let rule = match self.db.get_branch_protection(&repo.id, target_branch).await? {
+        let rule = match self
+            .db
+            .get_branch_protection(&repo.id, target_branch)
+            .await?
+        {
             Some(r) => r,
             None => return Ok(()), // No protection rules configured
         };
@@ -314,7 +361,8 @@ impl PermissionService {
 
         if rule.require_changes_addressed && has_changes_requested {
             return Err(ForgeError::UnprocessableEntity(
-                "Branch protection: cannot merge while there are outstanding change requests".into(),
+                "Branch protection: cannot merge while there are outstanding change requests"
+                    .into(),
             ));
         }
 
@@ -323,17 +371,21 @@ impl PermissionService {
             let unresolved = comments.iter().any(|c| !c.is_resolved);
             if unresolved {
                 return Err(ForgeError::UnprocessableEntity(
-                    "Branch protection: all inline review comments must be resolved before merging".into(),
+                    "Branch protection: all inline review comments must be resolved before merging"
+                        .into(),
                 ));
             }
         }
 
         if !rule.required_status_checks.is_empty() {
-            let checks = self.db.list_workflow_check_results(&repo.id, &pr.head_commit_id).await?;
+            let checks = self
+                .db
+                .list_workflow_check_results(&repo.id, &pr.head_commit_id)
+                .await?;
             for req_check in &rule.required_status_checks {
                 let check_opt = checks.iter().find(|c| c.check_name == *req_check);
                 match check_opt {
-                    Some(c) if c.status == "SUCCESS" => {},
+                    Some(c) if c.status == "SUCCESS" => {}
                     Some(c) => {
                         return Err(ForgeError::UnprocessableEntity(format!(
                             "Branch protection: required check '{}' has status '{}', must be 'SUCCESS' before merging",
@@ -353,7 +405,11 @@ impl PermissionService {
         Ok(())
     }
 
-    pub async fn can_read_repo(&self, user_id: Option<&str>, repo_id: &str) -> Result<bool, ForgeError> {
+    pub async fn can_read_repo(
+        &self,
+        user_id: Option<&str>,
+        repo_id: &str,
+    ) -> Result<bool, ForgeError> {
         let repo = match self.db.get_repository_by_id(repo_id).await? {
             Some(r) => r,
             None => return Ok(false),
@@ -366,7 +422,11 @@ impl PermissionService {
         Ok(self.check_read_access(caller.as_ref(), &repo).await.is_ok())
     }
 
-    pub async fn require_repo_read(&self, user_id: Option<&str>, repo_id: &str) -> Result<(), ForgeError> {
+    pub async fn require_repo_read(
+        &self,
+        user_id: Option<&str>,
+        repo_id: &str,
+    ) -> Result<(), ForgeError> {
         let repo = self
             .db
             .get_repository_by_id(repo_id)

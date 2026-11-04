@@ -70,7 +70,10 @@ pub async fn register(
             "Username must be between 3 and 32 characters".into(),
         ));
     }
-    if !username.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !username
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return Err(ForgeError::BadRequest(
             "Username may only contain letters, numbers, hyphens, and underscores".into(),
         ));
@@ -165,7 +168,10 @@ pub async fn login(
     }
 
     // Rate limiting
-    if !state.rate_limiter.check_and_record(&format!("login_{}", login_str.to_lowercase()), 5, 60) {
+    if !state
+        .rate_limiter
+        .check_and_record(&format!("login_{}", login_str.to_lowercase()), 5, 60)
+    {
         return Err(ForgeError::RateLimited(
             "Too many login attempts. Please wait 1 minute before retrying.".into(),
         ));
@@ -182,13 +188,17 @@ pub async fn login(
         Some(u) => u,
         None => {
             // Generic error message to prevent user enumeration
-            return Err(ForgeError::Unauthorized("Invalid username or password".into()));
+            return Err(ForgeError::Unauthorized(
+                "Invalid username or password".into(),
+            ));
         }
     };
 
     let valid = verify_password(&payload.password, &user.password_hash)?;
     if !valid {
-        return Err(ForgeError::Unauthorized("Invalid username or password".into()));
+        return Err(ForgeError::Unauthorized(
+            "Invalid username or password".into(),
+        ));
     }
 
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -279,14 +289,19 @@ pub async fn change_password(
 ) -> Result<impl IntoResponse, ForgeError> {
     let valid = verify_password(&payload.current_password, &user.password_hash)?;
     if !valid {
-        return Err(ForgeError::Unauthorized("Current password is incorrect".into()));
+        return Err(ForgeError::Unauthorized(
+            "Current password is incorrect".into(),
+        ));
     }
 
     validate_password_strength(&payload.new_password)?;
     let new_hash = hash_password(&payload.new_password)?;
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
-    state.db.update_user_password(&user.id, &new_hash, now).await?;
+    state
+        .db
+        .update_user_password(&user.id, &new_hash, now)
+        .await?;
     // Revoke other existing sessions
     state.db.revoke_all_user_sessions(&user.id).await?;
 
@@ -300,7 +315,10 @@ pub async fn request_password_reset(
     Json(payload): Json<ResetPasswordRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let email = payload.email.trim();
-    if !state.rate_limiter.check_and_record(&format!("reset_{}", email.to_lowercase()), 3, 300) {
+    if !state
+        .rate_limiter
+        .check_and_record(&format!("reset_{}", email.to_lowercase()), 3, 300)
+    {
         return Err(ForgeError::RateLimited(
             "Too many password reset requests. Please wait a few minutes.".into(),
         ));
@@ -346,7 +364,10 @@ pub async fn complete_password_reset(
         .ok_or_else(|| ForgeError::BadRequest("Invalid or expired password reset token".into()))?;
 
     let new_hash = hash_password(&payload.new_password)?;
-    state.db.update_user_password(&user_id, &new_hash, now).await?;
+    state
+        .db
+        .update_user_password(&user_id, &new_hash, now)
+        .await?;
     state.db.revoke_all_user_sessions(&user_id).await?;
 
     Ok(Json(GenericMessageResponse {

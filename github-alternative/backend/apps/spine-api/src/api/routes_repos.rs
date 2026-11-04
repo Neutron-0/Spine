@@ -34,7 +34,9 @@ pub async fn create_repository(
     user: Option<Extension<User>>,
     Json(payload): Json<CreateRepoApiRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let creator = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required to create repository".into()))?;
+    let creator = user.ok_or_else(|| {
+        ForgeError::Unauthorized("Authentication required to create repository".into())
+    })?;
 
     let durability = match payload.durability.as_deref() {
         Some("SingleCopy") | Some("SINGLE_COPY") => Some(DurabilityPolicy::SingleCopy),
@@ -62,7 +64,10 @@ pub async fn list_repositories(
     user: Option<Extension<User>>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.map(|Extension(u)| u);
-    let repos = state.repositories.list_repositories(caller.as_ref()).await?;
+    let repos = state
+        .repositories
+        .list_repositories(caller.as_ref())
+        .await?;
     let dtos: Vec<RepositoryDto> = repos.iter().map(RepositoryDto::from).collect();
     Ok(Json(dtos))
 }
@@ -171,9 +176,7 @@ pub async fn get_repo_blob(
         .get_repository(caller.as_ref(), &owner, &name)
         .await?;
 
-    let blob = state
-        .vcs
-        .get_blob(&repo.native_repo_id, &ref_name, &path)?;
+    let blob = state.vcs.get_blob(&repo.native_repo_id, &ref_name, &path)?;
     Ok(Json(blob))
 }
 

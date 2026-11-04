@@ -34,8 +34,14 @@ pub async fn upsert_repo_secret(
     Json(payload): Json<UpsertSecretRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
-    let repo = state.repositories.get_repository(Some(&caller), &owner, &repo_name).await?;
-    state.permissions.check_admin_access(Some(&caller), &repo).await?;
+    let repo = state
+        .repositories
+        .get_repository(Some(&caller), &owner, &repo_name)
+        .await?;
+    state
+        .permissions
+        .check_admin_access(Some(&caller), &repo)
+        .await?;
 
     let now_nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
     let secret = WorkflowSecret {
@@ -67,8 +73,14 @@ pub async fn list_repo_secrets(
     Path((owner, repo_name)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
-    let repo = state.repositories.get_repository(Some(&caller), &owner, &repo_name).await?;
-    state.permissions.check_admin_access(Some(&caller), &repo).await?;
+    let repo = state
+        .repositories
+        .get_repository(Some(&caller), &owner, &repo_name)
+        .await?;
+    state
+        .permissions
+        .check_admin_access(Some(&caller), &repo)
+        .await?;
 
     let secrets = state.db.list_workflow_secrets("REPO", &repo.id).await?;
     let summaries: Vec<SecretSummaryDto> = secrets
@@ -92,8 +104,14 @@ pub async fn delete_repo_secret(
     Path((owner, repo_name, secret_name)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
-    let repo = state.repositories.get_repository(Some(&caller), &owner, &repo_name).await?;
-    state.permissions.check_admin_access(Some(&caller), &repo).await?;
+    let repo = state
+        .repositories
+        .get_repository(Some(&caller), &owner, &repo_name)
+        .await?;
+    state
+        .permissions
+        .check_admin_access(Some(&caller), &repo)
+        .await?;
 
     state
         .db

@@ -85,7 +85,8 @@ pub async fn register_runner(
     user: Option<Extension<User>>,
     Json(payload): Json<RegisterRunnerRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let Extension(_caller) = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let Extension(_caller) =
+        user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
 
     let (runner, raw_token) = state
         .runners
@@ -115,7 +116,8 @@ pub async fn list_runners(
     State(state): State<AppState>,
     user: Option<Extension<User>>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let Extension(_caller) = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let Extension(_caller) =
+        user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
 
     let runners = state.db.list_runners().await?;
     Ok(Json(runners))
@@ -132,7 +134,10 @@ pub async fn heartbeat(
     }
 
     state.runners.authenticate_runner(runner_id, token).await?;
-    state.runners.heartbeat(runner_id, payload.active_jobs).await?;
+    state
+        .runners
+        .heartbeat(runner_id, payload.active_jobs)
+        .await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -148,10 +153,17 @@ pub async fn acquire_job(
     }
 
     state.runners.authenticate_runner(runner_id, token).await?;
-    let acquired = state.runners.acquire_job(runner_id, &payload.labels).await?;
+    let acquired = state
+        .runners
+        .acquire_job(runner_id, &payload.labels)
+        .await?;
 
     match acquired {
-        Some((job, steps, secrets)) => Ok(Json(Some(AcquiredJobResponse { job, steps, secrets }))),
+        Some((job, steps, secrets)) => Ok(Json(Some(AcquiredJobResponse {
+            job,
+            steps,
+            secrets,
+        }))),
         None => Ok(Json(None)),
     }
 }

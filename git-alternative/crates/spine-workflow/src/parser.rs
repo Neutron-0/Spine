@@ -27,8 +27,8 @@ impl WorkflowParser {
 
         // Try JSON parse first
         if trimmed.starts_with('{') {
-            let spec: WorkflowSpec = serde_json::from_str(trimmed)
-                .map_err(|e| ParseError::Json(e.to_string()))?;
+            let spec: WorkflowSpec =
+                serde_json::from_str(trimmed).map_err(|e| ParseError::Json(e.to_string()))?;
             Self::validate(&spec)?;
             return Ok(spec);
         }
@@ -159,7 +159,9 @@ impl WorkflowParser {
                             let list = Self::parse_bracket_list(v);
                             let target_filter = match current_event.as_str() {
                                 "push" => on.push.get_or_insert_with(EventFilter::default),
-                                "pull_request" => on.pull_request.get_or_insert_with(EventFilter::default),
+                                "pull_request" => {
+                                    on.pull_request.get_or_insert_with(EventFilter::default)
+                                }
                                 _ => continue,
                             };
                             match k {
@@ -285,7 +287,15 @@ impl WorkflowParser {
                 let mut step = StepSpec::default();
                 let remainder = trimmed.trim_start_matches('-').trim();
                 if let Some((k, v)) = Self::split_kv(remainder) {
-                    Self::apply_step_kv(&mut step, k, v, &mut in_multiline_run, &mut multiline_buf, &mut multiline_indent, indent + 2);
+                    Self::apply_step_kv(
+                        &mut step,
+                        k,
+                        v,
+                        &mut in_multiline_run,
+                        &mut multiline_buf,
+                        &mut multiline_indent,
+                        indent + 2,
+                    );
                 }
                 current_step = Some(step);
                 continue;
@@ -294,7 +304,15 @@ impl WorkflowParser {
             if indent >= 8 {
                 if let Some(step) = &mut current_step {
                     if let Some((k, v)) = Self::split_kv(trimmed) {
-                        Self::apply_step_kv(step, k, v, &mut in_multiline_run, &mut multiline_buf, &mut multiline_indent, indent + 2);
+                        Self::apply_step_kv(
+                            step,
+                            k,
+                            v,
+                            &mut in_multiline_run,
+                            &mut multiline_buf,
+                            &mut multiline_indent,
+                            indent + 2,
+                        );
                     }
                 }
             }

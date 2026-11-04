@@ -38,7 +38,10 @@ pub async fn list_teams(
         .await?
         .ok_or_else(|| ForgeError::NotFound("Organization not found".into()))?;
 
-    state.permissions.check_org_read_access(caller, &org).await?;
+    state
+        .permissions
+        .check_org_read_access(caller, &org)
+        .await?;
     let teams = state.db.list_teams_for_org(&org.id).await?;
     let dtos: Vec<TeamDto> = teams.iter().map(TeamDto::from).collect();
     Ok(Json(dtos))
@@ -104,7 +107,10 @@ pub async fn get_team(
         .await?
         .ok_or_else(|| ForgeError::NotFound("Organization not found".into()))?;
 
-    state.permissions.check_org_read_access(caller, &org).await?;
+    state
+        .permissions
+        .check_org_read_access(caller, &org)
+        .await?;
 
     let team = state
         .db
@@ -151,7 +157,10 @@ pub async fn list_team_members(
         .await?
         .ok_or_else(|| ForgeError::NotFound("Organization not found".into()))?;
 
-    state.permissions.check_org_read_access(caller, &org).await?;
+    state
+        .permissions
+        .check_org_read_access(caller, &org)
+        .await?;
 
     let team = state
         .db

@@ -22,14 +22,17 @@ pub async fn search_handler(
     user: Option<Extension<User>>,
     Query(params): Query<SearchQueryParams>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let r_type = params.result_type.as_deref().and_then(|t| match t.to_lowercase().as_str() {
-        "repo" | "repository" => Some(SearchResultType::Repository),
-        "code" => Some(SearchResultType::Code),
-        "issue" => Some(SearchResultType::Issue),
-        "pr" | "pull" | "pull_request" => Some(SearchResultType::PullRequest),
-        "discussion" => Some(SearchResultType::Discussion),
-        _ => None,
-    });
+    let r_type = params
+        .result_type
+        .as_deref()
+        .and_then(|t| match t.to_lowercase().as_str() {
+            "repo" | "repository" => Some(SearchResultType::Repository),
+            "code" => Some(SearchResultType::Code),
+            "issue" => Some(SearchResultType::Issue),
+            "pr" | "pull" | "pull_request" => Some(SearchResultType::PullRequest),
+            "discussion" => Some(SearchResultType::Discussion),
+            _ => None,
+        });
 
     let user_id = user.as_ref().map(|Extension(u)| u.id.as_str());
     let response = state

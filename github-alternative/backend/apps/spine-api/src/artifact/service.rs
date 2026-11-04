@@ -2,8 +2,8 @@ use crate::core::error::ForgeError;
 use crate::core::types::*;
 use crate::db::Database;
 use spine_artifact::{
-    chunker::ChunkerError, ArtifactManifest, ArtifactStore, ObjectReconstructor,
-    StreamChunker, TransferSession, DEFAULT_CHUNK_SIZE,
+    chunker::ChunkerError, ArtifactManifest, ArtifactStore, ObjectReconstructor, StreamChunker,
+    TransferSession, DEFAULT_CHUNK_SIZE,
 };
 use spine_cluster::durability::DurabilityPolicy;
 use std::collections::HashMap;
@@ -81,7 +81,10 @@ impl ArtifactService {
         };
 
         self.db.create_upload_session(db_session.clone()).await?;
-        self.active_sessions.write().await.insert(session_id, session);
+        self.active_sessions
+            .write()
+            .await
+            .insert(session_id, session);
 
         Ok(db_session)
     }
@@ -133,7 +136,9 @@ impl ArtifactService {
             .db
             .get_upload_session(session_id)
             .await?
-            .ok_or_else(|| ForgeError::NotFound(format!("Upload session {} not found", session_id)))?;
+            .ok_or_else(|| {
+                ForgeError::NotFound(format!("Upload session {} not found", session_id))
+            })?;
 
         // Put manifest in content-addressed store
         let manifest_id = self
@@ -141,8 +146,8 @@ impl ArtifactService {
             .store_manifest(&manifest)
             .map_err(|e| ForgeError::Internal(format!("Failed to store manifest: {}", e)))?;
 
-        let manifest_json = serde_json::to_string(&manifest)
-            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let manifest_json =
+            serde_json::to_string(&manifest).map_err(|e| ForgeError::Internal(e.to_string()))?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

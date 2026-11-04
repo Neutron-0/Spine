@@ -39,7 +39,10 @@ impl SsrfValidator {
 
     /// Validates a URL and resolves its host into a safe, pinned `SocketAddr`.
     /// Returning the pinned `SocketAddr` prevents DNS rebinding TOCTOU vulnerabilities.
-    pub async fn validate_and_resolve(&self, target_url: &str) -> Result<(Url, SocketAddr), SsrfError> {
+    pub async fn validate_and_resolve(
+        &self,
+        target_url: &str,
+    ) -> Result<(Url, SocketAddr), SsrfError> {
         let parsed = Url::parse(target_url).map_err(|e| SsrfError::InvalidUrl(e.to_string()))?;
 
         let scheme = parsed.scheme().to_lowercase();
@@ -48,7 +51,9 @@ impl SsrfValidator {
         }
 
         let host = parsed.host_str().ok_or(SsrfError::MissingHost)?;
-        let port = parsed.port_or_known_default().unwrap_or(if scheme == "https" { 443 } else { 80 });
+        let port = parsed
+            .port_or_known_default()
+            .unwrap_or(if scheme == "https" { 443 } else { 80 });
 
         // Check prohibited administrative and database ports
         if is_prohibited_port(port) {

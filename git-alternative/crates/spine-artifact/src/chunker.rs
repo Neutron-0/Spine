@@ -13,10 +13,7 @@ pub enum ChunkerError {
         computed: String,
     },
     #[error("Corrupted whole object: expected hash {expected}, got {computed}")]
-    CorruptedObject {
-        expected: String,
-        computed: String,
-    },
+    CorruptedObject { expected: String, computed: String },
     #[error("Manifest error: {0}")]
     Manifest(#[from] crate::manifest::ManifestError),
     #[error("Missing chunk {0}")]

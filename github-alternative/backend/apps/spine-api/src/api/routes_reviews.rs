@@ -54,7 +54,10 @@ pub async fn list_reviews(
     Path((owner, repo_name, number)): Path<(String, String, i64)>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.as_ref().map(|Extension(u)| u);
-    let repo = state.repositories.get_repository(caller, &owner, &repo_name).await?;
+    let repo = state
+        .repositories
+        .get_repository(caller, &owner, &repo_name)
+        .await?;
 
     let pr = state
         .db
@@ -91,8 +94,12 @@ pub async fn create_review(
     Path((owner, repo_name, number)): Path<(String, String, i64)>,
     Json(payload): Json<CreateReviewRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required to review".into()))?;
-    let repo = state.repositories.get_repository(Some(&caller), &owner, &repo_name).await?;
+    let caller =
+        user.ok_or_else(|| ForgeError::Unauthorized("Authentication required to review".into()))?;
+    let repo = state
+        .repositories
+        .get_repository(Some(&caller), &owner, &repo_name)
+        .await?;
 
     let pr = state
         .db
@@ -102,12 +109,16 @@ pub async fn create_review(
 
     let rev_state = payload.state.trim().to_uppercase();
     if rev_state != "APPROVED" && rev_state != "CHANGES_REQUESTED" && rev_state != "COMMENTED" {
-        return Err(ForgeError::BadRequest("Review state must be APPROVED, CHANGES_REQUESTED, or COMMENTED".into()));
+        return Err(ForgeError::BadRequest(
+            "Review state must be APPROVED, CHANGES_REQUESTED, or COMMENTED".into(),
+        ));
     }
 
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
     let review_id = format!("rev_{}", uuid::Uuid::new_v4().simple());
-    let commit_id = payload.commit_id.unwrap_or_else(|| pr.head_commit_id.clone());
+    let commit_id = payload
+        .commit_id
+        .unwrap_or_else(|| pr.head_commit_id.clone());
 
     let review = PullRequestReview {
         id: review_id.clone(),
@@ -132,7 +143,10 @@ pub async fn create_review(
             resource_type: "pull_request".to_string(),
             resource_id: pr.id.clone(),
             title: format!("New review on PR #{}: {}", pr.pr_number, rev_state),
-            message: format!("{} reviewed your pull request with status {}", caller.username, rev_state),
+            message: format!(
+                "{} reviewed your pull request with status {}",
+                caller.username, rev_state
+            ),
             is_read: false,
             created_at_nanos: now,
         };
@@ -148,11 +162,20 @@ pub async fn dismiss_review(
     Path((owner, repo_name, _number, review_id)): Path<(String, String, i64, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
-    let repo = state.repositories.get_repository(Some(&caller), &owner, &repo_name).await?;
-    state.permissions.check_admin_access(Some(&caller), &repo).await?;
+    let repo = state
+        .repositories
+        .get_repository(Some(&caller), &owner, &repo_name)
+        .await?;
+    state
+        .permissions
+        .check_admin_access(Some(&caller), &repo)
+        .await?;
 
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-    state.db.dismiss_pr_review(&review_id, &caller.id, now).await?;
+    state
+        .db
+        .dismiss_pr_review(&review_id, &caller.id, now)
+        .await?;
     Ok(StatusCode::OK)
 }
 
@@ -163,7 +186,10 @@ pub async fn request_reviewer(
     Json(payload): Json<RequestReviewerRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
-    let repo = state.repositories.get_repository(Some(&caller), &owner, &repo_name).await?;
+    let repo = state
+        .repositories
+        .get_repository(Some(&caller), &owner, &repo_name)
+        .await?;
 
     let pr = state
         .db
@@ -177,7 +203,10 @@ pub async fn request_reviewer(
         .await?
         .ok_or_else(|| ForgeError::NotFound("Reviewer user not found".into()))?;
 
-    state.db.request_pr_reviewer(&pr.id, &reviewer.id, &caller.id).await?;
+    state
+        .db
+        .request_pr_reviewer(&pr.id, &reviewer.id, &caller.id)
+        .await?;
 
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
     let notif = UserNotification {
@@ -187,7 +216,10 @@ pub async fn request_reviewer(
         resource_type: "pull_request".to_string(),
         resource_id: pr.id.clone(),
         title: format!("Review requested on PR #{}", pr.pr_number),
-        message: format!("{} requested your review on PR: {}", caller.username, pr.title),
+        message: format!(
+            "{} requested your review on PR: {}",
+            caller.username, pr.title
+        ),
         is_read: false,
         created_at_nanos: now,
     };
@@ -202,7 +234,10 @@ pub async fn list_review_comments(
     Path((owner, repo_name, number)): Path<(String, String, i64)>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.as_ref().map(|Extension(u)| u);
-    let repo = state.repositories.get_repository(caller, &owner, &repo_name).await?;
+    let repo = state
+        .repositories
+        .get_repository(caller, &owner, &repo_name)
+        .await?;
 
     let pr = state
         .db
@@ -245,8 +280,12 @@ pub async fn create_review_comment(
     Path((owner, repo_name, number)): Path<(String, String, i64)>,
     Json(payload): Json<CreateReviewCommentRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required to comment".into()))?;
-    let repo = state.repositories.get_repository(Some(&caller), &owner, &repo_name).await?;
+    let caller =
+        user.ok_or_else(|| ForgeError::Unauthorized("Authentication required to comment".into()))?;
+    let repo = state
+        .repositories
+        .get_repository(Some(&caller), &owner, &repo_name)
+        .await?;
 
     let pr = state
         .db
@@ -256,12 +295,16 @@ pub async fn create_review_comment(
 
     let body = payload.body.trim().to_string();
     if body.is_empty() {
-        return Err(ForgeError::BadRequest("Comment body cannot be empty".into()));
+        return Err(ForgeError::BadRequest(
+            "Comment body cannot be empty".into(),
+        ));
     }
 
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
     let comment_id = format!("prc_{}", uuid::Uuid::new_v4().simple());
-    let commit_id = payload.commit_id.unwrap_or_else(|| pr.head_commit_id.clone());
+    let commit_id = payload
+        .commit_id
+        .unwrap_or_else(|| pr.head_commit_id.clone());
 
     let comment = PullRequestReviewComment {
         id: comment_id.clone(),
@@ -289,9 +332,18 @@ pub async fn resolve_review_comment(
     Json(payload): Json<ResolveCommentRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
-    let repo = state.repositories.get_repository(Some(&caller), &owner, &repo_name).await?;
-    state.permissions.check_write_access(Some(&caller), &repo).await?;
+    let repo = state
+        .repositories
+        .get_repository(Some(&caller), &owner, &repo_name)
+        .await?;
+    state
+        .permissions
+        .check_write_access(Some(&caller), &repo)
+        .await?;
 
-    state.db.resolve_pr_review_comment(&comment_id, payload.resolved).await?;
+    state
+        .db
+        .resolve_pr_review_comment(&comment_id, payload.resolved)
+        .await?;
     Ok(StatusCode::OK)
 }

@@ -2,6 +2,8 @@ pub mod middleware;
 pub mod routes_activity;
 pub mod routes_artifacts;
 pub mod routes_auth;
+pub mod routes_discovery;
+pub mod routes_discussions;
 pub mod routes_health;
 pub mod routes_issues;
 pub mod routes_lfs;
@@ -13,16 +15,14 @@ pub mod routes_pulls;
 pub mod routes_releases;
 pub mod routes_repos;
 pub mod routes_reviews;
+pub mod routes_runners;
+pub mod routes_search;
+pub mod routes_secrets;
+pub mod routes_security;
 pub mod routes_teams;
 pub mod routes_users;
 pub mod routes_webhooks;
 pub mod routes_workflows;
-pub mod routes_runners;
-pub mod routes_secrets;
-pub mod routes_search;
-pub mod routes_discussions;
-pub mod routes_discovery;
-pub mod routes_security;
 
 pub use middleware::AppState;
 
@@ -45,6 +45,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(routes_health::health_liveness))
         .route("/health/live", get(routes_health::health_liveness))
         .route("/health/ready", get(routes_health::health_readiness))
+        .route(
+            "/health/diagnostics",
+            get(routes_health::health_diagnostics),
+        )
         // Auth endpoints
         .route("/api/v1/auth/register", post(routes_auth::register))
         .route("/api/v1/auth/login", post(routes_auth::login))
@@ -101,8 +105,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/orgs/:org_name/members",
-            get(routes_orgs::list_organization_members)
-                .post(routes_orgs::add_or_update_member),
+            get(routes_orgs::list_organization_members).post(routes_orgs::add_or_update_member),
         )
         .route(
             "/api/v1/orgs/:org_name/members/:user_id",
@@ -110,8 +113,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/orgs/:org_name/invitations",
-            get(routes_orgs::list_invitations)
-                .post(routes_orgs::create_invitation),
+            get(routes_orgs::list_invitations).post(routes_orgs::create_invitation),
         )
         .route(
             "/api/v1/orgs/invitations/:token/accept",
@@ -119,8 +121,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/orgs/:org_name/repos",
-            get(routes_orgs::list_org_repositories)
-                .post(routes_orgs::create_org_repository),
+            get(routes_orgs::list_org_repositories).post(routes_orgs::create_org_repository),
         )
         // Team endpoints (Batch 09)
         .route(
@@ -133,8 +134,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/orgs/:org_name/teams/:team_slug/members",
-            get(routes_teams::list_team_members)
-                .post(routes_teams::add_team_member),
+            get(routes_teams::list_team_members).post(routes_teams::add_team_member),
         )
         .route(
             "/api/v1/orgs/:org_name/teams/:team_slug/members/:user_id",
@@ -198,8 +198,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/repos/:owner/:name/issues/:number/comments",
-            get(routes_issues::list_issue_comments)
-                .post(routes_issues::create_issue_comment),
+            get(routes_issues::list_issue_comments).post(routes_issues::create_issue_comment),
         )
         .route(
             "/api/v1/repos/:owner/:name/labels",
@@ -211,24 +210,20 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/repos/:owner/:name/milestones",
-            get(routes_issues::list_milestones)
-                .post(routes_issues::create_milestone),
+            get(routes_issues::list_milestones).post(routes_issues::create_milestone),
         )
         .route(
             "/api/v1/repos/:owner/:name/milestones/:milestone_id",
-            patch(routes_issues::update_milestone)
-                .delete(routes_issues::delete_milestone),
+            patch(routes_issues::update_milestone).delete(routes_issues::delete_milestone),
         )
         // Pull Requests & Native Diffs & Merges (Batch 09)
         .route(
             "/api/v1/repos/:owner/:name/pulls",
-            get(routes_pulls::list_pull_requests)
-                .post(routes_pulls::create_pull_request),
+            get(routes_pulls::list_pull_requests).post(routes_pulls::create_pull_request),
         )
         .route(
             "/api/v1/repos/:owner/:name/pulls/:number",
-            get(routes_pulls::get_pull_request)
-                .patch(routes_pulls::update_pull_request),
+            get(routes_pulls::get_pull_request).patch(routes_pulls::update_pull_request),
         )
         .route(
             "/api/v1/repos/:owner/:name/pulls/:number/diff",
@@ -245,8 +240,7 @@ pub fn build_router(state: AppState) -> Router {
         // Reviews & Review Comments (Batch 09)
         .route(
             "/api/v1/repos/:owner/:name/pulls/:number/reviews",
-            get(routes_reviews::list_reviews)
-                .post(routes_reviews::create_review),
+            get(routes_reviews::list_reviews).post(routes_reviews::create_review),
         )
         .route(
             "/api/v1/repos/:owner/:name/pulls/:number/reviews/:review_id/dismiss",
@@ -258,8 +252,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/repos/:owner/:name/pulls/:number/comments",
-            get(routes_reviews::list_review_comments)
-                .post(routes_reviews::create_review_comment),
+            get(routes_reviews::list_review_comments).post(routes_reviews::create_review_comment),
         )
         .route(
             "/api/v1/repos/:owner/:name/pulls/:number/comments/:comment_id/resolve",
@@ -355,70 +348,221 @@ pub fn build_router(state: AppState) -> Router {
             get(routes_artifacts::download_artifact_version),
         )
         // Package Registry & Cargo (Batch 11)
-        .route("/index/config.json", get(routes_packages::cargo_index_config))
-        .route("/index/:p1/:crate_name", get(routes_packages::cargo_index_entry_single))
-        .route("/index/:p1/:p2/:crate_name", get(routes_packages::cargo_index_entry_double))
+        .route(
+            "/index/config.json",
+            get(routes_packages::cargo_index_config),
+        )
+        .route(
+            "/index/:p1/:crate_name",
+            get(routes_packages::cargo_index_entry_single),
+        )
+        .route(
+            "/index/:p1/:p2/:crate_name",
+            get(routes_packages::cargo_index_entry_double),
+        )
         .route("/api/v1/crates/new", put(routes_packages::cargo_publish))
-        .route("/api/v1/crates/:crate_name/:version/download", get(routes_packages::cargo_download))
-        .route("/api/v1/crates/:crate_name/:version/yank", delete(routes_packages::cargo_yank))
-        .route("/api/v1/crates/:crate_name/:version/unyank", put(routes_packages::cargo_unyank))
+        .route(
+            "/api/v1/crates/:crate_name/:version/download",
+            get(routes_packages::cargo_download),
+        )
+        .route(
+            "/api/v1/crates/:crate_name/:version/yank",
+            delete(routes_packages::cargo_yank),
+        )
+        .route(
+            "/api/v1/crates/:crate_name/:version/unyank",
+            put(routes_packages::cargo_unyank),
+        )
         .route("/api/v1/packages", get(routes_packages::list_packages))
-        .route("/api/v1/packages/:ecosystem/:name", get(routes_packages::get_package))
+        .route(
+            "/api/v1/packages/:ecosystem/:name",
+            get(routes_packages::get_package),
+        )
         // Webhooks (Batch 12)
-        .route("/api/v1/repos/:owner/:repo/webhooks", get(routes_webhooks::list_repo_webhooks).post(routes_webhooks::create_repo_webhook))
-        .route("/api/v1/webhooks/:id", get(routes_webhooks::get_webhook).delete(routes_webhooks::delete_webhook))
-        .route("/api/v1/webhooks/:id/deliveries", get(routes_webhooks::list_webhook_deliveries))
-        .route("/api/v1/orgs/:org/webhooks", get(routes_webhooks::list_org_webhooks).post(routes_webhooks::create_org_webhook))
+        .route(
+            "/api/v1/repos/:owner/:repo/webhooks",
+            get(routes_webhooks::list_repo_webhooks).post(routes_webhooks::create_repo_webhook),
+        )
+        .route(
+            "/api/v1/webhooks/:id",
+            get(routes_webhooks::get_webhook).delete(routes_webhooks::delete_webhook),
+        )
+        .route(
+            "/api/v1/webhooks/:id/deliveries",
+            get(routes_webhooks::list_webhook_deliveries),
+        )
+        .route(
+            "/api/v1/orgs/:org/webhooks",
+            get(routes_webhooks::list_org_webhooks).post(routes_webhooks::create_org_webhook),
+        )
         // Workflows & CI/CD (Batch 12)
-        .route("/api/v1/repos/:owner/:repo/actions/workflows", get(routes_workflows::list_workflows))
-        .route("/api/v1/repos/:owner/:repo/actions/workflows/sync", post(routes_workflows::sync_workflows))
-        .route("/api/v1/repos/:owner/:repo/actions/workflows/:id/dispatches", post(routes_workflows::dispatch_workflow))
-        .route("/api/v1/repos/:owner/:repo/actions/runs", get(routes_workflows::list_runs))
+        .route(
+            "/api/v1/repos/:owner/:repo/actions/workflows",
+            get(routes_workflows::list_workflows),
+        )
+        .route(
+            "/api/v1/repos/:owner/:repo/actions/workflows/sync",
+            post(routes_workflows::sync_workflows),
+        )
+        .route(
+            "/api/v1/repos/:owner/:repo/actions/workflows/:id/dispatches",
+            post(routes_workflows::dispatch_workflow),
+        )
+        .route(
+            "/api/v1/repos/:owner/:repo/actions/runs",
+            get(routes_workflows::list_runs),
+        )
         .route("/api/v1/actions/runs/:id", get(routes_workflows::get_run))
-        .route("/api/v1/actions/runs/:id/cancel", post(routes_workflows::cancel_run))
-        .route("/api/v1/actions/runs/:id/jobs", get(routes_workflows::list_jobs))
+        .route(
+            "/api/v1/actions/runs/:id/cancel",
+            post(routes_workflows::cancel_run),
+        )
+        .route(
+            "/api/v1/actions/runs/:id/jobs",
+            get(routes_workflows::list_jobs),
+        )
         .route("/api/v1/actions/jobs/:id", get(routes_workflows::get_job))
-        .route("/api/v1/actions/jobs/:id/steps", get(routes_workflows::list_steps))
-        .route("/api/v1/actions/jobs/:id/logs", get(routes_workflows::list_logs))
+        .route(
+            "/api/v1/actions/jobs/:id/steps",
+            get(routes_workflows::list_steps),
+        )
+        .route(
+            "/api/v1/actions/jobs/:id/logs",
+            get(routes_workflows::list_logs),
+        )
         // Runners (Batch 12)
         .route("/api/v1/runners", get(routes_runners::list_runners))
-        .route("/api/v1/runners/register", post(routes_runners::register_runner))
+        .route(
+            "/api/v1/runners/register",
+            post(routes_runners::register_runner),
+        )
         .route("/api/v1/runners/heartbeat", post(routes_runners::heartbeat))
-        .route("/api/v1/runners/jobs/acquire", post(routes_runners::acquire_job))
-        .route("/api/v1/runners/jobs/:id/logs", post(routes_runners::ingest_logs))
-        .route("/api/v1/runners/jobs/:id/complete", post(routes_runners::complete_job))
+        .route(
+            "/api/v1/runners/jobs/acquire",
+            post(routes_runners::acquire_job),
+        )
+        .route(
+            "/api/v1/runners/jobs/:id/logs",
+            post(routes_runners::ingest_logs),
+        )
+        .route(
+            "/api/v1/runners/jobs/:id/complete",
+            post(routes_runners::complete_job),
+        )
         // Workflow Secrets (Batch 12)
-        .route("/api/v1/repos/:owner/:repo/secrets", get(routes_secrets::list_repo_secrets))
-        .route("/api/v1/repos/:owner/:repo/secrets/:name", put(routes_secrets::upsert_repo_secret).delete(routes_secrets::delete_repo_secret))
-        .route("/api/v1/orgs/:org/secrets", get(routes_secrets::list_org_secrets))
-        .route("/api/v1/orgs/:org/secrets/:name", put(routes_secrets::upsert_org_secret).delete(routes_secrets::delete_org_secret))
+        .route(
+            "/api/v1/repos/:owner/:repo/secrets",
+            get(routes_secrets::list_repo_secrets),
+        )
+        .route(
+            "/api/v1/repos/:owner/:repo/secrets/:name",
+            put(routes_secrets::upsert_repo_secret).delete(routes_secrets::delete_repo_secret),
+        )
+        .route(
+            "/api/v1/orgs/:org/secrets",
+            get(routes_secrets::list_org_secrets),
+        )
+        .route(
+            "/api/v1/orgs/:org/secrets/:name",
+            put(routes_secrets::upsert_org_secret).delete(routes_secrets::delete_org_secret),
+        )
         // Search (Batch 13)
         .route("/api/v1/search", get(routes_search::search_handler))
         // Discussions (Batch 13)
-        .route("/api/v1/repos/:owner/:repo/discussions/categories", get(routes_discussions::list_categories).post(routes_discussions::create_category))
-        .route("/api/v1/repos/:owner/:repo/discussions", get(routes_discussions::list_discussions).post(routes_discussions::create_discussion))
-        .route("/api/v1/repos/:owner/:repo/discussions/:number", get(routes_discussions::get_discussion).patch(routes_discussions::update_discussion))
-        .route("/api/v1/repos/:owner/:repo/discussions/:number/comments", get(routes_discussions::list_comments).post(routes_discussions::create_comment))
-        .route("/api/v1/repos/:owner/:repo/discussions/:number/answer/:comment_id", post(routes_discussions::mark_answer))
-        .route("/api/v1/repos/:owner/:repo/discussions/:number/comments/:comment_id/reactions", post(routes_discussions::toggle_comment_reaction))
+        .route(
+            "/api/v1/repos/:owner/:repo/discussions/categories",
+            get(routes_discussions::list_categories).post(routes_discussions::create_category),
+        )
+        .route(
+            "/api/v1/repos/:owner/:repo/discussions",
+            get(routes_discussions::list_discussions).post(routes_discussions::create_discussion),
+        )
+        .route(
+            "/api/v1/repos/:owner/:repo/discussions/:number",
+            get(routes_discussions::get_discussion).patch(routes_discussions::update_discussion),
+        )
+        .route(
+            "/api/v1/repos/:owner/:repo/discussions/:number/comments",
+            get(routes_discussions::list_comments).post(routes_discussions::create_comment),
+        )
+        .route(
+            "/api/v1/repos/:owner/:repo/discussions/:number/answer/:comment_id",
+            post(routes_discussions::mark_answer),
+        )
+        .route(
+            "/api/v1/repos/:owner/:repo/discussions/:number/comments/:comment_id/reactions",
+            post(routes_discussions::toggle_comment_reaction),
+        )
         // Discovery, Topics, Languages, Profiles (Batch 13)
-        .route("/api/v1/users/:username/profile", get(routes_discovery::get_profile).put(routes_discovery::update_profile))
-        .route("/api/v1/explore/topics", get(routes_discovery::list_popular_topics))
-        .route("/api/v1/explore/repositories", get(routes_discovery::list_explore_repositories))
-        .route("/api/v1/repos/:owner/:repo/topics", get(routes_discovery::list_repo_topics).put(routes_discovery::set_repo_topics))
-        .route("/api/v1/repos/:owner/:repo/languages", get(routes_discovery::list_repo_languages))
-        .route("/api/v1/repos/:owner/:repo/languages/analyze", post(routes_discovery::analyze_repo_languages))
+        .route(
+            "/api/v1/users/:username/profile",
+            get(routes_discovery::get_profile).put(routes_discovery::update_profile),
+        )
+        .route(
+            "/api/v1/explore/topics",
+            get(routes_discovery::list_popular_topics),
+        )
+        .route(
+            "/api/v1/explore/repositories",
+            get(routes_discovery::list_explore_repositories),
+        )
+        .route(
+            "/api/v1/repos/:owner/:repo/topics",
+            get(routes_discovery::list_repo_topics).put(routes_discovery::set_repo_topics),
+        )
+        .route(
+            "/api/v1/repos/:owner/:repo/languages",
+            get(routes_discovery::list_repo_languages),
+        )
+        .route(
+            "/api/v1/repos/:owner/:repo/languages/analyze",
+            post(routes_discovery::analyze_repo_languages),
+        )
         // Security Center (Batch 13)
-        .route("/api/v1/repos/:owner/:repo/security/scans/secrets", post(routes_security::trigger_secret_scan))
-        .route("/api/v1/repos/:owner/:repo/security/secrets", get(routes_security::list_secret_findings))
-        .route("/api/v1/repos/:owner/:repo/security/secrets/:id", patch(routes_security::remediate_secret_finding))
-        .route("/api/v1/repos/:owner/:repo/security/scans/dependencies", post(routes_security::trigger_dependency_audit))
-        .route("/api/v1/repos/:owner/:repo/security/dependencies", get(routes_security::list_dependencies))
-        .route("/api/v1/repos/:owner/:repo/security/vulnerabilities", get(routes_security::list_vulnerabilities))
-        .route("/api/v1/repos/:owner/:repo/security/vulnerabilities/:id", patch(routes_security::remediate_vulnerability))
-        .route("/api/v1/repos/:owner/:repo/security/sbom/spdx", get(routes_security::export_sbom_spdx))
-        .route("/api/v1/repos/:owner/:repo/security/sbom/cyclonedx", get(routes_security::export_sbom_cyclonedx))
-        .route("/api/v1/repos/:owner/:repo/security/summary", get(routes_security::get_security_summary))
+        .route(
+            "/api/v1/repos/:owner/:repo/security/scans/secrets",
+            post(routes_security::trigger_secret_scan),
+        )
+        .route(
+            "/api/v1/repos/:owner/:repo/security/secrets",
+            get(routes_security::list_secret_findings),
+        )
+        .route(
+            "/api/v1/repos/:owner/:repo/security/secrets/:id",
+            patch(routes_security::remediate_secret_finding),
+        )
+        .route(
+            "/api/v1/repos/:owner/:repo/security/scans/dependencies",
+            post(routes_security::trigger_dependency_audit),
+        )
+        .route(
+            "/api/v1/repos/:owner/:repo/security/dependencies",
+            get(routes_security::list_dependencies),
+        )
+        .route(
+            "/api/v1/repos/:owner/:repo/security/vulnerabilities",
+            get(routes_security::list_vulnerabilities),
+        )
+        .route(
+            "/api/v1/repos/:owner/:repo/security/vulnerabilities/:id",
+            patch(routes_security::remediate_vulnerability),
+        )
+        .route(
+            "/api/v1/repos/:owner/:repo/security/sbom/spdx",
+            get(routes_security::export_sbom_spdx),
+        )
+        .route(
+            "/api/v1/repos/:owner/:repo/security/sbom/cyclonedx",
+            get(routes_security::export_sbom_cyclonedx),
+        )
+        .route(
+            "/api/v1/repos/:owner/:repo/security/summary",
+            get(routes_security::get_security_summary),
+        )
+        .route(
+            "/api/v1/security/advisories/provenance",
+            get(routes_security::get_advisory_provenance),
+        )
         // Layers
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),

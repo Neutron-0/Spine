@@ -92,7 +92,12 @@ struct CREDENTIALW {
 #[link(name = "advapi32")]
 extern "system" {
     fn CredWriteW(credential: *const CREDENTIALW, flags: u32) -> i32;
-    fn CredReadW(target_name: *const u16, r#type: u32, flags: u32, credential: *mut *mut CREDENTIALW) -> i32;
+    fn CredReadW(
+        target_name: *const u16,
+        r#type: u32,
+        flags: u32,
+        credential: *mut *mut CREDENTIALW,
+    ) -> i32;
     fn CredFree(buffer: *mut std::ffi::c_void);
     fn CredDeleteW(target_name: *const u16, r#type: u32, flags: u32) -> i32;
 }
@@ -119,7 +124,10 @@ impl CredentialStorage for WindowsCredentialStorage {
             }
 
             let cred = &*p_cred;
-            let blob_slice = std::slice::from_raw_parts(cred.credential_blob, cred.credential_blob_size as usize);
+            let blob_slice = std::slice::from_raw_parts(
+                cred.credential_blob,
+                cred.credential_blob_size as usize,
+            );
             let blob_str = String::from_utf8_lossy(blob_slice);
 
             // Stored format: username|token|expires_at_nanos
@@ -146,7 +154,10 @@ impl CredentialStorage for WindowsCredentialStorage {
     fn set(&self, creds: HostCredentials) -> Result<()> {
         let mut target = Self::target_name(&creds.host);
         let mut user = Self::to_wide(&creds.username);
-        let blob_str = format!("{}|{}|{}", creds.username, creds.token, creds.expires_at_nanos);
+        let blob_str = format!(
+            "{}|{}|{}",
+            creds.username, creds.token, creds.expires_at_nanos
+        );
         let mut blob_bytes = blob_str.into_bytes();
 
         let cred = CREDENTIALW {
@@ -271,7 +282,8 @@ impl OsCredentialManager {
         #[cfg(windows)]
         let primary: Box<dyn CredentialStorage> = Box::new(WindowsCredentialStorage::new());
         #[cfg(not(windows))]
-        let primary: Box<dyn CredentialStorage> = Box::new(SecureFallbackStorage::new_with_path(fallback.path.clone()));
+        let primary: Box<dyn CredentialStorage> =
+            Box::new(SecureFallbackStorage::new_with_path(fallback.path.clone()));
 
         Self { primary, fallback }
     }

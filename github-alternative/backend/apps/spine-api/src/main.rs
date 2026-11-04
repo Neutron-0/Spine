@@ -2,8 +2,8 @@ use clap::Parser;
 use spine_api::{
     auth::{DevMailCatcher, RateLimiter},
     build_router, AppState, ArtifactService, CargoRegistryAdapter, CoordinatorClient, Database,
-    InMemoryDatabase, NativeVcsService, PackageService, PermissionService, PgDatabase,
-    ProvisioningWorker, ReleaseService, RepositoryService, IsolatedRunnerExecutor, RunnerService,
+    InMemoryDatabase, IsolatedRunnerExecutor, NativeVcsService, PackageService, PermissionService,
+    PgDatabase, ProvisioningWorker, ReleaseService, RepositoryService, RunnerService,
     SsrfValidator, WebhookOutboxWorker, WebhookService, WorkflowScheduler, WorkflowService,
 };
 use std::net::SocketAddr;
@@ -94,7 +94,9 @@ async fn main() -> anyhow::Result<()> {
     let mail = Arc::new(DevMailCatcher::new());
 
     let artifact_store_path = storage_root_canonical.join("artifacts");
-    let artifact_store = Arc::new(spine_artifact::LocalArtifactStore::new(artifact_store_path)?);
+    let artifact_store = Arc::new(spine_artifact::LocalArtifactStore::new(
+        artifact_store_path,
+    )?);
     let artifacts = Arc::new(ArtifactService::new(Arc::clone(&db), artifact_store));
     let releases = Arc::new(ReleaseService::new(Arc::clone(&db), Arc::clone(&artifacts)));
     let packages = Arc::new(PackageService::new(Arc::clone(&db), Arc::clone(&artifacts)));
@@ -103,16 +105,37 @@ async fn main() -> anyhow::Result<()> {
     let ssrf = SsrfValidator::new(false);
     let webhooks = Arc::new(WebhookService::new(Arc::clone(&db), ssrf.clone()));
     let webhook_worker = Arc::new(WebhookOutboxWorker::new(Arc::clone(&db), ssrf));
-    let scheduler = Arc::new(WorkflowScheduler::new(Arc::clone(&db), Some((*webhooks).clone())));
-    let workflows = Arc::new(WorkflowService::new(Arc::clone(&db), Some((*webhooks).clone())));
+    let scheduler = Arc::new(WorkflowScheduler::new(
+        Arc::clone(&db),
+        Some((*webhooks).clone()),
+    ));
+    let workflows = Arc::new(WorkflowService::new(
+        Arc::clone(&db),
+        Some((*webhooks).clone()),
+    ));
     let runners = Arc::new(RunnerService::new(Arc::clone(&db), (*scheduler).clone()));
     let runner_workspace_root = storage_root_canonical.join("runner_workspaces");
     let runner_executor = Arc::new(IsolatedRunnerExecutor::new(runner_workspace_root));
 
-    let search = Arc::new(spine_api::SearchService::new(Arc::clone(&db), Arc::clone(&permissions), storage_root_canonical.clone()));
-    let discussions = Arc::new(spine_api::DiscussionService::new(Arc::clone(&db), Arc::clone(&permissions)));
-    let discovery = Arc::new(spine_api::DiscoveryService::new(Arc::clone(&db), Arc::clone(&permissions), storage_root_canonical.clone()));
-    let security = Arc::new(spine_api::SecurityService::new(Arc::clone(&db), Arc::clone(&permissions), storage_root_canonical.clone()));
+    let search = Arc::new(spine_api::SearchService::new(
+        Arc::clone(&db),
+        Arc::clone(&permissions),
+        storage_root_canonical.clone(),
+    ));
+    let discussions = Arc::new(spine_api::DiscussionService::new(
+        Arc::clone(&db),
+        Arc::clone(&permissions),
+    ));
+    let discovery = Arc::new(spine_api::DiscoveryService::new(
+        Arc::clone(&db),
+        Arc::clone(&permissions),
+        storage_root_canonical.clone(),
+    ));
+    let security = Arc::new(spine_api::SecurityService::new(
+        Arc::clone(&db),
+        Arc::clone(&permissions),
+        storage_root_canonical.clone(),
+    ));
 
     let state = AppState {
         db: Arc::clone(&db),

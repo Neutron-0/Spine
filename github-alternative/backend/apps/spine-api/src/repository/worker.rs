@@ -45,7 +45,12 @@ impl ProvisioningWorker {
             None => {
                 let _ = self
                     .db
-                    .update_job_status(&job.id, ProvisioningStatus::Failed, Some("Repository record missing".into()), now)
+                    .update_job_status(
+                        &job.id,
+                        ProvisioningStatus::Failed,
+                        Some("Repository record missing".into()),
+                        now,
+                    )
                     .await;
                 return Ok(true);
             }
@@ -63,7 +68,12 @@ impl ProvisioningWorker {
         // 1. If coordinator configured, request placement
         if let Some(ref coord) = self.coordinator {
             if let Err(e) = coord
-                .allocate_repository(&repo.native_repo_id, &repo.name, &repo.owner_username, repo.durability_policy)
+                .allocate_repository(
+                    &repo.native_repo_id,
+                    &repo.name,
+                    &repo.owner_username,
+                    repo.durability_policy,
+                )
                 .await
             {
                 let err_msg = format!("Coordinator allocation error: {}", e);
@@ -76,7 +86,10 @@ impl ProvisioningWorker {
                     .db
                     .update_job_status(&job.id, next_status, Some(err_msg.clone()), now)
                     .await;
-                let _ = self.db.update_repository_status(&repo.id, next_status, now).await;
+                let _ = self
+                    .db
+                    .update_repository_status(&repo.id, next_status, now)
+                    .await;
                 return Err(anyhow::anyhow!(err_msg));
             }
         }

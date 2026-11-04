@@ -1451,9 +1451,9 @@ pub struct SecretScanFinding {
     pub line_number: i32,
     pub rule_id: String,
     pub rule_name: String,
-    pub severity: String, // "CRITICAL", "HIGH", "MEDIUM", "LOW"
+    pub severity: String,         // "CRITICAL", "HIGH", "MEDIUM", "LOW"
     pub safe_fingerprint: String, // Truncated safe hash (NEVER plaintext secret!)
-    pub status: String,   // "OPEN", "RESOLVED", "FALSE_POSITIVE"
+    pub status: String,           // "OPEN", "RESOLVED", "FALSE_POSITIVE"
     pub created_at_nanos: i64,
     pub resolved_at_nanos: Option<i64>,
 }
@@ -1509,4 +1509,3 @@ pub struct SecuritySummaryDto {
     pub medium_count: usize,
     pub low_count: usize,
 }
-

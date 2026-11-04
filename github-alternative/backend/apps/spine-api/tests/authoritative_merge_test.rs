@@ -15,7 +15,9 @@ fn setup_repo_for_merge(tmp: &TempDir, native_repo_id: &str) -> (ObjectId, Objec
     let store = CompositeObjectStore::new(&spine_dir, HashAlgorithm::Blake3, 3).unwrap();
 
     // 1. Initial base commit
-    let b1 = store.write_object(ObjectType::Blob, b"base content\n").unwrap();
+    let b1 = store
+        .write_object(ObjectType::Blob, b"base content\n")
+        .unwrap();
     let tree_1 = store
         .write_object(
             ObjectType::Tree,
@@ -37,11 +39,19 @@ fn setup_repo_for_merge(tmp: &TempDir, native_repo_id: &str) -> (ObjectId, Objec
         1000,
         "Initial commit".into(),
     );
-    let c1_id = store.write_object(ObjectType::Commit, &serialize_commit(&c1)).unwrap();
-    fs::write(spine_dir.join("refs").join("heads").join("main"), format!("{}\n", c1_id.to_hex())).unwrap();
+    let c1_id = store
+        .write_object(ObjectType::Commit, &serialize_commit(&c1))
+        .unwrap();
+    fs::write(
+        spine_dir.join("refs").join("heads").join("main"),
+        format!("{}\n", c1_id.to_hex()),
+    )
+    .unwrap();
 
     // 2. Feature branch commit
-    let b2 = store.write_object(ObjectType::Blob, b"feature content\n").unwrap();
+    let b2 = store
+        .write_object(ObjectType::Blob, b"feature content\n")
+        .unwrap();
     let tree_2 = store
         .write_object(
             ObjectType::Tree,
@@ -70,8 +80,14 @@ fn setup_repo_for_merge(tmp: &TempDir, native_repo_id: &str) -> (ObjectId, Objec
         2000,
         "Add new feature".into(),
     );
-    let c2_id = store.write_object(ObjectType::Commit, &serialize_commit(&c2)).unwrap();
-    fs::write(spine_dir.join("refs").join("heads").join("feature"), format!("{}\n", c2_id.to_hex())).unwrap();
+    let c2_id = store
+        .write_object(ObjectType::Commit, &serialize_commit(&c2))
+        .unwrap();
+    fs::write(
+        spine_dir.join("refs").join("heads").join("feature"),
+        format!("{}\n", c2_id.to_hex()),
+    )
+    .unwrap();
 
     (c1_id, c2_id)
 }
@@ -156,7 +172,10 @@ async fn test_authoritative_merge_rejects_active_changes_requested() {
         )
         .await;
 
-    assert!(result.is_err(), "PR merge must be rejected when changes are requested");
+    assert!(
+        result.is_err(),
+        "PR merge must be rejected when changes are requested"
+    );
     let err_str = result.err().unwrap().to_string();
     assert!(err_str.contains("CHANGES_REQUESTED") || err_str.contains("rejected"));
 }

@@ -19,7 +19,11 @@ fn test_authenticated_e2e_remote_hosting_workflow() {
         .unwrap();
     assert!(out.status.success());
 
-    fs::write(server_repo_dir.join("README.md"), "# Spine Project\nHosted on Native Daemon\n").unwrap();
+    fs::write(
+        server_repo_dir.join("README.md"),
+        "# Spine Project\nHosted on Native Daemon\n",
+    )
+    .unwrap();
     let out = Command::new(spine_bin)
         .args(["add", "README.md"])
         .current_dir(&server_repo_dir)
@@ -102,11 +106,19 @@ fn test_authenticated_e2e_remote_hosting_workflow() {
         .env("SPINE_CAPABILITY_TICKET", &signed_write_ticket)
         .output()
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(client1_dir.join("README.md").is_file());
 
     // 5. Client 1: Add file and push with contributor ticket
-    fs::write(client1_dir.join("contributor_work.rs"), "pub fn compute() -> i32 { 42 }\n").unwrap();
+    fs::write(
+        client1_dir.join("contributor_work.rs"),
+        "pub fn compute() -> i32 { 42 }\n",
+    )
+    .unwrap();
     let out = Command::new(spine_bin)
         .args(["add", "contributor_work.rs"])
         .current_dir(&client1_dir)
@@ -127,7 +139,11 @@ fn test_authenticated_e2e_remote_hosting_workflow() {
         .env("SPINE_CAPABILITY_TICKET", &signed_write_ticket)
         .output()
         .unwrap();
-    assert!(out.status.success(), "Push failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "Push failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // 6. Reader-only client tries to push: must be rejected with authorization failure
     let client2_parent = tempdir().unwrap();
@@ -142,8 +158,14 @@ fn test_authenticated_e2e_remote_hosting_workflow() {
     assert!(client2_dir.join("contributor_work.rs").is_file());
 
     fs::write(client2_dir.join("hacked.txt"), "unauthorized change\n").unwrap();
-    let _ = Command::new(spine_bin).args(["add", "hacked.txt"]).current_dir(&client2_dir).output();
-    let _ = Command::new(spine_bin).args(["commit", "-m", "Bob trying to push"]).current_dir(&client2_dir).output();
+    let _ = Command::new(spine_bin)
+        .args(["add", "hacked.txt"])
+        .current_dir(&client2_dir)
+        .output();
+    let _ = Command::new(spine_bin)
+        .args(["commit", "-m", "Bob trying to push"])
+        .current_dir(&client2_dir)
+        .output();
 
     let out = Command::new(spine_bin)
         .args(["push", "origin", "main"])

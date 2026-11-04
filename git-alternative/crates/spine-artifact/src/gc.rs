@@ -155,11 +155,22 @@ mod tests {
             (chunk_a.len() + chunk_b.len()) as u64,
             chunk_a.len() as u32,
             vec![
-                ChunkEntry { index: 0, offset: 0, length: chunk_a.len() as u32, chunk_hash: hash_a.clone() },
-                ChunkEntry { index: 1, offset: chunk_a.len() as u64, length: chunk_b.len() as u32, chunk_hash: hash_b.clone() },
+                ChunkEntry {
+                    index: 0,
+                    offset: 0,
+                    length: chunk_a.len() as u32,
+                    chunk_hash: hash_a.clone(),
+                },
+                ChunkEntry {
+                    index: 1,
+                    offset: chunk_a.len() as u64,
+                    length: chunk_b.len() as u32,
+                    chunk_hash: hash_b.clone(),
+                },
             ],
             None,
-        ).unwrap();
+        )
+        .unwrap();
         let m1_id = store.store_manifest(&m1).unwrap();
 
         // Manifest 2 (Cargo Crate): [Chunk B, Chunk C]
@@ -169,11 +180,22 @@ mod tests {
             (chunk_b.len() + chunk_c.len()) as u64,
             chunk_b.len() as u32,
             vec![
-                ChunkEntry { index: 0, offset: 0, length: chunk_b.len() as u32, chunk_hash: hash_b.clone() },
-                ChunkEntry { index: 1, offset: chunk_b.len() as u64, length: chunk_c.len() as u32, chunk_hash: hash_c.clone() },
+                ChunkEntry {
+                    index: 0,
+                    offset: 0,
+                    length: chunk_b.len() as u32,
+                    chunk_hash: hash_b.clone(),
+                },
+                ChunkEntry {
+                    index: 1,
+                    offset: chunk_b.len() as u64,
+                    length: chunk_c.len() as u32,
+                    chunk_hash: hash_c.clone(),
+                },
             ],
             None,
-        ).unwrap();
+        )
+        .unwrap();
         let m2_id = store.store_manifest(&m2).unwrap();
 
         // Manifest 3 (LFS Pointer): [Chunk D]
@@ -182,33 +204,59 @@ mod tests {
             "hash_lfs".into(),
             chunk_d.len() as u64,
             chunk_d.len() as u32,
-            vec![
-                ChunkEntry { index: 0, offset: 0, length: chunk_d.len() as u32, chunk_hash: hash_d.clone() },
-            ],
+            vec![ChunkEntry {
+                index: 0,
+                offset: 0,
+                length: chunk_d.len() as u32,
+                chunk_hash: hash_d.clone(),
+            }],
             None,
-        ).unwrap();
+        )
+        .unwrap();
         let m3_id = store.store_manifest(&m3).unwrap();
 
-        let all_chunks = vec![hash_a.clone(), hash_b.clone(), hash_c.clone(), hash_d.clone()];
+        let all_chunks = vec![
+            hash_a.clone(),
+            hash_b.clone(),
+            hash_c.clone(),
+            hash_d.clone(),
+        ];
 
         // Phase 1: All 3 manifests active -> all 4 chunks reachable (0 candidates)
-        let rep1 = ArtifactGcCollector::collect_garbage(&store, &[m1_id.clone(), m2_id.clone(), m3_id.clone()], &all_chunks, false).unwrap();
+        let rep1 = ArtifactGcCollector::collect_garbage(
+            &store,
+            &[m1_id.clone(), m2_id.clone(), m3_id.clone()],
+            &all_chunks,
+            false,
+        )
+        .unwrap();
         assert_eq!(rep1.reachable_chunks, 4);
         assert_eq!(rep1.candidate_chunks, 0);
 
         // Phase 2: Release deleted (m1 omitted). m2 and m3 active.
         // Chunk A becomes orphan.
         // Chunk B MUST remain preserved because m2 still references it!
-        let rep2 = ArtifactGcCollector::collect_garbage(&store, &[m2_id.clone(), m3_id.clone()], &all_chunks, false).unwrap();
+        let rep2 = ArtifactGcCollector::collect_garbage(
+            &store,
+            &[m2_id.clone(), m3_id.clone()],
+            &all_chunks,
+            false,
+        )
+        .unwrap();
         assert_eq!(rep2.reachable_chunks, 3); // B, C, D
         assert_eq!(rep2.candidate_chunks, 1); // Only A is candidate
         assert_eq!(rep2.reclaimed_bytes, chunk_a.len() as u64);
 
         // Phase 3: Cargo crate also deleted (m2 omitted). Only m3 active.
         // Chunks A, B, C become candidates. Only D is preserved.
-        let rep3 = ArtifactGcCollector::collect_garbage(&store, &[m3_id.clone()], &all_chunks, false).unwrap();
+        let rep3 =
+            ArtifactGcCollector::collect_garbage(&store, &[m3_id.clone()], &all_chunks, false)
+                .unwrap();
         assert_eq!(rep3.reachable_chunks, 1); // Only D
         assert_eq!(rep3.candidate_chunks, 3); // A, B, C
-        assert_eq!(rep3.reclaimed_bytes, (chunk_a.len() + chunk_b.len() + chunk_c.len()) as u64);
+        assert_eq!(
+            rep3.reclaimed_bytes,
+            (chunk_a.len() + chunk_b.len() + chunk_c.len()) as u64
+        );
     }
 }

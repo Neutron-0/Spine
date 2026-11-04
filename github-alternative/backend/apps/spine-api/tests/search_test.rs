@@ -55,7 +55,15 @@ async fn test_permission_aware_global_and_code_search() {
     db.create_repository(public_repo).await.unwrap();
 
     // Set topic
-    state.discovery.set_repository_topics("user-alice", "repo-pub", &["distributed-systems".to_string(), "rust".to_string()]).await.unwrap();
+    state
+        .discovery
+        .set_repository_topics(
+            "user-alice",
+            "repo-pub",
+            &["distributed-systems".to_string(), "rust".to_string()],
+        )
+        .await
+        .unwrap();
 
     // Add source file to public repo
     let pub_code_dir = storage_root.join("repo-pub/src");
@@ -103,31 +111,57 @@ async fn test_permission_aware_global_and_code_search() {
 
     assert_eq!(anon_code_res.total, 1);
     assert_eq!(anon_code_res.hits[0].repo_id, "repo-pub");
-    assert_eq!(anon_code_res.hits[0].file_path.as_deref(), Some("src/engine.rs"));
+    assert_eq!(
+        anon_code_res.hits[0].file_path.as_deref(),
+        Some("src/engine.rs")
+    );
     assert_eq!(anon_code_res.hits[0].line_number, Some(1));
-    assert!(anon_code_res.hits[0].snippet.contains("initialize_quantum_engine"));
+    assert!(anon_code_res.hits[0]
+        .snippet
+        .contains("initialize_quantum_engine"));
 
     // 5. Anonymous Search for secret payload should find 0 results (Permission Isolation)
     let anon_priv_res = state
         .search
-        .search("SUPER_SECRET_ALGORITHM_XYZ", Some(SearchResultType::Code), None, None)
+        .search(
+            "SUPER_SECRET_ALGORITHM_XYZ",
+            Some(SearchResultType::Code),
+            None,
+            None,
+        )
         .await
         .unwrap();
-    assert_eq!(anon_priv_res.total, 0, "Anonymous search must not reveal private repo code");
+    assert_eq!(
+        anon_priv_res.total, 0,
+        "Anonymous search must not reveal private repo code"
+    );
 
     // 6. Authenticated Search by Alice for secret payload should succeed
     let alice_priv_res = state
         .search
-        .search("SUPER_SECRET_ALGORITHM_XYZ", Some(SearchResultType::Code), None, Some("user-alice"))
+        .search(
+            "SUPER_SECRET_ALGORITHM_XYZ",
+            Some(SearchResultType::Code),
+            None,
+            Some("user-alice"),
+        )
         .await
         .unwrap();
-    assert_eq!(alice_priv_res.total, 1, "Repository owner must be able to search private code");
+    assert_eq!(
+        alice_priv_res.total, 1,
+        "Repository owner must be able to search private code"
+    );
     assert_eq!(alice_priv_res.hits[0].repo_id, "repo-priv");
 
     // 7. Search for repository by topic
     let topic_res = state
         .search
-        .search("distributed-systems", Some(SearchResultType::Repository), None, None)
+        .search(
+            "distributed-systems",
+            Some(SearchResultType::Repository),
+            None,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(topic_res.total, 1);

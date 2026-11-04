@@ -22,7 +22,9 @@ impl ReleaseService {
     ) -> Result<ReleaseDto, ForgeError> {
         let tag_name = req.tag_name.trim();
         if tag_name.is_empty() {
-            return Err(ForgeError::BadRequest("Tag name cannot be empty".to_string()));
+            return Err(ForgeError::BadRequest(
+                "Tag name cannot be empty".to_string(),
+            ));
         }
 
         // Check if release with same tag exists
@@ -71,19 +73,32 @@ impl ReleaseService {
         self.to_dto(rel, assets).await
     }
 
-    pub async fn get_release_by_tag(&self, repo_id: &str, tag_name: &str) -> Result<ReleaseDto, ForgeError> {
+    pub async fn get_release_by_tag(
+        &self,
+        repo_id: &str,
+        tag_name: &str,
+    ) -> Result<ReleaseDto, ForgeError> {
         let rel = self
             .db
             .get_release_by_tag(repo_id, tag_name)
             .await?
-            .ok_or_else(|| ForgeError::NotFound(format!("Release with tag '{}' not found", tag_name)))?;
+            .ok_or_else(|| {
+                ForgeError::NotFound(format!("Release with tag '{}' not found", tag_name))
+            })?;
 
         let assets = self.db.list_assets_for_release(&rel.id).await?;
         self.to_dto(rel, assets).await
     }
 
-    pub async fn list_releases(&self, repo_id: &str, include_drafts: bool) -> Result<Vec<ReleaseDto>, ForgeError> {
-        let list = self.db.list_releases_for_repo(repo_id, include_drafts).await?;
+    pub async fn list_releases(
+        &self,
+        repo_id: &str,
+        include_drafts: bool,
+    ) -> Result<Vec<ReleaseDto>, ForgeError> {
+        let list = self
+            .db
+            .list_releases_for_repo(repo_id, include_drafts)
+            .await?;
         let mut dtos = Vec::with_capacity(list.len());
         for rel in list {
             let assets = self.db.list_assets_for_release(&rel.id).await?;
@@ -154,7 +169,11 @@ impl ReleaseService {
             .ok_or_else(|| ForgeError::NotFound("Repository not found".to_string()))?;
 
         // Ingest into unified artifact store under repository owner
-        let owner_type = if repo.owner_org_id.is_some() { "organization" } else { "user" };
+        let owner_type = if repo.owner_org_id.is_some() {
+            "organization"
+        } else {
+            "user"
+        };
         let owner_id = repo.owner_org_id.as_deref().unwrap_or(&repo.owner_user_id);
 
         let stored = self
@@ -189,17 +208,22 @@ impl ReleaseService {
         Ok(ReleaseAssetDto::from(&created))
     }
 
-    pub async fn download_asset(&self, asset_id: &str) -> Result<(ReleaseAsset, Vec<u8>), ForgeError> {
-        let mut asset = self
-            .db
-            .get_release_asset(asset_id)
-            .await?
-            .ok_or_else(|| ForgeError::NotFound(format!("Release asset {} not found", asset_id)))?;
+    pub async fn download_asset(
+        &self,
+        asset_id: &str,
+    ) -> Result<(ReleaseAsset, Vec<u8>), ForgeError> {
+        let mut asset =
+            self.db.get_release_asset(asset_id).await?.ok_or_else(|| {
+                ForgeError::NotFound(format!("Release asset {} not found", asset_id))
+            })?;
 
         self.db.increment_asset_downloads(asset_id).await?;
         asset.downloads_count += 1;
 
-        let bytes = self.artifacts.reconstruct_object(&asset.manifest_id).await?;
+        let bytes = self
+            .artifacts
+            .reconstruct_object(&asset.manifest_id)
+            .await?;
         Ok((asset, bytes))
     }
 
@@ -207,7 +231,11 @@ impl ReleaseService {
         self.db.delete_release_asset(asset_id).await
     }
 
-    async fn to_dto(&self, rel: Release, assets: Vec<ReleaseAsset>) -> Result<ReleaseDto, ForgeError> {
+    async fn to_dto(
+        &self,
+        rel: Release,
+        assets: Vec<ReleaseAsset>,
+    ) -> Result<ReleaseDto, ForgeError> {
         let user = self
             .db
             .get_user_by_id(&rel.author_id)

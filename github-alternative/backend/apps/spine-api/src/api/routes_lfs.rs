@@ -82,7 +82,11 @@ pub async fn lfs_batch(
     let mut response_objects = Vec::new();
 
     if payload.operation == "upload" {
-        let owner_type = if repo.owner_org_id.is_some() { "organization" } else { "user" };
+        let owner_type = if repo.owner_org_id.is_some() {
+            "organization"
+        } else {
+            "user"
+        };
         let owner_id = repo.owner_org_id.as_deref().unwrap_or(&repo.owner_user_id);
 
         for obj in payload.objects {

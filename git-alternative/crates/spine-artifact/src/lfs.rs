@@ -112,8 +112,7 @@ impl LfsPointer {
 
     /// Fast predicate to check if bytes begin with the LFS header.
     pub fn is_lfs_pointer_bytes(bytes: &[u8]) -> bool {
-        bytes.starts_with(Self::HEADER.as_bytes())
-            || bytes.starts_with(b"version https://")
+        bytes.starts_with(Self::HEADER.as_bytes()) || bytes.starts_with(b"version https://")
     }
 }
 

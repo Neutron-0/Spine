@@ -1,6 +1,6 @@
 use spine_artifact::{
-    ArtifactGcCollector, ArtifactStore, LocalArtifactStore, LfsPointer,
-    LfsTrackingRules, ObjectReconstructor, StreamChunker,
+    ArtifactGcCollector, ArtifactStore, LfsPointer, LfsTrackingRules, LocalArtifactStore,
+    ObjectReconstructor, StreamChunker,
 };
 use std::io::Cursor;
 use tempfile::tempdir;
@@ -38,7 +38,8 @@ fn test_lfs_pointer_parsing_and_encoding() {
         "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize {}\nmanifest_oid {}\n",
         object_hash, size_bytes, manifest_oid
     );
-    let parsed_multi = LfsPointer::parse(&multiline).expect("Multi-line pointer parse should succeed");
+    let parsed_multi =
+        LfsPointer::parse(&multiline).expect("Multi-line pointer parse should succeed");
     assert_eq!(parsed_multi.manifest_oid, manifest_oid);
     assert_eq!(parsed_multi.size_bytes, size_bytes);
 }
@@ -126,7 +127,11 @@ fn test_lfs_storage_chunking_and_reconstruction() {
 
     // Garbage collection verification
     let active_manifest_ids = vec![manifest_oid.clone()];
-    let all_chunk_hashes: Vec<String> = chunk_res.chunks.iter().map(|c| c.entry.chunk_hash.clone()).collect();
+    let all_chunk_hashes: Vec<String> = chunk_res
+        .chunks
+        .iter()
+        .map(|c| c.entry.chunk_hash.clone())
+        .collect();
 
     let gc_report = ArtifactGcCollector::collect_garbage(
         &store,

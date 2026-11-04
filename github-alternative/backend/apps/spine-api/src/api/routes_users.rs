@@ -87,10 +87,14 @@ pub async fn create_pat(
 ) -> Result<impl IntoResponse, ForgeError> {
     let name = payload.name.trim();
     if name.is_empty() || name.len() > 100 {
-        return Err(ForgeError::BadRequest("Token name must be 1-100 characters".into()));
+        return Err(ForgeError::BadRequest(
+            "Token name must be 1-100 characters".into(),
+        ));
     }
 
-    let scopes = payload.scopes.unwrap_or_else(|| vec!["repo:read".into(), "repo:write".into()]);
+    let scopes = payload
+        .scopes
+        .unwrap_or_else(|| vec!["repo:read".into(), "repo:write".into()]);
     let days = payload.expiry_days.unwrap_or(30).clamp(1, 365);
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
     let expires_at = now + (days * 24 * 3600 * 1_000_000_000);

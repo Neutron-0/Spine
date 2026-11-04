@@ -68,7 +68,10 @@ impl LocalArtifactStore {
         } else {
             "xx"
         };
-        self.root_dir.join("manifests").join(prefix).join(format!("{}.json", manifest_id))
+        self.root_dir
+            .join("manifests")
+            .join(prefix)
+            .join(format!("{}.json", manifest_id))
     }
 }
 
@@ -245,7 +248,10 @@ impl ArtifactStore for DistributedArtifactStore {
 
     fn has_manifest(&self, manifest_id: &str) -> bool {
         self.local.has_manifest(manifest_id)
-            || self.replica_stores.iter().any(|r| r.has_manifest(manifest_id))
+            || self
+                .replica_stores
+                .iter()
+                .any(|r| r.has_manifest(manifest_id))
     }
 
     fn verify_artifact_durability(

@@ -19,7 +19,10 @@ async fn test_cargo_registry_sparse_index_and_publish_protocol() {
     assert_eq!(CargoRegistryAdapter::crate_prefix("a"), "1");
     assert_eq!(CargoRegistryAdapter::crate_prefix("ab"), "2");
     assert_eq!(CargoRegistryAdapter::crate_prefix("abc"), "3/a");
-    assert_eq!(CargoRegistryAdapter::crate_prefix("spine-artifact"), "sp/in");
+    assert_eq!(
+        CargoRegistryAdapter::crate_prefix("spine-artifact"),
+        "sp/in"
+    );
 
     // 2. Verify sparse index config JSON
     let config = CargoRegistryAdapter::config_json("http://127.0.0.1:3000");
@@ -106,8 +109,13 @@ async fn test_cargo_registry_sparse_index_and_publish_protocol() {
         .await
         .expect("Yank should succeed");
 
-    let yanked_index = cargo.get_index_file("spine-test-crate").await.unwrap().unwrap();
-    let yanked_entry: serde_json::Value = serde_json::from_str(yanked_index.lines().next().unwrap()).unwrap();
+    let yanked_index = cargo
+        .get_index_file("spine-test-crate")
+        .await
+        .unwrap()
+        .unwrap();
+    let yanked_entry: serde_json::Value =
+        serde_json::from_str(yanked_index.lines().next().unwrap()).unwrap();
     assert_eq!(yanked_entry["yanked"], true);
 
     cargo
@@ -115,8 +123,13 @@ async fn test_cargo_registry_sparse_index_and_publish_protocol() {
         .await
         .expect("Unyank should succeed");
 
-    let unyanked_index = cargo.get_index_file("spine-test-crate").await.unwrap().unwrap();
-    let unyanked_entry: serde_json::Value = serde_json::from_str(unyanked_index.lines().next().unwrap()).unwrap();
+    let unyanked_index = cargo
+        .get_index_file("spine-test-crate")
+        .await
+        .unwrap()
+        .unwrap();
+    let unyanked_entry: serde_json::Value =
+        serde_json::from_str(unyanked_index.lines().next().unwrap()).unwrap();
     assert_eq!(unyanked_entry["yanked"], false);
 
     // 8. Immutability: Attempting to publish same version again must fail

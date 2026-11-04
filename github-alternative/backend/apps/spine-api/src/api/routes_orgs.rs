@@ -62,10 +62,14 @@ pub async fn create_organization(
     user: Option<Extension<User>>,
     Json(payload): Json<CreateOrgRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let creator = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required to create organization".into()))?;
+    let creator = user.ok_or_else(|| {
+        ForgeError::Unauthorized("Authentication required to create organization".into())
+    })?;
     let name = payload.name.trim().to_string();
     if name.is_empty() || name.len() > 100 {
-        return Err(ForgeError::BadRequest("Invalid organization name length".into()));
+        return Err(ForgeError::BadRequest(
+            "Invalid organization name length".into(),
+        ));
     }
     let norm = name.to_lowercase();
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -111,7 +115,10 @@ pub async fn get_organization(
         .await?
         .ok_or_else(|| ForgeError::NotFound("Organization not found".into()))?;
 
-    state.permissions.check_org_read_access(caller, &org).await?;
+    state
+        .permissions
+        .check_org_read_access(caller, &org)
+        .await?;
     Ok(Json(OrganizationDto::from(&org)))
 }
 
@@ -161,7 +168,9 @@ pub async fn delete_organization(
         .ok_or_else(|| ForgeError::NotFound("Organization not found".into()))?;
 
     if org.owner_user_id != caller.id {
-        return Err(ForgeError::Forbidden("Only organization owner may delete organization".into()));
+        return Err(ForgeError::Forbidden(
+            "Only organization owner may delete organization".into(),
+        ));
     }
 
     state.db.delete_organization(&org.id).await?;
@@ -180,7 +189,10 @@ pub async fn list_organization_members(
         .await?
         .ok_or_else(|| ForgeError::NotFound("Organization not found".into()))?;
 
-    state.permissions.check_org_read_access(caller, &org).await?;
+    state
+        .permissions
+        .check_org_read_access(caller, &org)
+        .await?;
     let members = state.db.list_organization_members(&org.id).await?;
 
     let mut dtos = Vec::new();
@@ -265,10 +277,15 @@ pub async fn remove_member(
     state.permissions.check_org_admin(&caller, &org.id).await?;
 
     if org.owner_user_id == user_id {
-        return Err(ForgeError::Forbidden("Cannot remove organization owner".into()));
+        return Err(ForgeError::Forbidden(
+            "Cannot remove organization owner".into(),
+        ));
     }
 
-    state.db.remove_organization_member(&org.id, &user_id).await?;
+    state
+        .db
+        .remove_organization_member(&org.id, &user_id)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -286,7 +303,8 @@ pub async fn list_invitations(
 
     state.permissions.check_org_admin(&caller, &org.id).await?;
     let invs = state.db.list_organization_invitations(&org.id).await?;
-    let dtos: Vec<OrganizationInvitationDto> = invs.iter().map(OrganizationInvitationDto::from).collect();
+    let dtos: Vec<OrganizationInvitationDto> =
+        invs.iter().map(OrganizationInvitationDto::from).collect();
     Ok(Json(dtos))
 }
 
@@ -311,7 +329,11 @@ pub async fn create_invitation(
         .map(OrganizationRole::from_str_lossy)
         .unwrap_or(OrganizationRole::Member);
 
-    let raw_token = format!("{}_{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+    let raw_token = format!(
+        "{}_{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
     let token_hash = blake3::hash(raw_token.as_bytes()).to_hex().to_string();
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
     let expires = now + 7 * 24 * 3600 * 1_000_000_000;
@@ -330,10 +352,13 @@ pub async fn create_invitation(
     };
 
     let created = state.db.create_organization_invitation(inv).await?;
-    Ok((StatusCode::CREATED, Json(serde_json::json!({
-        "invitation": OrganizationInvitationDto::from(&created),
-        "invitation_token": raw_token
-    }))))
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "invitation": OrganizationInvitationDto::from(&created),
+            "invitation_token": raw_token
+        })),
+    ))
 }
 
 pub async fn accept_invitation(
@@ -341,7 +366,9 @@ pub async fn accept_invitation(
     user: Option<Extension<User>>,
     Path(token): Path<String>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required to accept invitation".into()))?;
+    let caller = user.ok_or_else(|| {
+        ForgeError::Unauthorized("Authentication required to accept invitation".into())
+    })?;
     let token_hash = blake3::hash(token.as_bytes()).to_hex().to_string();
     let inv = state
         .db
@@ -350,7 +377,9 @@ pub async fn accept_invitation(
         .ok_or_else(|| ForgeError::NotFound("Invitation not found or expired".into()))?;
 
     if inv.status != "PENDING" {
-        return Err(ForgeError::BadRequest("Invitation is no longer pending".into()));
+        return Err(ForgeError::BadRequest(
+            "Invitation is no longer pending".into(),
+        ));
     }
 
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -358,7 +387,10 @@ pub async fn accept_invitation(
         return Err(ForgeError::BadRequest("Invitation has expired".into()));
     }
 
-    state.db.update_organization_invitation_status(&inv.id, "ACCEPTED", now).await?;
+    state
+        .db
+        .update_organization_invitation_status(&inv.id, "ACCEPTED", now)
+        .await?;
 
     let membership = OrganizationMembership {
         id: format!("mem_{}", uuid::Uuid::new_v4().simple()),
@@ -384,12 +416,20 @@ pub async fn list_org_repositories(
         .await?
         .ok_or_else(|| ForgeError::NotFound("Organization not found".into()))?;
 
-    state.permissions.check_org_read_access(caller, &org).await?;
+    state
+        .permissions
+        .check_org_read_access(caller, &org)
+        .await?;
     let repos = state.db.list_repositories_for_org(&org.id).await?;
 
     let mut dtos = Vec::new();
     for r in repos {
-        if state.permissions.check_read_access(caller, &r).await.is_ok() {
+        if state
+            .permissions
+            .check_read_access(caller, &r)
+            .await
+            .is_ok()
+        {
             dtos.push(RepositoryDto::from(&r));
         }
     }
@@ -469,5 +509,8 @@ pub async fn create_org_repository(
     };
     let _ = state.db.create_provisioning_job(job).await;
 
-    Ok((StatusCode::CREATED, Json(RepositoryDto::from(&created_repo))))
+    Ok((
+        StatusCode::CREATED,
+        Json(RepositoryDto::from(&created_repo)),
+    ))
 }

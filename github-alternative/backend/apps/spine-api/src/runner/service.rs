@@ -1,6 +1,6 @@
-use std::sync::Arc;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
@@ -60,7 +60,11 @@ impl RunnerService {
     }
 
     /// Authenticate a runner using its raw registration token.
-    pub async fn authenticate_runner(&self, runner_id: &str, raw_token: &str) -> Result<RunnerRegistration, ForgeError> {
+    pub async fn authenticate_runner(
+        &self,
+        runner_id: &str,
+        raw_token: &str,
+    ) -> Result<RunnerRegistration, ForgeError> {
         let runner = self
             .db
             .get_runner_by_id(runner_id)
@@ -75,7 +79,11 @@ impl RunnerService {
         hasher.update(raw_token.as_bytes());
         let computed_hash = hex::encode(hasher.finalize());
 
-        if computed_hash.as_bytes().ct_eq(runner.token_hash.as_bytes()).into() {
+        if computed_hash
+            .as_bytes()
+            .ct_eq(runner.token_hash.as_bytes())
+            .into()
+        {
             Ok(runner)
         } else {
             Err(ForgeError::Unauthorized("Invalid runner token".to_string()))
@@ -85,7 +93,9 @@ impl RunnerService {
     /// Record a runner heartbeat.
     pub async fn heartbeat(&self, runner_id: &str, active_jobs: i32) -> Result<(), ForgeError> {
         let now_nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        self.db.update_runner_heartbeat(runner_id, active_jobs, now_nanos).await
+        self.db
+            .update_runner_heartbeat(runner_id, active_jobs, now_nanos)
+            .await
     }
 
     /// Acquire a queued job matching the runner's supported labels.
@@ -99,10 +109,11 @@ impl RunnerService {
 
         for mut job in queued {
             // Check if runner satisfies all runs_on labels
-            let can_run = job
-                .runs_on
-                .iter()
-                .all(|req| runner_labels.iter().any(|label| label.eq_ignore_ascii_case(req)));
+            let can_run = job.runs_on.iter().all(|req| {
+                runner_labels
+                    .iter()
+                    .any(|label| label.eq_ignore_ascii_case(req))
+            });
 
             if !can_run {
                 continue;
@@ -123,7 +134,18 @@ impl RunnerService {
             job.lease_expires_at_nanos = Some(lease_expires_at);
 
             let steps = self.db.list_workflow_steps(&job.id).await?;
-            let secrets = self.db.list_workflow_secrets("REPO", &job.repo_id).await?;
+            let run = self.db.get_workflow_run(&job.run_id).await?;
+            let is_fork_or_untrusted_pr = run
+                .as_ref()
+                .map(|r| r.trigger_event == "pull_request_fork" || r.trigger_event == "fork")
+                .unwrap_or(false);
+
+            let secrets = if is_fork_or_untrusted_pr {
+                // Forked pull-request workflows must not receive repository or organization secrets by default
+                vec![]
+            } else {
+                self.db.list_workflow_secrets("REPO", &job.repo_id).await?
+            };
 
             return Ok(Some((job, steps, secrets)));
         }
@@ -149,7 +171,9 @@ impl RunnerService {
 
         // Verify lease ownership and fencing token
         if job.runner_id.as_deref() != Some(runner_id) || job.fencing_token != fencing_token {
-            return Err(ForgeError::Unauthorized("Stale fencing token or runner lease expired".to_string()));
+            return Err(ForgeError::Unauthorized(
+                "Stale fencing token or runner lease expired".to_string(),
+            ));
         }
 
         // Fetch secrets to mask them in logs
@@ -189,11 +213,17 @@ impl RunnerService {
             .ok_or_else(|| ForgeError::NotFound("Workflow job not found".to_string()))?;
 
         if job.runner_id.as_deref() != Some(runner_id) || job.fencing_token != fencing_token {
-            return Err(ForgeError::Unauthorized("Stale fencing token or runner lease expired".to_string()));
+            return Err(ForgeError::Unauthorized(
+                "Stale fencing token or runner lease expired".to_string(),
+            ));
         }
 
         let now_nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let final_status = if exit_code == 0 { "SUCCEEDED" } else { "FAILED" };
+        let final_status = if exit_code == 0 {
+            "SUCCEEDED"
+        } else {
+            "FAILED"
+        };
 
         // Update steps
         let steps = self.db.list_workflow_steps(job_id).await?;
@@ -205,13 +235,25 @@ impl RunnerService {
                 None => (None, "SKIPPED"),
             };
             self.db
-                .update_workflow_step(&step.id, status, code, step.started_at_nanos, Some(now_nanos))
+                .update_workflow_step(
+                    &step.id,
+                    status,
+                    code,
+                    step.started_at_nanos,
+                    Some(now_nanos),
+                )
                 .await?;
         }
 
         // Update job
         self.db
-            .update_workflow_job_status(job_id, final_status, Some(exit_code), job.started_at_nanos, Some(now_nanos))
+            .update_workflow_job_status(
+                job_id,
+                final_status,
+                Some(exit_code),
+                job.started_at_nanos,
+                Some(now_nanos),
+            )
             .await?;
 
         // Advance scheduler for repository

@@ -23,7 +23,9 @@ impl RepositoryService {
             ));
         }
 
-        let is_valid = trimmed.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
+        let is_valid = trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
         if !is_valid
             || trimmed.starts_with('.')
             || trimmed.starts_with('-')
@@ -158,7 +160,9 @@ impl RepositoryService {
             .await?
             .ok_or_else(|| ForgeError::NotFound("Repository not found".into()))?;
 
-        self.permissions.check_delete_access(Some(caller), &repo).await?;
+        self.permissions
+            .check_delete_access(Some(caller), &repo)
+            .await?;
         self.db.delete_repository(&repo.id).await?;
 
         let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);

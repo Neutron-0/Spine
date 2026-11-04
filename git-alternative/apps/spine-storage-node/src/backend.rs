@@ -313,7 +313,11 @@ impl StorageBackend for FileSystemStorageBackend {
     }
 
     fn store_chunk(&self, chunk_hash: &str, bytes: &[u8]) -> Result<()> {
-        let prefix = if chunk_hash.len() >= 2 { &chunk_hash[0..2] } else { "xx" };
+        let prefix = if chunk_hash.len() >= 2 {
+            &chunk_hash[0..2]
+        } else {
+            "xx"
+        };
         let dir = self.storage_root.join("chunks").join(prefix);
         fs::create_dir_all(&dir)?;
         let path = dir.join(chunk_hash);
@@ -326,8 +330,16 @@ impl StorageBackend for FileSystemStorageBackend {
     }
 
     fn get_chunk(&self, chunk_hash: &str) -> Result<Option<Vec<u8>>> {
-        let prefix = if chunk_hash.len() >= 2 { &chunk_hash[0..2] } else { "xx" };
-        let path = self.storage_root.join("chunks").join(prefix).join(chunk_hash);
+        let prefix = if chunk_hash.len() >= 2 {
+            &chunk_hash[0..2]
+        } else {
+            "xx"
+        };
+        let path = self
+            .storage_root
+            .join("chunks")
+            .join(prefix)
+            .join(chunk_hash);
         if path.exists() {
             Ok(Some(fs::read(&path)?))
         } else {
@@ -336,7 +348,11 @@ impl StorageBackend for FileSystemStorageBackend {
     }
 
     fn store_manifest(&self, manifest_id: &str, bytes: &[u8]) -> Result<()> {
-        let prefix = if manifest_id.len() >= 2 { &manifest_id[0..2] } else { "xx" };
+        let prefix = if manifest_id.len() >= 2 {
+            &manifest_id[0..2]
+        } else {
+            "xx"
+        };
         let dir = self.storage_root.join("manifests").join(prefix);
         fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}.json", manifest_id));
@@ -349,8 +365,16 @@ impl StorageBackend for FileSystemStorageBackend {
     }
 
     fn get_manifest(&self, manifest_id: &str) -> Result<Option<Vec<u8>>> {
-        let prefix = if manifest_id.len() >= 2 { &manifest_id[0..2] } else { "xx" };
-        let path = self.storage_root.join("manifests").join(prefix).join(format!("{}.json", manifest_id));
+        let prefix = if manifest_id.len() >= 2 {
+            &manifest_id[0..2]
+        } else {
+            "xx"
+        };
+        let path = self
+            .storage_root
+            .join("manifests")
+            .join(prefix)
+            .join(format!("{}.json", manifest_id));
         if path.exists() {
             Ok(Some(fs::read(&path)?))
         } else {

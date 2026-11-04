@@ -11,5 +11,7 @@ pub fn hash_pat(token: &str) -> String {
 }
 
 pub fn has_scope(scopes: &[String], required: &str) -> bool {
-    scopes.iter().any(|s| s == required || s == "admin" || s == "*")
+    scopes
+        .iter()
+        .any(|s| s == required || s == "admin" || s == "*")
 }

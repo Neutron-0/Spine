@@ -249,13 +249,15 @@ async fn handle_connection(
             },
             Err(e) => ClusterRpcResponse::Error(e.to_string()),
         },
-        ClusterRpcRequest::GetManifest { manifest_id } => match backend.get_manifest(&manifest_id) {
-            Ok(bytes) => ClusterRpcResponse::GetManifestAck {
-                manifest_id,
-                manifest_bytes: bytes,
-            },
-            Err(e) => ClusterRpcResponse::Error(e.to_string()),
-        },
+        ClusterRpcRequest::GetManifest { manifest_id } => {
+            match backend.get_manifest(&manifest_id) {
+                Ok(bytes) => ClusterRpcResponse::GetManifestAck {
+                    manifest_id,
+                    manifest_bytes: bytes,
+                },
+                Err(e) => ClusterRpcResponse::Error(e.to_string()),
+            }
+        }
         _ => ClusterRpcResponse::Error("Unhandled storage node request".into()),
     };
 

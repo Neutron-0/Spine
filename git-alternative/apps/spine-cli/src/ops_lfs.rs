@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use spine_artifact::{
-    ArtifactGcCollector, ArtifactManifest, ArtifactStore, LocalArtifactStore, LfsPointer,
-    LfsTrackingRules, ObjectReconstructor, StreamChunker, DEFAULT_CHUNK_SIZE,
+    ArtifactGcCollector, ArtifactManifest, ArtifactStore, LfsPointer, LfsTrackingRules,
+    LocalArtifactStore, ObjectReconstructor, StreamChunker, DEFAULT_CHUNK_SIZE,
 };
 use std::fs::{self, File};
 use std::io::BufReader;
@@ -39,7 +39,10 @@ pub fn track(repo_root: &Path, pattern: &str) -> Result<()> {
 pub fn untrack(repo_root: &Path, pattern: &str) -> Result<()> {
     let spinelfs_path = repo_root.join(".spinelfs");
     if !spinelfs_path.exists() {
-        println!("No .spinelfs file found; pattern \"{}\" was not tracked", pattern);
+        println!(
+            "No .spinelfs file found; pattern \"{}\" was not tracked",
+            pattern
+        );
         return Ok(());
     }
 
@@ -103,7 +106,11 @@ pub fn status(repo_root: &Path) -> Result<()> {
     println!("\nLocal Artifact Store (.spine/artifacts):");
     println!("  Manifests: {}", manifest_count);
     println!("  Stored chunks: {}", chunk_count);
-    println!("  Stored payload: {} bytes ({:.2} MiB)", chunk_bytes, chunk_bytes as f64 / (1024.0 * 1024.0));
+    println!(
+        "  Stored payload: {} bytes ({:.2} MiB)",
+        chunk_bytes,
+        chunk_bytes as f64 / (1024.0 * 1024.0)
+    );
 
     Ok(())
 }
@@ -118,7 +125,10 @@ pub fn ls_files(repo_root: &Path) -> Result<()> {
         LfsTrackingRules::default()
     };
 
-    println!("{:<40} {:<12} {:<64} {}", "MANIFEST OID", "SIZE", "OBJECT HASH", "PATH");
+    println!(
+        "{:<40} {:<12} {:<64} {}",
+        "MANIFEST OID", "SIZE", "OBJECT HASH", "PATH"
+    );
     println!("{}", "-".repeat(130));
 
     let mut count = 0;
@@ -153,7 +163,10 @@ pub fn ls_files(repo_root: &Path) -> Result<()> {
         if is_tracked {
             println!(
                 "{:<40} {:<12} {:<64} {} (uncommitted payload)",
-                "-", meta.len(), "-", rel_path_str
+                "-",
+                meta.len(),
+                "-",
+                rel_path_str
             );
             count += 1;
         }
@@ -209,7 +222,12 @@ pub fn verify(repo_root: &Path) -> Result<()> {
             }
 
             if missing == 0 && corrupt == 0 {
-                println!("OK: manifest {} ({} chunks, {} bytes)", manifest.artifact_id, manifest.chunks.len(), manifest.total_size);
+                println!(
+                    "OK: manifest {} ({} chunks, {} bytes)",
+                    manifest.artifact_id,
+                    manifest.chunks.len(),
+                    manifest.total_size
+                );
                 verified += 1;
             } else {
                 eprintln!(
@@ -221,7 +239,10 @@ pub fn verify(repo_root: &Path) -> Result<()> {
         }
     }
 
-    println!("\nVerification summary: {} verified, {} errors", verified, errors);
+    println!(
+        "\nVerification summary: {} verified, {} errors",
+        verified, errors
+    );
     if errors > 0 {
         bail!("Artifact verification completed with errors");
     }
@@ -235,8 +256,13 @@ pub fn prune(repo_root: &Path, dry_run: bool) -> Result<()> {
 
     let active_manifest_ids = load_all_manifest_ids(&artifacts_dir)?;
     let all_chunk_hashes = load_all_chunk_hashes(&artifacts_dir)?;
-    let report = ArtifactGcCollector::collect_garbage(&store, &active_manifest_ids, &all_chunk_hashes, dry_run)
-        .map_err(|e| anyhow::anyhow!("GC collection failed: {}", e))?;
+    let report = ArtifactGcCollector::collect_garbage(
+        &store,
+        &active_manifest_ids,
+        &all_chunk_hashes,
+        dry_run,
+    )
+    .map_err(|e| anyhow::anyhow!("GC collection failed: {}", e))?;
 
     println!("Spine LFS Garbage Collection Report:");
     println!("  Active manifests: {}", active_manifest_ids.len());
@@ -259,7 +285,10 @@ pub fn resolve_remote_store(repo_root: &Path, remote: &str) -> Result<LocalArtif
     let config_path = spine_dir.join("spine.toml");
     let url = if config_path.exists() {
         if let Ok(config) = spine_config::SpineConfig::load_from_file(&config_path) {
-            config.get_remote(remote).map(|r| r.url.clone()).unwrap_or_else(|| remote.to_string())
+            config
+                .get_remote(remote)
+                .map(|r| r.url.clone())
+                .unwrap_or_else(|| remote.to_string())
         } else {
             remote.to_string()
         }
@@ -389,7 +418,10 @@ pub fn pull(repo_root: &Path, remote: &str) -> Result<()> {
         }
     }
 
-    println!("LFS pull: Hydrated {} large files in working tree", hydrated);
+    println!(
+        "LFS pull: Hydrated {} large files in working tree",
+        hydrated
+    );
     Ok(())
 }
 
@@ -455,11 +487,7 @@ pub fn process_lfs_add(
 }
 
 /// Hydrates a file in the working tree if it is an LFS pointer and the artifact exists locally
-pub fn hydrate_pointer_file(
-    repo_root: &Path,
-    target_path: &Path,
-    content: &[u8],
-) -> Result<bool> {
+pub fn hydrate_pointer_file(repo_root: &Path, target_path: &Path, content: &[u8]) -> Result<bool> {
     let s = match std::str::from_utf8(content) {
         Ok(v) => v,
         Err(_) => return Ok(false),
@@ -489,9 +517,10 @@ pub fn hydrate_pointer_file(
     ObjectReconstructor::reconstruct(
         &manifest,
         |idx| {
-            let entry = manifest.chunks.get(idx as usize).ok_or_else(|| {
-                spine_artifact::chunker::ChunkerError::MissingChunk(idx)
-            })?;
+            let entry = manifest
+                .chunks
+                .get(idx as usize)
+                .ok_or_else(|| spine_artifact::chunker::ChunkerError::MissingChunk(idx))?;
             let bytes = store
                 .get_chunk(&entry.chunk_hash)
                 .map_err(|e| {

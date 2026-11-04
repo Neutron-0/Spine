@@ -54,7 +54,11 @@ impl PackageService {
         self.db.create_package(pkg).await
     }
 
-    pub async fn get_package(&self, ecosystem: &str, name: &str) -> Result<Option<PackageDto>, ForgeError> {
+    pub async fn get_package(
+        &self,
+        ecosystem: &str,
+        name: &str,
+    ) -> Result<Option<PackageDto>, ForgeError> {
         let pkg = match self.db.get_package_by_name(ecosystem, name).await? {
             Some(p) => p,
             None => return Ok(None),
@@ -164,7 +168,10 @@ impl PackageService {
             owner_id: pkg.owner_id,
             is_private: pkg.is_private,
             description: pkg.description,
-            versions: versions.into_iter().map(|v| self.version_to_dto(v)).collect(),
+            versions: versions
+                .into_iter()
+                .map(|v| self.version_to_dto(v))
+                .collect(),
             versions_count: count,
             created_at_nanos: pkg.created_at_nanos,
             updated_at_nanos: pkg.updated_at_nanos,

@@ -1,16 +1,16 @@
+use chrono::Utc;
 use std::sync::Arc;
 use std::time::Instant;
-use chrono::Utc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-use crate::core::types::{WebhookDelivery, WebhookOutboxItem, WebhookSubscription};
-use crate::core::error::ForgeError;
-use crate::db::Database;
 use super::service::WebhookService;
 use super::ssrf::SsrfValidator;
+use crate::core::error::ForgeError;
+use crate::core::types::{WebhookDelivery, WebhookOutboxItem, WebhookSubscription};
+use crate::db::Database;
 
 pub struct WebhookOutboxWorker {
     db: Arc<dyn Database>,
@@ -30,7 +30,10 @@ impl WebhookOutboxWorker {
     /// Process a batch of scheduled outbox webhook events.
     pub async fn process_batch(&self, limit: i64) -> Result<usize, ForgeError> {
         let now_nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let pending = self.db.claim_pending_webhook_outbox(limit, now_nanos).await?;
+        let pending = self
+            .db
+            .claim_pending_webhook_outbox(limit, now_nanos)
+            .await?;
         let count = pending.len();
 
         for event in pending {
@@ -79,7 +82,11 @@ impl WebhookOutboxWorker {
                             response_body: Some(resp_body),
                             execution_duration_ms: duration_ms,
                             attempt: event.attempts + 1,
-                            status: if is_success { "SUCCESS".to_string() } else { "FAILED".to_string() },
+                            status: if is_success {
+                                "SUCCESS".to_string()
+                            } else {
+                                "FAILED".to_string()
+                            },
                             delivered_at_nanos: delivered_at,
                         };
                         let _ = self.db.create_webhook_delivery(delivery_log).await;
@@ -115,14 +122,22 @@ impl WebhookOutboxWorker {
                     .update_webhook_outbox_status(&event.id, "DELIVERED", None, 0)
                     .await?;
             } else {
-                self.handle_failure(event, last_error.unwrap_or_else(|| "Unknown failure".to_string())).await?;
+                self.handle_failure(
+                    event,
+                    last_error.unwrap_or_else(|| "Unknown failure".to_string()),
+                )
+                .await?;
             }
         }
 
         Ok(count)
     }
 
-    async fn handle_failure(&self, event: WebhookOutboxItem, err_msg: String) -> Result<(), ForgeError> {
+    async fn handle_failure(
+        &self,
+        event: WebhookOutboxItem,
+        err_msg: String,
+    ) -> Result<(), ForgeError> {
         let attempts = event.attempts + 1;
         if attempts >= event.max_attempts {
             self.db
@@ -131,9 +146,15 @@ impl WebhookOutboxWorker {
         } else {
             // Exponential backoff: base (1s) * 2^(attempts-1) in nanoseconds
             let backoff_secs = 1i64 << (attempts - 1);
-            let next_scheduled_nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0) + (backoff_secs * 1_000_000_000);
+            let next_scheduled_nanos =
+                Utc::now().timestamp_nanos_opt().unwrap_or(0) + (backoff_secs * 1_000_000_000);
             self.db
-                .update_webhook_outbox_status(&event.id, "PENDING", Some(&err_msg), next_scheduled_nanos)
+                .update_webhook_outbox_status(
+                    &event.id,
+                    "PENDING",
+                    Some(&err_msg),
+                    next_scheduled_nanos,
+                )
                 .await?;
         }
         Ok(())
@@ -148,12 +169,17 @@ impl WebhookOutboxWorker {
         let (url, socket_addr) = self.ssrf.validate_and_resolve(&sub.target_url).await?;
 
         let host = url.host_str().unwrap_or("localhost");
-        let path = if url.path().is_empty() { "/" } else { url.path() };
+        let path = if url.path().is_empty() {
+            "/"
+        } else {
+            url.path()
+        };
         let query = url.query().map(|q| format!("?{}", q)).unwrap_or_default();
         let target_resource = format!("{}{}", path, query);
 
         let payload_str = serde_json::to_string(&event.payload)?;
-        let signature = WebhookService::sign_payload(&sub.secret_ciphertext, payload_str.as_bytes());
+        let signature =
+            WebhookService::sign_payload(&sub.secret_ciphertext, payload_str.as_bytes());
 
         // Connect with timeout
         let connect_fut = TcpStream::connect(socket_addr);
@@ -202,13 +228,20 @@ impl WebhookOutboxWorker {
 
         let resp_str = String::from_utf8_lossy(&response_buf);
         let mut lines = resp_str.lines();
-        let status_line = lines.next().ok_or_else(|| anyhow::anyhow!("Empty HTTP response"))?;
+        let status_line = lines
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Empty HTTP response"))?;
 
         let parts: Vec<&str> = status_line.split_whitespace().collect();
         if parts.len() < 2 {
-            return Err(anyhow::anyhow!("Malformed HTTP status line: {}", status_line));
+            return Err(anyhow::anyhow!(
+                "Malformed HTTP status line: {}",
+                status_line
+            ));
         }
-        let status_code: i32 = parts[1].parse().map_err(|_| anyhow::anyhow!("Invalid status code"))?;
+        let status_code: i32 = parts[1]
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid status code"))?;
 
         let body = if let Some(idx) = resp_str.find("\r\n\r\n") {
             resp_str[idx + 4..].to_string()

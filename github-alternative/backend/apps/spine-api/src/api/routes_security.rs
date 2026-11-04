@@ -29,12 +29,18 @@ pub struct FilterQuery {
     pub status: Option<String>,
 }
 
-async fn resolve_repo(state: &AppState, owner: &str, repo_name: &str) -> Result<String, ForgeError> {
+async fn resolve_repo(
+    state: &AppState,
+    owner: &str,
+    repo_name: &str,
+) -> Result<String, ForgeError> {
     let repo = state
         .db
         .get_repository_by_owner_name(owner, repo_name)
         .await?
-        .ok_or_else(|| ForgeError::NotFound(format!("Repository '{}/{}' not found", owner, repo_name)))?;
+        .ok_or_else(|| {
+            ForgeError::NotFound(format!("Repository '{}/{}' not found", owner, repo_name))
+        })?;
     Ok(repo.id)
 }
 
@@ -44,10 +50,14 @@ pub async fn trigger_secret_scan(
     Path((owner, repo_name)): Path<(String, String)>,
     Json(payload): Json<TriggerScanRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let Extension(user) = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let Extension(user) =
+        user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
     let commit_oid = payload.commit_oid.as_deref().unwrap_or("HEAD");
-    let scan = state.security.scan_repository_secrets(&user.id, &repo_id, commit_oid).await?;
+    let scan = state
+        .security
+        .scan_repository_secrets(&user.id, &repo_id, commit_oid)
+        .await?;
     Ok(Json(scan))
 }
 
@@ -57,9 +67,13 @@ pub async fn list_secret_findings(
     Path((owner, repo_name)): Path<(String, String)>,
     Query(query): Query<FilterQuery>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let Extension(user) = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let Extension(user) =
+        user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
-    let findings = state.security.list_secret_findings(&user.id, &repo_id, query.status.as_deref()).await?;
+    let findings = state
+        .security
+        .list_secret_findings(&user.id, &repo_id, query.status.as_deref())
+        .await?;
     Ok(Json(findings))
 }
 
@@ -69,10 +83,16 @@ pub async fn remediate_secret_finding(
     Path((owner, repo_name, id)): Path<(String, String, String)>,
     Json(payload): Json<RemediateFindingRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let Extension(user) = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let Extension(user) =
+        user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
-    state.security.remediate_secret_finding(&user.id, &repo_id, &id, &payload.status).await?;
-    Ok(Json(serde_json::json!({ "id": id, "status": payload.status })))
+    state
+        .security
+        .remediate_secret_finding(&user.id, &repo_id, &id, &payload.status)
+        .await?;
+    Ok(Json(
+        serde_json::json!({ "id": id, "status": payload.status }),
+    ))
 }
 
 pub async fn trigger_dependency_audit(
@@ -81,10 +101,14 @@ pub async fn trigger_dependency_audit(
     Path((owner, repo_name)): Path<(String, String)>,
     Json(payload): Json<TriggerScanRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let Extension(user) = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let Extension(user) =
+        user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
     let commit_oid = payload.commit_oid.as_deref().unwrap_or("HEAD");
-    let scan = state.security.audit_dependencies(&user.id, &repo_id, commit_oid).await?;
+    let scan = state
+        .security
+        .audit_dependencies(&user.id, &repo_id, commit_oid)
+        .await?;
     Ok(Json(scan))
 }
 
@@ -93,7 +117,8 @@ pub async fn list_dependencies(
     user: Option<Extension<User>>,
     Path((owner, repo_name)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let Extension(user) = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let Extension(user) =
+        user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
     let deps = state.security.list_dependencies(&user.id, &repo_id).await?;
     Ok(Json(deps))
@@ -105,9 +130,13 @@ pub async fn list_vulnerabilities(
     Path((owner, repo_name)): Path<(String, String)>,
     Query(query): Query<FilterQuery>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let Extension(user) = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let Extension(user) =
+        user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
-    let vulns = state.security.list_vulnerabilities(&user.id, &repo_id, query.status.as_deref()).await?;
+    let vulns = state
+        .security
+        .list_vulnerabilities(&user.id, &repo_id, query.status.as_deref())
+        .await?;
     Ok(Json(vulns))
 }
 
@@ -117,10 +146,16 @@ pub async fn remediate_vulnerability(
     Path((owner, repo_name, id)): Path<(String, String, String)>,
     Json(payload): Json<RemediateVulnRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let Extension(user) = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let Extension(user) =
+        user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
-    state.security.remediate_vulnerability(&user.id, &repo_id, &id, &payload.status).await?;
-    Ok(Json(serde_json::json!({ "id": id, "status": payload.status })))
+    state
+        .security
+        .remediate_vulnerability(&user.id, &repo_id, &id, &payload.status)
+        .await?;
+    Ok(Json(
+        serde_json::json!({ "id": id, "status": payload.status }),
+    ))
 }
 
 pub async fn export_sbom_spdx(
@@ -128,7 +163,8 @@ pub async fn export_sbom_spdx(
     user: Option<Extension<User>>,
     Path((owner, repo_name)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let Extension(user) = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let Extension(user) =
+        user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
     let spdx = state.security.export_sbom_spdx(&user.id, &repo_id).await?;
     Ok(Json(spdx))
@@ -139,9 +175,13 @@ pub async fn export_sbom_cyclonedx(
     user: Option<Extension<User>>,
     Path((owner, repo_name)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let Extension(user) = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let Extension(user) =
+        user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
-    let cdx = state.security.export_sbom_cyclonedx(&user.id, &repo_id).await?;
+    let cdx = state
+        .security
+        .export_sbom_cyclonedx(&user.id, &repo_id)
+        .await?;
     Ok(Json(cdx))
 }
 
@@ -150,8 +190,19 @@ pub async fn get_security_summary(
     user: Option<Extension<User>>,
     Path((owner, repo_name)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let Extension(user) = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let Extension(user) =
+        user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
-    let summary = state.security.get_security_summary(&user.id, &repo_id).await?;
+    let summary = state
+        .security
+        .get_security_summary(&user.id, &repo_id)
+        .await?;
     Ok(Json(summary))
+}
+
+pub async fn get_advisory_provenance(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, ForgeError> {
+    let prov = state.security.get_advisory_feed_provenance().await?;
+    Ok(Json(prov))
 }

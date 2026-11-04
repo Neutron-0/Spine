@@ -1,6 +1,6 @@
 use spine_artifact::{
-    ArtifactGcCollector, ArtifactStore, LocalArtifactStore, LfsPointer,
-    LfsTrackingRules, ObjectReconstructor, StreamChunker, DEFAULT_CHUNK_SIZE,
+    ArtifactGcCollector, ArtifactStore, LfsPointer, LfsTrackingRules, LocalArtifactStore,
+    ObjectReconstructor, StreamChunker, DEFAULT_CHUNK_SIZE,
 };
 use spine_cluster::durability::DurabilityPolicy;
 use std::fs;
@@ -47,7 +47,9 @@ fn test_lfs_full_remote_lifecycle_and_durability_and_gc() {
     assert_eq!(chunk_res.manifest.whole_object_hash, original_hash);
 
     for chunk in &chunk_res.chunks {
-        local_store.store_chunk(&chunk.entry.chunk_hash, &chunk.bytes).unwrap();
+        local_store
+            .store_chunk(&chunk.entry.chunk_hash, &chunk.bytes)
+            .unwrap();
     }
     let manifest_oid = local_store.store_manifest(&chunk_res.manifest).unwrap();
 
@@ -105,7 +107,10 @@ fn test_lfs_full_remote_lifecycle_and_durability_and_gc() {
     fs::write(clone_dir.join("weights.bin"), &hydrated_data).unwrap();
     assert_eq!(hydrated_data.len(), original_data.len());
     assert_eq!(hydrated_data, original_data);
-    assert_eq!(blake3::hash(&hydrated_data).to_hex().to_string(), original_hash);
+    assert_eq!(
+        blake3::hash(&hydrated_data).to_hex().to_string(),
+        original_hash
+    );
 
     // 9. Subsequent change (version 2): edit first chunk only, rest shared
     let mut v2_data = original_data.clone();
@@ -120,12 +125,23 @@ fn test_lfs_full_remote_lifecycle_and_durability_and_gc() {
         .unwrap();
     assert_eq!(v2_chunk_res.manifest.chunks.len(), 3);
     // Chunk 1 and Chunk 2 should be IDENTICAL to version 1!
-    assert_ne!(v2_chunk_res.manifest.chunks[0].chunk_hash, chunk_res.manifest.chunks[0].chunk_hash);
-    assert_eq!(v2_chunk_res.manifest.chunks[1].chunk_hash, chunk_res.manifest.chunks[1].chunk_hash);
-    assert_eq!(v2_chunk_res.manifest.chunks[2].chunk_hash, chunk_res.manifest.chunks[2].chunk_hash);
+    assert_ne!(
+        v2_chunk_res.manifest.chunks[0].chunk_hash,
+        chunk_res.manifest.chunks[0].chunk_hash
+    );
+    assert_eq!(
+        v2_chunk_res.manifest.chunks[1].chunk_hash,
+        chunk_res.manifest.chunks[1].chunk_hash
+    );
+    assert_eq!(
+        v2_chunk_res.manifest.chunks[2].chunk_hash,
+        chunk_res.manifest.chunks[2].chunk_hash
+    );
 
     for chunk in &v2_chunk_res.chunks {
-        remote_store.store_chunk(&chunk.entry.chunk_hash, &chunk.bytes).unwrap();
+        remote_store
+            .store_chunk(&chunk.entry.chunk_hash, &chunk.bytes)
+            .unwrap();
     }
     let v2_manifest_oid = remote_store.store_manifest(&v2_chunk_res.manifest).unwrap();
 
@@ -141,13 +157,9 @@ fn test_lfs_full_remote_lifecycle_and_durability_and_gc() {
     all_chunks.sort();
     all_chunks.dedup();
 
-    let gc_report = ArtifactGcCollector::collect_garbage(
-        &remote_store,
-        &active_manifests,
-        &all_chunks,
-        false,
-    )
-    .unwrap();
+    let gc_report =
+        ArtifactGcCollector::collect_garbage(&remote_store, &active_manifests, &all_chunks, false)
+            .unwrap();
 
     // All chunks in v1 and v2 must be preserved (0 candidate orphans)
     assert_eq!(gc_report.candidate_chunks, 0);

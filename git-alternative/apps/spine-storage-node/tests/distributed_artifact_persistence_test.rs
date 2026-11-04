@@ -21,7 +21,10 @@ fn test_storage_node_artifact_persistence_and_restart() {
         node1.store_manifest(&manifest_id, manifest_bytes).unwrap();
 
         assert_eq!(node1.get_chunk(&chunk_hash).unwrap().unwrap(), chunk_bytes);
-        assert_eq!(node1.get_manifest(&manifest_id).unwrap().unwrap(), manifest_bytes);
+        assert_eq!(
+            node1.get_manifest(&manifest_id).unwrap().unwrap(),
+            manifest_bytes
+        );
     } // node1 dropped (simulating process exit/shutdown)
 
     // 2. Restart Node 1: Verify data persists across process restart
@@ -35,7 +38,10 @@ fn test_storage_node_artifact_persistence_and_restart() {
 
         // Integrity verification
         assert_eq!(blake3::hash(&loaded_chunk).to_hex().to_string(), chunk_hash);
-        assert_eq!(blake3::hash(&loaded_manifest).to_hex().to_string(), manifest_id);
+        assert_eq!(
+            blake3::hash(&loaded_manifest).to_hex().to_string(),
+            manifest_id
+        );
     }
 
     // 3. Replicate from Node 1 to Node 2 (Replica Creation)
@@ -56,13 +62,22 @@ fn test_storage_node_artifact_persistence_and_restart() {
 
         // Node 2 has identical data
         assert_eq!(node2.get_chunk(&chunk_hash).unwrap().unwrap(), chunk_bytes);
-        assert_eq!(node2.get_manifest(&manifest_id).unwrap().unwrap(), manifest_bytes);
+        assert_eq!(
+            node2.get_manifest(&manifest_id).unwrap().unwrap(),
+            manifest_bytes
+        );
     }
 
     // 4. Restart Node 2 and verify replica persistence
     {
         let node2_restarted = FileSystemStorageBackend::new(&node2_dir, capacity).unwrap();
-        assert_eq!(node2_restarted.get_chunk(&chunk_hash).unwrap().unwrap(), chunk_bytes);
-        assert_eq!(node2_restarted.get_manifest(&manifest_id).unwrap().unwrap(), manifest_bytes);
+        assert_eq!(
+            node2_restarted.get_chunk(&chunk_hash).unwrap().unwrap(),
+            chunk_bytes
+        );
+        assert_eq!(
+            node2_restarted.get_manifest(&manifest_id).unwrap().unwrap(),
+            manifest_bytes
+        );
     }
 }

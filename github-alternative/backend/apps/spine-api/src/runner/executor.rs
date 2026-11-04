@@ -8,6 +8,16 @@ use tokio::time::timeout;
 
 use crate::core::types::{WorkflowJob, WorkflowSecret, WorkflowStep};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerSandboxMode {
+    /// Explicitly marked for trusted local development runs only.
+    TrustedLocalDevelopment,
+    /// OCI-compliant container isolation (Linux).
+    SandboxedOci,
+    /// Missing or unverified sandbox boundary on the host platform.
+    Unsandboxed,
+}
+
 #[derive(Debug, Clone)]
 pub struct StepExecutionResult {
     pub step_index: i32,
@@ -20,6 +30,7 @@ pub struct StepExecutionResult {
 pub struct IsolatedRunnerExecutor {
     workspace_root: PathBuf,
     default_timeout: Duration,
+    sandbox_mode: RunnerSandboxMode,
 }
 
 impl IsolatedRunnerExecutor {
@@ -27,7 +38,17 @@ impl IsolatedRunnerExecutor {
         Self {
             workspace_root,
             default_timeout: Duration::from_secs(60),
+            sandbox_mode: RunnerSandboxMode::TrustedLocalDevelopment,
         }
+    }
+
+    pub fn with_sandbox_mode(mut self, mode: RunnerSandboxMode) -> Self {
+        self.sandbox_mode = mode;
+        self
+    }
+
+    pub fn sandbox_mode(&self) -> RunnerSandboxMode {
+        self.sandbox_mode
     }
 
     /// Execute all steps in an isolated workspace with sanitized environment and timeout enforcement.
@@ -38,6 +59,31 @@ impl IsolatedRunnerExecutor {
         step_scripts: &HashMap<i32, String>,
         secrets: &[WorkflowSecret],
     ) -> (i32, Vec<StepExecutionResult>) {
+        self.execute_job_with_trust(job, steps, step_scripts, secrets, false)
+            .await
+    }
+
+    /// Execute all steps with explicit trust level check. Untrusted workflows fail closed if unsandboxed.
+    pub async fn execute_job_with_trust(
+        &self,
+        job: &WorkflowJob,
+        steps: &[WorkflowStep],
+        step_scripts: &HashMap<i32, String>,
+        secrets: &[WorkflowSecret],
+        is_untrusted: bool,
+    ) -> (i32, Vec<StepExecutionResult>) {
+        if is_untrusted && self.sandbox_mode == RunnerSandboxMode::Unsandboxed {
+            return (
+                1,
+                vec![StepExecutionResult {
+                    step_index: 0,
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: "SECURITY ERROR: Untrusted workflow execution requires a verified sandbox (e.g. OCI container isolation). Unsandboxed execution of untrusted workflows is disabled on this platform/backend to prevent host compromise. Configure an isolated runner or explicitly mark execution as trusted local development mode.".to_string(),
+                    timed_out: false,
+                }],
+            );
+        }
         let job_workspace = self.workspace_root.join(&job.id);
         if let Err(e) = tokio::fs::create_dir_all(&job_workspace).await {
             tracing::error!("Failed to create job workspace {:?}: {}", job_workspace, e);

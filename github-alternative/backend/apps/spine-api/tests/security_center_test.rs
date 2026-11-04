@@ -59,7 +59,10 @@ async fn test_security_center_secret_scanning_and_sbom_audit() {
     let fake_token = "sp_pat_999988887777666655554444333322221111";
     fs::write(
         repo_dir.join("config.env"),
-        format!("DATABASE_URL=postgres://localhost\nSPINE_TOKEN={}\n", fake_token),
+        format!(
+            "DATABASE_URL=postgres://localhost\nSPINE_TOKEN={}\n",
+            fake_token
+        ),
     )
     .unwrap();
 
@@ -129,7 +132,10 @@ version = "1.0.197"
         .unwrap();
 
     assert_eq!(dep_scan.scan_type, "DEPENDENCY_AUDIT");
-    assert!(dep_scan.findings_count >= 1, "Should find atty < 0.2.14 vulnerability");
+    assert!(
+        dep_scan.findings_count >= 1,
+        "Should find atty < 0.2.14 vulnerability"
+    );
 
     let vulns = state
         .security
@@ -153,8 +159,12 @@ version = "1.0.197"
     assert_eq!(spdx["spdxVersion"], "SPDX-2.3");
     let packages = spdx["packages"].as_array().expect("packages array");
     assert_eq!(packages.len(), 2);
-    assert!(packages.iter().any(|p| p["name"] == "atty" && p["versionInfo"] == "0.2.13"));
-    assert!(packages.iter().any(|p| p["name"] == "serde" && p["versionInfo"] == "1.0.197"));
+    assert!(packages
+        .iter()
+        .any(|p| p["name"] == "atty" && p["versionInfo"] == "0.2.13"));
+    assert!(packages
+        .iter()
+        .any(|p| p["name"] == "serde" && p["versionInfo"] == "1.0.197"));
 
     // 6. Test CycloneDX 1.5 SBOM Export
     let cdx = state

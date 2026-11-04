@@ -1,6 +1,6 @@
-use std::sync::Arc;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use uuid::Uuid;
 
 use spine_workflow::dag::JobDag;
@@ -95,8 +95,16 @@ impl WorkflowService {
             // Evaluate triggers
             let branch_clean = ref_name.strip_prefix("refs/heads/").unwrap_or(ref_name);
             let matched = match event_type {
-                "push" => spec.on.push.as_ref().map_or(false, |p| p.matches_branch(branch_clean)),
-                "pull_request" => spec.on.pull_request.as_ref().map_or(false, |pr| pr.matches_branch(branch_clean)),
+                "push" => spec
+                    .on
+                    .push
+                    .as_ref()
+                    .map_or(false, |p| p.matches_branch(branch_clean)),
+                "pull_request" => spec
+                    .on
+                    .pull_request
+                    .as_ref()
+                    .map_or(false, |pr| pr.matches_branch(branch_clean)),
                 "workflow_dispatch" => spec.on.workflow_dispatch.unwrap_or(true),
                 _ => false,
             };
@@ -180,7 +188,10 @@ impl WorkflowService {
                         id: Uuid::new_v4().to_string(),
                         job_id: job_id.clone(),
                         step_index: idx as i32,
-                        name: step_spec.name.clone().unwrap_or_else(|| format!("Step {}", idx + 1)),
+                        name: step_spec
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("Step {}", idx + 1)),
                         status: "QUEUED".to_string(),
                         exit_code: None,
                         started_at_nanos: None,
@@ -197,7 +208,9 @@ impl WorkflowService {
                     "workflow_run": created_run,
                     "repository_id": repo_id,
                 });
-                let _ = wh.dispatch_event("REPO", repo_id, "workflow_run", &payload).await;
+                let _ = wh
+                    .dispatch_event("REPO", repo_id, "workflow_run", &payload)
+                    .await;
             }
 
             triggered_runs.push(created_run);
@@ -210,7 +223,11 @@ impl WorkflowService {
         self.db.get_workflow_run(run_id).await
     }
 
-    pub async fn list_runs(&self, repo_id: &str, limit: i64) -> Result<Vec<WorkflowRun>, ForgeError> {
+    pub async fn list_runs(
+        &self,
+        repo_id: &str,
+        limit: i64,
+    ) -> Result<Vec<WorkflowRun>, ForgeError> {
         self.db.list_workflow_runs(repo_id, limit).await
     }
 
@@ -226,7 +243,10 @@ impl WorkflowService {
         self.db.list_workflow_steps(job_id).await
     }
 
-    pub async fn list_logs(&self, job_id: &str) -> Result<Vec<crate::core::types::WorkflowLogChunk>, ForgeError> {
+    pub async fn list_logs(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<crate::core::types::WorkflowLogChunk>, ForgeError> {
         self.db.list_workflow_logs(job_id).await
     }
 
@@ -234,11 +254,31 @@ impl WorkflowService {
         let now_nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let jobs = self.db.list_workflow_jobs(run_id).await?;
         for job in jobs {
-            if job.status == "QUEUED" || job.status == "WAITING_FOR_RUNNER" || job.status == "ASSIGNED" || job.status == "RUNNING" {
-                self.db.update_workflow_job_status(&job.id, "CANCELLED", Some(130), None, Some(now_nanos)).await?;
+            if job.status == "QUEUED"
+                || job.status == "WAITING_FOR_RUNNER"
+                || job.status == "ASSIGNED"
+                || job.status == "RUNNING"
+            {
+                self.db
+                    .update_workflow_job_status(
+                        &job.id,
+                        "CANCELLED",
+                        Some(130),
+                        None,
+                        Some(now_nanos),
+                    )
+                    .await?;
             }
         }
-        self.db.update_workflow_run_status(run_id, "COMPLETED", Some("CANCELLED"), None, Some(now_nanos)).await?;
+        self.db
+            .update_workflow_run_status(
+                run_id,
+                "COMPLETED",
+                Some("CANCELLED"),
+                None,
+                Some(now_nanos),
+            )
+            .await?;
         Ok(())
     }
 }

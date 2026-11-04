@@ -17,7 +17,9 @@ fn setup_test_spine_repo(root: &PathBuf, native_repo_id: &str) -> (PathBuf, Obje
 
     // 1. Create a blob for README.md
     let readme_content = b"# Spine Forge Repository\n\nNative Rust VCS hosting.\n";
-    let blob_id = store.write_object(ObjectType::Blob, readme_content).unwrap();
+    let blob_id = store
+        .write_object(ObjectType::Blob, readme_content)
+        .unwrap();
 
     // 2. Create a tree containing README.md
     let tree_entries = vec![TreeEntry {
@@ -40,7 +42,9 @@ fn setup_test_spine_repo(root: &PathBuf, native_repo_id: &str) -> (PathBuf, Obje
         "Initial commit\n".to_string(),
     );
     let commit_data = serialize_commit(&commit);
-    let commit_id = store.write_object(ObjectType::Commit, &commit_data).unwrap();
+    let commit_id = store
+        .write_object(ObjectType::Commit, &commit_data)
+        .unwrap();
 
     // 4. Write HEAD and refs
     fs::write(spine_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();

@@ -394,13 +394,9 @@ enum Commands {
 #[derive(Subcommand)]
 pub enum LfsAction {
     /// Track a file pattern for Spine LFS (e.g. '*.psd', 'models/*.onnx')
-    Track {
-        pattern: String,
-    },
+    Track { pattern: String },
     /// Stop tracking a file pattern for Spine LFS
-    Untrack {
-        pattern: String,
-    },
+    Untrack { pattern: String },
     /// Show LFS tracking rules and storage statistics
     Status,
     /// List LFS files in working copy
@@ -447,9 +443,7 @@ pub enum ReleaseAction {
         prerelease: bool,
     },
     /// List releases for a repository
-    List {
-        repo: String,
-    },
+    List { repo: String },
 }
 
 #[derive(Subcommand)]
@@ -1297,11 +1291,17 @@ async fn main() -> Result<()> {
 
             let mut total_staged = 0;
             for p in &paths {
-                let abs_p = if p.is_absolute() { p.clone() } else { worktree_root.join(p) };
+                let abs_p = if p.is_absolute() {
+                    p.clone()
+                } else {
+                    worktree_root.join(p)
+                };
                 if abs_p.is_file() {
                     let rel = abs_p.strip_prefix(&worktree_root).unwrap_or(&abs_p);
                     let rel_norm = rel.to_string_lossy().replace('\\', "/");
-                    if let Ok(Some(pointer_bytes)) = ops_lfs::process_lfs_add(&worktree_root, &rel_norm, &abs_p) {
+                    if let Ok(Some(pointer_bytes)) =
+                        ops_lfs::process_lfs_add(&worktree_root, &rel_norm, &abs_p)
+                    {
                         let object_id = store.write_object(ObjectType::Blob, &pointer_bytes)?;
                         let meta = fs::metadata(&abs_p)?;
                         let (mode, _, mtime_secs, mtime_nanos) = metadata_to_stat(&meta);
@@ -3970,10 +3970,20 @@ async fn main() -> Result<()> {
         }
 
         Commands::Release { action } => match action {
-            ReleaseAction::Create { tag, title, body: _, draft, prerelease } => {
+            ReleaseAction::Create {
+                tag,
+                title,
+                body: _,
+                draft,
+                prerelease,
+            } => {
                 println!("Created release for tag '{}' ({})", tag, title);
-                if draft { println!("  Status: Draft"); }
-                if prerelease { println!("  Pre-release: true"); }
+                if draft {
+                    println!("  Status: Draft");
+                }
+                if prerelease {
+                    println!("  Pre-release: true");
+                }
             }
             ReleaseAction::List { repo } => {
                 println!("Releases for repository '{}':", repo);
@@ -3982,7 +3992,10 @@ async fn main() -> Result<()> {
         },
 
         Commands::Package { action } => match action {
-            PackageAction::CargoConfig { registry_name, forge_url } => {
+            PackageAction::CargoConfig {
+                registry_name,
+                forge_url,
+            } => {
                 let url = forge_url.trim_end_matches('/');
                 println!("# Add this snippet to your ~/.cargo/config.toml or .cargo/config.toml in your project:");
                 println!();
@@ -3993,7 +4006,10 @@ async fn main() -> Result<()> {
                 println!("#   cargo publish --registry {}", registry_name);
                 println!();
                 println!("# To depend on a crate published to Spine Forge:");
-                println!("#   my-crate = {{ version = \"0.1.0\", registry = \"{}\" }}", registry_name);
+                println!(
+                    "#   my-crate = {{ version = \"0.1.0\", registry = \"{}\" }}",
+                    registry_name
+                );
             }
         },
     }

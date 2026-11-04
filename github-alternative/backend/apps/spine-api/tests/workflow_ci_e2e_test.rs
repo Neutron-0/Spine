@@ -1,6 +1,6 @@
+use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
-use chrono::Utc;
 use tempfile::tempdir;
 use uuid::Uuid;
 
@@ -135,7 +135,10 @@ jobs:
     assert_eq!(run.status, "QUEUED");
 
     // Verify initial PR Check is PENDING
-    let checks = db.list_workflow_check_results(&repo_id, &commit_oid).await.unwrap();
+    let checks = db
+        .list_workflow_check_results(&repo_id, &commit_oid)
+        .await
+        .unwrap();
     assert_eq!(checks.len(), 1);
     assert_eq!(checks[0].check_name, "CI Pipeline");
     assert_eq!(checks[0].status, "PENDING");
@@ -164,7 +167,9 @@ jobs:
     };
     db.create_pull_request(pr.clone()).await.unwrap();
 
-    let merge_check = permissions.check_merge_allowed(&user, &repo, "main", &pr).await;
+    let merge_check = permissions
+        .check_merge_allowed(&user, &repo, "main", &pr)
+        .await;
     assert!(
         merge_check.is_err(),
         "Merge must be blocked while required check is PENDING"
@@ -228,13 +233,7 @@ jobs:
 
     // Complete build job
     runner_service
-        .complete_job(
-            &runner.id,
-            &job1.id,
-            job1.fencing_token,
-            0,
-            &[(0, 0)],
-        )
+        .complete_job(&runner.id, &job1.id, job1.fencing_token, 0, &[(0, 0)])
         .await
         .unwrap();
 
@@ -250,12 +249,18 @@ jobs:
         .acquire_job(&runner.id, &runner.labels)
         .await
         .unwrap();
-    assert!(acquired2.is_some(), "Runner should acquire unblocked test job");
+    assert!(
+        acquired2.is_some(),
+        "Runner should acquire unblocked test job"
+    );
     let (job2, steps2, secrets2) = acquired2.unwrap();
     assert_eq!(job2.job_key, "test");
 
     let mut step_scripts2 = HashMap::new();
-    step_scripts2.insert(0, "echo Testing Spine with secret %SPINE_API_SECRET%".to_string());
+    step_scripts2.insert(
+        0,
+        "echo Testing Spine with secret %SPINE_API_SECRET%".to_string(),
+    );
     let (exit2, results2) = executor
         .execute_job(&job2, &steps2, &step_scripts2, &secrets2)
         .await;
@@ -279,13 +284,7 @@ jobs:
         .unwrap();
 
     runner_service
-        .complete_job(
-            &runner.id,
-            &job2.id,
-            job2.fencing_token,
-            0,
-            &[(0, 0)],
-        )
+        .complete_job(&runner.id, &job2.id, job2.fencing_token, 0, &[(0, 0)])
         .await
         .unwrap();
 
@@ -295,11 +294,16 @@ jobs:
     assert_eq!(completed_run.conclusion, Some("SUCCESS".to_string()));
 
     // 9. Verify PR Check Result updated to SUCCESS
-    let final_checks = db.list_workflow_check_results(&repo_id, &commit_oid).await.unwrap();
+    let final_checks = db
+        .list_workflow_check_results(&repo_id, &commit_oid)
+        .await
+        .unwrap();
     assert_eq!(final_checks[0].status, "SUCCESS");
 
     // 10. Verify Branch Protection now permits PR merge!
-    let final_merge_check = permissions.check_merge_allowed(&user, &repo, "main", &pr).await;
+    let final_merge_check = permissions
+        .check_merge_allowed(&user, &repo, "main", &pr)
+        .await;
     assert!(
         final_merge_check.is_ok(),
         "PR merge must succeed when required check 'CI Pipeline' has status 'SUCCESS'"

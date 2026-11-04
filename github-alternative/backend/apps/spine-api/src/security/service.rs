@@ -1,8 +1,23 @@
+use chrono::Utc;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use chrono::Utc;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+type HmacSha256 = Hmac<Sha256>;
+
+pub const DEFAULT_FINGERPRINT_KEY_ID: &str = "hmac-sha256:v1";
+pub const DEFAULT_FINGERPRINT_SECRET: &[u8] = b"spine_forge_protected_fingerprint_salt_2026";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AdvisoryFeedProvenance {
+    pub source_name: String,
+    pub feed_version: String,
+    pub status: String, // "ACTIVE_INDEXED", "NOT_CONFIGURED", "UNAVAILABLE", "STALE"
+    pub advisories_count: usize,
+    pub last_synced_nanos: i64,
+}
 
 use crate::core::error::ForgeError;
 use crate::core::types::{
@@ -19,7 +34,11 @@ pub struct SecurityService {
 }
 
 impl SecurityService {
-    pub fn new(db: Arc<dyn Database>, perms: Arc<PermissionService>, storage_root: PathBuf) -> Self {
+    pub fn new(
+        db: Arc<dyn Database>,
+        perms: Arc<PermissionService>,
+        storage_root: PathBuf,
+    ) -> Self {
         Self {
             db,
             perms,
@@ -129,8 +148,12 @@ impl SecurityService {
         repo_id: &str,
         status_filter: Option<&str>,
     ) -> Result<Vec<SecretScanFinding>, ForgeError> {
-        self.perms.require_repo_read(Some(actor_id), repo_id).await?;
-        self.db.list_secret_scan_findings(repo_id, status_filter).await
+        self.perms
+            .require_repo_read(Some(actor_id), repo_id)
+            .await?;
+        self.db
+            .list_secret_scan_findings(repo_id, status_filter)
+            .await
     }
 
     pub async fn remediate_secret_finding(
@@ -142,7 +165,9 @@ impl SecurityService {
     ) -> Result<(), ForgeError> {
         self.perms.require_repo_write(actor_id, repo_id).await?;
         let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        self.db.update_secret_scan_finding_status(finding_id, status, now).await
+        self.db
+            .update_secret_scan_finding_status(finding_id, status, now)
+            .await
     }
 
     // -------------------------------------------------------------------------
@@ -184,7 +209,9 @@ impl SecurityService {
 
         for dep in &inventory {
             for adv in &advisories {
-                if adv.package_name == dep.package_name && version_matches(&dep.version, &adv.vulnerable_version_range) {
+                if adv.package_name == dep.package_name
+                    && version_matches(&dep.version, &adv.vulnerable_version_range)
+                {
                     let vuln = DependencyVulnerability {
                         id: Uuid::new_v4().to_string(),
                         repo_id: repo_id.to_string(),
@@ -219,8 +246,14 @@ impl SecurityService {
         self.db.create_security_scan(scan).await
     }
 
-    pub async fn list_dependencies(&self, actor_id: &str, repo_id: &str) -> Result<Vec<DependencyInventory>, ForgeError> {
-        self.perms.require_repo_read(Some(actor_id), repo_id).await?;
+    pub async fn list_dependencies(
+        &self,
+        actor_id: &str,
+        repo_id: &str,
+    ) -> Result<Vec<DependencyInventory>, ForgeError> {
+        self.perms
+            .require_repo_read(Some(actor_id), repo_id)
+            .await?;
         self.db.list_dependency_inventory(repo_id).await
     }
 
@@ -230,8 +263,12 @@ impl SecurityService {
         repo_id: &str,
         status_filter: Option<&str>,
     ) -> Result<Vec<DependencyVulnerability>, ForgeError> {
-        self.perms.require_repo_read(Some(actor_id), repo_id).await?;
-        self.db.list_dependency_vulnerabilities(repo_id, status_filter).await
+        self.perms
+            .require_repo_read(Some(actor_id), repo_id)
+            .await?;
+        self.db
+            .list_dependency_vulnerabilities(repo_id, status_filter)
+            .await
     }
 
     pub async fn remediate_vulnerability(
@@ -243,14 +280,22 @@ impl SecurityService {
     ) -> Result<(), ForgeError> {
         self.perms.require_repo_write(actor_id, repo_id).await?;
         let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        self.db.update_dependency_vulnerability_status(vuln_id, status, now).await
+        self.db
+            .update_dependency_vulnerability_status(vuln_id, status, now)
+            .await
     }
 
     // -------------------------------------------------------------------------
     // SBOM Export (SPDX 2.3 & CycloneDX 1.5)
     // -------------------------------------------------------------------------
-    pub async fn export_sbom_spdx(&self, actor_id: &str, repo_id: &str) -> Result<serde_json::Value, ForgeError> {
-        self.perms.require_repo_read(Some(actor_id), repo_id).await?;
+    pub async fn export_sbom_spdx(
+        &self,
+        actor_id: &str,
+        repo_id: &str,
+    ) -> Result<serde_json::Value, ForgeError> {
+        self.perms
+            .require_repo_read(Some(actor_id), repo_id)
+            .await?;
         let repo = self
             .db
             .get_repository_by_id(repo_id)
@@ -290,8 +335,14 @@ impl SecurityService {
         Ok(spdx)
     }
 
-    pub async fn export_sbom_cyclonedx(&self, actor_id: &str, repo_id: &str) -> Result<serde_json::Value, ForgeError> {
-        self.perms.require_repo_read(Some(actor_id), repo_id).await?;
+    pub async fn export_sbom_cyclonedx(
+        &self,
+        actor_id: &str,
+        repo_id: &str,
+    ) -> Result<serde_json::Value, ForgeError> {
+        self.perms
+            .require_repo_read(Some(actor_id), repo_id)
+            .await?;
         let repo = self
             .db
             .get_repository_by_id(repo_id)
@@ -337,18 +388,28 @@ impl SecurityService {
         Ok(cdx)
     }
 
-    pub async fn get_security_summary(&self, actor_id: &str, repo_id: &str) -> Result<SecuritySummaryDto, ForgeError> {
-        self.perms.require_repo_read(Some(actor_id), repo_id).await?;
+    pub async fn get_security_summary(
+        &self,
+        actor_id: &str,
+        repo_id: &str,
+    ) -> Result<SecuritySummaryDto, ForgeError> {
+        self.perms
+            .require_repo_read(Some(actor_id), repo_id)
+            .await?;
 
         let secrets = self.db.list_secret_scan_findings(repo_id, None).await?;
         let deps = self.db.list_dependency_inventory(repo_id).await?;
-        let vulns = self.db.list_dependency_vulnerabilities(repo_id, None).await?;
+        let vulns = self
+            .db
+            .list_dependency_vulnerabilities(repo_id, None)
+            .await?;
 
         let total_secrets_found = secrets.len();
         let open_secrets_count = secrets.iter().filter(|s| s.status == "OPEN").count();
 
         let total_dependencies = deps.len();
-        let open_vulns: Vec<&DependencyVulnerability> = vulns.iter().filter(|v| v.status == "OPEN").collect();
+        let open_vulns: Vec<&DependencyVulnerability> =
+            vulns.iter().filter(|v| v.status == "OPEN").collect();
         let vulnerable_dependencies_count = open_vulns.len();
 
         let mut critical_count = 0;
@@ -385,12 +446,34 @@ impl SecurityService {
             low_count,
         })
     }
+
+    pub async fn get_advisory_feed_provenance(&self) -> Result<AdvisoryFeedProvenance, ForgeError> {
+        let advisories = self.db.list_security_advisories("CARGO").await?;
+        let count = advisories.len();
+        let status = if count > 0 {
+            "ACTIVE_INDEXED".to_string()
+        } else {
+            "NOT_CONFIGURED".to_string()
+        };
+        Ok(AdvisoryFeedProvenance {
+            source_name: "RustSec Advisory Database (crates.io)".to_string(),
+            feed_version: "2026.11.01-cargo".to_string(),
+            status,
+            advisories_count: count,
+            last_synced_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
+        })
+    }
 }
 
 // -----------------------------------------------------------------------------
 // Secret Scanner Engine (Safe Fingerprinting)
 // -----------------------------------------------------------------------------
-fn scan_dir_for_secrets(root: &Path, repo_id: &str, commit_oid: &str, findings: &mut Vec<SecretScanFinding>) {
+fn scan_dir_for_secrets(
+    root: &Path,
+    repo_id: &str,
+    commit_oid: &str,
+    findings: &mut Vec<SecretScanFinding>,
+) {
     let mut stack = vec![root.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
@@ -411,13 +494,20 @@ fn scan_dir_for_secrets(root: &Path, repo_id: &str, commit_oid: &str, findings: 
                 stack.push(path);
             } else if path.is_file() {
                 if let Ok(content) = std::fs::read_to_string(&path) {
-                    let rel_path = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+                    let rel_path = path
+                        .strip_prefix(root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
                     for (line_idx, line) in content.lines().enumerate() {
                         let line_num = (line_idx + 1) as i32;
 
                         // Rule 1: Spine PAT
                         if let Some(pos) = line.find("sp_pat_") {
-                            let candidate: String = line[pos..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+                            let candidate: String = line[pos..]
+                                .chars()
+                                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                                .collect();
                             if candidate.len() >= 35 {
                                 findings.push(SecretScanFinding {
                                     id: Uuid::new_v4().to_string(),
@@ -438,7 +528,10 @@ fn scan_dir_for_secrets(root: &Path, repo_id: &str, commit_oid: &str, findings: 
 
                         // Rule 2: GitHub PAT
                         if let Some(pos) = line.find("ghp_") {
-                            let candidate: String = line[pos..].chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+                            let candidate: String = line[pos..]
+                                .chars()
+                                .take_while(|c| c.is_ascii_alphanumeric())
+                                .collect();
                             if candidate.len() >= 40 {
                                 findings.push(SecretScanFinding {
                                     id: Uuid::new_v4().to_string(),
@@ -459,7 +552,10 @@ fn scan_dir_for_secrets(root: &Path, repo_id: &str, commit_oid: &str, findings: 
 
                         // Rule 3: AWS Access Key
                         if let Some(pos) = line.find("AKIA") {
-                            let candidate: String = line[pos..].chars().take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit()).collect();
+                            let candidate: String = line[pos..]
+                                .chars()
+                                .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+                                .collect();
                             if candidate.len() >= 20 {
                                 findings.push(SecretScanFinding {
                                     id: Uuid::new_v4().to_string(),
@@ -498,7 +594,10 @@ fn scan_dir_for_secrets(root: &Path, repo_id: &str, commit_oid: &str, findings: 
 
                         // Rule 5: Slack Webhook
                         if let Some(pos) = line.find("https://hooks.slack.com/services/") {
-                            let candidate: String = line[pos..].chars().take_while(|c| !c.is_whitespace() && *c != '"' && *c != '\'').collect();
+                            let candidate: String = line[pos..]
+                                .chars()
+                                .take_while(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
+                                .collect();
                             findings.push(SecretScanFinding {
                                 id: Uuid::new_v4().to_string(),
                                 repo_id: repo_id.to_string(),
@@ -517,7 +616,10 @@ fn scan_dir_for_secrets(root: &Path, repo_id: &str, commit_oid: &str, findings: 
 
                         // Rule 6: Stripe Secret Key
                         if let Some(pos) = line.find("sk_live_") {
-                            let candidate: String = line[pos..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+                            let candidate: String = line[pos..]
+                                .chars()
+                                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                                .collect();
                             if candidate.len() >= 24 {
                                 findings.push(SecretScanFinding {
                                     id: Uuid::new_v4().to_string(),
@@ -542,20 +644,35 @@ fn scan_dir_for_secrets(root: &Path, repo_id: &str, commit_oid: &str, findings: 
     }
 }
 
-/// Compute a safe, non-reversible fingerprint for discovered credentials.
-/// Never store or log raw secrets!
-pub fn compute_safe_fingerprint(raw_secret: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(raw_secret.as_bytes());
-    let hash = format!("{:x}", hasher.finalize());
+/// Compute a safe, non-reversible fingerprint for discovered credentials using keyed HMAC-SHA-256.
+/// Never store or log raw secrets! Key rotation is supported via key_id and secret salt.
+pub fn compute_keyed_safe_fingerprint(raw_secret: &str, key_id: &str, key_bytes: &[u8]) -> String {
+    let mut mac = HmacSha256::new_from_slice(key_bytes)
+        .unwrap_or_else(|_| HmacSha256::new_from_slice(DEFAULT_FINGERPRINT_SECRET).unwrap());
+    mac.update(raw_secret.as_bytes());
+    let hmac_hex = hex::encode(mac.finalize().into_bytes());
 
     if raw_secret.len() <= 8 {
-        format!("***... (sha256:{})", &hash[..8])
+        format!("***... ({}:{})", key_id, &hmac_hex[..12])
     } else {
         let prefix = &raw_secret[..4];
         let suffix = &raw_secret[raw_secret.len() - 4..];
-        format!("{}...****...{} (sha256:{})", prefix, suffix, &hash[..8])
+        format!(
+            "{}...****...{} ({}:{})",
+            prefix,
+            suffix,
+            key_id,
+            &hmac_hex[..12]
+        )
     }
+}
+
+pub fn compute_safe_fingerprint(raw_secret: &str) -> String {
+    compute_keyed_safe_fingerprint(
+        raw_secret,
+        DEFAULT_FINGERPRINT_KEY_ID,
+        DEFAULT_FINGERPRINT_SECRET,
+    )
 }
 
 // -----------------------------------------------------------------------------

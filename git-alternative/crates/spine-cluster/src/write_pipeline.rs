@@ -180,7 +180,9 @@ pub trait StorageDispatcher: Send + Sync {
         &'a self,
         node_id: &'a str,
         repo_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<(u64, Vec<String>, bool), WritePipelineError>> + Send + 'a>>;
+    ) -> Pin<
+        Box<dyn Future<Output = Result<(u64, Vec<String>, bool), WritePipelineError>> + Send + 'a>,
+    >;
 }
 
 /// Network-based storage dispatcher communicating over SPWP / Cluster TCP RPC.
@@ -213,7 +215,10 @@ impl StorageDispatcher for NetworkStorageDispatcher {
     ) -> Pin<Box<dyn Future<Output = Result<bool, WritePipelineError>> + Send + 'a>> {
         Box::pin(async move {
             let addr = self.node_addresses.get(node_id).ok_or_else(|| {
-                WritePipelineError::StorageNodeError(format!("Address for node {} not found", node_id))
+                WritePipelineError::StorageNodeError(format!(
+                    "Address for node {} not found",
+                    node_id
+                ))
             })?;
 
             let req = ClusterRpcRequest::PreparePush {
@@ -229,7 +234,9 @@ impl StorageDispatcher for NetworkStorageDispatcher {
 
             match send_tcp_rpc(addr, &req).await {
                 Ok(ClusterRpcResponse::PrepareAck { prepared, .. }) => Ok(prepared),
-                Ok(ClusterRpcResponse::Error(msg)) => Err(WritePipelineError::StorageNodeError(msg)),
+                Ok(ClusterRpcResponse::Error(msg)) => {
+                    Err(WritePipelineError::StorageNodeError(msg))
+                }
                 Ok(_) => Err(WritePipelineError::StorageNodeError(
                     "Unexpected response to PreparePush".into(),
                 )),
@@ -249,7 +256,10 @@ impl StorageDispatcher for NetworkStorageDispatcher {
     ) -> Pin<Box<dyn Future<Output = Result<(), WritePipelineError>> + Send + 'a>> {
         Box::pin(async move {
             let addr = self.node_addresses.get(node_id).ok_or_else(|| {
-                WritePipelineError::StorageNodeError(format!("Address for node {} not found", node_id))
+                WritePipelineError::StorageNodeError(format!(
+                    "Address for node {} not found",
+                    node_id
+                ))
             })?;
 
             let req = ClusterRpcRequest::CommitPush {
@@ -261,7 +271,9 @@ impl StorageDispatcher for NetworkStorageDispatcher {
 
             match send_tcp_rpc(addr, &req).await {
                 Ok(ClusterRpcResponse::CommitAck { .. }) => Ok(()),
-                Ok(ClusterRpcResponse::Error(msg)) => Err(WritePipelineError::StorageNodeError(msg)),
+                Ok(ClusterRpcResponse::Error(msg)) => {
+                    Err(WritePipelineError::StorageNodeError(msg))
+                }
                 Ok(_) => Err(WritePipelineError::StorageNodeError(
                     "Unexpected response to CommitPush".into(),
                 )),
@@ -296,10 +308,15 @@ impl StorageDispatcher for NetworkStorageDispatcher {
         &'a self,
         node_id: &'a str,
         repo_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<(u64, Vec<String>, bool), WritePipelineError>> + Send + 'a>> {
+    ) -> Pin<
+        Box<dyn Future<Output = Result<(u64, Vec<String>, bool), WritePipelineError>> + Send + 'a>,
+    > {
         Box::pin(async move {
             let addr = self.node_addresses.get(node_id).ok_or_else(|| {
-                WritePipelineError::StorageNodeError(format!("Address for node {} not found", node_id))
+                WritePipelineError::StorageNodeError(format!(
+                    "Address for node {} not found",
+                    node_id
+                ))
             })?;
 
             let req = ClusterRpcRequest::InspectRepository {
@@ -438,7 +455,10 @@ impl StorageDispatcher for LocalBackendStorageDispatcher {
             }
 
             let _ = std::fs::remove_dir_all(&stage);
-            let _ = std::fs::write(spine_dir.join("generation"), format!("{}\n", new_generation));
+            let _ = std::fs::write(
+                spine_dir.join("generation"),
+                format!("{}\n", new_generation),
+            );
 
             Ok(())
         })
@@ -471,7 +491,9 @@ impl StorageDispatcher for LocalBackendStorageDispatcher {
         &'a self,
         node_id: &'a str,
         repo_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<(u64, Vec<String>, bool), WritePipelineError>> + Send + 'a>> {
+    ) -> Pin<
+        Box<dyn Future<Output = Result<(u64, Vec<String>, bool), WritePipelineError>> + Send + 'a>,
+    > {
         Box::pin(async move {
             let root = {
                 let map = self.node_roots.read().unwrap();
@@ -717,9 +739,11 @@ impl AuthoritativeRepositoryWriter {
             if let Some(old) = update.expected_old_oid {
                 boundary.insert(old);
             }
-            if let Err(e) =
-                spine_net::closure::validate_push_object_closure(primary_store, &update.new_oid, &boundary)
-            {
+            if let Err(e) = spine_net::closure::validate_push_object_closure(
+                primary_store,
+                &update.new_oid,
+                &boundary,
+            ) {
                 return Err(WritePipelineError::MissingObject(format!(
                     "Object closure validation failed for {}: {}",
                     update.ref_name, e
@@ -885,7 +909,9 @@ impl AuthoritativeRepositoryWriter {
                 &ref_path,
                 format!("{}\n", update.new_oid.to_hex()).as_bytes(),
             )
-            .map_err(|e| WritePipelineError::Internal(format!("Failed to write ref atomically: {}", e)))?;
+            .map_err(|e| {
+                WritePipelineError::Internal(format!("Failed to write ref atomically: {}", e))
+            })?;
         }
 
         // Commit on Replicas that prepared

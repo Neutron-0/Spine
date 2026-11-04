@@ -64,12 +64,9 @@ async fn test_artifact_quota_enforcement() {
     let service = ArtifactService::new(db.clone(), store);
 
     // 1. Initialize user quota with small limit (5 MB)
-    let mut quota = db
-        .get_or_create_quota("user", "user_bob")
-        .await
-        .unwrap();
+    let mut quota = db.get_or_create_quota("user", "user_bob").await.unwrap();
     quota.logical_quota_bytes = 5 * 1024 * 1024; // 5 MB limit
-    // Re-save modified quota limit
+                                                 // Re-save modified quota limit
     db.update_quota_usage("user_bob", 0, 0).await.unwrap();
 
     // Directly set logical_quota_bytes in in_memory DB
@@ -153,7 +150,12 @@ async fn test_resumable_upload_session_chunk_by_chunk() {
 
     // Upload with wrong hash should fail
     let bad_hash_err = service
-        .upload_chunk(&session.id, 1, "00000000000000000000000000000000", &chunk2_data)
+        .upload_chunk(
+            &session.id,
+            1,
+            "00000000000000000000000000000000",
+            &chunk2_data,
+        )
         .await
         .expect_err("Chunk upload with corrupt hash must fail");
     assert!(bad_hash_err.to_string().contains("Chunk hash mismatch"));

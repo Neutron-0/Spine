@@ -13,7 +13,11 @@ pub struct SearchService {
 }
 
 impl SearchService {
-    pub fn new(db: Arc<dyn Database>, perms: Arc<PermissionService>, storage_root: PathBuf) -> Self {
+    pub fn new(
+        db: Arc<dyn Database>,
+        perms: Arc<PermissionService>,
+        storage_root: PathBuf,
+    ) -> Self {
         Self {
             db,
             perms,
@@ -57,7 +61,11 @@ impl SearchService {
         } else {
             let mut all = self.db.list_public_repositories().await.unwrap_or_default();
             if let Some(uid) = user_id {
-                let user_repos = self.db.list_repositories_for_user(uid).await.unwrap_or_default();
+                let user_repos = self
+                    .db
+                    .list_repositories_for_user(uid)
+                    .await
+                    .unwrap_or_default();
                 for r in user_repos {
                     if !all.iter().any(|existing| existing.id == r.id) {
                         all.push(r);
@@ -70,7 +78,12 @@ impl SearchService {
         // Filter repos user has read permission to
         let mut authorized_repos = Vec::new();
         for r in repos {
-            if self.perms.can_read_repo(user_id, &r.id).await.unwrap_or(false) {
+            if self
+                .perms
+                .can_read_repo(user_id, &r.id)
+                .await
+                .unwrap_or(false)
+            {
                 authorized_repos.push(r);
             }
         }
@@ -91,7 +104,11 @@ impl SearchService {
                 }
 
                 // Check topics
-                let topics = self.db.list_repository_topics(&repo.id).await.unwrap_or_default();
+                let topics = self
+                    .db
+                    .list_repository_topics(&repo.id)
+                    .await
+                    .unwrap_or_default();
                 for t in &topics {
                     if t.topic.contains(&query_lower) {
                         score += 5.0;
@@ -104,7 +121,11 @@ impl SearchService {
                         repo_id: repo.id.clone(),
                         repo_name: repo_full_name.clone(),
                         title: repo_full_name.clone(),
-                        snippet: if repo.description.is_empty() { "Repository".to_string() } else { repo.description.clone() },
+                        snippet: if repo.description.is_empty() {
+                            "Repository".to_string()
+                        } else {
+                            repo.description.clone()
+                        },
                         file_path: None,
                         line_number: None,
                         url: format!("/{}", repo_full_name),
@@ -115,7 +136,11 @@ impl SearchService {
 
             // B. Issues search
             if search_all || result_type == Some(SearchResultType::Issue) {
-                let issues = self.db.list_issues_for_repo(&repo.id, None).await.unwrap_or_default();
+                let issues = self
+                    .db
+                    .list_issues_for_repo(&repo.id, None)
+                    .await
+                    .unwrap_or_default();
                 for issue in issues {
                     let mut score = 0.0;
                     if issue.title.to_lowercase().contains(&query_lower) {
@@ -143,7 +168,11 @@ impl SearchService {
 
             // C. Pull requests search
             if search_all || result_type == Some(SearchResultType::PullRequest) {
-                let prs = self.db.list_pull_requests_for_repo(&repo.id, None).await.unwrap_or_default();
+                let prs = self
+                    .db
+                    .list_pull_requests_for_repo(&repo.id, None)
+                    .await
+                    .unwrap_or_default();
                 for pr in prs {
                     let mut score = 0.0;
                     if pr.title.to_lowercase().contains(&query_lower) {
@@ -171,7 +200,11 @@ impl SearchService {
 
             // D. Discussions search
             if search_all || result_type == Some(SearchResultType::Discussion) {
-                let discussions = self.db.list_discussions(&repo.id, None).await.unwrap_or_default();
+                let discussions = self
+                    .db
+                    .list_discussions(&repo.id, None)
+                    .await
+                    .unwrap_or_default();
                 for disc in discussions {
                     let mut score = 0.0;
                     if disc.title.to_lowercase().contains(&query_lower) {
@@ -201,14 +234,19 @@ impl SearchService {
             if search_all || result_type == Some(SearchResultType::Code) {
                 let repo_dir = self.storage_root.join(&repo.id);
                 if repo_dir.exists() {
-                    let code_hits = search_code_in_dir(&repo_dir, &repo.id, &repo_full_name, &query_lower);
+                    let code_hits =
+                        search_code_in_dir(&repo_dir, &repo.id, &repo_full_name, &query_lower);
                     hits.extend(code_hits);
                 }
             }
         }
 
         // Sort descending by score
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         hits.truncate(100);
 
         let total = hits.len();
@@ -234,7 +272,12 @@ fn extract_snippet(text: &str, query: &str) -> String {
     }
 }
 
-fn search_code_in_dir(root: &Path, repo_id: &str, repo_name: &str, query_lower: &str) -> Vec<SearchHit> {
+fn search_code_in_dir(
+    root: &Path,
+    repo_id: &str,
+    repo_name: &str,
+    query_lower: &str,
+) -> Vec<SearchHit> {
     let mut hits = Vec::new();
     let mut stack = vec![root.to_path_buf()];
 
@@ -258,7 +301,11 @@ fn search_code_in_dir(root: &Path, repo_id: &str, repo_name: &str, query_lower: 
             } else if path.is_file() {
                 // Check if file is text/code
                 if let Ok(content) = std::fs::read_to_string(&path) {
-                    let rel_path = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+                    let rel_path = path
+                        .strip_prefix(root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
                     for (line_idx, line) in content.lines().enumerate() {
                         if line.to_lowercase().contains(query_lower) {
                             let snippet = line.trim().to_string();
@@ -270,7 +317,12 @@ fn search_code_in_dir(root: &Path, repo_id: &str, repo_name: &str, query_lower: 
                                 snippet,
                                 file_path: Some(rel_path.clone()),
                                 line_number: Some(line_idx + 1),
-                                url: format!("/{}/blob/main/{}#L{}", repo_name, rel_path, line_idx + 1),
+                                url: format!(
+                                    "/{}/blob/main/{}#L{}",
+                                    repo_name,
+                                    rel_path,
+                                    line_idx + 1
+                                ),
                                 score: 6.0,
                             });
                             if hits.len() >= 50 {

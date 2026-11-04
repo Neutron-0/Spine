@@ -1,75 +1,38 @@
-# Webhook Security, SSRF Defense, and Signature Verification
+# WEBHOOK NETWORK SECURITY & SSRF MITIGATION SPECIFICATION
 
-## 1. Threat Landscape
-
-Webhooks involve server-initiated outbound HTTP requests to user-supplied URLs. Without rigorous security defenses, this creates critical vulnerabilities:
-1. **Server-Side Request Forgery (SSRF)**: Attackers submitting loopback (`127.0.0.1`), private RFC 1918 IPs, or link-local endpoints (`169.254.169.254`) to probe internal networks, databases, or cloud provider instance metadata.
-2. **DNS Rebinding & TOCTOU**: Attackers providing a domain that resolves to a public IP during registration, but changes to a private IP when the delivery request is made.
-3. **Payload Tampering & Spoofing**: Man-in-the-middle attackers forging or modifying delivery events.
-4. **Denial of Service / Port Scanning**: Specifying internal infrastructure ports (SSH 22, Redis 6379, Postgres 5432, Elasticsearch 9200) to cause timeouts or crash internal daemons.
+**Date:** 2026-11-04  
+**Batch Milestone:** Batch 14 — Full-System Integration, Security Hardening, Reliability, Recovery, and Performance  
+**Auditor / Engineering Lead:** DeepMind Advanced Agentic Coding Pair Program  
+**Workspace:** `d:\Vault\Spine`
 
 ---
 
-## 2. SSRF Defense Implementation (`spine-api::webhook::ssrf`)
+## 1. CONNECTION-BOUNDARY SSRF DEFENSE
 
-Spine implements comprehensive defenses before any socket connection is initiated:
+Spine protects internal networks and infrastructure against Server-Side Request Forgery (SSRF) at the actual socket connection boundary in `webhook/ssrf.rs` and `webhook/worker.rs`:
 
-### 2.1 Scheme & Port Filtering
-- Permitted schemes: `http` and `https` exclusively.
-- Prohibited ports: Internal database and administrative ports are blocked by policy:
-  `22, 23, 25, 53, 69, 111, 135, 139, 445, 2049, 2379, 2380, 3306, 5432, 6379, 9200, 9300, 11211, 27017`.
+### Forbidden Destinations
+1. **Loopback:** `127.0.0.0/8`, `::1`.
+2. **RFC 1918 Private Ranges:** `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`.
+3. **Cloud Metadata Endpoints:** `169.254.169.254`, `169.254.0.0/16`.
+4. **Carrier-Grade NAT (CGNAT):** `100.64.0.0/10`.
+5. **IPv4-Mapped IPv6:** `::ffff:127.0.0.1` (unwrapped and checked against IPv4 rules).
+6. **Unique Local IPv6:** `fc00::/7`.
+7. **Prohibited Ports:** Administrative & DB ports (`22`, `3306`, `5432`, `6379`, `27017`, `9200`, `2375`).
 
-### 2.2 Strict IP Range Prohibitions
-Every resolved address is validated against blocked network ranges:
-- **Loopback**: `127.0.0.0/8`, `::1`
-- **Cloud Metadata / Link-Local**: `169.254.0.0/16` (including `169.254.169.254`), `fe80::/10`
-- **RFC 1918 Private**: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`
-- **Carrier-Grade NAT**: `100.64.0.0/10`
-- **Broadcast / Unspecified**: `0.0.0.0/8`, `255.255.255.255`, `::`
-- **IPv4-Mapped IPv6**: `::ffff:0:0/96` (unwrapped and validated as IPv4)
-- **Multicast & Reserved**: `224.0.0.0/4`, `ff00::/8`
-
-### 2.3 DNS Pinning to Prevent DNS Rebinding
-To prevent Time-of-Check to Time-of-Use (TOCTOU) DNS rebinding attacks:
-1. `validate_and_resolve` performs DNS resolution once.
-2. All resolved IP addresses are verified against the SSRF policy.
-3. The worker connects **directly to the validated `SocketAddr`**, passing the original hostname only in the HTTP `Host` header. This guarantees that no subsequent DNS resolution occurs at socket connection time.
+### DNS Rebinding Defense & Pinned Sockets
+Unlike standard HTTP clients that resolve a hostname once for validation and again for HTTP dispatch (creating a Time-Of-Check to Time-Of-Use vulnerability), Spine:
+1. Resolves DNS via `tokio::net::lookup_host`.
+2. Validates all resolved `IpAddr` instances against the SSRF filter.
+3. Pins the validated `SocketAddr` and opens a direct `TcpStream::connect(socket_addr)`.
+4. Dispatches the raw HTTP/1.1 payload directly over that established socket.
+5. **Does NOT follow HTTP redirects.** Any 301/302 response is recorded as a delivery result without redirect dispatch, eliminating redirect-based SSRF bypasses.
 
 ---
 
-## 3. HMAC-SHA256 Signature Verification
+## 2. DELIVERY RELIABILITY & IDEMPOTENCY
 
-Every outbound webhook delivery includes the `X-Spine-Signature-256` header:
-```http
-POST /webhook HTTP/1.1
-Host: ci.external.org
-User-Agent: Spine-Hookshot/1.0
-X-Spine-Event: push
-X-Spine-Delivery: d4b3c2a1-0000-4000-8000-0123456789ab
-X-Spine-Signature-256: sha256=9b71d224bd62f3785d96d46ad3ea3d73319bfbc2890caadae2dff72519673ca7
-Content-Type: application/json
-Content-Length: 142
-
-{ ... payload ... }
-```
-
-### 3.1 Receiver Verification Example (Rust)
-```rust
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use subtle::ConstantTimeEq;
-
-type HmacSha256 = Hmac<Sha256>;
-
-pub fn verify_spine_webhook(secret: &str, body: &[u8], signature_header: &str) -> bool {
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
-    mac.update(body);
-    let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
-
-    if signature_header.len() != expected.len() {
-        return false;
-    }
-    signature_header.as_bytes().ct_eq(expected.as_bytes()).into()
-}
-```
-*Note: Signature comparison must always be executed in constant time (`subtle::ConstantTimeEq`) to prevent timing side-channel attacks.*
+1. **Transactional Outbox:** Events are inserted into `webhook_outbox` in the same database transaction as the triggering VCS or Forge operation.
+2. **Exponential Backoff:** Failed deliveries retry with exponential backoff (`1s * 2^(attempts-1)`), up to `max_attempts` (default 5).
+3. **HMAC-SHA256 Signing:** Every request contains `X-Spine-Signature-256: sha256=<hex>` computed using the webhook secret. Verification uses constant-time comparison (`subtle::ConstantTimeEq`).
+4. **Bounded Buffers:** Remote HTTP response ingestion is strictly capped at 64 KiB to prevent memory exhaustion attacks from malicious endpoints.

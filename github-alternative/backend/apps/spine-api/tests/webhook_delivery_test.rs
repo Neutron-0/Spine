@@ -17,12 +17,18 @@ async fn test_ssrf_validator_rejects_forbidden_ranges() {
     assert!(validator.validate_ip("::1".parse().unwrap()).is_err());
 
     // AWS/GCP Metadata
-    assert!(validator.validate_ip("169.254.169.254".parse().unwrap()).is_err());
+    assert!(validator
+        .validate_ip("169.254.169.254".parse().unwrap())
+        .is_err());
 
     // RFC 1918 Private ranges
     assert!(validator.validate_ip("10.0.0.1".parse().unwrap()).is_err());
-    assert!(validator.validate_ip("172.16.0.1".parse().unwrap()).is_err());
-    assert!(validator.validate_ip("192.168.1.1".parse().unwrap()).is_err());
+    assert!(validator
+        .validate_ip("172.16.0.1".parse().unwrap())
+        .is_err());
+    assert!(validator
+        .validate_ip("192.168.1.1".parse().unwrap())
+        .is_err());
 
     // Broadcast / Multicast
     assert!(validator.validate_ip("0.0.0.0".parse().unwrap()).is_err());
@@ -49,7 +55,11 @@ async fn test_webhook_hmac_signing_and_constant_time_verification() {
     assert!(!WebhookService::verify_signature(secret, tampered, &sig));
 
     // Wrong secret fails
-    assert!(!WebhookService::verify_signature("wrong_secret", payload, &sig));
+    assert!(!WebhookService::verify_signature(
+        "wrong_secret",
+        payload,
+        &sig
+    ));
 }
 
 #[tokio::test]
@@ -76,7 +86,8 @@ async fn test_webhook_outbox_queue_and_delivery_cycle() {
         assert!(request_str.contains("X-Spine-Signature-256: sha256="));
 
         // Reply 200 OK
-        let resp = "HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"received\":true}";
+        let resp =
+            "HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"received\":true}";
         socket.write_all(resp.as_bytes()).await.unwrap();
         socket.flush().await.unwrap();
     });
@@ -122,5 +133,9 @@ async fn test_webhook_outbox_queue_and_delivery_cycle() {
     assert_eq!(deliveries.len(), 1);
     assert_eq!(deliveries[0].status, "SUCCESS");
     assert_eq!(deliveries[0].response_status, Some(200));
-    assert!(deliveries[0].response_body.as_ref().unwrap().contains("\"received\":true"));
+    assert!(deliveries[0]
+        .response_body
+        .as_ref()
+        .unwrap()
+        .contains("\"received\":true"));
 }

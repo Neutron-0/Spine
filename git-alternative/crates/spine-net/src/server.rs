@@ -237,7 +237,11 @@ pub async fn handle_server_session_stream<S: AsyncRead + AsyncWrite + Unpin + Se
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as i64;
-        match crate::auth::CapabilityTicket::decode_and_verify(ticket_str, &config.secret_key, now_nanos) {
+        match crate::auth::CapabilityTicket::decode_and_verify(
+            ticket_str,
+            &config.secret_key,
+            now_nanos,
+        ) {
             Ok(ticket) => {
                 is_authed = true;
                 authenticated_principal = ticket.username.clone();

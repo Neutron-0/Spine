@@ -38,7 +38,9 @@ async fn test_notifications_lifecycle() {
     assert_eq!(unread.len(), 2);
 
     // 3. Mark one read
-    db.mark_notification_read(&notif_1.id, user_id).await.unwrap();
+    db.mark_notification_read(&notif_1.id, user_id)
+        .await
+        .unwrap();
     let unread_after = db.list_user_notifications(user_id, true).await.unwrap();
     assert_eq!(unread_after.len(), 1);
     assert_eq!(unread_after[0].id, notif_2.id);

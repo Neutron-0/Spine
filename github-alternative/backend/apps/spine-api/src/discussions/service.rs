@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use chrono::Utc;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::core::error::ForgeError;
@@ -21,7 +21,10 @@ impl DiscussionService {
     }
 
     /// Ensure default discussion categories exist for a repository.
-    pub async fn ensure_default_categories(&self, repo_id: &str) -> Result<Vec<DiscussionCategory>, ForgeError> {
+    pub async fn ensure_default_categories(
+        &self,
+        repo_id: &str,
+    ) -> Result<Vec<DiscussionCategory>, ForgeError> {
         let existing = self.db.list_discussion_categories(repo_id).await?;
         if !existing.is_empty() {
             return Ok(existing);
@@ -29,11 +32,41 @@ impl DiscussionService {
 
         let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let defaults = vec![
-            ("Announcements", "announcements", "Official updates and news", "📢", false),
-            ("General", "general", "Anything and everything related to the project", "💬", false),
-            ("Q&A", "q-and-a", "Ask questions and get answers from the community", "❓", true),
-            ("Ideas", "ideas", "Feature requests and architecture proposals", "💡", false),
-            ("Show and tell", "show-and-tell", "Show off what you've built with Spine", "🙌", false),
+            (
+                "Announcements",
+                "announcements",
+                "Official updates and news",
+                "📢",
+                false,
+            ),
+            (
+                "General",
+                "general",
+                "Anything and everything related to the project",
+                "💬",
+                false,
+            ),
+            (
+                "Q&A",
+                "q-and-a",
+                "Ask questions and get answers from the community",
+                "❓",
+                true,
+            ),
+            (
+                "Ideas",
+                "ideas",
+                "Feature requests and architecture proposals",
+                "💡",
+                false,
+            ),
+            (
+                "Show and tell",
+                "show-and-tell",
+                "Show off what you've built with Spine",
+                "🙌",
+                false,
+            ),
         ];
 
         let mut created = Vec::new();
@@ -55,7 +88,10 @@ impl DiscussionService {
         Ok(created)
     }
 
-    pub async fn list_categories(&self, repo_id: &str) -> Result<Vec<DiscussionCategory>, ForgeError> {
+    pub async fn list_categories(
+        &self,
+        repo_id: &str,
+    ) -> Result<Vec<DiscussionCategory>, ForgeError> {
         let categories = self.db.list_discussion_categories(repo_id).await?;
         if categories.is_empty() {
             self.ensure_default_categories(repo_id).await
@@ -81,7 +117,11 @@ impl DiscussionService {
             name: name.to_string(),
             slug: slug.to_string(),
             description: description.map(|s| s.to_string()),
-            emoji: if emoji.is_empty() { "💬".to_string() } else { emoji.to_string() },
+            emoji: if emoji.is_empty() {
+                "💬".to_string()
+            } else {
+                emoji.to_string()
+            },
             is_answerable,
             created_at_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
         };
@@ -96,13 +136,17 @@ impl DiscussionService {
         title: &str,
         body: &str,
     ) -> Result<DiscussionDto, ForgeError> {
-        self.perms.require_repo_read(Some(author_id), repo_id).await?;
+        self.perms
+            .require_repo_read(Some(author_id), repo_id)
+            .await?;
 
         let cat = self
             .db
             .get_discussion_category(category_id)
             .await?
-            .ok_or_else(|| ForgeError::NotFound(format!("Discussion category '{}' not found", category_id)))?;
+            .ok_or_else(|| {
+                ForgeError::NotFound(format!("Discussion category '{}' not found", category_id))
+            })?;
 
         let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let disc = Discussion {
@@ -124,12 +168,15 @@ impl DiscussionService {
         let created = self.db.create_discussion(disc).await?;
 
         // Automatically subscribe author
-        let _ = self.db.set_discussion_subscription(DiscussionSubscription {
-            user_id: author_id.to_string(),
-            discussion_id: created.id.clone(),
-            state: "SUBSCRIBED".to_string(),
-            updated_at_nanos: now,
-        }).await;
+        let _ = self
+            .db
+            .set_discussion_subscription(DiscussionSubscription {
+                user_id: author_id.to_string(),
+                discussion_id: created.id.clone(),
+                state: "SUBSCRIBED".to_string(),
+                updated_at_nanos: now,
+            })
+            .await;
 
         self.enrich_discussion(created, cat).await
     }
@@ -182,16 +229,19 @@ impl DiscussionService {
         let mut dtos = Vec::new();
 
         for d in discussions {
-            let cat = cat_map.get(&d.category_id).cloned().unwrap_or_else(|| DiscussionCategory {
-                id: d.category_id.clone(),
-                repo_id: repo_id.to_string(),
-                name: "General".to_string(),
-                slug: "general".to_string(),
-                description: None,
-                emoji: "💬".to_string(),
-                is_answerable: false,
-                created_at_nanos: 0,
-            });
+            let cat = cat_map
+                .get(&d.category_id)
+                .cloned()
+                .unwrap_or_else(|| DiscussionCategory {
+                    id: d.category_id.clone(),
+                    repo_id: repo_id.to_string(),
+                    name: "General".to_string(),
+                    slug: "general".to_string(),
+                    description: None,
+                    emoji: "💬".to_string(),
+                    is_answerable: false,
+                    created_at_nanos: 0,
+                });
 
             if let Ok(dto) = self.enrich_discussion(d, cat).await {
                 dtos.push(dto);
@@ -219,10 +269,16 @@ impl DiscussionService {
             .ok_or_else(|| ForgeError::NotFound(format!("Discussion #{} not found", number)))?;
 
         let is_author = disc.author_id == actor_id;
-        let is_admin = self.perms.can_admin_repo(actor_id, repo_id).await.unwrap_or(false);
+        let is_admin = self
+            .perms
+            .can_admin_repo(actor_id, repo_id)
+            .await
+            .unwrap_or(false);
 
         if !is_author && !is_admin {
-            return Err(ForgeError::Forbidden("Not authorized to modify this discussion".to_string()));
+            return Err(ForgeError::Forbidden(
+                "Not authorized to modify this discussion".to_string(),
+            ));
         }
 
         if let Some(t) = title {
@@ -236,13 +292,17 @@ impl DiscussionService {
         }
         if let Some(pinned) = is_pinned {
             if !is_admin {
-                return Err(ForgeError::Forbidden("Only repository administrators can pin discussions".to_string()));
+                return Err(ForgeError::Forbidden(
+                    "Only repository administrators can pin discussions".to_string(),
+                ));
             }
             disc.is_pinned = pinned;
         }
         if let Some(locked) = is_locked {
             if !is_admin {
-                return Err(ForgeError::Forbidden("Only repository administrators can lock discussions".to_string()));
+                return Err(ForgeError::Forbidden(
+                    "Only repository administrators can lock discussions".to_string(),
+                ));
             }
             disc.is_locked = locked;
         }
@@ -276,7 +336,9 @@ impl DiscussionService {
         parent_comment_id: Option<&str>,
         body: &str,
     ) -> Result<DiscussionCommentDto, ForgeError> {
-        self.perms.require_repo_read(Some(author_id), repo_id).await?;
+        self.perms
+            .require_repo_read(Some(author_id), repo_id)
+            .await?;
 
         let disc = self
             .db
@@ -285,7 +347,9 @@ impl DiscussionService {
             .ok_or_else(|| ForgeError::NotFound(format!("Discussion #{} not found", number)))?;
 
         if disc.is_locked {
-            return Err(ForgeError::Conflict("Discussion is locked for new comments".to_string()));
+            return Err(ForgeError::Conflict(
+                "Discussion is locked for new comments".to_string(),
+            ));
         }
 
         let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -342,9 +406,15 @@ impl DiscussionService {
             .ok_or_else(|| ForgeError::NotFound(format!("Discussion #{} not found", number)))?;
 
         let is_author = disc.author_id == actor_id;
-        let is_admin = self.perms.can_admin_repo(actor_id, repo_id).await.unwrap_or(false);
+        let is_admin = self
+            .perms
+            .can_admin_repo(actor_id, repo_id)
+            .await
+            .unwrap_or(false);
         if !is_author && !is_admin {
-            return Err(ForgeError::Forbidden("Only discussion author or repo admin can mark an answer".to_string()));
+            return Err(ForgeError::Forbidden(
+                "Only discussion author or repo admin can mark an answer".to_string(),
+            ));
         }
 
         let cat = self
@@ -354,7 +424,9 @@ impl DiscussionService {
             .ok_or_else(|| ForgeError::NotFound("Category not found".to_string()))?;
 
         if !cat.is_answerable {
-            return Err(ForgeError::Conflict("Category does not support accepted answers".to_string()));
+            return Err(ForgeError::Conflict(
+                "Category does not support accepted answers".to_string(),
+            ));
         }
 
         let mut comment = self
@@ -388,9 +460,17 @@ impl DiscussionService {
         subject_id: &str,
         reaction: &str,
     ) -> Result<bool, ForgeError> {
-        let existing = self.db.list_discussion_reactions(subject_type, subject_id).await?;
-        if existing.iter().any(|r| r.user_id == user_id && r.reaction == reaction) {
-            self.db.remove_discussion_reaction(subject_type, subject_id, user_id, reaction).await?;
+        let existing = self
+            .db
+            .list_discussion_reactions(subject_type, subject_id)
+            .await?;
+        if existing
+            .iter()
+            .any(|r| r.user_id == user_id && r.reaction == reaction)
+        {
+            self.db
+                .remove_discussion_reaction(subject_type, subject_id, user_id, reaction)
+                .await?;
             Ok(false) // Removed
         } else {
             let r = DiscussionReaction {
@@ -406,7 +486,11 @@ impl DiscussionService {
         }
     }
 
-    async fn enrich_discussion(&self, d: Discussion, cat: DiscussionCategory) -> Result<DiscussionDto, ForgeError> {
+    async fn enrich_discussion(
+        &self,
+        d: Discussion,
+        cat: DiscussionCategory,
+    ) -> Result<DiscussionDto, ForgeError> {
         let author = if let Some(u) = self.db.get_user_by_id(&d.author_id).await? {
             UserDto::from(&u)
         } else {
@@ -438,7 +522,10 @@ impl DiscussionService {
         })
     }
 
-    async fn enrich_comment(&self, c: DiscussionComment) -> Result<DiscussionCommentDto, ForgeError> {
+    async fn enrich_comment(
+        &self,
+        c: DiscussionComment,
+    ) -> Result<DiscussionCommentDto, ForgeError> {
         let author = if let Some(u) = self.db.get_user_by_id(&c.author_id).await? {
             UserDto::from(&u)
         } else {
@@ -453,8 +540,13 @@ impl DiscussionService {
             }
         };
 
-        let raw_reactions = self.db.list_discussion_reactions("COMMENT", &c.id).await.unwrap_or_default();
-        let mut grouped: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        let raw_reactions = self
+            .db
+            .list_discussion_reactions("COMMENT", &c.id)
+            .await
+            .unwrap_or_default();
+        let mut grouped: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
         for r in raw_reactions {
             grouped.entry(r.reaction).or_default().push(r.user_id);
         }

@@ -1,7 +1,7 @@
+use chrono::Utc;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use chrono::Utc;
 use uuid::Uuid;
 
 use crate::core::error::ForgeError;
@@ -19,7 +19,11 @@ pub struct DiscoveryService {
 }
 
 impl DiscoveryService {
-    pub fn new(db: Arc<dyn Database>, perms: Arc<PermissionService>, storage_root: PathBuf) -> Self {
+    pub fn new(
+        db: Arc<dyn Database>,
+        perms: Arc<PermissionService>,
+        storage_root: PathBuf,
+    ) -> Self {
         Self {
             db,
             perms,
@@ -30,7 +34,10 @@ impl DiscoveryService {
     // -------------------------------------------------------------------------
     // User Profiles
     // -------------------------------------------------------------------------
-    pub async fn get_user_profile(&self, username: &str) -> Result<ExtendedUserProfile, ForgeError> {
+    pub async fn get_user_profile(
+        &self,
+        username: &str,
+    ) -> Result<ExtendedUserProfile, ForgeError> {
         let user = self
             .db
             .get_user_by_username(username)
@@ -65,8 +72,11 @@ impl DiscoveryService {
         profile_readme: Option<&str>,
         pinned_repo_ids: Option<Vec<String>>,
     ) -> Result<ExtendedUserProfile, ForgeError> {
-        let existing = self.db.get_extended_user_profile(actor_id).await?.unwrap_or_else(|| {
-            ExtendedUserProfile {
+        let existing = self
+            .db
+            .get_extended_user_profile(actor_id)
+            .await?
+            .unwrap_or_else(|| ExtendedUserProfile {
                 user_id: actor_id.to_string(),
                 bio: None,
                 company: None,
@@ -76,8 +86,7 @@ impl DiscoveryService {
                 profile_readme: None,
                 pinned_repo_ids: Vec::new(),
                 updated_at_nanos: 0,
-            }
-        });
+            });
 
         let updated = ExtendedUserProfile {
             user_id: actor_id.to_string(),
@@ -85,8 +94,12 @@ impl DiscoveryService {
             company: company.map(|s| s.to_string()).or(existing.company),
             location: location.map(|s| s.to_string()).or(existing.location),
             website_url: website_url.map(|s| s.to_string()).or(existing.website_url),
-            twitter_username: twitter_username.map(|s| s.to_string()).or(existing.twitter_username),
-            profile_readme: profile_readme.map(|s| s.to_string()).or(existing.profile_readme),
+            twitter_username: twitter_username
+                .map(|s| s.to_string())
+                .or(existing.twitter_username),
+            profile_readme: profile_readme
+                .map(|s| s.to_string())
+                .or(existing.profile_readme),
             pinned_repo_ids: pinned_repo_ids.unwrap_or(existing.pinned_repo_ids),
             updated_at_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
         };
@@ -113,7 +126,10 @@ impl DiscoveryService {
                 continue;
             }
             // Must contain only lowercase alphanumeric and dashes
-            if clean.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+            if clean
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            {
                 if !normalized.contains(&clean) {
                     normalized.push(clean);
                 }
@@ -123,18 +139,27 @@ impl DiscoveryService {
         self.db.set_repository_topics(repo_id, &normalized).await
     }
 
-    pub async fn list_repository_topics(&self, repo_id: &str) -> Result<Vec<RepositoryTopic>, ForgeError> {
+    pub async fn list_repository_topics(
+        &self,
+        repo_id: &str,
+    ) -> Result<Vec<RepositoryTopic>, ForgeError> {
         self.db.list_repository_topics(repo_id).await
     }
 
-    pub async fn list_popular_topics(&self, limit: usize) -> Result<Vec<PopularTopicDto>, ForgeError> {
+    pub async fn list_popular_topics(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<PopularTopicDto>, ForgeError> {
         self.db.list_popular_topics(limit).await
     }
 
     // -------------------------------------------------------------------------
     // Language Analysis
     // -------------------------------------------------------------------------
-    pub async fn analyze_repository_languages(&self, repo_id: &str) -> Result<Vec<RepositoryLanguage>, ForgeError> {
+    pub async fn analyze_repository_languages(
+        &self,
+        repo_id: &str,
+    ) -> Result<Vec<RepositoryLanguage>, ForgeError> {
         let repo_dir = self.storage_root.join(repo_id);
         let mut byte_counts: HashMap<String, i64> = HashMap::new();
 
@@ -167,7 +192,10 @@ impl DiscoveryService {
         self.db.set_repository_languages(repo_id, &results).await
     }
 
-    pub async fn list_repository_languages(&self, repo_id: &str) -> Result<Vec<RepositoryLanguage>, ForgeError> {
+    pub async fn list_repository_languages(
+        &self,
+        repo_id: &str,
+    ) -> Result<Vec<RepositoryLanguage>, ForgeError> {
         let langs = self.db.list_repository_languages(repo_id).await?;
         if langs.is_empty() {
             self.analyze_repository_languages(repo_id).await
@@ -179,7 +207,10 @@ impl DiscoveryService {
     // -------------------------------------------------------------------------
     // Explore Feed
     // -------------------------------------------------------------------------
-    pub async fn list_explore_repositories(&self, topic_filter: Option<&str>) -> Result<Vec<RepositoryDiscoveryCard>, ForgeError> {
+    pub async fn list_explore_repositories(
+        &self,
+        topic_filter: Option<&str>,
+    ) -> Result<Vec<RepositoryDiscoveryCard>, ForgeError> {
         let repos = if let Some(t) = topic_filter {
             self.db.list_repositories_by_topic(t).await?
         } else {
@@ -200,14 +231,22 @@ impl DiscoveryService {
                 .map(|t| t.topic)
                 .collect();
 
-            let languages = self.db.list_repository_languages(&r.id).await.unwrap_or_default();
+            let languages = self
+                .db
+                .list_repository_languages(&r.id)
+                .await
+                .unwrap_or_default();
             let primary_language = languages.first().map(|l| l.language.clone());
 
             cards.push(RepositoryDiscoveryCard {
                 id: r.id,
                 owner_name: r.owner_username,
                 name: r.name,
-                description: if r.description.is_empty() { None } else { Some(r.description) },
+                description: if r.description.is_empty() {
+                    None
+                } else {
+                    Some(r.description)
+                },
                 is_private: r.is_private,
                 topics,
                 primary_language,

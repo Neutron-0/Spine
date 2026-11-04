@@ -19,9 +19,15 @@ pub async fn list_repo_activity(
     Query(query): Query<ActivityQuery>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.as_ref().map(|Extension(u)| u);
-    let repo = state.repositories.get_repository(caller, &owner, &repo_name).await?;
+    let repo = state
+        .repositories
+        .get_repository(caller, &owner, &repo_name)
+        .await?;
 
     let limit = query.limit.unwrap_or(30).min(100);
-    let events = state.db.list_activity_events_for_repo(&repo.id, limit).await?;
+    let events = state
+        .db
+        .list_activity_events_for_repo(&repo.id, limit)
+        .await?;
     Ok(Json(events))
 }

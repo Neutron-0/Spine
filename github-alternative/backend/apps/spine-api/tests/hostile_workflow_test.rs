@@ -24,7 +24,8 @@ fn test_hostile_malformed_workflow_yaml() {
     assert!(WorkflowParser::parse(no_jobs).is_err());
 
     // Step with neither run nor uses
-    let empty_step = "name: 'Invalid Step'\njobs:\n  build:\n    steps:\n      - name: 'No run or uses'";
+    let empty_step =
+        "name: 'Invalid Step'\njobs:\n  build:\n    steps:\n      - name: 'No run or uses'";
     assert!(WorkflowParser::parse(empty_step).is_err());
 }
 
@@ -57,7 +58,14 @@ async fn test_runner_stale_fencing_token_rejected() {
     let runner_service = RunnerService::new(Arc::clone(&db), scheduler);
 
     let (runner1, _token1) = runner_service
-        .register_runner("r1", "host1", "windows", "x86_64", vec!["self-hosted".to_string()], 1)
+        .register_runner(
+            "r1",
+            "host1",
+            "windows",
+            "x86_64",
+            vec!["self-hosted".to_string()],
+            1,
+        )
         .await
         .unwrap();
 
@@ -86,19 +94,28 @@ async fn test_runner_stale_fencing_token_rejected() {
     let stale_complete = runner_service
         .complete_job(&runner1.id, &job_id, 4, 0, &[])
         .await;
-    assert!(stale_complete.is_err(), "Completion with stale fencing token must be rejected");
+    assert!(
+        stale_complete.is_err(),
+        "Completion with stale fencing token must be rejected"
+    );
 
     // Runner with wrong runner_id rejected
     let imposter_complete = runner_service
         .complete_job("imposter_runner_id", &job_id, 5, 0, &[])
         .await;
-    assert!(imposter_complete.is_err(), "Completion from wrong runner must be rejected");
+    assert!(
+        imposter_complete.is_err(),
+        "Completion from wrong runner must be rejected"
+    );
 
     // Correct runner and matching token succeeds
     let valid_complete = runner_service
         .complete_job(&runner1.id, &job_id, 5, 0, &[])
         .await;
-    assert!(valid_complete.is_ok(), "Completion with valid fencing token and runner identity must succeed");
+    assert!(
+        valid_complete.is_ok(),
+        "Completion with valid fencing token and runner identity must succeed"
+    );
 }
 
 #[tokio::test]
@@ -209,7 +226,9 @@ async fn test_secret_masking_in_runner_output() {
 
     // The secret string must NEVER appear in the stdout
     assert!(
-        !results[0].stdout.contains("super_confidential_db_credential_88"),
+        !results[0]
+            .stdout
+            .contains("super_confidential_db_credential_88"),
         "Raw secret must never be revealed in stdout"
     );
     // It must be replaced with asterisks

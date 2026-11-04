@@ -30,12 +30,18 @@ pub struct ExploreQuery {
     pub topic: Option<String>,
 }
 
-async fn resolve_repo(state: &AppState, owner: &str, repo_name: &str) -> Result<String, ForgeError> {
+async fn resolve_repo(
+    state: &AppState,
+    owner: &str,
+    repo_name: &str,
+) -> Result<String, ForgeError> {
     let repo = state
         .db
         .get_repository_by_owner_name(owner, repo_name)
         .await?
-        .ok_or_else(|| ForgeError::NotFound(format!("Repository '{}/{}' not found", owner, repo_name)))?;
+        .ok_or_else(|| {
+            ForgeError::NotFound(format!("Repository '{}/{}' not found", owner, repo_name))
+        })?;
     Ok(repo.id)
 }
 
@@ -53,9 +59,12 @@ pub async fn update_profile(
     Path(username): Path<String>,
     Json(payload): Json<UpdateProfileRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let Extension(user) = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let Extension(user) =
+        user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     if user.username.to_lowercase() != username.to_lowercase() {
-        return Err(ForgeError::Forbidden("Cannot edit another user's profile".to_string()));
+        return Err(ForgeError::Forbidden(
+            "Cannot edit another user's profile".to_string(),
+        ));
     }
 
     let updated = state
@@ -74,7 +83,9 @@ pub async fn update_profile(
     Ok(Json(updated))
 }
 
-pub async fn list_popular_topics(State(state): State<AppState>) -> Result<impl IntoResponse, ForgeError> {
+pub async fn list_popular_topics(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, ForgeError> {
     let topics = state.discovery.list_popular_topics(30).await?;
     Ok(Json(topics))
 }
@@ -83,7 +94,10 @@ pub async fn list_explore_repositories(
     State(state): State<AppState>,
     Query(query): Query<ExploreQuery>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let repos = state.discovery.list_explore_repositories(query.topic.as_deref()).await?;
+    let repos = state
+        .discovery
+        .list_explore_repositories(query.topic.as_deref())
+        .await?;
     Ok(Json(repos))
 }
 
@@ -102,9 +116,13 @@ pub async fn set_repo_topics(
     Path((owner, repo_name)): Path<(String, String)>,
     Json(payload): Json<SetTopicsRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let Extension(user) = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let Extension(user) =
+        user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
-    let topics = state.discovery.set_repository_topics(&user.id, &repo_id, &payload.topics).await?;
+    let topics = state
+        .discovery
+        .set_repository_topics(&user.id, &repo_id, &payload.topics)
+        .await?;
     Ok(Json(topics))
 }
 
@@ -122,6 +140,9 @@ pub async fn analyze_repo_languages(
     Path((owner, repo_name)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
-    let langs = state.discovery.analyze_repository_languages(&repo_id).await?;
+    let langs = state
+        .discovery
+        .analyze_repository_languages(&repo_id)
+        .await?;
     Ok(Json(langs))
 }

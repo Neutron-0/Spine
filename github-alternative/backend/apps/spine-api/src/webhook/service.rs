@@ -1,16 +1,16 @@
-use std::sync::Arc;
 use chrono::Utc;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
+use super::ssrf::SsrfValidator;
+use crate::core::error::ForgeError;
 use crate::core::types::{
     CreateWebhookSubscriptionRequest, WebhookOutboxItem, WebhookSubscription,
 };
-use crate::core::error::ForgeError;
 use crate::db::Database;
-use super::ssrf::SsrfValidator;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -39,8 +39,8 @@ impl WebhookService {
 
     /// Sign a payload body using HMAC-SHA256, returning "sha256=<hex>".
     pub fn sign_payload(secret: &str, body: &[u8]) -> String {
-        let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-            .expect("HMAC can take key of any size");
+        let mut mac =
+            HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
         mac.update(body);
         let result = mac.finalize().into_bytes();
         format!("sha256={}", hex::encode(result))
@@ -52,7 +52,10 @@ impl WebhookService {
         if signature_header.len() != expected.len() {
             return false;
         }
-        signature_header.as_bytes().ct_eq(expected.as_bytes()).into()
+        signature_header
+            .as_bytes()
+            .ct_eq(expected.as_bytes())
+            .into()
     }
 
     pub async fn create_subscription(
@@ -63,7 +66,9 @@ impl WebhookService {
         self.ssrf.validate_and_resolve(&req.target_url).await?;
 
         if req.events.is_empty() {
-            return Err(WebhookError::Validation("At least one event must be selected".into()));
+            return Err(WebhookError::Validation(
+                "At least one event must be selected".into(),
+            ));
         }
 
         let secret = req.secret.unwrap_or_else(|| {
@@ -112,7 +117,10 @@ impl WebhookService {
     }
 
     pub async fn delete_subscription(&self, id: &str) -> Result<(), WebhookError> {
-        self.db.delete_webhook_subscription(id).await.map_err(Into::into)
+        self.db
+            .delete_webhook_subscription(id)
+            .await
+            .map_err(Into::into)
     }
 
     /// Queue outbox events for all matching subscriptions when an event occurs
@@ -123,7 +131,10 @@ impl WebhookService {
         event_type: &str,
         payload: &serde_json::Value,
     ) -> Result<usize, WebhookError> {
-        let subscriptions = self.db.list_webhook_subscriptions(owner_type, owner_id).await?;
+        let subscriptions = self
+            .db
+            .list_webhook_subscriptions(owner_type, owner_id)
+            .await?;
 
         let now_nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let mut queued_count = 0;

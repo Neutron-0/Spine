@@ -54,7 +54,8 @@ fn test_capability_ticket_signing_and_verification() {
 
     // Expired ticket
     let expired_time = now + validity + 1_000_000_000i64; // past expiry
-    let expired_err = CapabilityTicket::decode_and_verify(&signed_str, DEFAULT_SECRET_KEY, expired_time);
+    let expired_err =
+        CapabilityTicket::decode_and_verify(&signed_str, DEFAULT_SECRET_KEY, expired_time);
     assert!(expired_err.is_err());
 
     // Wrong secret key
@@ -73,11 +74,23 @@ async fn test_issue_capability_ticket_api_route() {
     let rate_limiter = Arc::new(RateLimiter::new());
     let mail = Arc::new(DevMailCatcher::new());
 
-    let artifact_store = Arc::new(spine_artifact::LocalArtifactStore::new(tmp.path().join("artifacts")).unwrap());
-    let artifacts = Arc::new(spine_api::artifact::ArtifactService::new(db.clone(), artifact_store));
-    let releases = Arc::new(spine_api::releases::ReleaseService::new(db.clone(), artifacts.clone()));
-    let packages = Arc::new(spine_api::packages::PackageService::new(db.clone(), artifacts.clone()));
-    let cargo = Arc::new(spine_api::packages::CargoRegistryAdapter::new(packages.clone()));
+    let artifact_store =
+        Arc::new(spine_artifact::LocalArtifactStore::new(tmp.path().join("artifacts")).unwrap());
+    let artifacts = Arc::new(spine_api::artifact::ArtifactService::new(
+        db.clone(),
+        artifact_store,
+    ));
+    let releases = Arc::new(spine_api::releases::ReleaseService::new(
+        db.clone(),
+        artifacts.clone(),
+    ));
+    let packages = Arc::new(spine_api::packages::PackageService::new(
+        db.clone(),
+        artifacts.clone(),
+    ));
+    let cargo = Arc::new(spine_api::packages::CargoRegistryAdapter::new(
+        packages.clone(),
+    ));
 
     let state = AppState::new_with_defaults(db.clone(), tmp.path(), None).unwrap();
 
@@ -101,7 +114,13 @@ async fn test_issue_capability_ticket_api_route() {
     db.create_user(user.clone()).await.unwrap();
 
     let repo = repos
-        .create_repository(&user, "cool-project", Some("A test repo".into()), false, None)
+        .create_repository(
+            &user,
+            "cool-project",
+            Some("A test repo".into()),
+            false,
+            None,
+        )
         .await
         .unwrap();
 
@@ -111,7 +130,10 @@ async fn test_issue_capability_ticket_api_route() {
     });
     let req = Request::builder()
         .method("POST")
-        .uri(format!("/api/v1/repos/{}/{}/capability", user.username, repo.name))
+        .uri(format!(
+            "/api/v1/repos/{}/{}/capability",
+            user.username, repo.name
+        ))
         .header("Content-Type", "application/json")
         .extension(user.clone())
         .body(Body::from(body.to_string()))
@@ -120,7 +142,9 @@ async fn test_issue_capability_ticket_api_route() {
     let resp = router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 64).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 64)
+        .await
+        .unwrap();
     let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert!(val.get("ticket").is_some());
     assert_eq!(val["role"].as_str().unwrap(), "admin");
@@ -134,7 +158,10 @@ async fn test_issue_capability_ticket_api_route() {
 
     let anon_req = Request::builder()
         .method("POST")
-        .uri(format!("/api/v1/repos/{}/{}/capability", user.username, private_repo.name))
+        .uri(format!(
+            "/api/v1/repos/{}/{}/capability",
+            user.username, private_repo.name
+        ))
         .header("Content-Type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();

@@ -8,7 +8,9 @@ async fn test_code_review_workflow() {
     let pr_id = "pr_test_1";
 
     // 1. Request reviewer
-    db.request_pr_reviewer(pr_id, "usr_reviewer_1", "usr_author").await.unwrap();
+    db.request_pr_reviewer(pr_id, "usr_reviewer_1", "usr_author")
+        .await
+        .unwrap();
     let requested = db.list_pr_requested_reviewers(pr_id).await.unwrap();
     assert_eq!(requested, vec!["usr_reviewer_1"]);
 
@@ -52,7 +54,9 @@ async fn test_code_review_workflow() {
     assert!(!comments[0].is_resolved);
 
     // Resolve comment
-    db.resolve_pr_review_comment(&comment.id, true).await.unwrap();
+    db.resolve_pr_review_comment(&comment.id, true)
+        .await
+        .unwrap();
     let updated_comments = db.list_pr_review_comments(pr_id).await.unwrap();
     assert!(updated_comments[0].is_resolved);
 
@@ -75,7 +79,9 @@ async fn test_code_review_workflow() {
     assert_eq!(reviews_now[1].state, "APPROVED");
 
     // 5. Dismiss review test
-    db.dismiss_pr_review(&rev_1.id, "usr_admin", 300).await.unwrap();
+    db.dismiss_pr_review(&rev_1.id, "usr_admin", 300)
+        .await
+        .unwrap();
     let reviews_after_dismiss = db.list_pr_reviews(pr_id).await.unwrap();
     assert_eq!(reviews_after_dismiss[0].state, "DISMISSED");
 }

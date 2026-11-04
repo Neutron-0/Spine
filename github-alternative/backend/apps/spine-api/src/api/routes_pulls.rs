@@ -56,7 +56,10 @@ pub async fn list_pull_requests(
     Query(query): Query<ListPullsQuery>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.as_ref().map(|Extension(u)| u);
-    let repo = state.repositories.get_repository(caller, &owner, &repo_name).await?;
+    let repo = state
+        .repositories
+        .get_repository(caller, &owner, &repo_name)
+        .await?;
 
     let prs = state
         .db
@@ -117,8 +120,12 @@ pub async fn create_pull_request(
     Path((owner, repo_name)): Path<(String, String)>,
     Json(payload): Json<CreatePullRequestRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required to create PR".into()))?;
-    let repo = state.repositories.get_repository(Some(&caller), &owner, &repo_name).await?;
+    let caller = user
+        .ok_or_else(|| ForgeError::Unauthorized("Authentication required to create PR".into()))?;
+    let repo = state
+        .repositories
+        .get_repository(Some(&caller), &owner, &repo_name)
+        .await?;
 
     let title = payload.title.trim().to_string();
     if title.is_empty() {
@@ -128,7 +135,9 @@ pub async fn create_pull_request(
     let base_branch = payload.base_branch.trim().to_string();
     let head_branch = payload.head_branch.trim().to_string();
     if base_branch == head_branch {
-        return Err(ForgeError::BadRequest("Base branch and head branch cannot be identical".into()));
+        return Err(ForgeError::BadRequest(
+            "Base branch and head branch cannot be identical".into(),
+        ));
     }
 
     // Resolve commits from native storage
@@ -163,19 +172,22 @@ pub async fn create_pull_request(
     let created = state.db.create_pull_request(pr).await?;
 
     // Activity event
-    let _ = state.db.record_activity_event(RepositoryActivityEvent {
-        id: format!("act_{}", uuid::Uuid::new_v4().simple()),
-        repo_id: repo.id.clone(),
-        actor_id: Some(caller.id.clone()),
-        event_type: "pull_request.opened".to_string(),
-        payload: serde_json::json!({
-            "pr_number": created.pr_number,
-            "title": created.title,
-            "base": created.base_branch,
-            "head": created.head_branch,
-        }),
-        created_at_nanos: now,
-    }).await;
+    let _ = state
+        .db
+        .record_activity_event(RepositoryActivityEvent {
+            id: format!("act_{}", uuid::Uuid::new_v4().simple()),
+            repo_id: repo.id.clone(),
+            actor_id: Some(caller.id.clone()),
+            event_type: "pull_request.opened".to_string(),
+            payload: serde_json::json!({
+                "pr_number": created.pr_number,
+                "title": created.title,
+                "base": created.base_branch,
+                "head": created.head_branch,
+            }),
+            created_at_nanos: now,
+        })
+        .await;
 
     Ok((StatusCode::CREATED, Json(created)))
 }
@@ -186,7 +198,10 @@ pub async fn get_pull_request(
     Path((owner, repo_name, number)): Path<(String, String, i64)>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.as_ref().map(|Extension(u)| u);
-    let repo = state.repositories.get_repository(caller, &owner, &repo_name).await?;
+    let repo = state
+        .repositories
+        .get_repository(caller, &owner, &repo_name)
+        .await?;
 
     let pr = state
         .db
@@ -246,7 +261,10 @@ pub async fn update_pull_request(
     Json(payload): Json<UpdatePullRequestRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
-    let repo = state.repositories.get_repository(Some(&caller), &owner, &repo_name).await?;
+    let repo = state
+        .repositories
+        .get_repository(Some(&caller), &owner, &repo_name)
+        .await?;
 
     let mut pr = state
         .db
@@ -255,9 +273,15 @@ pub async fn update_pull_request(
         .ok_or_else(|| ForgeError::NotFound("Pull request not found".into()))?;
 
     let is_author = pr.author_id == caller.id;
-    let is_collaborator = state.permissions.check_write_access(Some(&caller), &repo).await.is_ok();
+    let is_collaborator = state
+        .permissions
+        .check_write_access(Some(&caller), &repo)
+        .await
+        .is_ok();
     if !is_author && !is_collaborator {
-        return Err(ForgeError::Forbidden("Only PR author or repository collaborators can edit PR".into()));
+        return Err(ForgeError::Forbidden(
+            "Only PR author or repository collaborators can edit PR".into(),
+        ));
     }
 
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -289,7 +313,10 @@ pub async fn get_pull_request_diff(
     Path((owner, repo_name, number)): Path<(String, String, i64)>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.as_ref().map(|Extension(u)| u);
-    let repo = state.repositories.get_repository(caller, &owner, &repo_name).await?;
+    let repo = state
+        .repositories
+        .get_repository(caller, &owner, &repo_name)
+        .await?;
 
     let pr = state
         .db
@@ -297,7 +324,10 @@ pub async fn get_pull_request_diff(
         .await?
         .ok_or_else(|| ForgeError::NotFound("Pull request not found".into()))?;
 
-    let diff = state.vcs.compare_branches(&repo.native_repo_id, &pr.base_branch, &pr.head_branch)?;
+    let diff =
+        state
+            .vcs
+            .compare_branches(&repo.native_repo_id, &pr.base_branch, &pr.head_branch)?;
     Ok(Json(diff))
 }
 
@@ -307,7 +337,10 @@ pub async fn get_pull_request_mergeability(
     Path((owner, repo_name, number)): Path<(String, String, i64)>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.as_ref().map(|Extension(u)| u);
-    let repo = state.repositories.get_repository(caller, &owner, &repo_name).await?;
+    let repo = state
+        .repositories
+        .get_repository(caller, &owner, &repo_name)
+        .await?;
 
     let pr = state
         .db
@@ -315,7 +348,10 @@ pub async fn get_pull_request_mergeability(
         .await?
         .ok_or_else(|| ForgeError::NotFound("Pull request not found".into()))?;
 
-    let report = state.vcs.check_mergeability(&repo.native_repo_id, &pr.base_branch, &pr.head_branch)?;
+    let report =
+        state
+            .vcs
+            .check_mergeability(&repo.native_repo_id, &pr.base_branch, &pr.head_branch)?;
     Ok(Json(report))
 }
 
@@ -325,8 +361,12 @@ pub async fn execute_pull_request_merge(
     Path((owner, repo_name, number)): Path<(String, String, i64)>,
     Json(payload): Json<MergePullRequestRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required to merge PR".into()))?;
-    let repo = state.repositories.get_repository(Some(&caller), &owner, &repo_name).await?;
+    let caller =
+        user.ok_or_else(|| ForgeError::Unauthorized("Authentication required to merge PR".into()))?;
+    let repo = state
+        .repositories
+        .get_repository(Some(&caller), &owner, &repo_name)
+        .await?;
 
     let mut pr = state
         .db
@@ -335,22 +375,40 @@ pub async fn execute_pull_request_merge(
         .ok_or_else(|| ForgeError::NotFound("Pull request not found".into()))?;
 
     if pr.state != "OPEN" {
-        return Err(ForgeError::BadRequest(format!("Cannot merge PR in '{}' state", pr.state)));
+        return Err(ForgeError::BadRequest(format!(
+            "Cannot merge PR in '{}' state",
+            pr.state
+        )));
     }
 
     // Branch protection checks
-    state.permissions.check_merge_allowed(&caller, &repo, &pr.base_branch, &pr).await?;
+    state
+        .permissions
+        .check_merge_allowed(&caller, &repo, &pr.base_branch, &pr)
+        .await?;
 
     let commit_message = payload.commit_message.unwrap_or_else(|| {
-        format!("Merge pull request #{} from {}\n\n{}", pr.pr_number, pr.head_branch, pr.title)
+        format!(
+            "Merge pull request #{} from {}\n\n{}",
+            pr.pr_number, pr.head_branch, pr.title
+        )
     });
 
     // Check cross-service crash reconciliation
-    let current_base_oid = state.vcs.resolve_ref(&repo.native_repo_id, &pr.base_branch).ok();
+    let current_base_oid = state
+        .vcs
+        .resolve_ref(&repo.native_repo_id, &pr.base_branch)
+        .ok();
     let mut already_merged = false;
     if let Some(cur_oid) = current_base_oid {
-        if let Ok(commit) = state.vcs.get_commit(&repo.native_repo_id, &cur_oid.to_hex()) {
-            if commit.parents.len() == 2 && commit.parents[0] == pr.base_commit_id && commit.parents[1] == pr.head_commit_id {
+        if let Ok(commit) = state
+            .vcs
+            .get_commit(&repo.native_repo_id, &cur_oid.to_hex())
+        {
+            if commit.parents.len() == 2
+                && commit.parents[0] == pr.base_commit_id
+                && commit.parents[1] == pr.head_commit_id
+            {
                 already_merged = true;
             }
         }
@@ -360,8 +418,15 @@ pub async fn execute_pull_request_merge(
         current_base_oid.unwrap().to_hex()
     } else {
         let reviews = state.db.list_pr_reviews(&pr.id).await.unwrap_or_default();
-        let comments = state.db.list_pr_review_comments(&pr.id).await.unwrap_or_default();
-        let approved_count = reviews.iter().filter(|r| r.state == "APPROVED" && r.reviewer_id != pr.author_id).count() as u32;
+        let comments = state
+            .db
+            .list_pr_review_comments(&pr.id)
+            .await
+            .unwrap_or_default();
+        let approved_count = reviews
+            .iter()
+            .filter(|r| r.state == "APPROVED" && r.reviewer_id != pr.author_id)
+            .count() as u32;
         let has_active_change_requests = reviews.iter().any(|r| r.state == "CHANGES_REQUESTED");
         let has_unresolved_comments = comments.iter().any(|c| !c.is_resolved);
 
@@ -373,16 +438,19 @@ pub async fn execute_pull_request_merge(
             has_unresolved_comments,
         };
 
-        let merge_result = state.vcs.execute_merge(
-            &repo.native_repo_id,
-            &pr.base_branch,
-            &pr.head_branch,
-            &caller.id,
-            &caller.display_name,
-            &caller.email,
-            &commit_message,
-            Some(&pr_context),
-        ).await?;
+        let merge_result = state
+            .vcs
+            .execute_merge(
+                &repo.native_repo_id,
+                &pr.base_branch,
+                &pr.head_branch,
+                &caller.id,
+                &caller.display_name,
+                &caller.email,
+                &commit_message,
+                Some(&pr_context),
+            )
+            .await?;
 
         merge_result.merge_commit_id.unwrap_or_default()
     };
@@ -437,22 +505,28 @@ pub async fn execute_pull_request_merge(
     }
 
     // Activity event
-    let _ = state.db.record_activity_event(RepositoryActivityEvent {
-        id: format!("act_{}", uuid::Uuid::new_v4().simple()),
-        repo_id: repo.id.clone(),
-        actor_id: Some(caller.id.clone()),
-        event_type: "pull_request.merged".to_string(),
-        payload: serde_json::json!({
-            "pr_number": pr.pr_number,
-            "title": pr.title,
-            "merge_commit_id": merge_commit_id,
-        }),
-        created_at_nanos: now,
-    }).await;
+    let _ = state
+        .db
+        .record_activity_event(RepositoryActivityEvent {
+            id: format!("act_{}", uuid::Uuid::new_v4().simple()),
+            repo_id: repo.id.clone(),
+            actor_id: Some(caller.id.clone()),
+            event_type: "pull_request.merged".to_string(),
+            payload: serde_json::json!({
+                "pr_number": pr.pr_number,
+                "title": pr.title,
+                "merge_commit_id": merge_commit_id,
+            }),
+            created_at_nanos: now,
+        })
+        .await;
 
     Ok(Json(MergeResultDto {
         success: true,
         merge_commit_id: Some(merge_commit_id),
-        message: format!("Successfully merged {} into {}", pr.head_branch, pr.base_branch),
+        message: format!(
+            "Successfully merged {} into {}",
+            pr.head_branch, pr.base_branch
+        ),
     }))
 }

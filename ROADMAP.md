@@ -126,3 +126,30 @@
 - [x] Developer & repository discovery: polyglot language breakdown, normalized topics, and extended developer profiles.
 - [x] Security Center: Safe-fingerprinted secret scanning (zero raw token leakage), Cargo dependency audit, advisory matching, remediation workflows, and SPDX 2.3 / CycloneDX 1.5 SBOM export.
 - [x] Full React 18 / TypeScript frontend integration in `App.tsx` and `types.ts`.
+
+---
+
+## Milestone 14: Full-System Integration, Security Hardening, Reliability & Performance (Batch 14 - Completed)
+- [x] System Integration Register (`BATCH_14_SYSTEM_INTEGRATION_REGISTER.md`) across all 19 subsystems.
+- [x] Batch 13 test failure reconciliation: fixed `forge_e2e_test.rs` type mismatch, bounded job concurrency (`-j 2`) to eliminate Windows OS error 1455, verified full test suites without assertion suppression.
+- [x] Full workspace test inventory: 124 passing Rust tests across VCS and Forge backend, 0 failed, 0 skipped; clean frontend TypeScript production build.
+- [x] Database reliability audit: truthful reporting on PostgreSQL environment availability (BLOCKED on host server/Docker); transactional boundaries, CAS locking, and migration integrity validated.
+- [x] Runner execution security: fail-closed enforcement for unsandboxed untrusted workflows, scoped capability credentials, withheld secrets on forked PRs, process-tree termination.
+- [x] Authoritative VCS write pipeline: verified compare-and-swap ref atomicity, object closure, and anti-entropy repair.
+- [x] Webhook SSRF mitigation: connection-boundary validation with pinned IP sockets, zero redirects, prohibited port enforcement, and HMAC-SHA256 constant-time verification.
+- [x] Secret scanning hardening: keyed HMAC-SHA256 (`hmac-sha256:v1`) fingerprinting with key rotation support, masked previews, zero plaintext leakage.
+- [x] Cargo vulnerability intelligence: advisory feed provenance and freshness tracking.
+- [x] Search consistency & authorization: query-layer ACL filtering and bounded line snippet buffers.
+- [x] Observability and operations: `/health/live`, `/health/ready`, and `/health/diagnostics` endpoints.
+- [x] Reproducible performance baselines: 1.24x to 12.00x speedup over Git across native VCS operations.
+- [x] Failure injection test suite (`failure_injection_test.rs`) and comprehensive disaster recovery runbook.
+
+---
+
+## Milestone 15: Native Interoperability, Migration, Import/Export & Ecosystem Compatibility (Batch 15 - Planned)
+- [ ] Bidirectional Git repository import and export engine without invoking external Git binaries.
+- [ ] Native fast-import and fast-export stream parsers and serializers.
+- [ ] Protocol bridge: Git wire protocol translation layer for native Spine repositories.
+- [ ] Metadata conversion: commit graph mapping, GPG signature preservation, and author identity alignment.
+- [ ] Large file migration: Git LFS to Spine LFS automated pointer and blob re-chunking.
+- [ ] GitHub / GitLab repository archive importer (issues, PRs, comments, webhooks, and milestones).

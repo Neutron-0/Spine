@@ -262,7 +262,9 @@ impl CargoRegistryAdapter {
             let mut entry: serde_json::Value = serde_json::from_str(&v.metadata_json)
                 .map_err(|e| ForgeError::Internal(e.to_string()))?;
             entry["yanked"] = serde_json::json!(v.is_yanked);
-            lines.push(serde_json::to_string(&entry).map_err(|e| ForgeError::Internal(e.to_string()))?);
+            lines.push(
+                serde_json::to_string(&entry).map_err(|e| ForgeError::Internal(e.to_string()))?,
+            );
         }
 
         let index_content = lines.join("\n") + "\n";
@@ -276,7 +278,10 @@ impl CargoRegistryAdapter {
             .get_version(CARGO_ECOSYSTEM, crate_name, version)
             .await?
             .ok_or_else(|| {
-                ForgeError::NotFound(format!("Crate {} version {} not found", crate_name, version))
+                ForgeError::NotFound(format!(
+                    "Crate {} version {} not found",
+                    crate_name, version
+                ))
             })?;
 
         self.package_service
@@ -286,7 +291,12 @@ impl CargoRegistryAdapter {
     }
 
     /// Yanks or unyanks a crate version
-    pub async fn set_yanked(&self, crate_name: &str, version: &str, yanked: bool) -> Result<(), ForgeError> {
+    pub async fn set_yanked(
+        &self,
+        crate_name: &str,
+        version: &str,
+        yanked: bool,
+    ) -> Result<(), ForgeError> {
         self.package_service
             .set_yanked(CARGO_ECOSYSTEM, crate_name, version, yanked)
             .await

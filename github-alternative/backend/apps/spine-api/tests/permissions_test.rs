@@ -22,7 +22,13 @@ fn make_test_user(id: &str, username: &str, email: &str) -> User {
     }
 }
 
-fn make_test_repo(id: &str, owner_id: &str, owner_username: &str, name: &str, is_private: bool) -> ForgeRepository {
+fn make_test_repo(
+    id: &str,
+    owner_id: &str,
+    owner_username: &str,
+    name: &str,
+    is_private: bool,
+) -> ForgeRepository {
     ForgeRepository {
         id: id.to_string(),
         owner_user_id: owner_id.to_string(),
@@ -50,7 +56,13 @@ async fn test_public_repository_permissions() {
     let owner = make_test_user("usr_alice", "alice", "alice@spine.build");
     db.create_user(owner.clone()).await.unwrap();
 
-    let public_repo = make_test_repo("repo_pub", &owner.id, &owner.username, "public-project", false);
+    let public_repo = make_test_repo(
+        "repo_pub",
+        &owner.id,
+        &owner.username,
+        "public-project",
+        false,
+    );
     db.create_repository(public_repo.clone()).await.unwrap();
 
     let stranger = make_test_user("usr_bob", "bob", "bob@spine.build");
@@ -66,17 +78,29 @@ async fn test_public_repository_permissions() {
     }
 
     // Stranger read: allowed
-    assert!(perms.check_read_access(Some(&stranger), &public_repo).await.is_ok());
+    assert!(perms
+        .check_read_access(Some(&stranger), &public_repo)
+        .await
+        .is_ok());
 
     // Stranger write: forbidden (not collaborator)
-    match perms.check_write_access(Some(&stranger), &public_repo).await {
+    match perms
+        .check_write_access(Some(&stranger), &public_repo)
+        .await
+    {
         Err(ForgeError::Forbidden(_)) => {}
         other => panic!("Expected Forbidden, got {:?}", other),
     }
 
     // Owner read & write: allowed
-    assert!(perms.check_read_access(Some(&owner), &public_repo).await.is_ok());
-    assert!(perms.check_write_access(Some(&owner), &public_repo).await.is_ok());
+    assert!(perms
+        .check_read_access(Some(&owner), &public_repo)
+        .await
+        .is_ok());
+    assert!(perms
+        .check_write_access(Some(&owner), &public_repo)
+        .await
+        .is_ok());
 }
 
 #[tokio::test]
@@ -87,7 +111,13 @@ async fn test_private_repository_metadata_isolation() {
     let owner = make_test_user("usr_alice", "alice", "alice@spine.build");
     db.create_user(owner.clone()).await.unwrap();
 
-    let private_repo = make_test_repo("repo_priv", &owner.id, &owner.username, "classified-project", true);
+    let private_repo = make_test_repo(
+        "repo_priv",
+        &owner.id,
+        &owner.username,
+        "classified-project",
+        true,
+    );
     db.create_repository(private_repo.clone()).await.unwrap();
 
     let stranger = make_test_user("usr_bob", "bob", "bob@spine.build");
@@ -100,20 +130,32 @@ async fn test_private_repository_metadata_isolation() {
     }
 
     // Stranger read: must return NotFound
-    match perms.check_read_access(Some(&stranger), &private_repo).await {
+    match perms
+        .check_read_access(Some(&stranger), &private_repo)
+        .await
+    {
         Err(ForgeError::NotFound(_)) => {}
         other => panic!("Expected NotFound, got {:?}", other),
     }
 
     // Stranger write: must return NotFound
-    match perms.check_write_access(Some(&stranger), &private_repo).await {
+    match perms
+        .check_write_access(Some(&stranger), &private_repo)
+        .await
+    {
         Err(ForgeError::NotFound(_)) => {}
         other => panic!("Expected NotFound, got {:?}", other),
     }
 
     // Owner read & write: allowed
-    assert!(perms.check_read_access(Some(&owner), &private_repo).await.is_ok());
-    assert!(perms.check_write_access(Some(&owner), &private_repo).await.is_ok());
+    assert!(perms
+        .check_read_access(Some(&owner), &private_repo)
+        .await
+        .is_ok());
+    assert!(perms
+        .check_write_access(Some(&owner), &private_repo)
+        .await
+        .is_ok());
 }
 
 #[tokio::test]
@@ -157,15 +199,30 @@ async fn test_collaborator_role_hierarchy() {
 
     // Reader tests:
     assert!(perms.check_read_access(Some(&reader), &repo).await.is_ok());
-    assert!(perms.check_write_access(Some(&reader), &repo).await.is_err());
-    assert!(perms.check_admin_access(Some(&reader), &repo).await.is_err());
-    assert!(perms.check_delete_access(Some(&reader), &repo).await.is_err());
+    assert!(perms
+        .check_write_access(Some(&reader), &repo)
+        .await
+        .is_err());
+    assert!(perms
+        .check_admin_access(Some(&reader), &repo)
+        .await
+        .is_err());
+    assert!(perms
+        .check_delete_access(Some(&reader), &repo)
+        .await
+        .is_err());
 
     // Writer tests:
     assert!(perms.check_read_access(Some(&writer), &repo).await.is_ok());
     assert!(perms.check_write_access(Some(&writer), &repo).await.is_ok());
-    assert!(perms.check_admin_access(Some(&writer), &repo).await.is_err());
-    assert!(perms.check_delete_access(Some(&writer), &repo).await.is_err());
+    assert!(perms
+        .check_admin_access(Some(&writer), &repo)
+        .await
+        .is_err());
+    assert!(perms
+        .check_delete_access(Some(&writer), &repo)
+        .await
+        .is_err());
 
     // Owner tests:
     assert!(perms.check_read_access(Some(&owner), &repo).await.is_ok());

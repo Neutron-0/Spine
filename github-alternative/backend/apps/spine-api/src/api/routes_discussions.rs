@@ -50,12 +50,18 @@ pub struct ReactionRequest {
     pub reaction: String,
 }
 
-async fn resolve_repo(state: &AppState, owner: &str, repo_name: &str) -> Result<String, ForgeError> {
+async fn resolve_repo(
+    state: &AppState,
+    owner: &str,
+    repo_name: &str,
+) -> Result<String, ForgeError> {
     let repo = state
         .db
         .get_repository_by_owner_name(owner, repo_name)
         .await?
-        .ok_or_else(|| ForgeError::NotFound(format!("Repository '{}/{}' not found", owner, repo_name)))?;
+        .ok_or_else(|| {
+            ForgeError::NotFound(format!("Repository '{}/{}' not found", owner, repo_name))
+        })?;
     Ok(repo.id)
 }
 
@@ -74,7 +80,8 @@ pub async fn create_category(
     Path((owner, repo_name)): Path<(String, String)>,
     Json(payload): Json<CreateCategoryRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let Extension(user) = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let Extension(user) =
+        user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
     let cat = state
         .discussions
@@ -112,11 +119,18 @@ pub async fn create_discussion(
     Path((owner, repo_name)): Path<(String, String)>,
     Json(payload): Json<CreateDiscussionRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let Extension(user) = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let Extension(user) =
+        user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
     let disc = state
         .discussions
-        .create_discussion(&user.id, &repo_id, &payload.category_id, &payload.title, &payload.body)
+        .create_discussion(
+            &user.id,
+            &repo_id,
+            &payload.category_id,
+            &payload.title,
+            &payload.body,
+        )
         .await?;
     Ok(Json(disc))
 }
@@ -141,7 +155,8 @@ pub async fn update_discussion(
     Path((owner, repo_name, number)): Path<(String, String, i32)>,
     Json(payload): Json<UpdateDiscussionRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let Extension(user) = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let Extension(user) =
+        user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
     let disc = state
         .discussions
@@ -166,7 +181,10 @@ pub async fn list_comments(
 ) -> Result<impl IntoResponse, ForgeError> {
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
     let user_id = user.as_ref().map(|Extension(u)| u.id.as_str());
-    let comments = state.discussions.list_comments(user_id, &repo_id, number).await?;
+    let comments = state
+        .discussions
+        .list_comments(user_id, &repo_id, number)
+        .await?;
     Ok(Json(comments))
 }
 
@@ -176,11 +194,18 @@ pub async fn create_comment(
     Path((owner, repo_name, number)): Path<(String, String, i32)>,
     Json(payload): Json<CreateCommentRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let Extension(user) = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let Extension(user) =
+        user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
     let comment = state
         .discussions
-        .create_comment(&user.id, &repo_id, number, payload.parent_comment_id.as_deref(), &payload.body)
+        .create_comment(
+            &user.id,
+            &repo_id,
+            number,
+            payload.parent_comment_id.as_deref(),
+            &payload.body,
+        )
         .await?;
     Ok(Json(comment))
 }
@@ -190,7 +215,8 @@ pub async fn mark_answer(
     user: Option<Extension<User>>,
     Path((owner, repo_name, number, comment_id)): Path<(String, String, i32, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let Extension(user) = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let Extension(user) =
+        user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
     let disc = state
         .discussions
@@ -205,10 +231,13 @@ pub async fn toggle_comment_reaction(
     Path((_owner, _repo_name, _number, comment_id)): Path<(String, String, i32, String)>,
     Json(payload): Json<ReactionRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let Extension(user) = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let Extension(user) =
+        user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let added = state
         .discussions
         .toggle_reaction(&user.id, "COMMENT", &comment_id, &payload.reaction)
         .await?;
-    Ok(Json(serde_json::json!({ "added": added, "reaction": payload.reaction })))
+    Ok(Json(
+        serde_json::json!({ "added": added, "reaction": payload.reaction }),
+    ))
 }

@@ -38,7 +38,10 @@ pub async fn list_workflows(
     Path((owner, repo_name)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.as_ref().map(|Extension(u)| u);
-    let repo = state.repositories.get_repository(caller, &owner, &repo_name).await?;
+    let repo = state
+        .repositories
+        .get_repository(caller, &owner, &repo_name)
+        .await?;
     let defs = state.db.list_workflow_definitions(&repo.id).await?;
     Ok(Json(defs))
 }
@@ -50,8 +53,14 @@ pub async fn sync_workflows(
     Json(payload): Json<SyncWorkflowsRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
-    let repo = state.repositories.get_repository(Some(&caller), &owner, &repo_name).await?;
-    state.permissions.check_write_access(Some(&caller), &repo).await?;
+    let repo = state
+        .repositories
+        .get_repository(Some(&caller), &owner, &repo_name)
+        .await?;
+    state
+        .permissions
+        .check_write_access(Some(&caller), &repo)
+        .await?;
 
     let file_tuples: Vec<(&str, &str)> = payload
         .files
@@ -59,7 +68,10 @@ pub async fn sync_workflows(
         .map(|f| (f.path.as_str(), f.content.as_str()))
         .collect();
 
-    let synced = state.workflows.sync_workflows_from_tree(&repo.id, file_tuples).await?;
+    let synced = state
+        .workflows
+        .sync_workflows_from_tree(&repo.id, file_tuples)
+        .await?;
     Ok((StatusCode::CREATED, Json(synced)))
 }
 
@@ -70,10 +82,18 @@ pub async fn dispatch_workflow(
     Json(payload): Json<DispatchWorkflowRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
-    let repo = state.repositories.get_repository(Some(&caller), &owner, &repo_name).await?;
-    state.permissions.check_write_access(Some(&caller), &repo).await?;
+    let repo = state
+        .repositories
+        .get_repository(Some(&caller), &owner, &repo_name)
+        .await?;
+    state
+        .permissions
+        .check_write_access(Some(&caller), &repo)
+        .await?;
 
-    let ref_name = payload.ref_name.unwrap_or_else(|| repo.default_branch.clone());
+    let ref_name = payload
+        .ref_name
+        .unwrap_or_else(|| repo.default_branch.clone());
     let commit_oid = state
         .vcs
         .list_branches(&repo.native_repo_id)
@@ -88,7 +108,13 @@ pub async fn dispatch_workflow(
 
     let runs = state
         .workflows
-        .trigger_workflows(&repo.id, &commit_oid, &ref_name, "workflow_dispatch", &caller.id)
+        .trigger_workflows(
+            &repo.id,
+            &commit_oid,
+            &ref_name,
+            "workflow_dispatch",
+            &caller.id,
+        )
         .await?;
 
     Ok((StatusCode::CREATED, Json(runs)))
@@ -101,7 +127,10 @@ pub async fn list_runs(
     Query(query): Query<RunsQuery>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.as_ref().map(|Extension(u)| u);
-    let repo = state.repositories.get_repository(caller, &owner, &repo_name).await?;
+    let repo = state
+        .repositories
+        .get_repository(caller, &owner, &repo_name)
+        .await?;
     let limit = query.limit.unwrap_or(50);
     let runs = state.workflows.list_runs(&repo.id, limit).await?;
     Ok(Json(runs))
@@ -132,8 +161,15 @@ pub async fn cancel_run(
         .await?
         .ok_or_else(|| ForgeError::NotFound("Workflow run not found".into()))?;
 
-    let repo = state.db.get_repository_by_id(&run.repo_id).await?.ok_or_else(|| ForgeError::NotFound("Repository not found".into()))?;
-    state.permissions.check_write_access(Some(&caller), &repo).await?;
+    let repo = state
+        .db
+        .get_repository_by_id(&run.repo_id)
+        .await?
+        .ok_or_else(|| ForgeError::NotFound("Repository not found".into()))?;
+    state
+        .permissions
+        .check_write_access(Some(&caller), &repo)
+        .await?;
 
     state.workflows.cancel_run(&id).await?;
     Ok(StatusCode::NO_CONTENT)

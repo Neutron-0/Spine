@@ -1,6 +1,6 @@
+use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
-use chrono::Utc;
 
 use crate::core::error::ForgeError;
 use crate::core::types::WorkflowCheckResult;
@@ -46,11 +46,19 @@ impl WorkflowScheduler {
             // Check for timed out leases on ASSIGNED / RUNNING jobs
             for job in &jobs {
                 if (job.status == "ASSIGNED" || job.status == "RUNNING")
-                    && job.lease_expires_at_nanos.map_or(false, |exp| exp < now_nanos)
+                    && job
+                        .lease_expires_at_nanos
+                        .map_or(false, |exp| exp < now_nanos)
                 {
                     tracing::warn!("Job {} lease expired; marking TIMED_OUT", job.id);
                     self.db
-                        .update_workflow_job_status(&job.id, "TIMED_OUT", Some(124), None, Some(now_nanos))
+                        .update_workflow_job_status(
+                            &job.id,
+                            "TIMED_OUT",
+                            Some(124),
+                            None,
+                            Some(now_nanos),
+                        )
                         .await?;
                     job_status_map.insert(job.job_key.clone(), "TIMED_OUT".to_string());
                 }
@@ -85,7 +93,13 @@ impl WorkflowScheduler {
                     } else if any_failed {
                         // Dependency failed; skip this job
                         self.db
-                            .update_workflow_job_status(&job.id, "SKIPPED", Some(0), None, Some(now_nanos))
+                            .update_workflow_job_status(
+                                &job.id,
+                                "SKIPPED",
+                                Some(0),
+                                None,
+                                Some(now_nanos),
+                            )
                             .await?;
                         job_status_map.insert(job.job_key.clone(), "SKIPPED".to_string());
                     }
@@ -94,14 +108,23 @@ impl WorkflowScheduler {
 
             // Check if all jobs have reached a terminal state
             let all_terminal = jobs.iter().all(|j| {
-                let status = job_status_map.get(&j.job_key).map(|s| s.as_str()).unwrap_or(&j.status);
-                matches!(status, "SUCCEEDED" | "FAILED" | "TIMED_OUT" | "CANCELLED" | "SKIPPED")
+                let status = job_status_map
+                    .get(&j.job_key)
+                    .map(|s| s.as_str())
+                    .unwrap_or(&j.status);
+                matches!(
+                    status,
+                    "SUCCEEDED" | "FAILED" | "TIMED_OUT" | "CANCELLED" | "SKIPPED"
+                )
             });
 
             if all_terminal {
                 let mut conclusion = "SUCCESS";
                 for j in &jobs {
-                    let status = job_status_map.get(&j.job_key).map(|s| s.as_str()).unwrap_or(&j.status);
+                    let status = job_status_map
+                        .get(&j.job_key)
+                        .map(|s| s.as_str())
+                        .unwrap_or(&j.status);
                     if status == "FAILED" || status == "TIMED_OUT" {
                         conclusion = "FAILURE";
                         break;
@@ -112,7 +135,13 @@ impl WorkflowScheduler {
 
                 // Finalize run
                 self.db
-                    .update_workflow_run_status(&run.id, "COMPLETED", Some(conclusion), None, Some(now_nanos))
+                    .update_workflow_run_status(
+                        &run.id,
+                        "COMPLETED",
+                        Some(conclusion),
+                        None,
+                        Some(now_nanos),
+                    )
                     .await?;
 
                 // Update PR Check Result
@@ -136,7 +165,9 @@ impl WorkflowScheduler {
                         "repository_id": run.repo_id,
                         "commit_oid": run.commit_oid,
                     });
-                    let _ = wh.dispatch_event("REPO", &run.repo_id, "workflow_run", &payload).await;
+                    let _ = wh
+                        .dispatch_event("REPO", &run.repo_id, "workflow_run", &payload)
+                        .await;
                 }
             }
         }

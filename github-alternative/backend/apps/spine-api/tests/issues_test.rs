@@ -121,11 +121,17 @@ async fn test_issues_labels_and_milestones() {
     assert_eq!(updated.status, "CLOSED");
 
     // Filter by status
-    let open_issues = db.list_issues_for_repo(repo_id, Some("OPEN")).await.unwrap();
+    let open_issues = db
+        .list_issues_for_repo(repo_id, Some("OPEN"))
+        .await
+        .unwrap();
     assert_eq!(open_issues.len(), 1);
     assert_eq!(open_issues[0].id, created_2.id);
 
-    let closed_issues = db.list_issues_for_repo(repo_id, Some("CLOSED")).await.unwrap();
+    let closed_issues = db
+        .list_issues_for_repo(repo_id, Some("CLOSED"))
+        .await
+        .unwrap();
     assert_eq!(closed_issues.len(), 1);
     assert_eq!(closed_issues[0].id, created_1.id);
 }

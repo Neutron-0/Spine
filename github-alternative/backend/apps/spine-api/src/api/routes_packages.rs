@@ -11,16 +11,16 @@ use axum::{
 };
 
 /// GET /index/config.json
-pub async fn cargo_index_config(
-    Host(host): Host,
-) -> impl IntoResponse {
+pub async fn cargo_index_config(Host(host): Host) -> impl IntoResponse {
     let scheme = if host.starts_with("localhost") || host.starts_with("127.0.0.1") {
         "http"
     } else {
         "https"
     };
     let base_url = format!("{}://{}", scheme, host);
-    Json(crate::packages::CargoRegistryAdapter::config_json(&base_url))
+    Json(crate::packages::CargoRegistryAdapter::config_json(
+        &base_url,
+    ))
 }
 
 /// GET /index/:prefix/:crate_name (1 or 2 letter crate, or non-nested)
@@ -51,7 +51,10 @@ async fn serve_crate_index(state: &AppState, crate_name: &str) -> Result<Respons
                 .map_err(|e| ForgeError::Internal(e.to_string()))?;
             Ok(res)
         }
-        None => Err(ForgeError::NotFound(format!("Crate '{}' not found", crate_name))),
+        None => Err(ForgeError::NotFound(format!(
+            "Crate '{}' not found",
+            crate_name
+        ))),
     }
 }
 
@@ -61,7 +64,11 @@ pub async fn cargo_publish(
     user: Option<Extension<User>>,
     body: Bytes,
 ) -> Result<Json<CargoPublishResponse>, ForgeError> {
-    let current_user = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required to publish crate".to_string()))?.0;
+    let current_user = user
+        .ok_or_else(|| {
+            ForgeError::Unauthorized("Authentication required to publish crate".to_string())
+        })?
+        .0;
     let res = state.cargo.publish(&body, &current_user.id).await?;
     Ok(Json(res))
 }
@@ -91,7 +98,11 @@ pub async fn cargo_yank(
     Path((crate_name, version)): Path<(String, String)>,
     user: Option<Extension<User>>,
 ) -> Result<Json<serde_json::Value>, ForgeError> {
-    let _current_user = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required to yank crate".to_string()))?.0;
+    let _current_user = user
+        .ok_or_else(|| {
+            ForgeError::Unauthorized("Authentication required to yank crate".to_string())
+        })?
+        .0;
     state.cargo.set_yanked(&crate_name, &version, true).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -102,7 +113,11 @@ pub async fn cargo_unyank(
     Path((crate_name, version)): Path<(String, String)>,
     user: Option<Extension<User>>,
 ) -> Result<Json<serde_json::Value>, ForgeError> {
-    let _current_user = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required to unyank crate".to_string()))?.0;
+    let _current_user = user
+        .ok_or_else(|| {
+            ForgeError::Unauthorized("Authentication required to unyank crate".to_string())
+        })?
+        .0;
     state.cargo.set_yanked(&crate_name, &version, false).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }

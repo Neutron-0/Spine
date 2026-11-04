@@ -1,6 +1,6 @@
 use spine_api::auth::{
-    generate_pat, generate_session_token, has_scope, hash_pat, hash_password,
-    hash_session_token, validate_password_strength, verify_password, RateLimiter,
+    generate_pat, generate_session_token, has_scope, hash_password, hash_pat, hash_session_token,
+    validate_password_strength, verify_password, RateLimiter,
 };
 use spine_api::core::types::*;
 use spine_api::db::{Database, InMemoryDatabase};
@@ -111,16 +111,30 @@ async fn test_database_user_lifecycle() {
         last_login_nanos: None,
     };
 
-    db.create_user(user.clone()).await.expect("User creation succeeds");
+    db.create_user(user.clone())
+        .await
+        .expect("User creation succeeds");
 
     // Retrieve by ID, username, and email
-    let by_id = db.get_user_by_id("usr_01").await.unwrap().expect("Found by ID");
+    let by_id = db
+        .get_user_by_id("usr_01")
+        .await
+        .unwrap()
+        .expect("Found by ID");
     assert_eq!(by_id.username, "developer_one");
 
-    let by_name = db.get_user_by_username("developer_one").await.unwrap().expect("Found by name");
+    let by_name = db
+        .get_user_by_username("developer_one")
+        .await
+        .unwrap()
+        .expect("Found by name");
     assert_eq!(by_name.email, "dev1@spine.build");
 
-    let by_email = db.get_user_by_email("dev1@spine.build").await.unwrap().expect("Found by email");
+    let by_email = db
+        .get_user_by_email("dev1@spine.build")
+        .await
+        .unwrap()
+        .expect("Found by email");
     assert_eq!(by_email.id, "usr_01");
 
     // Verify duplicate username or email fails
@@ -142,7 +156,9 @@ async fn test_database_user_lifecycle() {
 
     // Update password
     let new_hash = hash_password("SpineNewPass2026!").unwrap();
-    db.update_user_password("usr_01", &new_hash, 2000).await.expect("Password update succeeds");
+    db.update_user_password("usr_01", &new_hash, 2000)
+        .await
+        .expect("Password update succeeds");
 
     let updated = db.get_user_by_id("usr_01").await.unwrap().unwrap();
     assert_eq!(updated.password_hash, new_hash);
@@ -167,17 +183,27 @@ async fn test_database_session_and_token_revocation() {
 
     db.create_session(session).await.expect("Session created");
 
-    let found = db.get_session_by_hash(&token_h).await.unwrap().expect("Session found");
+    let found = db
+        .get_session_by_hash(&token_h)
+        .await
+        .unwrap()
+        .expect("Session found");
     assert_eq!(found.id, "sess_01");
     assert!(!found.revoked);
 
     // Revoke session
     db.revoke_session("sess_01").await.expect("Session revoked");
-    let after_revoke = db.get_session_by_hash(&token_h).await.unwrap().expect("Session still exists");
+    let after_revoke = db
+        .get_session_by_hash(&token_h)
+        .await
+        .unwrap()
+        .expect("Session still exists");
     assert!(after_revoke.revoked);
 
     // Revoke all sessions for user
-    db.revoke_all_user_sessions("usr_01").await.expect("All user sessions revoked");
+    db.revoke_all_user_sessions("usr_01")
+        .await
+        .expect("All user sessions revoked");
     let sessions = db.list_user_sessions("usr_01").await.unwrap();
     for s in sessions {
         assert!(s.revoked);

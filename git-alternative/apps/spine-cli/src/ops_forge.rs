@@ -128,17 +128,32 @@ pub async fn get_capability_ticket(
     repo_name: &str,
     operation: &str,
 ) -> Result<String> {
-    let creds = load_credentials(forge_host)?
-        .ok_or_else(|| anyhow::anyhow!("Not logged in to {}. Run `spine auth login` first.", forge_host))?;
+    let creds = load_credentials(forge_host)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Not logged in to {}. Run `spine auth login` first.",
+            forge_host
+        )
+    })?;
 
-    let url = format!("{}/api/v1/repos/{}/{}/capability", forge_host.trim_end_matches('/'), repo_owner, repo_name);
+    let url = format!(
+        "{}/api/v1/repos/{}/{}/capability",
+        forge_host.trim_end_matches('/'),
+        repo_owner,
+        repo_name
+    );
     let payload = serde_json::json!({ "operation": operation }).to_string();
     let (status, body) = http_request("POST", &url, Some(&payload), Some(&creds.token)).await?;
     if status != 200 {
-        anyhow::bail!("Failed to obtain capability ticket (status {}): {}", status, body);
+        anyhow::bail!(
+            "Failed to obtain capability ticket (status {}): {}",
+            status,
+            body
+        );
     }
     let parsed: serde_json::Value = serde_json::from_str(&body)?;
-    let ticket = parsed["ticket"].as_str().context("Missing ticket in response")?;
+    let ticket = parsed["ticket"]
+        .as_str()
+        .context("Missing ticket in response")?;
     Ok(ticket.to_string())
 }
 
@@ -178,11 +193,7 @@ pub async fn resolve_remote_auth(url_str: &str, operation: &str) -> Option<Strin
     None
 }
 
-pub async fn cmd_auth_login(
-    host: &str,
-    username: Option<&str>,
-    token: Option<&str>,
-) -> Result<()> {
+pub async fn cmd_auth_login(host: &str, username: Option<&str>, token: Option<&str>) -> Result<()> {
     let clean_host = host.trim_end_matches('/');
 
     if let Some(tok) = token {
@@ -235,8 +246,7 @@ pub async fn cmd_auth_login(
         "password": clean_pwd
     });
 
-    let (status, body) =
-        http_request("POST", &login_url, Some(&payload.to_string()), None).await?;
+    let (status, body) = http_request("POST", &login_url, Some(&payload.to_string()), None).await?;
     if status != 200 {
         bail!("Login failed: {}", body);
     }
@@ -282,7 +292,14 @@ pub async fn cmd_auth_status() -> Result<()> {
                     println!("  Host:     {}", creds.host);
                     println!("  User:     {}", creds.username);
                     println!("  Token:    {}", mask_token(&creds.token));
-                    println!("  Status:   {}", if is_auth { "ACTIVE" } else { "EXPIRED / INVALID" });
+                    println!(
+                        "  Status:   {}",
+                        if is_auth {
+                            "ACTIVE"
+                        } else {
+                            "EXPIRED / INVALID"
+                        }
+                    );
                 }
                 _ => {
                     println!("  Host:     {}", creds.host);
@@ -293,7 +310,10 @@ pub async fn cmd_auth_status() -> Result<()> {
             }
         }
         None => {
-            println!("No credentials configured for {}. Run `spine auth login`.", default_host);
+            println!(
+                "No credentials configured for {}. Run `spine auth login`.",
+                default_host
+            );
         }
     }
     Ok(())
@@ -318,8 +338,8 @@ pub async fn cmd_repo_create(
     host: Option<&str>,
 ) -> Result<()> {
     let target_host = host.unwrap_or("http://127.0.0.1:3000");
-    let creds = load_credentials(target_host)?
-        .context("Not logged in. Run `spine auth login` first.")?;
+    let creds =
+        load_credentials(target_host)?.context("Not logged in. Run `spine auth login` first.")?;
 
     let create_url = format!("{}/api/v1/repos", target_host);
     let payload = serde_json::json!({
@@ -346,6 +366,9 @@ pub async fn cmd_repo_create(
     println!("  Name:    {}", parsed["name"]);
     println!("  Owner:   {}", parsed["owner"]);
     println!("  Private: {}", parsed["is_private"]);
-    println!("  Clone:   spine://127.0.0.1:4434/{}/{}", parsed["owner"], parsed["name"]);
+    println!(
+        "  Clone:   spine://127.0.0.1:4434/{}/{}",
+        parsed["owner"], parsed["name"]
+    );
     Ok(())
 }

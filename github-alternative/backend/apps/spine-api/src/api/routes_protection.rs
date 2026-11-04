@@ -27,7 +27,10 @@ pub async fn list_branch_protection(
     Path((owner, repo_name)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.as_ref().map(|Extension(u)| u);
-    let repo = state.repositories.get_repository(caller, &owner, &repo_name).await?;
+    let repo = state
+        .repositories
+        .get_repository(caller, &owner, &repo_name)
+        .await?;
 
     let rules = state.db.list_branch_protection_rules(&repo.id).await?;
     Ok(Json(rules))
@@ -40,8 +43,14 @@ pub async fn set_branch_protection(
     Json(payload): Json<SetBranchProtectionRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
-    let repo = state.repositories.get_repository(Some(&caller), &owner, &repo_name).await?;
-    state.permissions.check_admin_access(Some(&caller), &repo).await?;
+    let repo = state
+        .repositories
+        .get_repository(Some(&caller), &owner, &repo_name)
+        .await?;
+    state
+        .permissions
+        .check_admin_access(Some(&caller), &repo)
+        .await?;
 
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
     let rule = BranchProtectionRule {
@@ -69,8 +78,14 @@ pub async fn delete_branch_protection(
     Path((owner, repo_name, rule_id)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
-    let repo = state.repositories.get_repository(Some(&caller), &owner, &repo_name).await?;
-    state.permissions.check_admin_access(Some(&caller), &repo).await?;
+    let repo = state
+        .repositories
+        .get_repository(Some(&caller), &owner, &repo_name)
+        .await?;
+    state
+        .permissions
+        .check_admin_access(Some(&caller), &repo)
+        .await?;
 
     state.db.delete_branch_protection(&rule_id).await?;
     Ok(StatusCode::NO_CONTENT)

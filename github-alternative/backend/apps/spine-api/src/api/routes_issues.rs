@@ -77,7 +77,10 @@ pub async fn list_issues(
     Query(query): Query<ListIssuesQuery>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.as_ref().map(|Extension(u)| u);
-    let repo = state.repositories.get_repository(caller, &owner, &repo_name).await?;
+    let repo = state
+        .repositories
+        .get_repository(caller, &owner, &repo_name)
+        .await?;
 
     let issues = state
         .db
@@ -110,7 +113,11 @@ pub async fn list_issues(
             .collect();
 
         let milestone = if let Some(mid) = &issue.milestone_id {
-            state.db.get_milestone_by_id(mid).await?.map(|m| MilestoneDto::from(&m))
+            state
+                .db
+                .get_milestone_by_id(mid)
+                .await?
+                .map(|m| MilestoneDto::from(&m))
         } else {
             None
         };
@@ -144,8 +151,13 @@ pub async fn create_issue(
     Path((owner, repo_name)): Path<(String, String)>,
     Json(payload): Json<CreateIssueRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required to create issue".into()))?;
-    let repo = state.repositories.get_repository(Some(&caller), &owner, &repo_name).await?;
+    let caller = user.ok_or_else(|| {
+        ForgeError::Unauthorized("Authentication required to create issue".into())
+    })?;
+    let repo = state
+        .repositories
+        .get_repository(Some(&caller), &owner, &repo_name)
+        .await?;
 
     let title = payload.title.trim().to_string();
     if title.is_empty() {
@@ -189,17 +201,20 @@ pub async fn create_issue(
     }
 
     // Record activity
-    let _ = state.db.record_activity_event(RepositoryActivityEvent {
-        id: format!("act_{}", uuid::Uuid::new_v4().simple()),
-        repo_id: repo.id.clone(),
-        actor_id: Some(caller.id.clone()),
-        event_type: "issue.opened".to_string(),
-        payload: serde_json::json!({
-            "issue_number": created.issue_number,
-            "title": created.title,
-        }),
-        created_at_nanos: now,
-    }).await;
+    let _ = state
+        .db
+        .record_activity_event(RepositoryActivityEvent {
+            id: format!("act_{}", uuid::Uuid::new_v4().simple()),
+            repo_id: repo.id.clone(),
+            actor_id: Some(caller.id.clone()),
+            event_type: "issue.opened".to_string(),
+            payload: serde_json::json!({
+                "issue_number": created.issue_number,
+                "title": created.title,
+            }),
+            created_at_nanos: now,
+        })
+        .await;
 
     Ok((StatusCode::CREATED, Json(created)))
 }
@@ -210,7 +225,10 @@ pub async fn get_issue(
     Path((owner, repo_name, number)): Path<(String, String, i64)>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.as_ref().map(|Extension(u)| u);
-    let repo = state.repositories.get_repository(caller, &owner, &repo_name).await?;
+    let repo = state
+        .repositories
+        .get_repository(caller, &owner, &repo_name)
+        .await?;
 
     let issue = state
         .db
@@ -242,7 +260,11 @@ pub async fn get_issue(
         .collect();
 
     let milestone = if let Some(mid) = &issue.milestone_id {
-        state.db.get_milestone_by_id(mid).await?.map(|m| MilestoneDto::from(&m))
+        state
+            .db
+            .get_milestone_by_id(mid)
+            .await?
+            .map(|m| MilestoneDto::from(&m))
     } else {
         None
     };
@@ -276,7 +298,10 @@ pub async fn update_issue(
     Json(payload): Json<UpdateIssueRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
-    let repo = state.repositories.get_repository(Some(&caller), &owner, &repo_name).await?;
+    let repo = state
+        .repositories
+        .get_repository(Some(&caller), &owner, &repo_name)
+        .await?;
 
     let mut issue = state
         .db
@@ -286,9 +311,15 @@ pub async fn update_issue(
 
     // Only author or collaborator can update
     let is_author = issue.author_id == caller.id;
-    let is_collaborator = state.permissions.check_write_access(Some(&caller), &repo).await.is_ok();
+    let is_collaborator = state
+        .permissions
+        .check_write_access(Some(&caller), &repo)
+        .await
+        .is_ok();
     if !is_author && !is_collaborator {
-        return Err(ForgeError::Forbidden("Only issue author or repository collaborators can edit issue".into()));
+        return Err(ForgeError::Forbidden(
+            "Only issue author or repository collaborators can edit issue".into(),
+        ));
     }
 
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -325,7 +356,10 @@ pub async fn list_issue_comments(
     Path((owner, repo_name, number)): Path<(String, String, i64)>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.as_ref().map(|Extension(u)| u);
-    let repo = state.repositories.get_repository(caller, &owner, &repo_name).await?;
+    let repo = state
+        .repositories
+        .get_repository(caller, &owner, &repo_name)
+        .await?;
 
     let issue = state
         .db
@@ -362,7 +396,10 @@ pub async fn create_issue_comment(
     Json(payload): Json<CreateCommentRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
-    let repo = state.repositories.get_repository(Some(&caller), &owner, &repo_name).await?;
+    let repo = state
+        .repositories
+        .get_repository(Some(&caller), &owner, &repo_name)
+        .await?;
 
     let issue = state
         .db
@@ -372,7 +409,9 @@ pub async fn create_issue_comment(
 
     let body = payload.body.trim().to_string();
     if body.is_empty() {
-        return Err(ForgeError::BadRequest("Comment body cannot be empty".into()));
+        return Err(ForgeError::BadRequest(
+            "Comment body cannot be empty".into(),
+        ));
     }
 
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -413,7 +452,10 @@ pub async fn list_labels(
     Path((owner, repo_name)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.as_ref().map(|Extension(u)| u);
-    let repo = state.repositories.get_repository(caller, &owner, &repo_name).await?;
+    let repo = state
+        .repositories
+        .get_repository(caller, &owner, &repo_name)
+        .await?;
 
     let labels = state.db.list_labels_for_repo(&repo.id).await?;
     let dtos: Vec<LabelDto> = labels.iter().map(LabelDto::from).collect();
@@ -427,8 +469,14 @@ pub async fn create_label(
     Json(payload): Json<CreateLabelRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
-    let repo = state.repositories.get_repository(Some(&caller), &owner, &repo_name).await?;
-    state.permissions.check_write_access(Some(&caller), &repo).await?;
+    let repo = state
+        .repositories
+        .get_repository(Some(&caller), &owner, &repo_name)
+        .await?;
+    state
+        .permissions
+        .check_write_access(Some(&caller), &repo)
+        .await?;
 
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
     let label = RepositoryLabel {
@@ -450,8 +498,14 @@ pub async fn delete_label(
     Path((owner, repo_name, label_id)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
-    let repo = state.repositories.get_repository(Some(&caller), &owner, &repo_name).await?;
-    state.permissions.check_write_access(Some(&caller), &repo).await?;
+    let repo = state
+        .repositories
+        .get_repository(Some(&caller), &owner, &repo_name)
+        .await?;
+    state
+        .permissions
+        .check_write_access(Some(&caller), &repo)
+        .await?;
 
     state.db.delete_label(&label_id).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -464,7 +518,10 @@ pub async fn list_milestones(
     Path((owner, repo_name)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.as_ref().map(|Extension(u)| u);
-    let repo = state.repositories.get_repository(caller, &owner, &repo_name).await?;
+    let repo = state
+        .repositories
+        .get_repository(caller, &owner, &repo_name)
+        .await?;
 
     let milestones = state.db.list_milestones_for_repo(&repo.id).await?;
     let dtos: Vec<MilestoneDto> = milestones.iter().map(MilestoneDto::from).collect();
@@ -478,8 +535,14 @@ pub async fn create_milestone(
     Json(payload): Json<CreateMilestoneRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
-    let repo = state.repositories.get_repository(Some(&caller), &owner, &repo_name).await?;
-    state.permissions.check_write_access(Some(&caller), &repo).await?;
+    let repo = state
+        .repositories
+        .get_repository(Some(&caller), &owner, &repo_name)
+        .await?;
+    state
+        .permissions
+        .check_write_access(Some(&caller), &repo)
+        .await?;
 
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
     let milestone = Milestone {
@@ -505,8 +568,14 @@ pub async fn update_milestone(
     Json(payload): Json<UpdateMilestoneRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
-    let repo = state.repositories.get_repository(Some(&caller), &owner, &repo_name).await?;
-    state.permissions.check_write_access(Some(&caller), &repo).await?;
+    let repo = state
+        .repositories
+        .get_repository(Some(&caller), &owner, &repo_name)
+        .await?;
+    state
+        .permissions
+        .check_write_access(Some(&caller), &repo)
+        .await?;
 
     let mut milestone = state
         .db
@@ -546,8 +615,14 @@ pub async fn delete_milestone(
     Path((owner, repo_name, milestone_id)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
-    let repo = state.repositories.get_repository(Some(&caller), &owner, &repo_name).await?;
-    state.permissions.check_write_access(Some(&caller), &repo).await?;
+    let repo = state
+        .repositories
+        .get_repository(Some(&caller), &owner, &repo_name)
+        .await?;
+    state
+        .permissions
+        .check_write_access(Some(&caller), &repo)
+        .await?;
 
     state.db.delete_milestone(&milestone_id).await?;
     Ok(StatusCode::NO_CONTENT)
