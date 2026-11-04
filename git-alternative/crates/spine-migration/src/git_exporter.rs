@@ -89,6 +89,42 @@ impl GitExporter {
         &self.git_to_spine
     }
 
+    pub fn export_blob_pub(
+        &mut self,
+        store: &FileSystemObjectStore,
+        id: &ObjectId,
+        stats: &mut ExportStats,
+    ) -> Result<GitOid, GitExportError> {
+        self.export_blob(store, id, stats)
+    }
+
+    pub fn export_tree_recursive_pub(
+        &mut self,
+        store: &FileSystemObjectStore,
+        tree_id: &ObjectId,
+        stats: &mut ExportStats,
+    ) -> Result<GitOid, GitExportError> {
+        self.export_tree_recursive(store, tree_id, stats)
+    }
+
+    pub fn export_commit_recursive_pub(
+        &mut self,
+        store: &FileSystemObjectStore,
+        commit_id: &ObjectId,
+        stats: &mut ExportStats,
+    ) -> Result<GitOid, GitExportError> {
+        self.export_commit_recursive(store, commit_id, stats)
+    }
+
+    pub fn export_tag_or_target_pub(
+        &mut self,
+        store: &FileSystemObjectStore,
+        id: &ObjectId,
+        stats: &mut ExportStats,
+    ) -> Result<GitOid, GitExportError> {
+        self.export_tag_or_target(store, id, stats)
+    }
+
     pub fn execute_export(&mut self) -> Result<ExportStats, GitExportError> {
         let mut stats = ExportStats::default();
 

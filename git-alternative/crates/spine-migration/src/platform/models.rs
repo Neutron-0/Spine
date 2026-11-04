@@ -14,34 +14,101 @@ pub enum PlatformParseError {
     MissingFile(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+fn default_now() -> DateTime<Utc> {
+    Utc::now()
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct PlatformUser {
     pub username: String,
     pub email: Option<String>,
     pub name: Option<String>,
 }
 
+impl<'de> Deserialize<'de> for PlatformUser {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct UserVisitor;
+        impl<'de> serde::de::Visitor<'de> for UserVisitor {
+            type Value = PlatformUser;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a username string or a user object")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<PlatformUser, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(PlatformUser {
+                    username: value.to_string(),
+                    email: None,
+                    name: None,
+                })
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<PlatformUser, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                let mut username = None;
+                let mut email = None;
+                let mut name = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "username" | "login" | "user" => username = Some(map.next_value()?),
+                        "email" => email = map.next_value()?,
+                        "name" => name = map.next_value()?,
+                        _ => {
+                            let _ = map.next_value::<serde_json::Value>()?;
+                        }
+                    }
+                }
+
+                Ok(PlatformUser {
+                    username: username.unwrap_or_else(|| "unknown".to_string()),
+                    email,
+                    name,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(UserVisitor)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlatformLabel {
     pub name: String,
     pub color: String,
+    #[serde(default)]
     pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlatformMilestone {
     pub title: String,
+    #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
     pub state: String, // "open" | "closed"
+    #[serde(default)]
     pub due_on: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlatformComment {
+    #[serde(default)]
     pub id: u64,
+    #[serde(alias = "user")]
     pub author: PlatformUser,
     pub body: String,
+    #[serde(default = "default_now")]
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
     pub updated_at: Option<DateTime<Utc>>,
 }
 
@@ -50,13 +117,21 @@ pub struct PlatformIssue {
     pub number: u64,
     pub title: String,
     pub body: String,
+    #[serde(default)]
     pub state: String, // "open" | "closed"
+    #[serde(alias = "user")]
     pub author: PlatformUser,
+    #[serde(default)]
     pub labels: Vec<String>,
+    #[serde(default)]
     pub milestone: Option<String>,
+    #[serde(default = "default_now")]
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
     pub updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
     pub closed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
     pub comments: Vec<PlatformComment>,
 }
 
@@ -65,24 +140,38 @@ pub struct PlatformPullRequest {
     pub number: u64,
     pub title: String,
     pub body: String,
+    #[serde(default)]
     pub state: String, // "open" | "closed" | "merged"
+    #[serde(alias = "user")]
     pub author: PlatformUser,
+    #[serde(alias = "head_branch", alias = "source_branch", default)]
     pub source_branch: String,
+    #[serde(alias = "base_branch", alias = "target_branch", default)]
     pub target_branch: String,
+    #[serde(default)]
     pub labels: Vec<String>,
+    #[serde(default)]
     pub milestone: Option<String>,
+    #[serde(default = "default_now")]
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
     pub updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
     pub merged_at: Option<DateTime<Utc>>,
+    #[serde(default)]
     pub comments: Vec<PlatformComment>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PlatformRelease {
     pub tag_name: String,
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub body: String,
+    #[serde(default)]
     pub is_prerelease: bool,
+    #[serde(default = "default_now", alias = "published_at")]
     pub created_at: DateTime<Utc>,
 }
 

@@ -63,6 +63,17 @@ enum RawPackEntry {
 
 /// Parses an entire Git packfile (v2) from a byte slice, resolving all OFS_DELTA and REF_DELTA objects.
 pub fn parse_packfile(pack_data: &[u8]) -> Result<Vec<ParsedPackObject>, PackParseError> {
+    parse_packfile_with_resolver(pack_data, |_| None)
+}
+
+/// Parses an entire Git packfile (v2) with an external base resolver for thin packs.
+pub fn parse_packfile_with_resolver<F>(
+    pack_data: &[u8],
+    mut base_resolver: F,
+) -> Result<Vec<ParsedPackObject>, PackParseError>
+where
+    F: FnMut(&GitOid) -> Option<(GitObjectType, Vec<u8>)>,
+{
     if pack_data.len() < 32 {
         // 12 bytes header + 20 bytes checksum
         return Err(PackParseError::TooShort(pack_data.len()));
@@ -273,15 +284,19 @@ pub fn parse_packfile(pack_data: &[u8]) -> Result<Vec<ParsedPackObject>, PackPar
                     base_oid,
                     delta_payload,
                 } => {
-                    if let Some((base_type, base_payload)) = resolved_by_oid.get(base_oid) {
-                        let target_payload = apply_delta(base_payload, delta_payload).map_err(
+                    let base_opt = resolved_by_oid
+                        .get(base_oid)
+                        .cloned()
+                        .or_else(|| base_resolver(base_oid));
+                    if let Some((base_type, base_payload)) = base_opt {
+                        let target_payload = apply_delta(&base_payload, delta_payload).map_err(
                             |e| PackParseError::DeltaError {
                                 offset,
                                 source: e,
                             },
                         )?;
                         let oid = GitOid::compute_object(base_type.as_str(), &target_payload);
-                        newly_resolved.push((offset, *base_type, target_payload, oid));
+                        newly_resolved.push((offset, base_type, target_payload, oid));
                     }
                 }
                 RawPackEntry::Resolved { .. } => {}

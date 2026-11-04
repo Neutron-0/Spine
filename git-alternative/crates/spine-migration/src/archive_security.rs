@@ -1,4 +1,5 @@
 use flate2::read::GzDecoder;
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -18,6 +19,10 @@ pub enum ArchiveSecurityError {
     Zip(#[from] zip::result::ZipError),
     #[error("Security violation: Zip Slip or path traversal attempt detected in path: {0}")]
     ZipSlipAttempt(String),
+    #[error("Security violation: Symlink or hardlink escape attempt detected: link {0} points outside staging boundary to {1}")]
+    LinkEscapeAttempt(String, String),
+    #[error("Security violation: Case-insensitive path collision or duplicate archive entry detected: {0}")]
+    DuplicateOrCollision(String),
     #[error("Security violation: Windows reserved device name forbidden in archive: {0}")]
     WindowsReservedName(String),
     #[error("Security violation: Decompression bomb limit exceeded: extracted {actual} bytes exceeds limit of {limit} bytes")]
@@ -149,6 +154,7 @@ pub fn extract_zip_secure<P: AsRef<Path>, D: AsRef<Path>>(
 
     let mut total_bytes: u64 = 0;
     let count = archive.len();
+    let mut seen_entries = HashSet::new();
 
     for i in 0..count {
         let mut entry = archive.by_index(i)?;
@@ -165,6 +171,11 @@ pub fn extract_zip_secure<P: AsRef<Path>, D: AsRef<Path>>(
         if entry.is_dir() {
             fs::create_dir_all(&target_path)?;
         } else {
+            let norm_key = clean_rel.to_string_lossy().to_lowercase();
+            if !seen_entries.insert(norm_key) {
+                return Err(ArchiveSecurityError::DuplicateOrCollision(name));
+            }
+
             if let Some(parent) = target_path.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -215,6 +226,7 @@ pub fn extract_tar_secure<P: AsRef<Path>, D: AsRef<Path>>(
 
     let mut entry_count = 0;
     let mut total_bytes: u64 = 0;
+    let mut seen_entries = HashSet::new();
 
     let reader: Box<dyn Read> = if is_gzipped {
         Box::new(GzDecoder::new(file))
@@ -246,9 +258,24 @@ pub fn extract_tar_secure<P: AsRef<Path>, D: AsRef<Path>>(
         }
 
         let header = entry.header();
+        if header.entry_type().is_symlink() || header.entry_type().is_hard_link() {
+            if let Ok(Some(link_target)) = entry.link_name() {
+                let link_target_str = link_target.to_string_lossy().to_string();
+                let norm_link = link_target_str.replace('\\', "/");
+                if norm_link.starts_with('/') || norm_link.contains(':') || norm_link.contains("..") {
+                    return Err(ArchiveSecurityError::LinkEscapeAttempt(name_str, link_target_str));
+                }
+            }
+        }
+
         if header.entry_type().is_dir() {
             fs::create_dir_all(&target_path)?;
         } else {
+            let norm_key = clean_rel.to_string_lossy().to_lowercase();
+            if !seen_entries.insert(norm_key) {
+                return Err(ArchiveSecurityError::DuplicateOrCollision(name_str));
+            }
+
             if let Some(parent) = target_path.parent() {
                 fs::create_dir_all(parent)?;
             }

@@ -24,6 +24,7 @@ pub mod routes_users;
 pub mod routes_webhooks;
 pub mod routes_workflows;
 pub mod routes_migration;
+pub mod routes_git_http;
 
 pub use middleware::AppState;
 
@@ -581,6 +582,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/migration/export/git",
             post(routes_migration::export_git),
         )
+        // Native Git Smart HTTP endpoints (Batch 16)
+        .route("/:owner/:repo_git/info/refs", get(routes_git_http::git_info_refs))
+        .route("/:owner/:repo_git/git-upload-pack", post(routes_git_http::git_upload_pack))
+        .route("/:owner/:repo_git/git-receive-pack", post(routes_git_http::git_receive_pack))
         // Layers
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),

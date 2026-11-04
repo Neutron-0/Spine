@@ -71,6 +71,8 @@ export const App: React.FC = () => {
   const [selectedBlob, setSelectedBlob] = useState<BlobContentDto | null>(null);
   const [currentPath, setCurrentPath] = useState<string>('');
   const [loading, setLoading] = useState<boolean>(true);
+  const [showCloneDropdown, setShowCloneDropdown] = useState<boolean>(false);
+  const [copiedClone, setCopiedClone] = useState<boolean>(false);
 
   // Issues State
   const [issues, setIssues] = useState<IssueDto[]>([]);
@@ -1534,6 +1536,63 @@ export const App: React.FC = () => {
               >
                 Commits ({commits.length})
               </button>
+
+              <div style={{ position: 'relative' }}>
+                <button
+                  className="btn btn-primary"
+                  onClick={() => setShowCloneDropdown(!showCloneDropdown)}
+                >
+                  ⬇️ Clone
+                </button>
+                {showCloneDropdown && (
+                  <div
+                    style={{
+                      position: 'absolute',
+                      right: 0,
+                      top: '115%',
+                      backgroundColor: '#161b22',
+                      border: '1px solid #30363d',
+                      borderRadius: '6px',
+                      padding: '1rem',
+                      width: '420px',
+                      boxShadow: '0 8px 24px rgba(0,0,0,0.5)',
+                      zIndex: 100,
+                    }}
+                  >
+                    <div style={{ fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.5rem', color: '#c9d1d9' }}>
+                      Git Smart HTTP URL
+                    </div>
+                    <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '0.75rem' }}>
+                      <input
+                        type="text"
+                        readOnly
+                        className="form-input"
+                        style={{ fontSize: '0.8rem', padding: '0.3rem 0.5rem', flex: 1 }}
+                        value={`${window.location.origin}/${selectedRepo.owner}/${selectedRepo.name}.git`}
+                      />
+                      <button
+                        className="btn btn-secondary"
+                        style={{ whiteSpace: 'nowrap', fontSize: '0.8rem' }}
+                        onClick={() => {
+                          navigator.clipboard.writeText(`${window.location.origin}/${selectedRepo.owner}/${selectedRepo.name}.git`);
+                          setCopiedClone(true);
+                          setTimeout(() => setCopiedClone(false), 2000);
+                        }}
+                      >
+                        {copiedClone ? 'Copied!' : 'Copy'}
+                      </button>
+                    </div>
+                    <div style={{ fontSize: '0.75rem', color: '#8b949e', lineHeight: 1.4 }}>
+                      <div style={{ marginBottom: '0.25rem' }}>
+                        🌐 <strong>Standard Git Remote:</strong> Works with native <code>git clone</code>, <code>fetch</code>, and <code>push</code>.
+                      </div>
+                      <div>
+                        🔒 <strong>Authentication:</strong> Use your Forge username and Personal Access Token (<code>sp_pat_...</code>) as password.
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
           </div>
 

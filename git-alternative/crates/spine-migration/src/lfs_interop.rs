@@ -1,6 +1,6 @@
 use sha2::{Digest, Sha256};
-use std::fs;
-use std::io;
+use spine_artifact::{ArtifactManifest, ArtifactStore, LocalArtifactStore, StreamChunker};
+use std::io::{self, Cursor};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -117,5 +117,96 @@ impl GitLfsPointer {
         } else {
             None
         }
+    }
+
+    /// Ingests the actual LFS binary payload into Spine's native artifact storage.
+    /// Verifies that SHA-256 and size match this pointer before chunking and storing.
+    pub fn import_to_artifact_store<P: AsRef<Path>>(
+        &self,
+        payload: &[u8],
+        store_root: P,
+    ) -> Result<ArtifactManifest, LfsError> {
+        if payload.len() as u64 != self.size_bytes {
+            return Err(LfsError::InvalidPointer(format!(
+                "Payload size {} does not match declared size {}",
+                payload.len(),
+                self.size_bytes
+            )));
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(payload);
+        let actual_hash = hex::encode(hasher.finalize());
+        if actual_hash != self.oid_sha256 {
+            return Err(LfsError::ChecksumMismatch {
+                expected: self.oid_sha256.clone(),
+                actual: actual_hash,
+            });
+        }
+
+        let chunker = StreamChunker::new(None);
+        let cursor = Cursor::new(payload);
+        let result = chunker
+            .chunk_reader(cursor, &self.oid_sha256, Some("application/octet-stream".to_string()))
+            .map_err(|e| LfsError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+
+        let store = LocalArtifactStore::new(store_root)
+            .map_err(|e| LfsError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+
+        for chunk in &result.chunks {
+            store
+                .store_chunk(&chunk.entry.chunk_hash, &chunk.bytes)
+                .map_err(|e| LfsError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+        }
+
+        store
+            .store_manifest(&result.manifest)
+            .map_err(|e| LfsError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+
+        Ok(result.manifest)
+    }
+
+    /// Hydrates the file from native artifact storage back into full binary bytes.
+    pub fn hydrate_from_artifact_store<P: AsRef<Path>>(
+        &self,
+        manifest: &ArtifactManifest,
+        store_root: P,
+    ) -> Result<Vec<u8>, LfsError> {
+        let store = LocalArtifactStore::new(store_root)
+            .map_err(|e| LfsError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+
+        let mut payload = Vec::with_capacity(manifest.total_size as usize);
+        for chunk_entry in &manifest.chunks {
+            let chunk_bytes = store
+                .get_chunk(&chunk_entry.chunk_hash)
+                .map_err(|e| LfsError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?
+                .ok_or_else(|| {
+                    LfsError::Io(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("Missing chunk {}", chunk_entry.chunk_hash),
+                    ))
+                })?;
+            payload.extend_from_slice(&chunk_bytes);
+        }
+
+        if payload.len() as u64 != self.size_bytes {
+            return Err(LfsError::InvalidPointer(format!(
+                "Hydrated size {} does not match pointer size {}",
+                payload.len(),
+                self.size_bytes
+            )));
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(&payload);
+        let actual_hash = hex::encode(hasher.finalize());
+        if actual_hash != self.oid_sha256 {
+            return Err(LfsError::ChecksumMismatch {
+                expected: self.oid_sha256.clone(),
+                actual: actual_hash,
+            });
+        }
+
+        Ok(payload)
     }
 }

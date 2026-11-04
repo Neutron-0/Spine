@@ -165,3 +165,40 @@
 - [x] React 18 / TypeScript frontend UI with dedicated Migration tab, source inspector, planning report, progress tracker, and Git export.
 - [x] Roundtrip export verified against official host Git CLI oracle (`git fsck --full`, `git log`, `git cat-file`).
 - [x] 13 comprehensive architectural, operational, and format documentation guides in `docs/`.
+
+---
+
+## Milestone 16: Native Git Smart HTTP, Remote Clone/Fetch/Push, and Forge Transport Integration (Batch 16 - Completed)
+- [x] Phase Zero gap closure from Batch 15 (`BATCH_16_PHASE_ZERO_GAP_REGISTER.md`):
+  - Strictly lexicographical `packed-refs` sorting ensuring clean validation by `git fsck --full`.
+  - Resilient platform metadata deserialization supporting string and object user structures (`PlatformUser`).
+  - Genuine LFS chunk hydration connecting Git LFS pointers to `spine-artifact` content-addressed storage.
+  - Hardened archive extraction security defending against symlink/hardlink escapes and case-insensitive duplicates.
+  - Deterministic migration checkpoint resumption and reconciliation verification.
+- [x] Pure Rust Git Smart HTTP protocol transport (`pkt_line.rs`, `git_transport.rs`) with zero external Git or libgit2 runtime dependencies:
+  - Canonical packet-line framing, flush (`0000`), delimiter (`0001`), and end-of-response (`0002`) packets.
+  - Protocol v1 and v2 capability advertisement (`multi_ack_detailed`, `side-band-64k`, `thin-pack`, `ofs-delta`, `agent`, `report-status`).
+  - Read transport: `GET /info/refs?service=git-upload-pack` and `POST /git-upload-pack` with wants/haves reachability negotiation and sideband channel 1 streaming.
+  - Write transport: `GET /info/refs?service=git-receive-pack` and `POST /git-receive-pack` with atomic ref update commands and `report-status` responses.
+- [x] Ingest & Thin Pack Delta Resolution:
+  - Built-in external base object resolver for thin packs resolving `OFS_DELTA` and `REF_DELTA` bases against existing repository commits, trees, and blobs.
+  - Git-to-Spine and Spine-to-Git bidirectional object conversion with cached raw Git objects and persisted `git_map.json` mapping.
+  - Bit-for-bit Git commit SHA-1 preservation guaranteeing zero history divergence during subsequent `git pull` operations across independent Git clients.
+- [x] Forge API Git Smart HTTP routes (`routes_git_http.rs`) mounted at `/:owner/:repo_git/info/refs`, `/:owner/:repo_git/git-upload-pack`, and `/:owner/:repo_git/git-receive-pack` supporting both `.git` and bare repository path suffixes.
+- [x] HTTP Basic Authentication & Access Control:
+  - Constant-time verification supporting both Personal Access Tokens (`sp_pat_...`) and user passwords (Argon2id).
+  - Public repository anonymous read discovery/clone and authenticated write gating.
+  - Private repository authentication enforcement across all read and write endpoints.
+- [x] Pre-Receive Security & Consistency Pipeline:
+  - Immediate blob scanning against known secret patterns prior to ref updates, rejecting offending pushes with descriptive client-visible error lines.
+  - Pre-receive branch protection rules enforcement (`require_pull_request`, fast-forward check, deletion gating).
+  - Authoritative CAS ref publication ensuring atomic, conflict-free repository state transitions.
+- [x] Frontend UI Integration (`App.tsx`):
+  - Interactive `Clone` dropdown in the repository Code tab providing canonical Git Smart HTTP URLs, copy-to-clipboard functionality, and PAT usage guidelines.
+- [x] End-to-end integration test suite (`git_smart_http_test.rs`) using host Git CLI (`git 2.53.0.windows.1`) as external oracle:
+  - Verified initial push, clone roundtrip, and incremental commit push/pull with bit-for-bit file tree verification.
+  - Verified private repository authentication gating and PAT authorization.
+  - Verified branch protection rule enforcement and push rejection.
+  - Verified pre-receive secret scanning rejection of credential leakage.
+  - Verified clone and push via bare repository URLs (omitting `.git`).
+- [x] Architecture, protocol, authentication, push security, pack transfer, and operational runbook documentation in `docs/`.

@@ -161,16 +161,29 @@ pub fn write_git_refs<P: AsRef<Path>>(git_dir: P, ref_map: &GitRefMap) -> Result
         fs::write(tag_path, format!("{}\n", oid))?;
     }
 
-    // 4. Optionally write packed-refs
-    let mut packed = String::from("# pack-refs with: peeled fully-peeled sorted \n");
-    for (tag, oid) in &ref_map.tags {
-        packed.push_str(&format!("{} refs/tags/{}\n", oid, tag));
-        if let Some(peeled) = ref_map.peeled_tags.get(tag) {
-            packed.push_str(&format!("^{}\n", peeled));
-        }
-    }
+    // 4. Write packed-refs sorted lexicographically by full refname
+    let mut all_refs: Vec<(String, GitOid, Option<GitOid>)> = Vec::new();
     for (branch, oid) in &ref_map.branches {
-        packed.push_str(&format!("{} refs/heads/{}\n", oid, branch));
+        all_refs.push((format!("refs/heads/{}", branch), *oid, None));
+    }
+    for (tag, oid) in &ref_map.tags {
+        all_refs.push((
+            format!("refs/tags/{}", tag),
+            *oid,
+            ref_map.peeled_tags.get(tag).copied(),
+        ));
+    }
+    for (other, oid) in &ref_map.other_refs {
+        all_refs.push((other.clone(), *oid, None));
+    }
+    all_refs.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut packed = String::from("# pack-refs with: peeled fully-peeled sorted \n");
+    for (ref_name, oid, peeled) in all_refs {
+        packed.push_str(&format!("{} {}\n", oid, ref_name));
+        if let Some(peeled_oid) = peeled {
+            packed.push_str(&format!("^{}\n", peeled_oid));
+        }
     }
     fs::write(git_dir.join("packed-refs"), packed)?;
 

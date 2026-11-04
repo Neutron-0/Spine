@@ -482,3 +482,383 @@ fn test_roundtrip_spine_to_git_and_official_oracle_verification() {
     let rt_content = fs::read(roundtrip_spine.join("hello.txt")).unwrap();
     assert_eq!(rt_content, blob_content);
 }
+
+#[test]
+fn test_real_git_repository_import_oracle_roundtrip() {
+    let tmp = tempdir().unwrap();
+    let source_git = tmp.path().join("source_git");
+    fs::create_dir_all(&source_git).unwrap();
+
+    // 1. Generate a real, complex Git repository using the official Git CLI
+    let git_check = Command::new("git").arg("--version").output();
+    if let Ok(output) = git_check {
+        if !output.status.success() {
+            println!("Official git CLI not available, skipping test_real_git_repository_import_oracle_roundtrip");
+            return;
+        }
+    } else {
+        println!("Official git CLI not available, skipping test_real_git_repository_import_oracle_roundtrip");
+        return;
+    }
+
+    let run_git = |args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&source_git)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("Failed to run git {:?}: {}", args, e));
+        assert!(
+            output.status.success(),
+            "git command failed: {:?}\nstdout: {}\nstderr: {}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    run_git(&["init", "-b", "main"]);
+    run_git(&["config", "user.name", "Lead Architect"]);
+    run_git(&["config", "user.email", "architect@spine.local"]);
+
+    // A. Root commit on main: regular file + binary file + non-ASCII filename
+    fs::write(source_git.join("README.md"), "# Spine Comprehensive Test\n").unwrap();
+    let binary_bytes: Vec<u8> = (0..=255).cycle().take(1024).collect();
+    fs::write(source_git.join("payload.bin"), &binary_bytes).unwrap();
+    fs::write(
+        source_git.join("documentation_üñîçødé.txt"),
+        "UTF-8 encoded filename with accents\n",
+    )
+    .unwrap();
+
+    run_git(&["add", "."]);
+    run_git(&["commit", "-m", "feat: root commit with binary and unicode files"]);
+
+    // B. Create lightweight tag on root commit
+    run_git(&["tag", "v0.9.0"]);
+
+    // C. Create feature branch and commit executable file
+    run_git(&["checkout", "-b", "feature-alpha"]);
+    fs::write(
+        source_git.join("build.sh"),
+        "#!/bin/sh\necho 'Building feature alpha'\n",
+    )
+    .unwrap();
+    run_git(&["add", "build.sh"]);
+    run_git(&["commit", "-m", "feat(alpha): add executable script"]);
+
+    // D. Switch back to main and commit an unusual commit message
+    run_git(&["checkout", "main"]);
+    fs::write(
+        source_git.join("CHANGELOG.md"),
+        "## Changes in v1.0.0\n- Initial release\n",
+    )
+    .unwrap();
+    run_git(&["add", "CHANGELOG.md"]);
+    run_git(&[
+        "commit",
+        "-m",
+        "fix(core): resolve issue \"#42\" & update <spec>\n\nMultiline commit with special chars: !@#$%^&*() and emojis: 🚀✨",
+    ]);
+
+    // E. Create annotated tag
+    run_git(&["tag", "-a", "v1.0.0", "-m", "Release version 1.0.0 annotated tag"]);
+
+    // F. Create merge commit
+    run_git(&[
+        "merge",
+        "feature-alpha",
+        "-m",
+        "Merge branch 'feature-alpha' into main",
+    ]);
+
+    // G. Pack objects and references
+    run_git(&["repack", "-a", "-d"]);
+    run_git(&["pack-refs", "--all"]);
+
+    // 2. Import into native Spine repository using GitImporter
+    let target_spine = tmp.path().join("imported_spine");
+    let target_spine_dir = target_spine.join(".spine");
+    let mut importer = GitImporter::new(&source_git, &target_spine_dir, Some(target_spine.clone()))
+        .expect("GitImporter init failed");
+    importer.load_git_objects().expect("Load git objects failed");
+    let stats = importer.execute_import().expect("Execute import failed");
+
+    assert!(stats.commits_count >= 4);
+    assert!(stats.blobs_count >= 4);
+    assert!(stats.branches_count >= 2);
+    assert!(stats.tags_count >= 1);
+
+    // Verify checked-out working tree
+    assert!(target_spine.join("README.md").exists());
+    assert!(target_spine.join("payload.bin").exists());
+    assert!(target_spine.join("build.sh").exists());
+    assert_eq!(fs::read(target_spine.join("payload.bin")).unwrap(), binary_bytes);
+
+    // 3. Export back from Spine into standard Git repository
+    let exported_git = tmp.path().join("exported_git");
+    let mut exporter = GitExporter::new(&target_spine, &exported_git, false)
+        .expect("GitExporter init failed");
+    let export_stats = exporter.execute_export().expect("Execute export failed");
+
+    assert!(export_stats.commits_count >= 4);
+    assert!(export_stats.branches_count >= 2);
+
+    // 4. External Test Oracle Verification using host Git
+    let run_oracle = |args: &[&str]| -> std::process::Output {
+        Command::new("git")
+            .arg("-C")
+            .arg(&exported_git)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("Failed to run git oracle {:?}: {}", args, e))
+    };
+
+    // A. `git fsck --full` -> must pass with zero errors
+    let fsck = run_oracle(&["fsck", "--full"]);
+    assert!(
+        fsck.status.success(),
+        "git fsck failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+
+    // B. `git log --all --graph` -> shows commits and merge topology
+    let log = run_oracle(&["log", "--all", "--graph", "--oneline"]);
+    assert!(log.status.success());
+    let log_str = String::from_utf8_lossy(&log.stdout);
+    assert!(log_str.contains("Merge branch 'feature-alpha' into main"));
+    assert!(log_str.contains("feat(alpha): add executable script"));
+
+    // C. `git rev-list --count --all` -> matches commit count
+    let rev_count = run_oracle(&["rev-list", "--count", "--all"]);
+    assert!(rev_count.status.success());
+    let count_val: usize = String::from_utf8_lossy(&rev_count.stdout).trim().parse().unwrap();
+    assert!(count_val >= 4);
+
+    // D. `git show` HEAD -> shows merge commit with parents
+    let show = run_oracle(&["show", "HEAD"]);
+    assert!(show.status.success());
+    let show_str = String::from_utf8_lossy(&show.stdout);
+    assert!(show_str.contains("Merge:"));
+
+    // E. `git branch --all` -> shows branches
+    let branch = run_oracle(&["branch", "--all"]);
+    assert!(branch.status.success());
+    let branch_str = String::from_utf8_lossy(&branch.stdout);
+    assert!(branch_str.contains("main"));
+    assert!(branch_str.contains("feature-alpha"));
+
+    // F. `git tag` -> shows tags
+    let tag = run_oracle(&["tag"]);
+    assert!(tag.status.success());
+    let tag_str = String::from_utf8_lossy(&tag.stdout);
+    assert!(tag_str.contains("v0.9.0"));
+    assert!(tag_str.contains("v1.0.0"));
+
+    // G. `git ls-tree` HEAD -> lists files
+    let ls_tree = run_oracle(&["ls-tree", "HEAD"]);
+    assert!(ls_tree.status.success());
+    let tree_str = String::from_utf8_lossy(&ls_tree.stdout);
+    assert!(tree_str.contains("README.md"));
+    assert!(tree_str.contains("payload.bin"));
+    assert!(tree_str.contains("build.sh"));
+}
+
+#[test]
+fn test_github_and_gitlab_synthetic_archive_fixtures() {
+    let tmp = tempdir().unwrap();
+    let meta_dir = tmp.path().join("github_metadata");
+    fs::create_dir_all(&meta_dir).unwrap();
+
+    // 1. Synthetic GitHub fixture
+    fs::write(
+        meta_dir.join("issues.json"),
+        r#"[
+            {
+                "number": 1,
+                "title": "Bug in parser",
+                "body": "Null pointer exception on edge case",
+                "user": "external_dev",
+                "state": "open",
+                "created_at": "2026-11-01T12:00:00Z",
+                "closed_at": null,
+                "labels": ["bug", "urgent"],
+                "milestone": "v1.0",
+                "comments": [
+                    {
+                        "user": "external_dev",
+                        "body": "Can reproduce reliably",
+                        "created_at": "2026-11-01T13:00:00Z"
+                    }
+                ]
+            }
+        ]"#,
+    )
+    .unwrap();
+
+    fs::write(
+        meta_dir.join("pull_requests.json"),
+        r#"[
+            {
+                "number": 2,
+                "title": "Fix parser null pointer",
+                "body": "Added guard clause",
+                "user": "contributor_jane",
+                "state": "closed",
+                "head_branch": "patch-1",
+                "base_branch": "main",
+                "created_at": "2026-11-02T10:00:00Z",
+                "closed_at": "2026-11-02T14:00:00Z",
+                "merged_at": "2026-11-02T14:00:00Z",
+                "labels": ["fix"]
+            }
+        ]"#,
+    )
+    .unwrap();
+
+    fs::write(
+        meta_dir.join("releases.json"),
+        r#"[
+            {
+                "tag_name": "v1.0.0",
+                "name": "Initial Release",
+                "body": "First stable version",
+                "published_at": "2026-11-03T18:00:00Z",
+                "assets": []
+            }
+        ]"#,
+    )
+    .unwrap();
+
+    let repo_data = parse_github_metadata_dir(&meta_dir).expect("Failed to parse github metadata");
+    assert_eq!(repo_data.issues.len(), 1);
+    assert_eq!(repo_data.pull_requests.len(), 1);
+    assert_eq!(repo_data.releases.len(), 1);
+
+    // Test attribution policy: ghost / tombstone user mapping
+    let policy = AttributionPolicy::default();
+    let user = PlatformUser {
+        username: "external_dev".to_string(),
+        email: None,
+        name: None,
+    };
+    let resolved = policy.resolve_user(&user);
+    assert_eq!(resolved.spine_username, "external_dev-migrated");
+    assert!(resolved.is_tombstone);
+
+    // Test workflow file detection and fail-closed security
+    assert!(is_workflow_file(".github/workflows/ci.yml"));
+    assert!(is_workflow_file(".gitlab-ci.yml"));
+    assert!(!is_workflow_file("src/main.rs"));
+}
+
+#[test]
+fn test_lfs_full_source_import_and_hydration_workflow() {
+    let tmp = tempdir().unwrap();
+    let artifact_store_dir = tmp.path().join("artifact_store");
+    fs::create_dir_all(&artifact_store_dir).unwrap();
+
+    // 1. Create a 256 KB test binary payload
+    let mut payload = Vec::with_capacity(256 * 1024);
+    for i in 0..(256 * 1024) {
+        payload.push((i % 256) as u8);
+    }
+
+    // 2. Generate Git LFS pointer
+    let pointer = GitLfsPointer::from_data(&payload);
+    assert_eq!(pointer.size_bytes, 256 * 1024);
+
+    // 3. Import actual payload into native artifact storage
+    let manifest = pointer
+        .import_to_artifact_store(&payload, &artifact_store_dir)
+        .expect("Import to artifact store failed");
+
+    assert_eq!(manifest.total_size, 256 * 1024);
+    assert!(!manifest.chunks.is_empty());
+
+    // 4. Hydrate payload from native artifact storage
+    let hydrated = pointer
+        .hydrate_from_artifact_store(&manifest, &artifact_store_dir)
+        .expect("Hydrate from artifact store failed");
+
+    // 5. Compare exact bytes
+    assert_eq!(hydrated, payload);
+
+    // 6. Test corruption detection: modify one byte of payload
+    let mut corrupt_payload = payload.clone();
+    corrupt_payload[42] ^= 0xFF;
+    let corrupt_err = pointer.import_to_artifact_store(&corrupt_payload, &artifact_store_dir);
+    assert!(corrupt_err.is_err());
+}
+
+#[test]
+fn test_archive_security_adversarial_expansions() {
+    let tmp = tempdir().unwrap();
+    let dest_dir = tmp.path().join("secure_extracted");
+    fs::create_dir_all(&dest_dir).unwrap();
+
+    // A. Windows reserved device name validation
+    assert!(validate_and_sanitize_archive_path("CON.txt").is_err());
+    assert!(validate_and_sanitize_archive_path("nested/PRN").is_err());
+    assert!(validate_and_sanitize_archive_path("aux.dat").is_err());
+    assert!(validate_and_sanitize_archive_path("nul").is_err());
+    assert!(validate_and_sanitize_archive_path("COM1.log").is_err());
+    assert!(validate_and_sanitize_archive_path("LPT3").is_err());
+
+    // B. Zip Slip path traversal validation
+    assert!(validate_and_sanitize_archive_path("../../escape.txt").is_err());
+    assert!(validate_and_sanitize_archive_path("foo/../../../etc/passwd").is_err());
+    assert!(validate_and_sanitize_archive_path("C:\\Windows\\system32").is_err());
+    assert!(validate_and_sanitize_archive_path("//network-share/secret").is_err());
+    assert!(validate_and_sanitize_archive_path("file:alternate_stream").is_err());
+
+    // C. Valid relative path succeeds
+    let valid = validate_and_sanitize_archive_path("safe/path/file.txt").unwrap();
+    assert_eq!(valid.to_str().unwrap().replace('\\', "/"), "safe/path/file.txt");
+}
+
+#[test]
+fn test_migration_recovery_checkpoint_resumption() {
+    let tmp = tempdir().unwrap();
+    let source_dir = tmp.path().join("source_repo");
+    let spine_dir = tmp.path().join("target_spine");
+    fs::create_dir_all(&source_dir).unwrap();
+
+    // Create a minimal bare Git repo layout
+    fs::create_dir_all(source_dir.join("objects")).unwrap();
+    fs::create_dir_all(source_dir.join("refs").join("heads")).unwrap();
+    fs::write(source_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    // 1. Inspect source
+    let inspection = MigrationEngine::inspect(&source_dir).expect("Inspection failed");
+    assert_eq!(inspection.default_branch, "main");
+
+    // 2. Run migration import
+    let report = MigrationEngine::run_git_import(
+        &source_dir,
+        &spine_dir,
+        AttributionPolicy::default(),
+        false,
+    )
+    .expect("Run git import failed");
+
+    assert!(report.verification_passed);
+
+    // 3. Verify manifest checkpoint
+    let manifest_file = spine_dir.join(".spine").join("migration_manifest.json");
+    assert!(manifest_file.exists());
+    let manifest_content = fs::read_to_string(&manifest_file).unwrap();
+    assert!(manifest_content.contains("Completed"));
+
+    // 4. Re-run idempotency
+    let report_rerun = MigrationEngine::run_git_import(
+        &source_dir,
+        &spine_dir,
+        AttributionPolicy::default(),
+        false,
+    )
+    .expect("Re-run git import failed");
+
+    assert!(report_rerun.verification_passed);
+}

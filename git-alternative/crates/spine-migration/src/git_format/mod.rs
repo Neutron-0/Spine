@@ -14,7 +14,7 @@ pub use loose::{
     parse_loose_object, serialize_loose_object, GitObjectType, LooseObjectError,
 };
 pub use oid::{GitOid, GitOidError};
-pub use pack::{parse_packfile, PackParseError, ParsedPackObject};
+pub use pack::{parse_packfile, parse_packfile_with_resolver, PackParseError, ParsedPackObject};
 pub use pack_builder::{build_pack_and_index, PackBuildError, PackObjectToBuild};
 pub use refs::{read_git_refs, write_git_refs, GitHead, GitRefMap, RefError};
 pub use tag::{parse_git_tag, serialize_git_tag, GitAnnotatedTag};

@@ -19,6 +19,14 @@ pub struct GitOid([u8; 20]);
 impl GitOid {
     pub const ZERO: Self = Self([0u8; 20]);
 
+    pub const fn zero() -> Self {
+        Self::ZERO
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.0 == [0u8; 20]
+    }
+
     pub const fn from_bytes(bytes: [u8; 20]) -> Self {
         Self(bytes)
     }
