@@ -254,6 +254,145 @@ pub fn prune(repo_root: &Path, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+pub fn resolve_remote_store(repo_root: &Path, remote: &str) -> Result<LocalArtifactStore> {
+    let spine_dir = repo_root.join(".spine");
+    let config_path = spine_dir.join("spine.toml");
+    let url = if config_path.exists() {
+        if let Ok(config) = spine_config::SpineConfig::load_from_file(&config_path) {
+            config.get_remote(remote).map(|r| r.url.clone()).unwrap_or_else(|| remote.to_string())
+        } else {
+            remote.to_string()
+        }
+    } else {
+        remote.to_string()
+    };
+
+    let path_str = url.strip_prefix("file://").unwrap_or(&url);
+    let path = PathBuf::from(path_str);
+    let artifacts_dir = if path.join(".spine").exists() {
+        path.join(".spine").join("artifacts")
+    } else if path.join("artifacts").exists() || path.join("chunks").exists() {
+        path.join("artifacts")
+    } else {
+        path.join(".spine").join("artifacts")
+    };
+    LocalArtifactStore::new(artifacts_dir).context("Failed to open remote artifact store")
+}
+
+/// Pushes local LFS manifests and chunks to the remote artifact store
+pub fn push(repo_root: &Path, remote: &str) -> Result<()> {
+    let local_store = get_artifact_store(repo_root)?;
+    let remote_store = resolve_remote_store(repo_root, remote)?;
+    let artifacts_dir = get_artifacts_dir(repo_root);
+
+    let manifest_ids = load_all_manifest_ids(&artifacts_dir)?;
+    let mut pushed_manifests = 0;
+    let mut pushed_chunks = 0;
+    let mut pushed_bytes = 0u64;
+
+    for manifest_id in &manifest_ids {
+        if let Ok(Some(manifest)) = local_store.get_manifest(manifest_id) {
+            for chunk in &manifest.chunks {
+                if !remote_store.has_chunk(&chunk.chunk_hash) {
+                    if let Ok(Some(bytes)) = local_store.get_chunk(&chunk.chunk_hash) {
+                        remote_store.store_chunk(&chunk.chunk_hash, &bytes)?;
+                        pushed_chunks += 1;
+                        pushed_bytes += bytes.len() as u64;
+                    }
+                }
+            }
+            if !remote_store.has_manifest(manifest_id) {
+                remote_store.store_manifest(&manifest)?;
+                pushed_manifests += 1;
+            }
+        }
+    }
+
+    println!(
+        "LFS push complete: {} manifests, {} chunks ({} bytes) pushed to '{}'",
+        pushed_manifests, pushed_chunks, pushed_bytes, remote
+    );
+    Ok(())
+}
+
+/// Fetches referenced LFS manifests and chunks from the remote artifact store
+pub fn fetch(repo_root: &Path, remote: &str) -> Result<()> {
+    let local_store = get_artifact_store(repo_root)?;
+    let remote_store = resolve_remote_store(repo_root, remote)?;
+
+    let mut fetched_manifests = 0;
+    let mut fetched_chunks = 0;
+    let mut fetched_bytes = 0u64;
+
+    for entry in walk_tree_files(repo_root)? {
+        let rel_path = match entry.strip_prefix(repo_root) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let rel_str = rel_path.to_string_lossy().replace('\\', "/");
+        if rel_str.starts_with(".spine") {
+            continue;
+        }
+
+        if let Ok(content) = fs::read(&entry) {
+            if let Ok(s) = std::str::from_utf8(&content) {
+                if let Ok(ptr) = LfsPointer::parse(s) {
+                    if !local_store.has_manifest(&ptr.manifest_oid) {
+                        if let Ok(Some(m)) = remote_store.get_manifest(&ptr.manifest_oid) {
+                            local_store.store_manifest(&m)?;
+                            fetched_manifests += 1;
+                        }
+                    }
+
+                    if let Ok(Some(m)) = local_store.get_manifest(&ptr.manifest_oid) {
+                        for chunk in &m.chunks {
+                            if !local_store.has_chunk(&chunk.chunk_hash) {
+                                if let Ok(Some(bytes)) = remote_store.get_chunk(&chunk.chunk_hash) {
+                                    local_store.store_chunk(&chunk.chunk_hash, &bytes)?;
+                                    fetched_chunks += 1;
+                                    fetched_bytes += bytes.len() as u64;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    println!(
+        "LFS fetch complete: {} manifests, {} chunks ({} bytes) fetched from '{}'",
+        fetched_manifests, fetched_chunks, fetched_bytes, remote
+    );
+    Ok(())
+}
+
+/// Pulls LFS manifests and chunks from remote and hydrates all pointers in working directory
+pub fn pull(repo_root: &Path, remote: &str) -> Result<()> {
+    fetch(repo_root, remote)?;
+
+    let mut hydrated = 0;
+    for entry in walk_tree_files(repo_root)? {
+        let rel_path = match entry.strip_prefix(repo_root) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let rel_str = rel_path.to_string_lossy().replace('\\', "/");
+        if rel_str.starts_with(".spine") {
+            continue;
+        }
+
+        if let Ok(content) = fs::read(&entry) {
+            if hydrate_pointer_file(repo_root, &entry, &content)? {
+                hydrated += 1;
+            }
+        }
+    }
+
+    println!("LFS pull: Hydrated {} large files in working tree", hydrated);
+    Ok(())
+}
+
 /// Intercepts a file during `spine add`: if it matches LFS tracking rules,
 /// chunks it into `.spine/artifacts/`, writes chunks + manifest,
 /// and returns the serialized `LfsPointer` bytes to be stored in the index/tree!

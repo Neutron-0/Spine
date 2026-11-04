@@ -412,6 +412,24 @@ pub enum LfsAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Push local LFS objects to remote artifact store
+    Push {
+        /// Remote name or URL (default: "origin")
+        #[arg(default_value = "origin")]
+        remote: String,
+    },
+    /// Fetch referenced LFS objects from remote artifact store
+    Fetch {
+        /// Remote name or URL (default: "origin")
+        #[arg(default_value = "origin")]
+        remote: String,
+    },
+    /// Fetch and hydrate all LFS files in working copy
+    Pull {
+        /// Remote name or URL (default: "origin")
+        #[arg(default_value = "origin")]
+        remote: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3945,6 +3963,9 @@ async fn main() -> Result<()> {
                 LfsAction::LsFiles => ops_lfs::ls_files(&worktree_root)?,
                 LfsAction::Verify => ops_lfs::verify(&worktree_root)?,
                 LfsAction::Prune { dry_run } => ops_lfs::prune(&worktree_root, dry_run)?,
+                LfsAction::Push { remote } => ops_lfs::push(&worktree_root, &remote)?,
+                LfsAction::Fetch { remote } => ops_lfs::fetch(&worktree_root, &remote)?,
+                LfsAction::Pull { remote } => ops_lfs::pull(&worktree_root, &remote)?,
             }
         }
 

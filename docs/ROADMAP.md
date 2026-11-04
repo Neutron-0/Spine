@@ -88,10 +88,6 @@
 - PR Merge Distributed Integration: PR merges directly construct genuine `.spk` and `.spidx` packfiles from 3-way tree and commit objects, submitting through `AuthoritativeRepositoryWriter` with cross-service crash reconciliation.
 - Comprehensive Test Suites: 109 VCS/CLI tests and 25 Forge API tests passing with zero failures.
 
----
-
-## Next Milestones
-
 ### Batch 11: Distributed Large Object Storage, Spine LFS, Releases, Artifact Management, and Package Registries
 - Unified Content-Addressed Storage Crate (`spine-artifact`): Deterministic 4 MiB bounded streaming chunker (`StreamChunker`), whole-object and per-chunk BLAKE3 digests, cryptographic manifests (`ArtifactManifest`), and memory-bounded reconstructor (`ObjectReconstructor`).
 - Spine LFS Engine: Text pointer format (`spine-lfs-v1 <manifest_oid> <size_bytes> <object_hash>`), `.spinelfs` tracking rules file, worktree interception in `spine add` staging compact pointers instead of multi-gigabyte blobs, and full CLI commands (`spine lfs track`, `untrack`, `status`, `ls-files`, `verify`, `prune`).
@@ -104,14 +100,23 @@
 - Developer Experience & UI: Live `cargo publish` verified with official Cargo CLI; React 18 frontend expanded with Releases and Package Registry tabs, binary download triggers, and storage quota progress bar.
 - Windows 11 Native Stability: Bounded memory footprints (< 12 MiB per streaming operation) preventing system paging exhaustion, atomic temporary file replacement, and 100% test pass rate across all crates.
 
+### Batch 12: Forge Automation Platform, Webhooks, CI/CD Workflows, and Isolated Build Runners
+- Native Workflow Engine (`spine-workflow`): Declarative `.spine/workflows/*.yml` YAML/JSON parser with line-number diagnostics, trigger filter evaluation (`push.branches`, `pull_request.branches`, `workflow_dispatch`), and Directed Acyclic Graph (`JobDag`) with Tarjan cycle detection and topological sorting.
+- Forge CI/CD Orchestration: Control plane service (`WorkflowService`), scheduler (`WorkflowScheduler`), immutable `WorkflowRun` instances, multi-job DAG execution, step tracking, and PR check status reporting (`workflow_check_results`).
+- Authoritative Branch Protection Gatekeeper: `check_merge_allowed` blocks PR merges unless all configured `required_status_checks` report `status: "SUCCESS"` for the target commit.
+- Dedicated Isolated Runner Architecture: Strict control plane vs runner execution plane isolation boundary. `RunnerService` with CSPRNG registration tokens, heartbeat tracking, atomic job acquisition, fenced leases with monotonically incrementing tokens, and stale token rejection.
+- Isolated Sandboxed Runner Executor (`IsolatedRunnerExecutor`): Ephemeral workspace lifecycle (`runner_workspaces/<job_id>`), environment sanitization, hard step timeouts, process-tree termination (`taskkill /PID ... /T /F` on Windows), and realtime log streaming with dynamic secret masking (`***`).
+- Webhook Subsystem & Transactional Outbox: `WebhookService`, `WebhookOutboxWorker`, RFC 2104 HMAC-SHA256 signatures (`X-Spine-Signature-256`), constant-time signature verification, exponential backoff retries, and delivery logging.
+- Strict SSRF Defenses (`SsrfValidator`): Scheme & port filtering, blocking loopback, RFC 1918 private, link-local / cloud metadata (`169.254.169.254`), broadcast, and multicast ranges, with DNS pinning preventing TOCTOU DNS rebinding attacks.
+- Frontend Collaboration Suite: React 18 / TypeScript frontend expanded with dedicated Actions (DAG view, live console logs), Webhooks (subscriptions, test deliveries), Runners (connected agents, concurrency, registration), and Secrets management tabs.
+- Full Windows 11 Native Integration: Zero mock compromises, verified against native Windows MSVC toolchains and official CLI workflows.
+
 ---
 
 ## Next Milestones
 
-### Batch 12: Real-time Collaboration, Webhooks, CI/CD Pipeline Gateway, and Enterprise Federation
+### Batch 13: Real-time Collaboration, Enterprise Federation, and Global Edge Mirrors
 - Real-time updates via WebSockets for collaborative review, diff comments, and notification feeds.
-- Webhook dispatch system with HMAC-SHA256 payload signing, delivery logs, and exponential backoff retry queues.
-- CI/CD Pipeline Gateway: Native runner execution protocols, secret masking, build status checks reporting to pull requests.
 - Enterprise Single Sign-On (SAML 2.0 and OIDC).
 - Comprehensive immutable audit log exports and compliance reporting.
 - Global repository replication and geo-distributed caching mirrors.

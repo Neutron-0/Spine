@@ -328,6 +328,28 @@ impl PermissionService {
             }
         }
 
+        if !rule.required_status_checks.is_empty() {
+            let checks = self.db.list_workflow_check_results(&repo.id, &pr.head_commit_id).await?;
+            for req_check in &rule.required_status_checks {
+                let check_opt = checks.iter().find(|c| c.check_name == *req_check);
+                match check_opt {
+                    Some(c) if c.status == "SUCCESS" => {},
+                    Some(c) => {
+                        return Err(ForgeError::UnprocessableEntity(format!(
+                            "Branch protection: required check '{}' has status '{}', must be 'SUCCESS' before merging",
+                            req_check, c.status
+                        )));
+                    }
+                    None => {
+                        return Err(ForgeError::UnprocessableEntity(format!(
+                            "Branch protection: required check '{}' has not passed for commit {}",
+                            req_check, pr.head_commit_id
+                        )));
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 }

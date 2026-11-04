@@ -686,6 +686,8 @@ pub struct BranchProtectionRule {
     pub require_changes_addressed: bool,
     pub dismiss_stale_reviews_on_push: bool,
     pub restrict_merges_to_admins: bool,
+    #[serde(default)]
+    pub required_status_checks: Vec<String>,
     pub created_at_nanos: i64,
     pub updated_at_nanos: i64,
 }
@@ -1053,4 +1055,184 @@ pub struct PackageVersionDto {
     pub is_yanked: bool,
     pub created_by_user_id: String,
     pub created_at_nanos: i64,
+}
+
+// -----------------------------------------------------------------------------
+// Webhooks, Workflows, Runners, and CI/CD (Batch 12)
+// -----------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateWebhookSubscriptionRequest {
+    pub owner_type: String, // "REPO" or "ORG"
+    pub owner_id: String,
+    pub target_url: String,
+    pub secret: Option<String>,
+    pub events: Vec<String>,
+    pub is_active: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebhookSubscription {
+    pub id: String,
+    pub owner_type: String, // "REPO" or "ORG"
+    pub owner_id: String,
+    pub target_url: String,
+    pub secret_hash: String,
+    pub secret_ciphertext: String,
+    pub events: String,
+    pub is_active: bool,
+    pub created_at_nanos: i64,
+    pub updated_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebhookSubscriptionDto {
+    pub id: String,
+    pub owner_type: String,
+    pub owner_id: String,
+    pub target_url: String,
+    pub events: Vec<String>,
+    pub is_active: bool,
+    pub created_at_nanos: i64,
+    pub updated_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebhookOutboxItem {
+    pub id: String,
+    pub event_type: String,
+    pub owner_type: String,
+    pub owner_id: String,
+    pub payload: serde_json::Value,
+    pub attempts: i32,
+    pub max_attempts: i32,
+    pub status: String, // "PENDING", "PROCESSING", "DELIVERED", "FAILED"
+    pub last_error: Option<String>,
+    pub created_at_nanos: i64,
+    pub next_attempt_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebhookDelivery {
+    pub id: String,
+    pub subscription_id: String,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+    pub response_status: Option<i32>,
+    pub response_body: Option<String>,
+    pub execution_duration_ms: i64,
+    pub attempt: i32,
+    pub status: String,
+    pub delivered_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowDefinition {
+    pub id: String,
+    pub repo_id: String,
+    pub path: String,
+    pub name: String,
+    pub yaml_content: String,
+    pub digest: String,
+    pub created_at_nanos: i64,
+    pub updated_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRun {
+    pub id: String,
+    pub repo_id: String,
+    pub workflow_id: String,
+    pub workflow_name: String,
+    pub commit_oid: String,
+    pub ref_name: String,
+    pub trigger_event: String,
+    pub actor_id: String,
+    pub status: String, // "QUEUED", "RUNNING", "SUCCEEDED", "FAILED", "CANCELLED"
+    pub conclusion: Option<String>,
+    pub definition_yaml: String,
+    pub definition_digest: String,
+    pub created_at_nanos: i64,
+    pub started_at_nanos: Option<i64>,
+    pub completed_at_nanos: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowJob {
+    pub id: String,
+    pub run_id: String,
+    pub repo_id: String,
+    pub job_key: String,
+    pub name: String,
+    pub status: String, // "QUEUED", "WAITING_FOR_RUNNER", "ASSIGNED", "RUNNING", "SUCCEEDED", "FAILED", "CANCELLED", "TIMED_OUT", "LOST"
+    pub runner_id: Option<String>,
+    pub runs_on: Vec<String>,
+    pub needs: Vec<String>,
+    pub attempt: i32,
+    pub fencing_token: i64,
+    pub lease_expires_at_nanos: Option<i64>,
+    pub exit_code: Option<i32>,
+    pub created_at_nanos: i64,
+    pub started_at_nanos: Option<i64>,
+    pub completed_at_nanos: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowStep {
+    pub id: String,
+    pub job_id: String,
+    pub step_index: i32,
+    pub name: String,
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub started_at_nanos: Option<i64>,
+    pub completed_at_nanos: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowLogChunk {
+    pub id: String,
+    pub job_id: String,
+    pub step_index: i32,
+    pub stream: String,
+    pub content: String,
+    pub timestamp_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerRegistration {
+    pub id: String,
+    pub name: String,
+    pub hostname: String,
+    pub token_hash: String,
+    pub os: String,
+    pub arch: String,
+    pub labels: Vec<String>,
+    pub max_concurrency: i32,
+    pub active_jobs: i32,
+    pub status: String, // "ACTIVE", "DRAINED", "REVOKED"
+    pub last_heartbeat_at_nanos: i64,
+    pub created_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowSecret {
+    pub id: String,
+    pub owner_type: String,
+    pub owner_id: String,
+    pub name: String,
+    pub ciphertext: String,
+    pub created_at_nanos: i64,
+    pub updated_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowCheckResult {
+    pub id: String,
+    pub repo_id: String,
+    pub commit_oid: String,
+    pub check_name: String,
+    pub status: String, // "PENDING", "SUCCESS", "FAILURE", "ERROR"
+    pub run_id: String,
+    pub updated_at_nanos: i64,
 }

@@ -8,7 +8,10 @@ pub mod packages;
 pub mod permissions;
 pub mod releases;
 pub mod repository;
+pub mod runner;
 pub mod storage;
+pub mod webhook;
+pub mod workflow;
 
 pub use api::{build_router, AppState};
 pub use artifact::ArtifactService;
@@ -20,4 +23,7 @@ pub use packages::{CargoRegistryAdapter, PackageService};
 pub use permissions::PermissionService;
 pub use releases::ReleaseService;
 pub use repository::{ProvisioningWorker, RepositoryService};
+pub use runner::{IsolatedRunnerExecutor, RunnerService};
 pub use storage::NativeVcsService;
+pub use webhook::{SsrfValidator, WebhookOutboxWorker, WebhookService};
+pub use workflow::{WorkflowScheduler, WorkflowService};

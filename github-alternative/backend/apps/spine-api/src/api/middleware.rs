@@ -32,6 +32,12 @@ pub struct AppState {
     pub releases: Arc<ReleaseService>,
     pub packages: Arc<PackageService>,
     pub cargo: Arc<CargoRegistryAdapter>,
+    pub webhooks: Arc<crate::webhook::WebhookService>,
+    pub webhook_worker: Arc<crate::webhook::WebhookOutboxWorker>,
+    pub workflows: Arc<crate::workflow::WorkflowService>,
+    pub scheduler: Arc<crate::workflow::WorkflowScheduler>,
+    pub runners: Arc<crate::runner::RunnerService>,
+    pub runner_executor: Arc<crate::runner::IsolatedRunnerExecutor>,
 }
 
 pub async fn auth_middleware(

@@ -80,6 +80,23 @@ struct MemoryState {
     packages: HashMap<String, Package>,
     pkg_by_eco_name: HashMap<(String, String), String>,
     package_versions: HashMap<String, PackageVersion>,
+
+    // Webhooks, Workflows & Runners (Batch 12)
+    webhook_subscriptions: HashMap<String, WebhookSubscription>,
+    webhook_deliveries: HashMap<String, WebhookDelivery>,
+    webhook_outbox: HashMap<String, WebhookOutboxItem>,
+
+    workflow_definitions: HashMap<String, WorkflowDefinition>,
+    workflow_runs: HashMap<String, WorkflowRun>,
+    workflow_jobs: HashMap<String, WorkflowJob>,
+    workflow_steps: HashMap<String, WorkflowStep>,
+    workflow_logs: Vec<WorkflowLogChunk>,
+
+    runners: HashMap<String, RunnerRegistration>,
+    runner_by_token_hash: HashMap<String, String>,
+
+    workflow_secrets: HashMap<String, WorkflowSecret>,
+    workflow_check_results: HashMap<(String, String, String), WorkflowCheckResult>,
 }
 
 pub struct InMemoryDatabase {
@@ -1597,5 +1614,439 @@ impl Database for InMemoryDatabase {
         } else {
             Err(ForgeError::NotFound(format!("Version '{}' not found", version)))
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Webhooks (Batch 12)
+    // -------------------------------------------------------------------------
+
+    async fn create_webhook_subscription(&self, sub: WebhookSubscription) -> Result<WebhookSubscription, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.webhook_subscriptions.insert(sub.id.clone(), sub.clone());
+        Ok(sub)
+    }
+
+    async fn get_webhook_subscription(&self, id: &str) -> Result<Option<WebhookSubscription>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(state.webhook_subscriptions.get(id).cloned())
+    }
+
+    async fn list_webhook_subscriptions(&self, owner_type: &str, owner_id: &str) -> Result<Vec<WebhookSubscription>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut list: Vec<WebhookSubscription> = state
+            .webhook_subscriptions
+            .values()
+            .filter(|s| s.owner_type == owner_type && s.owner_id == owner_id)
+            .cloned()
+            .collect();
+        list.sort_by_key(|s| s.created_at_nanos);
+        Ok(list)
+    }
+
+    async fn update_webhook_subscription(&self, sub: WebhookSubscription) -> Result<WebhookSubscription, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if state.webhook_subscriptions.contains_key(&sub.id) {
+            state.webhook_subscriptions.insert(sub.id.clone(), sub.clone());
+            Ok(sub)
+        } else {
+            Err(ForgeError::NotFound("Webhook subscription not found".into()))
+        }
+    }
+
+    async fn delete_webhook_subscription(&self, id: &str) -> Result<(), ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.webhook_subscriptions.remove(id);
+        Ok(())
+    }
+
+    async fn create_webhook_delivery(&self, delivery: WebhookDelivery) -> Result<WebhookDelivery, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.webhook_deliveries.insert(delivery.id.clone(), delivery.clone());
+        Ok(delivery)
+    }
+
+    async fn list_webhook_deliveries(&self, subscription_id: &str, limit: i64) -> Result<Vec<WebhookDelivery>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut list: Vec<WebhookDelivery> = state
+            .webhook_deliveries
+            .values()
+            .filter(|d| d.subscription_id == subscription_id)
+            .cloned()
+            .collect();
+        list.sort_by_key(|d| std::cmp::Reverse(d.delivered_at_nanos));
+        list.truncate(limit as usize);
+        Ok(list)
+    }
+
+    async fn enqueue_webhook_outbox(&self, item: WebhookOutboxItem) -> Result<WebhookOutboxItem, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.webhook_outbox.insert(item.id.clone(), item.clone());
+        Ok(item)
+    }
+
+    async fn claim_pending_webhook_outbox(&self, limit: i64, now_nanos: i64) -> Result<Vec<WebhookOutboxItem>, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut claimed = Vec::new();
+        for item in state.webhook_outbox.values_mut() {
+            if item.status == "PENDING" && item.next_attempt_at_nanos <= now_nanos {
+                item.status = "PROCESSING".into();
+                item.attempts += 1;
+                claimed.push(item.clone());
+                if claimed.len() >= limit as usize {
+                    break;
+                }
+            }
+        }
+        Ok(claimed)
+    }
+
+    async fn update_webhook_outbox_status(&self, id: &str, status: &str, error: Option<&str>, next_attempt_nanos: i64) -> Result<(), ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(item) = state.webhook_outbox.get_mut(id) {
+            item.status = status.to_string();
+            item.last_error = error.map(|s| s.to_string());
+            item.next_attempt_at_nanos = next_attempt_nanos;
+            Ok(())
+        } else {
+            Err(ForgeError::NotFound("Outbox item not found".into()))
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Workflows, Runs, Jobs, Steps, Logs (Batch 12)
+    // -------------------------------------------------------------------------
+
+    async fn upsert_workflow_definition(&self, def: WorkflowDefinition) -> Result<WorkflowDefinition, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let key = format!("{}:{}", def.repo_id, def.path);
+        state.workflow_definitions.insert(key, def.clone());
+        Ok(def)
+    }
+
+    async fn get_workflow_definition(&self, repo_id: &str, path: &str) -> Result<Option<WorkflowDefinition>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let key = format!("{}:{}", repo_id, path);
+        Ok(state.workflow_definitions.get(&key).cloned())
+    }
+
+    async fn list_workflow_definitions(&self, repo_id: &str) -> Result<Vec<WorkflowDefinition>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut list: Vec<WorkflowDefinition> = state
+            .workflow_definitions
+            .values()
+            .filter(|d| d.repo_id == repo_id)
+            .cloned()
+            .collect();
+        list.sort_by_key(|d| d.path.clone());
+        Ok(list)
+    }
+
+    async fn create_workflow_run(&self, run: WorkflowRun) -> Result<WorkflowRun, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.workflow_runs.insert(run.id.clone(), run.clone());
+        Ok(run)
+    }
+
+    async fn get_workflow_run(&self, id: &str) -> Result<Option<WorkflowRun>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(state.workflow_runs.get(id).cloned())
+    }
+
+    async fn list_workflow_runs(&self, repo_id: &str, limit: i64) -> Result<Vec<WorkflowRun>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut list: Vec<WorkflowRun> = state
+            .workflow_runs
+            .values()
+            .filter(|r| r.repo_id == repo_id)
+            .cloned()
+            .collect();
+        list.sort_by_key(|r| std::cmp::Reverse(r.created_at_nanos));
+        list.truncate(limit as usize);
+        Ok(list)
+    }
+
+    async fn update_workflow_run_status(
+        &self,
+        id: &str,
+        status: &str,
+        conclusion: Option<&str>,
+        started_at: Option<i64>,
+        completed_at: Option<i64>,
+    ) -> Result<(), ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(r) = state.workflow_runs.get_mut(id) {
+            r.status = status.to_string();
+            if let Some(c) = conclusion {
+                r.conclusion = Some(c.to_string());
+            }
+            if started_at.is_some() {
+                r.started_at_nanos = started_at;
+            }
+            if completed_at.is_some() {
+                r.completed_at_nanos = completed_at;
+            }
+            Ok(())
+        } else {
+            Err(ForgeError::NotFound("Workflow run not found".into()))
+        }
+    }
+
+    async fn create_workflow_job(&self, job: WorkflowJob) -> Result<WorkflowJob, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.workflow_jobs.insert(job.id.clone(), job.clone());
+        Ok(job)
+    }
+
+    async fn get_workflow_job(&self, id: &str) -> Result<Option<WorkflowJob>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(state.workflow_jobs.get(id).cloned())
+    }
+
+    async fn list_workflow_jobs(&self, run_id: &str) -> Result<Vec<WorkflowJob>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut list: Vec<WorkflowJob> = state
+            .workflow_jobs
+            .values()
+            .filter(|j| j.run_id == run_id)
+            .cloned()
+            .collect();
+        list.sort_by_key(|j| j.created_at_nanos);
+        Ok(list)
+    }
+
+    async fn list_queued_workflow_jobs(&self, now_nanos: i64) -> Result<Vec<WorkflowJob>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut list: Vec<WorkflowJob> = state
+            .workflow_jobs
+            .values()
+            .filter(|j| {
+                j.status == "QUEUED"
+                    || (j.status == "ASSIGNED" && j.lease_expires_at_nanos.map_or(false, |exp| exp < now_nanos))
+            })
+            .cloned()
+            .collect();
+        list.sort_by_key(|j| j.created_at_nanos);
+        Ok(list)
+    }
+
+    async fn assign_workflow_job(
+        &self,
+        job_id: &str,
+        runner_id: &str,
+        fencing_token: i64,
+        lease_expires_at: i64,
+    ) -> Result<(), ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(j) = state.workflow_jobs.get_mut(job_id) {
+            j.status = "ASSIGNED".into();
+            j.runner_id = Some(runner_id.to_string());
+            j.fencing_token = fencing_token;
+            j.lease_expires_at_nanos = Some(lease_expires_at);
+            Ok(())
+        } else {
+            Err(ForgeError::NotFound("Workflow job not found".into()))
+        }
+    }
+
+    async fn update_workflow_job_status(
+        &self,
+        job_id: &str,
+        status: &str,
+        exit_code: Option<i32>,
+        started_at: Option<i64>,
+        completed_at: Option<i64>,
+    ) -> Result<(), ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(j) = state.workflow_jobs.get_mut(job_id) {
+            j.status = status.to_string();
+            if exit_code.is_some() {
+                j.exit_code = exit_code;
+            }
+            if started_at.is_some() {
+                j.started_at_nanos = started_at;
+            }
+            if completed_at.is_some() {
+                j.completed_at_nanos = completed_at;
+            }
+            Ok(())
+        } else {
+            Err(ForgeError::NotFound("Workflow job not found".into()))
+        }
+    }
+
+    async fn create_workflow_step(&self, step: WorkflowStep) -> Result<WorkflowStep, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.workflow_steps.insert(step.id.clone(), step.clone());
+        Ok(step)
+    }
+
+    async fn list_workflow_steps(&self, job_id: &str) -> Result<Vec<WorkflowStep>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut list: Vec<WorkflowStep> = state
+            .workflow_steps
+            .values()
+            .filter(|s| s.job_id == job_id)
+            .cloned()
+            .collect();
+        list.sort_by_key(|s| s.step_index);
+        Ok(list)
+    }
+
+    async fn update_workflow_step(
+        &self,
+        step_id: &str,
+        status: &str,
+        exit_code: Option<i32>,
+        started_at: Option<i64>,
+        completed_at: Option<i64>,
+    ) -> Result<(), ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(s) = state.workflow_steps.get_mut(step_id) {
+            s.status = status.to_string();
+            if exit_code.is_some() {
+                s.exit_code = exit_code;
+            }
+            if started_at.is_some() {
+                s.started_at_nanos = started_at;
+            }
+            if completed_at.is_some() {
+                s.completed_at_nanos = completed_at;
+            }
+            Ok(())
+        } else {
+            Err(ForgeError::NotFound("Workflow step not found".into()))
+        }
+    }
+
+    async fn append_workflow_log(&self, log: WorkflowLogChunk) -> Result<(), ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.workflow_logs.push(log);
+        Ok(())
+    }
+
+    async fn list_workflow_logs(&self, job_id: &str) -> Result<Vec<WorkflowLogChunk>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut list: Vec<WorkflowLogChunk> = state
+            .workflow_logs
+            .iter()
+            .filter(|l| l.job_id == job_id)
+            .cloned()
+            .collect();
+        list.sort_by_key(|l| l.timestamp_nanos);
+        Ok(list)
+    }
+
+    // -------------------------------------------------------------------------
+    // Runners (Batch 12)
+    // -------------------------------------------------------------------------
+
+    async fn register_runner(&self, runner: RunnerRegistration) -> Result<RunnerRegistration, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state.runner_by_token_hash.insert(runner.token_hash.clone(), runner.id.clone());
+        state.runners.insert(runner.id.clone(), runner.clone());
+        Ok(runner)
+    }
+
+    async fn get_runner_by_id(&self, id: &str) -> Result<Option<RunnerRegistration>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(state.runners.get(id).cloned())
+    }
+
+    async fn get_runner_by_token_hash(&self, token_hash: &str) -> Result<Option<RunnerRegistration>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(id) = state.runner_by_token_hash.get(token_hash) {
+            Ok(state.runners.get(id).cloned())
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn list_runners(&self) -> Result<Vec<RunnerRegistration>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut list: Vec<RunnerRegistration> = state.runners.values().cloned().collect();
+        list.sort_by_key(|r| r.name.clone());
+        Ok(list)
+    }
+
+    async fn update_runner_heartbeat(&self, runner_id: &str, active_jobs: i32, now_nanos: i64) -> Result<(), ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(r) = state.runners.get_mut(runner_id) {
+            r.active_jobs = active_jobs;
+            r.last_heartbeat_at_nanos = now_nanos;
+            Ok(())
+        } else {
+            Err(ForgeError::NotFound("Runner not found".into()))
+        }
+    }
+
+    async fn update_runner_status(&self, runner_id: &str, status: &str) -> Result<(), ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(r) = state.runners.get_mut(runner_id) {
+            r.status = status.to_string();
+            Ok(())
+        } else {
+            Err(ForgeError::NotFound("Runner not found".into()))
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Workflow Secrets & PR Check Results (Batch 12)
+    // -------------------------------------------------------------------------
+
+    async fn upsert_workflow_secret(&self, secret: WorkflowSecret) -> Result<WorkflowSecret, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let key = format!("{}:{}:{}", secret.owner_type, secret.owner_id, secret.name);
+        state.workflow_secrets.insert(key, secret.clone());
+        Ok(secret)
+    }
+
+    async fn get_workflow_secret(&self, owner_type: &str, owner_id: &str, name: &str) -> Result<Option<WorkflowSecret>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let key = format!("{}:{}:{}", owner_type, owner_id, name);
+        Ok(state.workflow_secrets.get(&key).cloned())
+    }
+
+    async fn list_workflow_secrets(&self, owner_type: &str, owner_id: &str) -> Result<Vec<WorkflowSecret>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut list: Vec<WorkflowSecret> = state
+            .workflow_secrets
+            .values()
+            .filter(|s| s.owner_type == owner_type && s.owner_id == owner_id)
+            .cloned()
+            .collect();
+        list.sort_by_key(|s| s.name.clone());
+        Ok(list)
+    }
+
+    async fn delete_workflow_secret(&self, owner_type: &str, owner_id: &str, name: &str) -> Result<(), ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let key = format!("{}:{}:{}", owner_type, owner_id, name);
+        state.workflow_secrets.remove(&key);
+        Ok(())
+    }
+
+    async fn upsert_workflow_check_result(&self, check: WorkflowCheckResult) -> Result<WorkflowCheckResult, ForgeError> {
+        let mut state = self.state.write().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let key = (check.repo_id.clone(), check.commit_oid.clone(), check.check_name.clone());
+        state.workflow_check_results.insert(key, check.clone());
+        Ok(check)
+    }
+
+    async fn get_workflow_check_result(&self, repo_id: &str, commit_oid: &str, check_name: &str) -> Result<Option<WorkflowCheckResult>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let key = (repo_id.to_string(), commit_oid.to_string(), check_name.to_string());
+        Ok(state.workflow_check_results.get(&key).cloned())
+    }
+
+    async fn list_workflow_check_results(&self, repo_id: &str, commit_oid: &str) -> Result<Vec<WorkflowCheckResult>, ForgeError> {
+        let state = self.state.read().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut list: Vec<WorkflowCheckResult> = state
+            .workflow_check_results
+            .values()
+            .filter(|c| c.repo_id == repo_id && c.commit_oid == commit_oid)
+            .cloned()
+            .collect();
+        list.sort_by_key(|c| c.check_name.clone());
+        Ok(list)
     }
 }

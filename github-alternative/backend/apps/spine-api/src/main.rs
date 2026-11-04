@@ -3,7 +3,8 @@ use spine_api::{
     auth::{DevMailCatcher, RateLimiter},
     build_router, AppState, ArtifactService, CargoRegistryAdapter, CoordinatorClient, Database,
     InMemoryDatabase, NativeVcsService, PackageService, PermissionService, PgDatabase,
-    ProvisioningWorker, ReleaseService, RepositoryService,
+    ProvisioningWorker, ReleaseService, RepositoryService, IsolatedRunnerExecutor, RunnerService,
+    SsrfValidator, WebhookOutboxWorker, WebhookService, WorkflowScheduler, WorkflowService,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -99,6 +100,15 @@ async fn main() -> anyhow::Result<()> {
     let packages = Arc::new(PackageService::new(Arc::clone(&db), Arc::clone(&artifacts)));
     let cargo = Arc::new(CargoRegistryAdapter::new(Arc::clone(&packages)));
 
+    let ssrf = SsrfValidator::new(false);
+    let webhooks = Arc::new(WebhookService::new(Arc::clone(&db), ssrf.clone()));
+    let webhook_worker = Arc::new(WebhookOutboxWorker::new(Arc::clone(&db), ssrf));
+    let scheduler = Arc::new(WorkflowScheduler::new(Arc::clone(&db), Some((*webhooks).clone())));
+    let workflows = Arc::new(WorkflowService::new(Arc::clone(&db), Some((*webhooks).clone())));
+    let runners = Arc::new(RunnerService::new(Arc::clone(&db), (*scheduler).clone()));
+    let runner_workspace_root = storage_root_canonical.join("runner_workspaces");
+    let runner_executor = Arc::new(IsolatedRunnerExecutor::new(runner_workspace_root));
+
     let state = AppState {
         db: Arc::clone(&db),
         permissions: Arc::clone(&permissions),
@@ -111,6 +121,12 @@ async fn main() -> anyhow::Result<()> {
         releases,
         packages,
         cargo,
+        webhooks,
+        webhook_worker,
+        workflows,
+        scheduler,
+        runners,
+        runner_executor,
     };
 
     // 4. Spawn background provisioning worker

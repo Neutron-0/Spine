@@ -355,3 +355,124 @@ export interface ArtifactNamespaceDto {
   created_at_nanos: number;
   updated_at_nanos: number;
 }
+
+
+// -------------------------------------------------------------
+// Batch 12: Workflows, Actions, Webhooks, Runners & Secrets
+// -------------------------------------------------------------
+
+export interface WebhookSubscriptionDto {
+  id: string;
+  owner_type: string;
+  owner_id: string;
+  target_url: string;
+  events: string[];
+  is_active: boolean;
+  created_at_nanos: number;
+  updated_at_nanos: number;
+}
+
+export interface WebhookDeliveryDto {
+  id: string;
+  subscription_id: string;
+  event_type: string;
+  payload: any;
+  response_status?: number | null;
+  response_body?: string | null;
+  execution_duration_ms: number;
+  attempt: number;
+  status: string;
+  delivered_at_nanos: number;
+}
+
+export interface WorkflowDefinitionDto {
+  id: string;
+  repo_id: string;
+  path: string;
+  name: string;
+  yaml_content: string;
+  digest: string;
+  created_at_nanos: number;
+  updated_at_nanos: number;
+}
+
+export interface WorkflowRunDto {
+  id: string;
+  repo_id: string;
+  workflow_id: string;
+  workflow_name: string;
+  commit_oid: string;
+  ref_name: string;
+  trigger_event: string;
+  actor_id: string;
+  status: string;
+  conclusion?: string | null;
+  definition_yaml: string;
+  definition_digest: string;
+  created_at_nanos: number;
+  started_at_nanos?: number | null;
+  completed_at_nanos?: number | null;
+}
+
+export interface WorkflowJobDto {
+  id: string;
+  run_id: string;
+  repo_id: string;
+  job_key: string;
+  name: string;
+  status: string;
+  runner_id?: string | null;
+  runs_on: string[];
+  needs: string[];
+  attempt: number;
+  fencing_token: number;
+  lease_expires_at_nanos?: number | null;
+  exit_code?: number | null;
+  created_at_nanos: number;
+  started_at_nanos?: number | null;
+  completed_at_nanos?: number | null;
+}
+
+export interface WorkflowStepDto {
+  id: string;
+  job_id: string;
+  step_index: number;
+  name: string;
+  status: string;
+  exit_code?: number | null;
+  started_at_nanos?: number | null;
+  completed_at_nanos?: number | null;
+}
+
+export interface WorkflowLogChunkDto {
+  id: string;
+  job_id: string;
+  step_index: number;
+  stream: string;
+  content: string;
+  timestamp_nanos: number;
+}
+
+export interface RunnerRegistrationDto {
+  id: string;
+  name: string;
+  hostname: string;
+  token_hash: string;
+  os: string;
+  arch: string;
+  labels: string[];
+  max_concurrency: number;
+  active_jobs: number;
+  status: string;
+  last_heartbeat_at_nanos: number;
+  created_at_nanos: number;
+}
+
+export interface SecretSummaryDto {
+  id: string;
+  name: string;
+  owner_type: string;
+  owner_id: string;
+  created_at_nanos: number;
+  updated_at_nanos: number;
+}

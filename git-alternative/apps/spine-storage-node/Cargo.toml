@@ -5,6 +5,14 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[lib]
+name = "spine_storage_node"
+path = "src/lib.rs"
+
+[[bin]]
+name = "spine-storage-node"
+path = "src/main.rs"
+
 [dependencies]
 spine-core.workspace = true
 spine-format.workspace = true

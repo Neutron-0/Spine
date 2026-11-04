@@ -15,6 +15,10 @@ pub mod routes_repos;
 pub mod routes_reviews;
 pub mod routes_teams;
 pub mod routes_users;
+pub mod routes_webhooks;
+pub mod routes_workflows;
+pub mod routes_runners;
+pub mod routes_secrets;
 
 pub use middleware::AppState;
 
@@ -356,6 +360,34 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/crates/:crate_name/:version/unyank", put(routes_packages::cargo_unyank))
         .route("/api/v1/packages", get(routes_packages::list_packages))
         .route("/api/v1/packages/:ecosystem/:name", get(routes_packages::get_package))
+        // Webhooks (Batch 12)
+        .route("/api/v1/repos/:owner/:repo/webhooks", get(routes_webhooks::list_repo_webhooks).post(routes_webhooks::create_repo_webhook))
+        .route("/api/v1/webhooks/:id", get(routes_webhooks::get_webhook).delete(routes_webhooks::delete_webhook))
+        .route("/api/v1/webhooks/:id/deliveries", get(routes_webhooks::list_webhook_deliveries))
+        .route("/api/v1/orgs/:org/webhooks", get(routes_webhooks::list_org_webhooks).post(routes_webhooks::create_org_webhook))
+        // Workflows & CI/CD (Batch 12)
+        .route("/api/v1/repos/:owner/:repo/actions/workflows", get(routes_workflows::list_workflows))
+        .route("/api/v1/repos/:owner/:repo/actions/workflows/sync", post(routes_workflows::sync_workflows))
+        .route("/api/v1/repos/:owner/:repo/actions/workflows/:id/dispatches", post(routes_workflows::dispatch_workflow))
+        .route("/api/v1/repos/:owner/:repo/actions/runs", get(routes_workflows::list_runs))
+        .route("/api/v1/actions/runs/:id", get(routes_workflows::get_run))
+        .route("/api/v1/actions/runs/:id/cancel", post(routes_workflows::cancel_run))
+        .route("/api/v1/actions/runs/:id/jobs", get(routes_workflows::list_jobs))
+        .route("/api/v1/actions/jobs/:id", get(routes_workflows::get_job))
+        .route("/api/v1/actions/jobs/:id/steps", get(routes_workflows::list_steps))
+        .route("/api/v1/actions/jobs/:id/logs", get(routes_workflows::list_logs))
+        // Runners (Batch 12)
+        .route("/api/v1/runners", get(routes_runners::list_runners))
+        .route("/api/v1/runners/register", post(routes_runners::register_runner))
+        .route("/api/v1/runners/heartbeat", post(routes_runners::heartbeat))
+        .route("/api/v1/runners/jobs/acquire", post(routes_runners::acquire_job))
+        .route("/api/v1/runners/jobs/:id/logs", post(routes_runners::ingest_logs))
+        .route("/api/v1/runners/jobs/:id/complete", post(routes_runners::complete_job))
+        // Workflow Secrets (Batch 12)
+        .route("/api/v1/repos/:owner/:repo/secrets", get(routes_secrets::list_repo_secrets))
+        .route("/api/v1/repos/:owner/:repo/secrets/:name", put(routes_secrets::upsert_repo_secret).delete(routes_secrets::delete_repo_secret))
+        .route("/api/v1/orgs/:org/secrets", get(routes_secrets::list_org_secrets))
+        .route("/api/v1/orgs/:org/secrets/:name", put(routes_secrets::upsert_org_secret).delete(routes_secrets::delete_org_secret))
         // Layers
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),

@@ -173,4 +173,90 @@ index = "sparse+http://127.0.0.1:{}/index/"
         .await
         .expect("Crate download should succeed");
     assert!(!downloaded_crate.is_empty());
+
+    // 8. Attempt overwrite: Publishing the same version again MUST be rejected with 409 Conflict
+    let overwrite_output = Command::new("cargo")
+        .args([
+            "publish",
+            "--registry",
+            "spine-live",
+            "--no-verify",
+            "--allow-dirty",
+        ])
+        .current_dir(&crate_dir)
+        .stdin(std::process::Stdio::null())
+        .env("CARGO_REGISTRIES_SPINE_LIVE_TOKEN", pat_secret)
+        .output()
+        .await
+        .expect("Failed to execute cargo overwrite attempt");
+
+    let overwrite_stderr = String::from_utf8_lossy(&overwrite_output.stderr);
+    println!("overwrite stderr: {}", overwrite_stderr);
+    assert!(
+        !overwrite_output.status.success(),
+        "Re-publishing an existing version MUST fail with error"
+    );
+    assert!(
+        overwrite_stderr.contains("already exists")
+            || overwrite_stderr.contains("409")
+            || overwrite_stderr.contains("already been published"),
+        "Overwrite should report that crate version already exists: {}",
+        overwrite_stderr
+    );
+
+    // 9. Consumer project: create an independent project consuming spine-test-crate from Spine registry
+    let consumer_dir = tmp.path().join("spine_consumer_app");
+    let consumer_src = consumer_dir.join("src");
+    let consumer_cargo = consumer_dir.join(".cargo");
+    fs::create_dir_all(&consumer_src).unwrap();
+    fs::create_dir_all(&consumer_cargo).unwrap();
+
+    let consumer_cargo_toml = format!(
+        r#"
+[package]
+name = "spine-consumer-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+spine-test-crate = {{ version = "0.1.0", registry = "spine-live" }}
+"#
+    );
+    fs::write(consumer_dir.join("Cargo.toml"), consumer_cargo_toml).unwrap();
+    fs::write(
+        consumer_src.join("main.rs"),
+        "fn main() { println!(\"{}\", spine_test_crate::spine_hello()); }\n",
+    )
+    .unwrap();
+
+    let consumer_config = format!(
+        r#"
+[registries.spine-live]
+index = "sparse+http://127.0.0.1:{}/index/"
+credential-provider = "cargo:token"
+"#,
+        port
+    );
+    fs::write(consumer_cargo.join("config.toml"), consumer_config).unwrap();
+
+    // 10. Run `cargo check` in the consumer project to verify resolution, download, and compilation!
+    let check_output = Command::new("cargo")
+        .args(["check"])
+        .current_dir(&consumer_dir)
+        .stdin(std::process::Stdio::null())
+        .env("CARGO_REGISTRIES_SPINE_LIVE_TOKEN", pat_secret)
+        .output()
+        .await
+        .expect("Failed to execute cargo check on consumer project");
+
+    let check_stdout = String::from_utf8_lossy(&check_output.stdout);
+    let check_stderr = String::from_utf8_lossy(&check_output.stderr);
+    println!("consumer check stdout: {}", check_stdout);
+    println!("consumer check stderr: {}", check_stderr);
+
+    assert!(
+        check_output.status.success(),
+        "Consumer project must download and build successfully! Stderr: {}",
+        check_stderr
+    );
 }

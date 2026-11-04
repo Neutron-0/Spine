@@ -20,6 +20,7 @@ members = [
     "crates/spine-net",
     "crates/spine-cluster",
     "crates/spine-artifact",
+    "crates/spine-workflow",
 ]
 
 [workspace.package]
@@ -44,6 +45,7 @@ spine-protocol = { path = "crates/spine-protocol" }
 spine-net = { path = "crates/spine-net" }
 spine-cluster = { path = "crates/spine-cluster" }
 spine-artifact = { path = "crates/spine-artifact" }
+spine-workflow = { path = "crates/spine-workflow" }
 
 tokio = { version = "1.38", features = ["full"] }
 blake3 = "1.5"

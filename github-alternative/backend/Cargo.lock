@@ -1869,6 +1869,7 @@ dependencies = [
  "chrono",
  "clap",
  "hex",
+ "hmac",
  "rand 0.8.8",
  "serde",
  "serde_json",
@@ -1883,6 +1884,7 @@ dependencies = [
  "spine-merge",
  "spine-net",
  "spine-object-store",
+ "spine-workflow",
  "sqlx",
  "subtle",
  "tempfile",
@@ -1892,6 +1894,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 
@@ -2063,6 +2066,18 @@ dependencies = [
  "spine-core",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "spine-workflow"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "chrono",
+ "hex",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -2718,6 +2733,7 @@ dependencies = [
  "form_urlencoded",
  "idna",
  "percent-encoding",
+ "serde",
 ]
 
 [[package]]

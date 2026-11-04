@@ -370,4 +370,68 @@ pub trait Database: Send + Sync {
     async fn get_package_version(&self, package_id: &str, version: &str) -> Result<Option<PackageVersion>, ForgeError>;
     async fn list_package_versions(&self, package_id: &str) -> Result<Vec<PackageVersion>, ForgeError>;
     async fn set_package_version_yanked(&self, package_id: &str, version: &str, yanked: bool) -> Result<(), ForgeError>;
+
+    // -------------------------------------------------------------------------
+    // Webhooks (Batch 12)
+    // -------------------------------------------------------------------------
+    async fn create_webhook_subscription(&self, sub: WebhookSubscription) -> Result<WebhookSubscription, ForgeError>;
+    async fn get_webhook_subscription(&self, id: &str) -> Result<Option<WebhookSubscription>, ForgeError>;
+    async fn list_webhook_subscriptions(&self, owner_type: &str, owner_id: &str) -> Result<Vec<WebhookSubscription>, ForgeError>;
+    async fn update_webhook_subscription(&self, sub: WebhookSubscription) -> Result<WebhookSubscription, ForgeError>;
+    async fn delete_webhook_subscription(&self, id: &str) -> Result<(), ForgeError>;
+
+    async fn create_webhook_delivery(&self, delivery: WebhookDelivery) -> Result<WebhookDelivery, ForgeError>;
+    async fn list_webhook_deliveries(&self, subscription_id: &str, limit: i64) -> Result<Vec<WebhookDelivery>, ForgeError>;
+
+    async fn enqueue_webhook_outbox(&self, item: WebhookOutboxItem) -> Result<WebhookOutboxItem, ForgeError>;
+    async fn claim_pending_webhook_outbox(&self, limit: i64, now_nanos: i64) -> Result<Vec<WebhookOutboxItem>, ForgeError>;
+    async fn update_webhook_outbox_status(&self, id: &str, status: &str, error: Option<&str>, next_attempt_nanos: i64) -> Result<(), ForgeError>;
+
+    // -------------------------------------------------------------------------
+    // Workflows, Runs, Jobs, Steps, Logs (Batch 12)
+    // -------------------------------------------------------------------------
+    async fn upsert_workflow_definition(&self, def: WorkflowDefinition) -> Result<WorkflowDefinition, ForgeError>;
+    async fn get_workflow_definition(&self, repo_id: &str, path: &str) -> Result<Option<WorkflowDefinition>, ForgeError>;
+    async fn list_workflow_definitions(&self, repo_id: &str) -> Result<Vec<WorkflowDefinition>, ForgeError>;
+
+    async fn create_workflow_run(&self, run: WorkflowRun) -> Result<WorkflowRun, ForgeError>;
+    async fn get_workflow_run(&self, id: &str) -> Result<Option<WorkflowRun>, ForgeError>;
+    async fn list_workflow_runs(&self, repo_id: &str, limit: i64) -> Result<Vec<WorkflowRun>, ForgeError>;
+    async fn update_workflow_run_status(&self, id: &str, status: &str, conclusion: Option<&str>, started_at: Option<i64>, completed_at: Option<i64>) -> Result<(), ForgeError>;
+
+    async fn create_workflow_job(&self, job: WorkflowJob) -> Result<WorkflowJob, ForgeError>;
+    async fn get_workflow_job(&self, id: &str) -> Result<Option<WorkflowJob>, ForgeError>;
+    async fn list_workflow_jobs(&self, run_id: &str) -> Result<Vec<WorkflowJob>, ForgeError>;
+    async fn list_queued_workflow_jobs(&self, now_nanos: i64) -> Result<Vec<WorkflowJob>, ForgeError>;
+    async fn assign_workflow_job(&self, job_id: &str, runner_id: &str, fencing_token: i64, lease_expires_at: i64) -> Result<(), ForgeError>;
+    async fn update_workflow_job_status(&self, job_id: &str, status: &str, exit_code: Option<i32>, started_at: Option<i64>, completed_at: Option<i64>) -> Result<(), ForgeError>;
+
+    async fn create_workflow_step(&self, step: WorkflowStep) -> Result<WorkflowStep, ForgeError>;
+    async fn list_workflow_steps(&self, job_id: &str) -> Result<Vec<WorkflowStep>, ForgeError>;
+    async fn update_workflow_step(&self, step_id: &str, status: &str, exit_code: Option<i32>, started_at: Option<i64>, completed_at: Option<i64>) -> Result<(), ForgeError>;
+
+    async fn append_workflow_log(&self, log: WorkflowLogChunk) -> Result<(), ForgeError>;
+    async fn list_workflow_logs(&self, job_id: &str) -> Result<Vec<WorkflowLogChunk>, ForgeError>;
+
+    // -------------------------------------------------------------------------
+    // Runners (Batch 12)
+    // -------------------------------------------------------------------------
+    async fn register_runner(&self, runner: RunnerRegistration) -> Result<RunnerRegistration, ForgeError>;
+    async fn get_runner_by_id(&self, id: &str) -> Result<Option<RunnerRegistration>, ForgeError>;
+    async fn get_runner_by_token_hash(&self, token_hash: &str) -> Result<Option<RunnerRegistration>, ForgeError>;
+    async fn list_runners(&self) -> Result<Vec<RunnerRegistration>, ForgeError>;
+    async fn update_runner_heartbeat(&self, runner_id: &str, active_jobs: i32, now_nanos: i64) -> Result<(), ForgeError>;
+    async fn update_runner_status(&self, runner_id: &str, status: &str) -> Result<(), ForgeError>;
+
+    // -------------------------------------------------------------------------
+    // Workflow Secrets & PR Check Results (Batch 12)
+    // -------------------------------------------------------------------------
+    async fn upsert_workflow_secret(&self, secret: WorkflowSecret) -> Result<WorkflowSecret, ForgeError>;
+    async fn get_workflow_secret(&self, owner_type: &str, owner_id: &str, name: &str) -> Result<Option<WorkflowSecret>, ForgeError>;
+    async fn list_workflow_secrets(&self, owner_type: &str, owner_id: &str) -> Result<Vec<WorkflowSecret>, ForgeError>;
+    async fn delete_workflow_secret(&self, owner_type: &str, owner_id: &str, name: &str) -> Result<(), ForgeError>;
+
+    async fn upsert_workflow_check_result(&self, check: WorkflowCheckResult) -> Result<WorkflowCheckResult, ForgeError>;
+    async fn get_workflow_check_result(&self, repo_id: &str, commit_oid: &str, check_name: &str) -> Result<Option<WorkflowCheckResult>, ForgeError>;
+    async fn list_workflow_check_results(&self, repo_id: &str, commit_oid: &str) -> Result<Vec<WorkflowCheckResult>, ForgeError>;
 }

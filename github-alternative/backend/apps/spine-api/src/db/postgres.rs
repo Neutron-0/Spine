@@ -2207,6 +2207,7 @@ impl Database for PgDatabase {
             require_changes_addressed: r.get(6),
             dismiss_stale_reviews_on_push: r.get(7),
             restrict_merges_to_admins: r.get(8),
+            required_status_checks: Vec::new(),
             created_at_nanos: r.get(9),
             updated_at_nanos: r.get(10),
         }).collect();
@@ -3013,5 +3014,882 @@ impl Database for PgDatabase {
             .await
             .map_err(|e| ForgeError::Internal(e.to_string()))?;
         Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Webhooks (Batch 12)
+    // -------------------------------------------------------------------------
+
+    async fn create_webhook_subscription(&self, sub: WebhookSubscription) -> Result<WebhookSubscription, ForgeError> {
+        let query = "INSERT INTO webhook_subscriptions (id, owner_type, owner_id, target_url, secret_hash, secret_ciphertext, events, is_active, created_at_nanos, updated_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
+        sqlx::query(query)
+            .bind(&sub.id)
+            .bind(&sub.owner_type)
+            .bind(&sub.owner_id)
+            .bind(&sub.target_url)
+            .bind(&sub.secret_hash)
+            .bind(&sub.secret_ciphertext)
+            .bind(&sub.events)
+            .bind(sub.is_active)
+            .bind(sub.created_at_nanos)
+            .bind(sub.updated_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(sub)
+    }
+
+    async fn get_webhook_subscription(&self, id: &str) -> Result<Option<WebhookSubscription>, ForgeError> {
+        let query = "SELECT id, owner_type, owner_id, target_url, secret_hash, secret_ciphertext, events, is_active, created_at_nanos, updated_at_nanos FROM webhook_subscriptions WHERE id = $1";
+        let row = sqlx::query(query)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        Ok(row.map(|r| WebhookSubscription {
+            id: r.get(0),
+            owner_type: r.get(1),
+            owner_id: r.get(2),
+            target_url: r.get(3),
+            secret_hash: r.get(4),
+            secret_ciphertext: r.get(5),
+            events: r.get(6),
+            is_active: r.get(7),
+            created_at_nanos: r.get(8),
+            updated_at_nanos: r.get(9),
+        }))
+    }
+
+    async fn list_webhook_subscriptions(&self, owner_type: &str, owner_id: &str) -> Result<Vec<WebhookSubscription>, ForgeError> {
+        let query = "SELECT id, owner_type, owner_id, target_url, secret_hash, secret_ciphertext, events, is_active, created_at_nanos, updated_at_nanos FROM webhook_subscriptions WHERE owner_type = $1 AND owner_id = $2 ORDER BY created_at_nanos ASC";
+        let rows = sqlx::query(query)
+            .bind(owner_type)
+            .bind(owner_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| WebhookSubscription {
+            id: r.get(0),
+            owner_type: r.get(1),
+            owner_id: r.get(2),
+            target_url: r.get(3),
+            secret_hash: r.get(4),
+            secret_ciphertext: r.get(5),
+            events: r.get(6),
+            is_active: r.get(7),
+            created_at_nanos: r.get(8),
+            updated_at_nanos: r.get(9),
+        }).collect();
+        Ok(list)
+    }
+
+    async fn update_webhook_subscription(&self, sub: WebhookSubscription) -> Result<WebhookSubscription, ForgeError> {
+        let query = "UPDATE webhook_subscriptions SET target_url = $1, secret_hash = $2, secret_ciphertext = $3, events = $4, is_active = $5, updated_at_nanos = $6 WHERE id = $7";
+        sqlx::query(query)
+            .bind(&sub.target_url)
+            .bind(&sub.secret_hash)
+            .bind(&sub.secret_ciphertext)
+            .bind(&sub.events)
+            .bind(sub.is_active)
+            .bind(sub.updated_at_nanos)
+            .bind(&sub.id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(sub)
+    }
+
+    async fn delete_webhook_subscription(&self, id: &str) -> Result<(), ForgeError> {
+        let query = "DELETE FROM webhook_subscriptions WHERE id = $1";
+        sqlx::query(query)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn create_webhook_delivery(&self, delivery: WebhookDelivery) -> Result<WebhookDelivery, ForgeError> {
+        let query = "INSERT INTO webhook_deliveries (id, subscription_id, event_type, payload, response_status, response_body, execution_duration_ms, attempt, status, delivered_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
+        sqlx::query(query)
+            .bind(&delivery.id)
+            .bind(&delivery.subscription_id)
+            .bind(&delivery.event_type)
+            .bind(&delivery.payload)
+            .bind(delivery.response_status)
+            .bind(&delivery.response_body)
+            .bind(delivery.execution_duration_ms)
+            .bind(delivery.attempt)
+            .bind(&delivery.status)
+            .bind(delivery.delivered_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(delivery)
+    }
+
+    async fn list_webhook_deliveries(&self, subscription_id: &str, limit: i64) -> Result<Vec<WebhookDelivery>, ForgeError> {
+        let query = "SELECT id, subscription_id, event_type, payload, response_status, response_body, execution_duration_ms, attempt, status, delivered_at_nanos FROM webhook_deliveries WHERE subscription_id = $1 ORDER BY delivered_at_nanos DESC LIMIT $2";
+        let rows = sqlx::query(query)
+            .bind(subscription_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| WebhookDelivery {
+            id: r.get(0),
+            subscription_id: r.get(1),
+            event_type: r.get(2),
+            payload: r.get(3),
+            response_status: r.get(4),
+            response_body: r.get(5),
+            execution_duration_ms: r.get(6),
+            attempt: r.get(7),
+            status: r.get(8),
+            delivered_at_nanos: r.get(9),
+        }).collect();
+        Ok(list)
+    }
+
+    async fn enqueue_webhook_outbox(&self, item: WebhookOutboxItem) -> Result<WebhookOutboxItem, ForgeError> {
+        let query = "INSERT INTO webhook_outbox (id, event_type, owner_type, owner_id, payload, attempts, max_attempts, status, last_error, created_at_nanos, next_attempt_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)";
+        sqlx::query(query)
+            .bind(&item.id)
+            .bind(&item.event_type)
+            .bind(&item.owner_type)
+            .bind(&item.owner_id)
+            .bind(&item.payload)
+            .bind(item.attempts)
+            .bind(item.max_attempts)
+            .bind(&item.status)
+            .bind(&item.last_error)
+            .bind(item.created_at_nanos)
+            .bind(item.next_attempt_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(item)
+    }
+
+    async fn claim_pending_webhook_outbox(&self, limit: i64, now_nanos: i64) -> Result<Vec<WebhookOutboxItem>, ForgeError> {
+        let query = "UPDATE webhook_outbox SET status = 'PROCESSING', attempts = attempts + 1 WHERE id IN (SELECT id FROM webhook_outbox WHERE status = 'PENDING' AND next_attempt_at_nanos <= $1 ORDER BY next_attempt_at_nanos ASC LIMIT $2 FOR UPDATE SKIP LOCKED) RETURNING id, event_type, owner_type, owner_id, payload, attempts, max_attempts, status, last_error, created_at_nanos, next_attempt_at_nanos";
+        let rows = sqlx::query(query)
+            .bind(now_nanos)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| WebhookOutboxItem {
+            id: r.get(0),
+            event_type: r.get(1),
+            owner_type: r.get(2),
+            owner_id: r.get(3),
+            payload: r.get(4),
+            attempts: r.get(5),
+            max_attempts: r.get(6),
+            status: r.get(7),
+            last_error: r.get(8),
+            created_at_nanos: r.get(9),
+            next_attempt_at_nanos: r.get(10),
+        }).collect();
+        Ok(list)
+    }
+
+    async fn update_webhook_outbox_status(&self, id: &str, status: &str, error: Option<&str>, next_attempt_nanos: i64) -> Result<(), ForgeError> {
+        let query = "UPDATE webhook_outbox SET status = $1, last_error = $2, next_attempt_at_nanos = $3 WHERE id = $4";
+        sqlx::query(query)
+            .bind(status)
+            .bind(error)
+            .bind(next_attempt_nanos)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Workflows, Runs, Jobs, Steps, Logs (Batch 12)
+    // -------------------------------------------------------------------------
+
+    async fn upsert_workflow_definition(&self, def: WorkflowDefinition) -> Result<WorkflowDefinition, ForgeError> {
+        let query = "INSERT INTO workflow_definitions (id, repo_id, path, name, yaml_content, digest, created_at_nanos, updated_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (repo_id, path) DO UPDATE SET name = EXCLUDED.name, yaml_content = EXCLUDED.yaml_content, digest = EXCLUDED.digest, updated_at_nanos = EXCLUDED.updated_at_nanos";
+        sqlx::query(query)
+            .bind(&def.id)
+            .bind(&def.repo_id)
+            .bind(&def.path)
+            .bind(&def.name)
+            .bind(&def.yaml_content)
+            .bind(&def.digest)
+            .bind(def.created_at_nanos)
+            .bind(def.updated_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(def)
+    }
+
+    async fn get_workflow_definition(&self, repo_id: &str, path: &str) -> Result<Option<WorkflowDefinition>, ForgeError> {
+        let query = "SELECT id, repo_id, path, name, yaml_content, digest, created_at_nanos, updated_at_nanos FROM workflow_definitions WHERE repo_id = $1 AND path = $2";
+        let row = sqlx::query(query)
+            .bind(repo_id)
+            .bind(path)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        Ok(row.map(|r| WorkflowDefinition {
+            id: r.get(0),
+            repo_id: r.get(1),
+            path: r.get(2),
+            name: r.get(3),
+            yaml_content: r.get(4),
+            digest: r.get(5),
+            created_at_nanos: r.get(6),
+            updated_at_nanos: r.get(7),
+        }))
+    }
+
+    async fn list_workflow_definitions(&self, repo_id: &str) -> Result<Vec<WorkflowDefinition>, ForgeError> {
+        let query = "SELECT id, repo_id, path, name, yaml_content, digest, created_at_nanos, updated_at_nanos FROM workflow_definitions WHERE repo_id = $1 ORDER BY path ASC";
+        let rows = sqlx::query(query)
+            .bind(repo_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| WorkflowDefinition {
+            id: r.get(0),
+            repo_id: r.get(1),
+            path: r.get(2),
+            name: r.get(3),
+            yaml_content: r.get(4),
+            digest: r.get(5),
+            created_at_nanos: r.get(6),
+            updated_at_nanos: r.get(7),
+        }).collect();
+        Ok(list)
+    }
+
+    async fn create_workflow_run(&self, run: WorkflowRun) -> Result<WorkflowRun, ForgeError> {
+        let query = "INSERT INTO workflow_runs (id, repo_id, workflow_id, workflow_name, commit_oid, ref_name, trigger_event, actor_id, status, conclusion, definition_yaml, definition_digest, created_at_nanos, started_at_nanos, completed_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)";
+        sqlx::query(query)
+            .bind(&run.id)
+            .bind(&run.repo_id)
+            .bind(&run.workflow_id)
+            .bind(&run.workflow_name)
+            .bind(&run.commit_oid)
+            .bind(&run.ref_name)
+            .bind(&run.trigger_event)
+            .bind(&run.actor_id)
+            .bind(&run.status)
+            .bind(&run.conclusion)
+            .bind(&run.definition_yaml)
+            .bind(&run.definition_digest)
+            .bind(run.created_at_nanos)
+            .bind(run.started_at_nanos)
+            .bind(run.completed_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(run)
+    }
+
+    async fn get_workflow_run(&self, id: &str) -> Result<Option<WorkflowRun>, ForgeError> {
+        let query = "SELECT id, repo_id, workflow_id, workflow_name, commit_oid, ref_name, trigger_event, actor_id, status, conclusion, definition_yaml, definition_digest, created_at_nanos, started_at_nanos, completed_at_nanos FROM workflow_runs WHERE id = $1";
+        let row = sqlx::query(query)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        Ok(row.map(|r| WorkflowRun {
+            id: r.get(0),
+            repo_id: r.get(1),
+            workflow_id: r.get(2),
+            workflow_name: r.get(3),
+            commit_oid: r.get(4),
+            ref_name: r.get(5),
+            trigger_event: r.get(6),
+            actor_id: r.get(7),
+            status: r.get(8),
+            conclusion: r.get(9),
+            definition_yaml: r.get(10),
+            definition_digest: r.get(11),
+            created_at_nanos: r.get(12),
+            started_at_nanos: r.get(13),
+            completed_at_nanos: r.get(14),
+        }))
+    }
+
+    async fn list_workflow_runs(&self, repo_id: &str, limit: i64) -> Result<Vec<WorkflowRun>, ForgeError> {
+        let query = "SELECT id, repo_id, workflow_id, workflow_name, commit_oid, ref_name, trigger_event, actor_id, status, conclusion, definition_yaml, definition_digest, created_at_nanos, started_at_nanos, completed_at_nanos FROM workflow_runs WHERE repo_id = $1 ORDER BY created_at_nanos DESC LIMIT $2";
+        let rows = sqlx::query(query)
+            .bind(repo_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| WorkflowRun {
+            id: r.get(0),
+            repo_id: r.get(1),
+            workflow_id: r.get(2),
+            workflow_name: r.get(3),
+            commit_oid: r.get(4),
+            ref_name: r.get(5),
+            trigger_event: r.get(6),
+            actor_id: r.get(7),
+            status: r.get(8),
+            conclusion: r.get(9),
+            definition_yaml: r.get(10),
+            definition_digest: r.get(11),
+            created_at_nanos: r.get(12),
+            started_at_nanos: r.get(13),
+            completed_at_nanos: r.get(14),
+        }).collect();
+        Ok(list)
+    }
+
+    async fn update_workflow_run_status(
+        &self,
+        id: &str,
+        status: &str,
+        conclusion: Option<&str>,
+        started_at: Option<i64>,
+        completed_at: Option<i64>,
+    ) -> Result<(), ForgeError> {
+        let query = "UPDATE workflow_runs SET status = $1, conclusion = COALESCE($2, conclusion), started_at_nanos = COALESCE($3, started_at_nanos), completed_at_nanos = COALESCE($4, completed_at_nanos) WHERE id = $5";
+        sqlx::query(query)
+            .bind(status)
+            .bind(conclusion)
+            .bind(started_at)
+            .bind(completed_at)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn create_workflow_job(&self, job: WorkflowJob) -> Result<WorkflowJob, ForgeError> {
+        let query = "INSERT INTO workflow_jobs (id, run_id, repo_id, job_key, name, status, runner_id, runs_on, needs, attempt, fencing_token, lease_expires_at_nanos, exit_code, created_at_nanos, started_at_nanos, completed_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)";
+        sqlx::query(query)
+            .bind(&job.id)
+            .bind(&job.run_id)
+            .bind(&job.repo_id)
+            .bind(&job.job_key)
+            .bind(&job.name)
+            .bind(&job.status)
+            .bind(&job.runner_id)
+            .bind(serde_json::to_value(&job.runs_on).unwrap_or_default())
+            .bind(serde_json::to_value(&job.needs).unwrap_or_default())
+            .bind(job.attempt)
+            .bind(job.fencing_token)
+            .bind(job.lease_expires_at_nanos)
+            .bind(job.exit_code)
+            .bind(job.created_at_nanos)
+            .bind(job.started_at_nanos)
+            .bind(job.completed_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(job)
+    }
+
+    async fn get_workflow_job(&self, id: &str) -> Result<Option<WorkflowJob>, ForgeError> {
+        let query = "SELECT id, run_id, repo_id, job_key, name, status, runner_id, runs_on, needs, attempt, fencing_token, lease_expires_at_nanos, exit_code, created_at_nanos, started_at_nanos, completed_at_nanos FROM workflow_jobs WHERE id = $1";
+        let row = sqlx::query(query)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        Ok(row.map(|r| {
+            let runs_on_val: serde_json::Value = r.get(7);
+            let needs_val: serde_json::Value = r.get(8);
+            WorkflowJob {
+                id: r.get(0),
+                run_id: r.get(1),
+                repo_id: r.get(2),
+                job_key: r.get(3),
+                name: r.get(4),
+                status: r.get(5),
+                runner_id: r.get(6),
+                runs_on: serde_json::from_value(runs_on_val).unwrap_or_default(),
+                needs: serde_json::from_value(needs_val).unwrap_or_default(),
+                attempt: r.get(9),
+                fencing_token: r.get(10),
+                lease_expires_at_nanos: r.get(11),
+                exit_code: r.get(12),
+                created_at_nanos: r.get(13),
+                started_at_nanos: r.get(14),
+                completed_at_nanos: r.get(15),
+            }
+        }))
+    }
+
+    async fn list_workflow_jobs(&self, run_id: &str) -> Result<Vec<WorkflowJob>, ForgeError> {
+        let query = "SELECT id, run_id, repo_id, job_key, name, status, runner_id, runs_on, needs, attempt, fencing_token, lease_expires_at_nanos, exit_code, created_at_nanos, started_at_nanos, completed_at_nanos FROM workflow_jobs WHERE run_id = $1 ORDER BY created_at_nanos ASC";
+        let rows = sqlx::query(query)
+            .bind(run_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| {
+            let runs_on_val: serde_json::Value = r.get(7);
+            let needs_val: serde_json::Value = r.get(8);
+            WorkflowJob {
+                id: r.get(0),
+                run_id: r.get(1),
+                repo_id: r.get(2),
+                job_key: r.get(3),
+                name: r.get(4),
+                status: r.get(5),
+                runner_id: r.get(6),
+                runs_on: serde_json::from_value(runs_on_val).unwrap_or_default(),
+                needs: serde_json::from_value(needs_val).unwrap_or_default(),
+                attempt: r.get(9),
+                fencing_token: r.get(10),
+                lease_expires_at_nanos: r.get(11),
+                exit_code: r.get(12),
+                created_at_nanos: r.get(13),
+                started_at_nanos: r.get(14),
+                completed_at_nanos: r.get(15),
+            }
+        }).collect();
+        Ok(list)
+    }
+
+    async fn list_queued_workflow_jobs(&self, now_nanos: i64) -> Result<Vec<WorkflowJob>, ForgeError> {
+        let query = "SELECT id, run_id, repo_id, job_key, name, status, runner_id, runs_on, needs, attempt, fencing_token, lease_expires_at_nanos, exit_code, created_at_nanos, started_at_nanos, completed_at_nanos FROM workflow_jobs WHERE status = 'QUEUED' OR (status = 'ASSIGNED' AND lease_expires_at_nanos < $1) ORDER BY created_at_nanos ASC";
+        let rows = sqlx::query(query)
+            .bind(now_nanos)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| {
+            let runs_on_val: serde_json::Value = r.get(7);
+            let needs_val: serde_json::Value = r.get(8);
+            WorkflowJob {
+                id: r.get(0),
+                run_id: r.get(1),
+                repo_id: r.get(2),
+                job_key: r.get(3),
+                name: r.get(4),
+                status: r.get(5),
+                runner_id: r.get(6),
+                runs_on: serde_json::from_value(runs_on_val).unwrap_or_default(),
+                needs: serde_json::from_value(needs_val).unwrap_or_default(),
+                attempt: r.get(9),
+                fencing_token: r.get(10),
+                lease_expires_at_nanos: r.get(11),
+                exit_code: r.get(12),
+                created_at_nanos: r.get(13),
+                started_at_nanos: r.get(14),
+                completed_at_nanos: r.get(15),
+            }
+        }).collect();
+        Ok(list)
+    }
+
+    async fn assign_workflow_job(
+        &self,
+        job_id: &str,
+        runner_id: &str,
+        fencing_token: i64,
+        lease_expires_at: i64,
+    ) -> Result<(), ForgeError> {
+        let query = "UPDATE workflow_jobs SET status = 'ASSIGNED', runner_id = $1, fencing_token = $2, lease_expires_at_nanos = $3 WHERE id = $4";
+        sqlx::query(query)
+            .bind(runner_id)
+            .bind(fencing_token)
+            .bind(lease_expires_at)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn update_workflow_job_status(
+        &self,
+        job_id: &str,
+        status: &str,
+        exit_code: Option<i32>,
+        started_at: Option<i64>,
+        completed_at: Option<i64>,
+    ) -> Result<(), ForgeError> {
+        let query = "UPDATE workflow_jobs SET status = $1, exit_code = COALESCE($2, exit_code), started_at_nanos = COALESCE($3, started_at_nanos), completed_at_nanos = COALESCE($4, completed_at_nanos) WHERE id = $5";
+        sqlx::query(query)
+            .bind(status)
+            .bind(exit_code)
+            .bind(started_at)
+            .bind(completed_at)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn create_workflow_step(&self, step: WorkflowStep) -> Result<WorkflowStep, ForgeError> {
+        let query = "INSERT INTO workflow_steps (id, job_id, step_index, name, status, exit_code, started_at_nanos, completed_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)";
+        sqlx::query(query)
+            .bind(&step.id)
+            .bind(&step.job_id)
+            .bind(step.step_index)
+            .bind(&step.name)
+            .bind(&step.status)
+            .bind(step.exit_code)
+            .bind(step.started_at_nanos)
+            .bind(step.completed_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(step)
+    }
+
+    async fn list_workflow_steps(&self, job_id: &str) -> Result<Vec<WorkflowStep>, ForgeError> {
+        let query = "SELECT id, job_id, step_index, name, status, exit_code, started_at_nanos, completed_at_nanos FROM workflow_steps WHERE job_id = $1 ORDER BY step_index ASC";
+        let rows = sqlx::query(query)
+            .bind(job_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| WorkflowStep {
+            id: r.get(0),
+            job_id: r.get(1),
+            step_index: r.get(2),
+            name: r.get(3),
+            status: r.get(4),
+            exit_code: r.get(5),
+            started_at_nanos: r.get(6),
+            completed_at_nanos: r.get(7),
+        }).collect();
+        Ok(list)
+    }
+
+    async fn update_workflow_step(
+        &self,
+        step_id: &str,
+        status: &str,
+        exit_code: Option<i32>,
+        started_at: Option<i64>,
+        completed_at: Option<i64>,
+    ) -> Result<(), ForgeError> {
+        let query = "UPDATE workflow_steps SET status = $1, exit_code = COALESCE($2, exit_code), started_at_nanos = COALESCE($3, started_at_nanos), completed_at_nanos = COALESCE($4, completed_at_nanos) WHERE id = $5";
+        sqlx::query(query)
+            .bind(status)
+            .bind(exit_code)
+            .bind(started_at)
+            .bind(completed_at)
+            .bind(step_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn append_workflow_log(&self, log: WorkflowLogChunk) -> Result<(), ForgeError> {
+        let query = "INSERT INTO workflow_logs (id, job_id, step_index, stream, content, timestamp_nanos) VALUES ($1, $2, $3, $4, $5, $6)";
+        sqlx::query(query)
+            .bind(&log.id)
+            .bind(&log.job_id)
+            .bind(log.step_index)
+            .bind(&log.stream)
+            .bind(&log.content)
+            .bind(log.timestamp_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_workflow_logs(&self, job_id: &str) -> Result<Vec<WorkflowLogChunk>, ForgeError> {
+        let query = "SELECT id, job_id, step_index, stream, content, timestamp_nanos FROM workflow_logs WHERE job_id = $1 ORDER BY timestamp_nanos ASC";
+        let rows = sqlx::query(query)
+            .bind(job_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| WorkflowLogChunk {
+            id: r.get(0),
+            job_id: r.get(1),
+            step_index: r.get(2),
+            stream: r.get(3),
+            content: r.get(4),
+            timestamp_nanos: r.get(5),
+        }).collect();
+        Ok(list)
+    }
+
+    // -------------------------------------------------------------------------
+    // Runners (Batch 12)
+    // -------------------------------------------------------------------------
+
+    async fn register_runner(&self, runner: RunnerRegistration) -> Result<RunnerRegistration, ForgeError> {
+        let query = "INSERT INTO runner_registrations (id, name, hostname, token_hash, os, arch, labels, max_concurrency, active_jobs, status, last_heartbeat_at_nanos, created_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)";
+        sqlx::query(query)
+            .bind(&runner.id)
+            .bind(&runner.name)
+            .bind(&runner.hostname)
+            .bind(&runner.token_hash)
+            .bind(&runner.os)
+            .bind(&runner.arch)
+            .bind(serde_json::to_value(&runner.labels).unwrap_or_default())
+            .bind(runner.max_concurrency)
+            .bind(runner.active_jobs)
+            .bind(&runner.status)
+            .bind(runner.last_heartbeat_at_nanos)
+            .bind(runner.created_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(runner)
+    }
+
+    async fn get_runner_by_id(&self, id: &str) -> Result<Option<RunnerRegistration>, ForgeError> {
+        let query = "SELECT id, name, hostname, token_hash, os, arch, labels, max_concurrency, active_jobs, status, last_heartbeat_at_nanos, created_at_nanos FROM runner_registrations WHERE id = $1";
+        let row = sqlx::query(query)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        Ok(row.map(|r| {
+            let labels_val: serde_json::Value = r.get(6);
+            RunnerRegistration {
+                id: r.get(0),
+                name: r.get(1),
+                hostname: r.get(2),
+                token_hash: r.get(3),
+                os: r.get(4),
+                arch: r.get(5),
+                labels: serde_json::from_value(labels_val).unwrap_or_default(),
+                max_concurrency: r.get(7),
+                active_jobs: r.get(8),
+                status: r.get(9),
+                last_heartbeat_at_nanos: r.get(10),
+                created_at_nanos: r.get(11),
+            }
+        }))
+    }
+
+    async fn get_runner_by_token_hash(&self, token_hash: &str) -> Result<Option<RunnerRegistration>, ForgeError> {
+        let query = "SELECT id, name, hostname, token_hash, os, arch, labels, max_concurrency, active_jobs, status, last_heartbeat_at_nanos, created_at_nanos FROM runner_registrations WHERE token_hash = $1";
+        let row = sqlx::query(query)
+            .bind(token_hash)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        Ok(row.map(|r| {
+            let labels_val: serde_json::Value = r.get(6);
+            RunnerRegistration {
+                id: r.get(0),
+                name: r.get(1),
+                hostname: r.get(2),
+                token_hash: r.get(3),
+                os: r.get(4),
+                arch: r.get(5),
+                labels: serde_json::from_value(labels_val).unwrap_or_default(),
+                max_concurrency: r.get(7),
+                active_jobs: r.get(8),
+                status: r.get(9),
+                last_heartbeat_at_nanos: r.get(10),
+                created_at_nanos: r.get(11),
+            }
+        }))
+    }
+
+    async fn list_runners(&self) -> Result<Vec<RunnerRegistration>, ForgeError> {
+        let query = "SELECT id, name, hostname, token_hash, os, arch, labels, max_concurrency, active_jobs, status, last_heartbeat_at_nanos, created_at_nanos FROM runner_registrations ORDER BY name ASC";
+        let rows = sqlx::query(query)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| {
+            let labels_val: serde_json::Value = r.get(6);
+            RunnerRegistration {
+                id: r.get(0),
+                name: r.get(1),
+                hostname: r.get(2),
+                token_hash: r.get(3),
+                os: r.get(4),
+                arch: r.get(5),
+                labels: serde_json::from_value(labels_val).unwrap_or_default(),
+                max_concurrency: r.get(7),
+                active_jobs: r.get(8),
+                status: r.get(9),
+                last_heartbeat_at_nanos: r.get(10),
+                created_at_nanos: r.get(11),
+            }
+        }).collect();
+        Ok(list)
+    }
+
+    async fn update_runner_heartbeat(&self, runner_id: &str, active_jobs: i32, now_nanos: i64) -> Result<(), ForgeError> {
+        let query = "UPDATE runner_registrations SET active_jobs = $1, last_heartbeat_at_nanos = $2 WHERE id = $3";
+        sqlx::query(query)
+            .bind(active_jobs)
+            .bind(now_nanos)
+            .bind(runner_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn update_runner_status(&self, runner_id: &str, status: &str) -> Result<(), ForgeError> {
+        let query = "UPDATE runner_registrations SET status = $1 WHERE id = $2";
+        sqlx::query(query)
+            .bind(status)
+            .bind(runner_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Workflow Secrets & PR Check Results (Batch 12)
+    // -------------------------------------------------------------------------
+
+    async fn upsert_workflow_secret(&self, secret: WorkflowSecret) -> Result<WorkflowSecret, ForgeError> {
+        let query = "INSERT INTO workflow_secrets (id, owner_type, owner_id, name, ciphertext, created_at_nanos, updated_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (owner_type, owner_id, name) DO UPDATE SET ciphertext = EXCLUDED.ciphertext, updated_at_nanos = EXCLUDED.updated_at_nanos";
+        sqlx::query(query)
+            .bind(&secret.id)
+            .bind(&secret.owner_type)
+            .bind(&secret.owner_id)
+            .bind(&secret.name)
+            .bind(&secret.ciphertext)
+            .bind(secret.created_at_nanos)
+            .bind(secret.updated_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(secret)
+    }
+
+    async fn get_workflow_secret(&self, owner_type: &str, owner_id: &str, name: &str) -> Result<Option<WorkflowSecret>, ForgeError> {
+        let query = "SELECT id, owner_type, owner_id, name, ciphertext, created_at_nanos, updated_at_nanos FROM workflow_secrets WHERE owner_type = $1 AND owner_id = $2 AND name = $3";
+        let row = sqlx::query(query)
+            .bind(owner_type)
+            .bind(owner_id)
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        Ok(row.map(|r| WorkflowSecret {
+            id: r.get(0),
+            owner_type: r.get(1),
+            owner_id: r.get(2),
+            name: r.get(3),
+            ciphertext: r.get(4),
+            created_at_nanos: r.get(5),
+            updated_at_nanos: r.get(6),
+        }))
+    }
+
+    async fn list_workflow_secrets(&self, owner_type: &str, owner_id: &str) -> Result<Vec<WorkflowSecret>, ForgeError> {
+        let query = "SELECT id, owner_type, owner_id, name, ciphertext, created_at_nanos, updated_at_nanos FROM workflow_secrets WHERE owner_type = $1 AND owner_id = $2 ORDER BY name ASC";
+        let rows = sqlx::query(query)
+            .bind(owner_type)
+            .bind(owner_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| WorkflowSecret {
+            id: r.get(0),
+            owner_type: r.get(1),
+            owner_id: r.get(2),
+            name: r.get(3),
+            ciphertext: r.get(4),
+            created_at_nanos: r.get(5),
+            updated_at_nanos: r.get(6),
+        }).collect();
+        Ok(list)
+    }
+
+    async fn delete_workflow_secret(&self, owner_type: &str, owner_id: &str, name: &str) -> Result<(), ForgeError> {
+        let query = "DELETE FROM workflow_secrets WHERE owner_type = $1 AND owner_id = $2 AND name = $3";
+        sqlx::query(query)
+            .bind(owner_type)
+            .bind(owner_id)
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn upsert_workflow_check_result(&self, check: WorkflowCheckResult) -> Result<WorkflowCheckResult, ForgeError> {
+        let query = "INSERT INTO workflow_check_results (id, repo_id, commit_oid, check_name, status, run_id, updated_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (repo_id, commit_oid, check_name) DO UPDATE SET status = EXCLUDED.status, run_id = EXCLUDED.run_id, updated_at_nanos = EXCLUDED.updated_at_nanos";
+        sqlx::query(query)
+            .bind(&check.id)
+            .bind(&check.repo_id)
+            .bind(&check.commit_oid)
+            .bind(&check.check_name)
+            .bind(&check.status)
+            .bind(&check.run_id)
+            .bind(check.updated_at_nanos)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(check)
+    }
+
+    async fn get_workflow_check_result(&self, repo_id: &str, commit_oid: &str, check_name: &str) -> Result<Option<WorkflowCheckResult>, ForgeError> {
+        let query = "SELECT id, repo_id, commit_oid, check_name, status, run_id, updated_at_nanos FROM workflow_check_results WHERE repo_id = $1 AND commit_oid = $2 AND check_name = $3";
+        let row = sqlx::query(query)
+            .bind(repo_id)
+            .bind(commit_oid)
+            .bind(check_name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        Ok(row.map(|r| WorkflowCheckResult {
+            id: r.get(0),
+            repo_id: r.get(1),
+            commit_oid: r.get(2),
+            check_name: r.get(3),
+            status: r.get(4),
+            run_id: r.get(5),
+            updated_at_nanos: r.get(6),
+        }))
+    }
+
+    async fn list_workflow_check_results(&self, repo_id: &str, commit_oid: &str) -> Result<Vec<WorkflowCheckResult>, ForgeError> {
+        let query = "SELECT id, repo_id, commit_oid, check_name, status, run_id, updated_at_nanos FROM workflow_check_results WHERE repo_id = $1 AND commit_oid = $2 ORDER BY check_name ASC";
+        let rows = sqlx::query(query)
+            .bind(repo_id)
+            .bind(commit_oid)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows.into_iter().map(|r| WorkflowCheckResult {
+            id: r.get(0),
+            repo_id: r.get(1),
+            commit_oid: r.get(2),
+            check_name: r.get(3),
+            status: r.get(4),
+            run_id: r.get(5),
+            updated_at_nanos: r.get(6),
+        }).collect();
+        Ok(list)
     }
 }

@@ -18,6 +18,7 @@ pub struct SetBranchProtectionRequest {
     pub require_changes_addressed: Option<bool>,
     pub dismiss_stale_reviews_on_push: Option<bool>,
     pub restrict_merges_to_admins: Option<bool>,
+    pub required_status_checks: Option<Vec<String>>,
 }
 
 pub async fn list_branch_protection(
@@ -53,6 +54,7 @@ pub async fn set_branch_protection(
         require_changes_addressed: payload.require_changes_addressed.unwrap_or(true),
         dismiss_stale_reviews_on_push: payload.dismiss_stale_reviews_on_push.unwrap_or(true),
         restrict_merges_to_admins: payload.restrict_merges_to_admins.unwrap_or(false),
+        required_status_checks: payload.required_status_checks.unwrap_or_default(),
         created_at_nanos: now,
         updated_at_nanos: now,
     };

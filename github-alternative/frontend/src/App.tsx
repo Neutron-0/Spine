@@ -22,6 +22,15 @@ import {
   ReleaseDto,
   PackageDto,
   ArtifactQuota,
+  WebhookSubscriptionDto,
+  WebhookDeliveryDto,
+  WorkflowDefinitionDto,
+  WorkflowRunDto,
+  WorkflowJobDto,
+  WorkflowStepDto,
+  WorkflowLogChunkDto,
+  RunnerRegistrationDto,
+  SecretSummaryDto,
 } from './types';
 
 export const App: React.FC = () => {
@@ -39,7 +48,7 @@ export const App: React.FC = () => {
   const [branches, setBranches] = useState<BranchDto[]>([]);
   const [currentBranch, setCurrentBranch] = useState<string>('main');
   const [commits, setCommits] = useState<CommitDto[]>([]);
-  const [activeTab, setActiveTab] = useState<'code' | 'issues' | 'pulls' | 'orgs' | 'protection' | 'releases' | 'packages'>('code');
+  const [activeTab, setActiveTab] = useState<'code' | 'issues' | 'pulls' | 'orgs' | 'protection' | 'releases' | 'packages' | 'actions' | 'webhooks' | 'runners' | 'secrets'>('code');
   const [codeSubTab, setCodeSubTab] = useState<'files' | 'commits'>('files');
   const [treeEntries, setTreeEntries] = useState<TreeEntryDto[]>([]);
   const [selectedBlob, setSelectedBlob] = useState<BlobContentDto | null>(null);
@@ -270,8 +279,118 @@ export const App: React.FC = () => {
   useEffect(() => {
     if (activeTab === 'packages') {
       fetchPackages();
+    } else if (activeTab === 'actions') {
+      fetchWorkflowsAndRuns();
+    } else if (activeTab === 'webhooks') {
+      fetchWebhooks();
+    } else if (activeTab === 'runners') {
+      fetchRunners();
+    } else if (activeTab === 'secrets') {
+      fetchSecrets();
     }
-  }, [activeTab]);
+  }, [activeTab, selectedRepo]);
+
+  // -------------------------------------------------------------
+  // Batch 12: Workflows, Actions, Webhooks, Runners & Secrets State
+  // -------------------------------------------------------------
+  const [workflows, setWorkflows] = useState<WorkflowDefinitionDto[]>([]);
+  const [workflowRuns, setWorkflowRuns] = useState<WorkflowRunDto[]>([]);
+  const [selectedRun, setSelectedRun] = useState<WorkflowRunDto | null>(null);
+  const [runJobs, setRunJobs] = useState<WorkflowJobDto[]>([]);
+  const [selectedJob, setSelectedJob] = useState<WorkflowJobDto | null>(null);
+  const [jobSteps, setJobSteps] = useState<WorkflowStepDto[]>([]);
+  const [jobLogs, setJobLogs] = useState<WorkflowLogChunkDto[]>([]);
+
+  const [webhooks, setWebhooks] = useState<WebhookSubscriptionDto[]>([]);
+  const [newWebhookUrl, setNewWebhookUrl] = useState<string>('');
+  const [newWebhookSecret, setNewWebhookSecret] = useState<string>('');
+  const [newWebhookEvents, setNewWebhookEvents] = useState<string>('push,pull_request');
+  const [selectedWebhook, setSelectedWebhook] = useState<WebhookSubscriptionDto | null>(null);
+  const [webhookDeliveries, setWebhookDeliveries] = useState<WebhookDeliveryDto[]>([]);
+
+  const [runners, setRunners] = useState<RunnerRegistrationDto[]>([]);
+  const [newRunnerName, setNewRunnerName] = useState<string>('');
+  const [newRunnerLabels, setNewRunnerLabels] = useState<string>('windows,self-hosted');
+  const [registeredToken, setRegisteredToken] = useState<string | null>(null);
+
+  const [secrets, setSecrets] = useState<SecretSummaryDto[]>([]);
+  const [newSecretName, setNewSecretName] = useState<string>('');
+  const [newSecretValue, setNewSecretValue] = useState<string>('');
+
+  const fetchWorkflowsAndRuns = () => {
+    if (!selectedRepo) return;
+    fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/actions/workflows`, { headers: getAuthHeaders() })
+      .then(res => res.ok ? res.json() : [])
+      .then(data => setWorkflows(Array.isArray(data) ? data : []))
+      .catch(() => setWorkflows([]));
+
+    fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/actions/runs`, { headers: getAuthHeaders() })
+      .then(res => res.ok ? res.json() : [])
+      .then(data => setWorkflowRuns(Array.isArray(data) ? data : []))
+      .catch(() => setWorkflowRuns([]));
+  };
+
+  const fetchRunDetails = (runId: string) => {
+    fetch(`/api/v1/actions/runs/${runId}`, { headers: getAuthHeaders() })
+      .then(res => res.ok ? res.json() : null)
+      .then(run => {
+        setSelectedRun(run);
+        if (run) {
+          fetch(`/api/v1/actions/runs/${runId}/jobs`, { headers: getAuthHeaders() })
+            .then(res => res.ok ? res.json() : [])
+            .then(jobs => {
+              setRunJobs(jobs);
+              if (jobs.length > 0) {
+                selectJobDetails(jobs[0]);
+              }
+            })
+            .catch(() => setRunJobs([]));
+        }
+      });
+  };
+
+  const selectJobDetails = (job: WorkflowJobDto) => {
+    setSelectedJob(job);
+    fetch(`/api/v1/actions/jobs/${job.id}/steps`, { headers: getAuthHeaders() })
+      .then(res => res.ok ? res.json() : [])
+      .then(steps => setJobSteps(steps))
+      .catch(() => setJobSteps([]));
+
+    fetch(`/api/v1/actions/jobs/${job.id}/logs`, { headers: getAuthHeaders() })
+      .then(res => res.ok ? res.json() : [])
+      .then(logs => setJobLogs(logs))
+      .catch(() => setJobLogs([]));
+  };
+
+  const fetchWebhooks = () => {
+    if (!selectedRepo) return;
+    fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/webhooks`, { headers: getAuthHeaders() })
+      .then(res => res.ok ? res.json() : [])
+      .then(data => setWebhooks(Array.isArray(data) ? data : []))
+      .catch(() => setWebhooks([]));
+  };
+
+  const fetchWebhookDeliveries = (subId: string) => {
+    fetch(`/api/v1/webhooks/${subId}/deliveries`, { headers: getAuthHeaders() })
+      .then(res => res.ok ? res.json() : [])
+      .then(data => setWebhookDeliveries(Array.isArray(data) ? data : []))
+      .catch(() => setWebhookDeliveries([]));
+  };
+
+  const fetchRunners = () => {
+    fetch('/api/v1/runners', { headers: getAuthHeaders() })
+      .then(res => res.ok ? res.json() : [])
+      .then(data => setRunners(Array.isArray(data) ? data : []))
+      .catch(() => setRunners([]));
+  };
+
+  const fetchSecrets = () => {
+    if (!selectedRepo) return;
+    fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/secrets`, { headers: getAuthHeaders() })
+      .then(res => res.ok ? res.json() : [])
+      .then(data => setSecrets(Array.isArray(data) ? data : []))
+      .catch(() => setSecrets([]));
+  };
 
   const handleCreateRelease = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -784,6 +903,30 @@ export const App: React.FC = () => {
               onClick={() => setActiveTab('packages')}
             >
               📦 Packages {packages.length > 0 && <span className="badge badge-open" style={{ marginLeft: '4px' }}>{packages.length}</span>}
+            </button>
+            <button
+              className={`btn ${activeTab === 'actions' ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => { setActiveTab('actions'); setSelectedRun(null); }}
+            >
+              ⚙️ Actions {workflowRuns.length > 0 && <span className="badge badge-open" style={{ marginLeft: '4px' }}>{workflowRuns.length}</span>}
+            </button>
+            <button
+              className={`btn ${activeTab === 'webhooks' ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setActiveTab('webhooks')}
+            >
+              🔗 Webhooks
+            </button>
+            <button
+              className={`btn ${activeTab === 'runners' ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setActiveTab('runners')}
+            >
+              🏃 Runners
+            </button>
+            <button
+              className={`btn ${activeTab === 'secrets' ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setActiveTab('secrets')}
+            >
+              🔑 Secrets
             </button>
           </div>
         </div>
@@ -1746,8 +1889,634 @@ index = "sparse+http://127.0.0.1:3000/index/"
       )}
 
       {/* ---------------------------------------------------------------------- */}
-      {/* MODAL: Notifications Drawer                                            */}
+      {/* TAB: Actions / CI/CD (Batch 12)                                        */}
       {/* ---------------------------------------------------------------------- */}
+      {activeTab === 'actions' && selectedRepo && (
+        <div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+            <div>
+              <h3 style={{ margin: 0 }}>⚙️ Workflows & CI/CD Automation</h3>
+              <p style={{ margin: 0, fontSize: '0.85rem', color: '#8b949e' }}>
+                Declarative workflows, directed acyclic graph execution, and isolated runners
+              </p>
+            </div>
+            <div style={{ display: 'flex', gap: '0.5rem' }}>
+              <button
+                className="btn btn-secondary"
+                onClick={async () => {
+                  try {
+                    await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/actions/workflows/sync`, {
+                      method: 'POST',
+                      headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        files: [{
+                          path: '.spine/workflows/ci.yml',
+                          content: "name: CI Workflow\non:\n  push:\n    branches:\n      - main\n  pull_request:\n    branches:\n      - main\njobs:\n  build:\n    name: Build & Test\n    runs-on:\n      - self-hosted\n    steps:\n      - name: Checkout Code\n        run: echo \"Checking out repository\"\n      - name: Run Tests\n        run: echo \"Running unit tests\""
+                        }]
+                      })
+                    });
+                    fetchWorkflowsAndRuns();
+                  } catch (e) {
+                    alert('Sync failed: ' + e);
+                  }
+                }}
+              >
+                🔄 Sync Workflows
+              </button>
+              <button
+                className="btn btn-primary"
+                onClick={async () => {
+                  if (workflows.length === 0) {
+                    alert('No workflows registered. Click "Sync Workflows" first.');
+                    return;
+                  }
+                  try {
+                    await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/actions/workflows/${workflows[0].id}/dispatches`, {
+                      method: 'POST',
+                      headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ ref_name: currentBranch })
+                    });
+                    fetchWorkflowsAndRuns();
+                  } catch (e) {
+                    alert('Dispatch failed: ' + e);
+                  }
+                }}
+              >
+                ▶ Run Workflow
+              </button>
+            </div>
+          </div>
+
+          {!selectedRun ? (
+            <div>
+              {/* Registered Workflows */}
+              <div className="diff-container" style={{ marginBottom: '1.5rem' }}>
+                <div className="diff-header">
+                  <span>Registered Workflows ({workflows.length})</span>
+                </div>
+                <div style={{ padding: '0.75rem' }}>
+                  {workflows.map(wf => (
+                    <div key={wf.id} style={{ padding: '0.5rem', borderBottom: '1px solid #30363d', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <div>
+                        <strong>{wf.name}</strong> <span style={{ color: '#8b949e', fontSize: '0.85rem' }}>({wf.path})</span>
+                      </div>
+                      <div style={{ fontSize: '0.8rem', color: '#8b949e' }}>
+                        SHA-256: <code>{wf.digest.substring(0, 12)}</code>
+                      </div>
+                    </div>
+                  ))}
+                  {workflows.length === 0 && (
+                    <div style={{ textAlign: 'center', padding: '1rem', color: '#8b949e' }}>
+                      No workflows detected in repository. Click "Sync Workflows" to import <code>.spine/workflows/*.yml</code>.
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Workflow Runs */}
+              <div className="diff-container">
+                <div className="diff-header">
+                  <span>Workflow Runs ({workflowRuns.length})</span>
+                </div>
+                <div style={{ padding: '0.75rem' }}>
+                  {workflowRuns.map(run => (
+                    <div
+                      key={run.id}
+                      onClick={() => fetchRunDetails(run.id)}
+                      style={{
+                        padding: '0.75rem',
+                        borderBottom: '1px solid #30363d',
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        cursor: 'pointer'
+                      }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                        <span className={`badge ${run.conclusion === 'SUCCESS' ? 'badge-open' : run.status === 'RUNNING' ? 'badge-ready' : 'badge-closed'}`}>
+                          {run.conclusion || run.status}
+                        </span>
+                        <div>
+                          <strong>{run.workflow_name}</strong>
+                          <div style={{ fontSize: '0.8rem', color: '#8b949e', marginTop: '0.2rem' }}>
+                            Trigger: <code>{run.trigger_event}</code> on <code>{run.ref_name}</code> (commit <code>{run.commit_oid.substring(0, 7)}</code>)
+                          </div>
+                        </div>
+                      </div>
+                      <div style={{ fontSize: '0.8rem', color: '#8b949e' }}>
+                        {new Date(run.created_at_nanos / 1_000_000).toLocaleString()}
+                      </div>
+                    </div>
+                  ))}
+                  {workflowRuns.length === 0 && (
+                    <div style={{ textAlign: 'center', padding: '2rem', color: '#8b949e' }}>
+                      No workflow runs yet. Trigger a run or push commits to execute CI pipelines.
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div>
+              {/* Detailed Run View */}
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem', background: '#161b22', padding: '1rem', borderRadius: '6px' }}>
+                <div>
+                  <button className="btn btn-secondary" style={{ marginRight: '1rem' }} onClick={() => setSelectedRun(null)}>
+                    ← Back to Runs
+                  </button>
+                  <strong style={{ fontSize: '1.1rem' }}>{selectedRun.workflow_name}</strong>
+                  <span className={`badge ${selectedRun.conclusion === 'SUCCESS' ? 'badge-open' : 'badge-closed'}`} style={{ marginLeft: '0.75rem' }}>
+                    {selectedRun.conclusion || selectedRun.status}
+                  </span>
+                </div>
+                {selectedRun.status !== 'COMPLETED' && selectedRun.status !== 'CANCELLED' && (
+                  <button
+                    className="btn btn-secondary"
+                    onClick={async () => {
+                      await fetch(`/api/v1/actions/runs/${selectedRun.id}/cancel`, { method: 'POST', headers: getAuthHeaders() });
+                      fetchRunDetails(selectedRun.id);
+                    }}
+                  >
+                    ⏹ Cancel Run
+                  </button>
+                )}
+              </div>
+
+              {/* Jobs and Steps/Logs Layout */}
+              <div style={{ display: 'grid', gridTemplateColumns: '300px 1fr', gap: '1rem' }}>
+                {/* Jobs column */}
+                <div className="diff-container">
+                  <div className="diff-header">
+                    <span>Jobs ({runJobs.length})</span>
+                  </div>
+                  <div style={{ padding: '0.5rem' }}>
+                    {runJobs.map(job => (
+                      <div
+                        key={job.id}
+                        onClick={() => selectJobDetails(job)}
+                        style={{
+                          padding: '0.75rem',
+                          borderRadius: '4px',
+                          marginBottom: '0.5rem',
+                          cursor: 'pointer',
+                          background: selectedJob?.id === job.id ? '#1f242c' : 'transparent',
+                          border: selectedJob?.id === job.id ? '1px solid #388bfd' : '1px solid #30363d'
+                        }}
+                      >
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <strong>{job.name}</strong>
+                          <span className={`badge ${job.status === 'SUCCEEDED' ? 'badge-open' : job.status === 'RUNNING' ? 'badge-ready' : 'badge-closed'}`}>
+                            {job.status}
+                          </span>
+                        </div>
+                        <div style={{ fontSize: '0.75rem', color: '#8b949e', marginTop: '0.25rem' }}>
+                          Runs-on: {job.runs_on.join(', ')}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Steps and Logs Column */}
+                <div>
+                  <div className="diff-container" style={{ marginBottom: '1rem' }}>
+                    <div className="diff-header">
+                      <span>Steps Execution</span>
+                    </div>
+                    <div style={{ padding: '0.5rem' }}>
+                      {jobSteps.map(step => (
+                        <div key={step.id} style={{ display: 'flex', justifyContent: 'space-between', padding: '0.5rem', borderBottom: '1px solid #21262d' }}>
+                          <span>Step {step.step_index + 1}: <strong>{step.name}</strong></span>
+                          <span className={`badge ${step.status === 'SUCCEEDED' ? 'badge-open' : 'badge-closed'}`}>
+                            {step.status} {step.exit_code !== null ? `(code ${step.exit_code})` : ''}
+                          </span>
+                        </div>
+                      ))}
+                      {jobSteps.length === 0 && (
+                        <div style={{ color: '#8b949e', padding: '0.5rem' }}>Select a job to view steps.</div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="diff-container">
+                    <div className="diff-header">
+                      <span>Live Runner Console Output</span>
+                    </div>
+                    <div style={{ background: '#0d1117', color: '#58a6ff', padding: '1rem', fontFamily: 'monospace', fontSize: '0.85rem', maxHeight: '400px', overflowY: 'auto' }}>
+                      {jobLogs.map(log => (
+                        <div key={log.id} style={{ marginBottom: '0.25rem', whiteSpace: 'pre-wrap' }}>
+                          <span style={{ color: '#8b949e', marginRight: '0.5rem' }}>[{new Date(log.timestamp_nanos / 1_000_000).toLocaleTimeString()}]</span>
+                          <span style={{ color: log.stream === 'stderr' ? '#f85149' : '#7ee787' }}>{log.content}</span>
+                        </div>
+                      ))}
+                      {jobLogs.length === 0 && (
+                        <div style={{ color: '#8b949e' }}>No console logs recorded for this job.</div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ---------------------------------------------------------------------- */}
+      {/* TAB: Webhooks (Batch 12)                                               */}
+      {/* ---------------------------------------------------------------------- */}
+      {activeTab === 'webhooks' && selectedRepo && (
+        <div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+            <div>
+              <h3 style={{ margin: 0 }}>🔗 Webhook Subscriptions & Event Dispatch</h3>
+              <p style={{ margin: 0, fontSize: '0.85rem', color: '#8b949e' }}>
+                Transactional outbox delivery with HMAC-SHA256 signatures and strict SSRF defenses
+              </p>
+            </div>
+          </div>
+
+          {/* New Webhook Form */}
+          <div className="diff-container" style={{ marginBottom: '1.5rem' }}>
+            <div className="diff-header">
+              <span>Register Webhook</span>
+            </div>
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                if (!newWebhookUrl) return;
+                try {
+                  const res = await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/webhooks`, {
+                    method: 'POST',
+                    headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      target_url: newWebhookUrl,
+                      secret: newWebhookSecret || undefined,
+                      events: newWebhookEvents.split(',').map(s => s.trim())
+                    })
+                  });
+                  if (!res.ok) {
+                    const err = await res.json();
+                    alert('Error: ' + JSON.stringify(err));
+                    return;
+                  }
+                  setNewWebhookUrl('');
+                  setNewWebhookSecret('');
+                  fetchWebhooks();
+                } catch (e) {
+                  alert('Failed to create webhook: ' + e);
+                }
+              }}
+              style={{ padding: '1rem', display: 'flex', flexDirection: 'column', gap: '0.75rem' }}
+            >
+              <div>
+                <label style={{ display: 'block', marginBottom: '0.25rem', fontSize: '0.85rem' }}>Target Payload URL (HTTP/HTTPS):</label>
+                <input
+                  type="text"
+                  className="input-field"
+                  placeholder="https://ci.example.com/webhook"
+                  value={newWebhookUrl}
+                  onChange={e => setNewWebhookUrl(e.target.value)}
+                  style={{ width: '100%' }}
+                  required
+                />
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+                <div>
+                  <label style={{ display: 'block', marginBottom: '0.25rem', fontSize: '0.85rem' }}>Secret (for HMAC-SHA256):</label>
+                  <input
+                    type="password"
+                    className="input-field"
+                    placeholder="Leave blank to auto-generate"
+                    value={newWebhookSecret}
+                    onChange={e => setNewWebhookSecret(e.target.value)}
+                    style={{ width: '100%' }}
+                  />
+                </div>
+                <div>
+                  <label style={{ display: 'block', marginBottom: '0.25rem', fontSize: '0.85rem' }}>Subscribed Events (comma-separated or *):</label>
+                  <input
+                    type="text"
+                    className="input-field"
+                    value={newWebhookEvents}
+                    onChange={e => setNewWebhookEvents(e.target.value)}
+                    style={{ width: '100%' }}
+                  />
+                </div>
+              </div>
+              <button type="submit" className="btn btn-primary" style={{ alignSelf: 'flex-start' }}>
+                + Add Webhook
+              </button>
+            </form>
+          </div>
+
+          {/* Subscriptions List */}
+          <div className="diff-container" style={{ marginBottom: '1.5rem' }}>
+            <div className="diff-header">
+              <span>Active Subscriptions ({webhooks.length})</span>
+            </div>
+            <div style={{ padding: '0.75rem' }}>
+              {webhooks.map(sub => (
+                <div key={sub.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.75rem', borderBottom: '1px solid #30363d' }}>
+                  <div>
+                    <strong><code>{sub.target_url}</code></strong>
+                    <div style={{ fontSize: '0.8rem', color: '#8b949e', marginTop: '0.25rem' }}>
+                      Events: {sub.events.join(', ')} | Status: <span style={{ color: sub.is_active ? '#3fb950' : '#f85149' }}>{sub.is_active ? 'Active' : 'Disabled'}</span>
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', gap: '0.5rem' }}>
+                    <button
+                      className="btn btn-secondary"
+                      onClick={() => {
+                        setSelectedWebhook(sub);
+                        fetchWebhookDeliveries(sub.id);
+                      }}
+                    >
+                      📜 Deliveries
+                    </button>
+                    <button
+                      className="btn btn-secondary"
+                      style={{ color: '#f85149' }}
+                      onClick={async () => {
+                        await fetch(`/api/v1/webhooks/${sub.id}`, { method: 'DELETE', headers: getAuthHeaders() });
+                        fetchWebhooks();
+                        if (selectedWebhook?.id === sub.id) setSelectedWebhook(null);
+                      }}
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </div>
+              ))}
+              {webhooks.length === 0 && (
+                <div style={{ textAlign: 'center', padding: '2rem', color: '#8b949e' }}>
+                  No webhook subscriptions configured for this repository.
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Deliveries Inspection */}
+          {selectedWebhook && (
+            <div className="diff-container">
+              <div className="diff-header">
+                <span>Recent Deliveries for <code>{selectedWebhook.target_url}</code></span>
+              </div>
+              <div style={{ padding: '0.75rem' }}>
+                {webhookDeliveries.map(del => (
+                  <div key={del.id} style={{ padding: '0.5rem', borderBottom: '1px solid #21262d', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div>
+                      <span className={`badge ${del.status === 'SUCCESS' ? 'badge-open' : 'badge-closed'}`} style={{ marginRight: '0.5rem' }}>
+                        {del.response_status || 'ERR'}
+                      </span>
+                      <strong>{del.event_type}</strong> (attempt #{del.attempt})
+                    </div>
+                    <div style={{ fontSize: '0.8rem', color: '#8b949e' }}>
+                      {del.execution_duration_ms} ms | {new Date(del.delivered_at_nanos / 1_000_000).toLocaleTimeString()}
+                    </div>
+                  </div>
+                ))}
+                {webhookDeliveries.length === 0 && (
+                  <div style={{ textAlign: 'center', padding: '1rem', color: '#8b949e' }}>
+                    No delivery attempts logged yet.
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ---------------------------------------------------------------------- */}
+      {/* TAB: Runners (Batch 12)                                                */}
+      {/* ---------------------------------------------------------------------- */}
+      {activeTab === 'runners' && (
+        <div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+            <div>
+              <h3 style={{ margin: 0 }}>🏃 Self-Hosted Build Runners</h3>
+              <p style={{ margin: 0, fontSize: '0.85rem', color: '#8b949e' }}>
+                Isolated runner agents polling for jobs, executing within isolated sandboxes
+              </p>
+            </div>
+          </div>
+
+          {/* Registration Box */}
+          <div className="diff-container" style={{ marginBottom: '1.5rem' }}>
+            <div className="diff-header">
+              <span>Register Runner</span>
+            </div>
+            <div style={{ padding: '1rem' }}>
+              {registeredToken && (
+                <div style={{ background: '#1c2128', border: '1px solid #3fb950', padding: '1rem', borderRadius: '6px', marginBottom: '1rem' }}>
+                  <strong style={{ color: '#3fb950' }}>Runner Registered Successfully!</strong>
+                  <p style={{ fontSize: '0.85rem', margin: '0.5rem 0' }}>Save this authentication token immediately; it will not be shown again:</p>
+                  <code style={{ fontSize: '0.95rem', background: '#0d1117', padding: '0.5rem', display: 'block', borderRadius: '4px' }}>
+                    {registeredToken}
+                  </code>
+                </div>
+              )}
+              <form
+                onSubmit={async (e) => {
+                  e.preventDefault();
+                  if (!newRunnerName) return;
+                  try {
+                    const res = await fetch('/api/v1/runners/register', {
+                      method: 'POST',
+                      headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        name: newRunnerName,
+                        hostname: 'localhost',
+                        os: 'windows',
+                        arch: 'x86_64',
+                        labels: newRunnerLabels.split(',').map(s => s.trim()),
+                        max_concurrency: 2
+                      })
+                    });
+                    if (res.ok) {
+                      const data = await res.json();
+                      setRegisteredToken(data.token);
+                      setNewRunnerName('');
+                      fetchRunners();
+                    } else {
+                      const err = await res.json();
+                      alert('Registration failed: ' + JSON.stringify(err));
+                    }
+                  } catch (e) {
+                    alert('Error: ' + e);
+                  }
+                }}
+                style={{ display: 'flex', gap: '1rem', alignItems: 'flex-end' }}
+              >
+                <div style={{ flex: 1 }}>
+                  <label style={{ display: 'block', fontSize: '0.85rem', marginBottom: '0.25rem' }}>Runner Name:</label>
+                  <input
+                    type="text"
+                    className="input-field"
+                    placeholder="windows-build-worker-01"
+                    value={newRunnerName}
+                    onChange={e => setNewRunnerName(e.target.value)}
+                    style={{ width: '100%' }}
+                    required
+                  />
+                </div>
+                <div style={{ flex: 1 }}>
+                  <label style={{ display: 'block', fontSize: '0.85rem', marginBottom: '0.25rem' }}>Labels (comma-separated):</label>
+                  <input
+                    type="text"
+                    className="input-field"
+                    value={newRunnerLabels}
+                    onChange={e => setNewRunnerLabels(e.target.value)}
+                    style={{ width: '100%' }}
+                  />
+                </div>
+                <button type="submit" className="btn btn-primary">
+                  + Register Runner
+                </button>
+              </form>
+            </div>
+          </div>
+
+          {/* Runners List */}
+          <div className="diff-container">
+            <div className="diff-header">
+              <span>Connected Runners ({runners.length})</span>
+            </div>
+            <div style={{ padding: '0.75rem' }}>
+              {runners.map(r => (
+                <div key={r.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.75rem', borderBottom: '1px solid #30363d' }}>
+                  <div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                      <strong>{r.name}</strong>
+                      <span className={`badge ${r.status === 'ACTIVE' ? 'badge-open' : 'badge-closed'}`}>
+                        {r.status}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: '0.8rem', color: '#8b949e', marginTop: '0.25rem' }}>
+                      Platform: <code>{r.os}/{r.arch}</code> | Host: <code>{r.hostname}</code> | Labels: <code>{r.labels.join(', ')}</code>
+                    </div>
+                  </div>
+                  <div style={{ textAlign: 'right', fontSize: '0.8rem', color: '#8b949e' }}>
+                    <div>Concurrency: {r.active_jobs} / {r.max_concurrency}</div>
+                    <div>Heartbeat: {new Date(r.last_heartbeat_at_nanos / 1_000_000).toLocaleTimeString()}</div>
+                  </div>
+                </div>
+              ))}
+              {runners.length === 0 && (
+                <div style={{ textAlign: 'center', padding: '2rem', color: '#8b949e' }}>
+                  No runners registered yet. Register a runner to start processing jobs.
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ---------------------------------------------------------------------- */}
+      {/* TAB: Secrets (Batch 12)                                                */}
+      {/* ---------------------------------------------------------------------- */}
+      {activeTab === 'secrets' && selectedRepo && (
+        <div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+            <div>
+              <h3 style={{ margin: 0 }}>🔑 Repository Secrets</h3>
+              <p style={{ margin: 0, fontSize: '0.85rem', color: '#8b949e' }}>
+                Encrypted secrets injected securely into isolated runner environments and masked in logs
+              </p>
+            </div>
+          </div>
+
+          {/* Add Secret Form */}
+          <div className="diff-container" style={{ marginBottom: '1.5rem' }}>
+            <div className="diff-header">
+              <span>Add / Update Secret</span>
+            </div>
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                if (!newSecretName || !newSecretValue) return;
+                try {
+                  await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/secrets/${newSecretName}`, {
+                    method: 'PUT',
+                    headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ value: newSecretValue })
+                  });
+                  setNewSecretName('');
+                  setNewSecretValue('');
+                  fetchSecrets();
+                } catch (e) {
+                  alert('Failed to save secret: ' + e);
+                }
+              }}
+              style={{ padding: '1rem', display: 'flex', gap: '1rem', alignItems: 'flex-end' }}
+            >
+              <div style={{ flex: 1 }}>
+                <label style={{ display: 'block', fontSize: '0.85rem', marginBottom: '0.25rem' }}>Secret Name (uppercase):</label>
+                <input
+                  type="text"
+                  className="input-field"
+                  placeholder="DEPLOY_KEY"
+                  value={newSecretName}
+                  onChange={e => setNewSecretName(e.target.value)}
+                  style={{ width: '100%' }}
+                  required
+                />
+              </div>
+              <div style={{ flex: 2 }}>
+                <label style={{ display: 'block', fontSize: '0.85rem', marginBottom: '0.25rem' }}>Secret Value:</label>
+                <input
+                  type="password"
+                  className="input-field"
+                  placeholder="Enter secret ciphertext / token"
+                  value={newSecretValue}
+                  onChange={e => setNewSecretValue(e.target.value)}
+                  style={{ width: '100%' }}
+                  required
+                />
+              </div>
+              <button type="submit" className="btn btn-primary">
+                Save Secret
+              </button>
+            </form>
+          </div>
+
+          {/* Secrets List */}
+          <div className="diff-container">
+            <div className="diff-header">
+              <span>Stored Secrets ({secrets.length})</span>
+            </div>
+            <div style={{ padding: '0.75rem' }}>
+              {secrets.map(s => (
+                <div key={s.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.75rem', borderBottom: '1px solid #30363d' }}>
+                  <div>
+                    <strong><code>{s.name}</code></strong>
+                    <div style={{ fontSize: '0.8rem', color: '#8b949e', marginTop: '0.25rem' }}>
+                      Updated: {new Date(s.updated_at_nanos / 1_000_000).toLocaleString()}
+                    </div>
+                  </div>
+                  <button
+                    className="btn btn-secondary"
+                    style={{ color: '#f85149' }}
+                    onClick={async () => {
+                      await fetch(`/api/v1/repos/${selectedRepo.owner}/${selectedRepo.name}/secrets/${s.name}`, {
+                        method: 'DELETE',
+                        headers: getAuthHeaders()
+                      });
+                      fetchSecrets();
+                    }}
+                  >
+                    Delete
+                  </button>
+                </div>
+              ))}
+              {secrets.length === 0 && (
+                <div style={{ textAlign: 'center', padding: '2rem', color: '#8b949e' }}>
+                  No secrets defined. Secrets defined here are available as environment variables in workflow runners.
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
       {showNotificationsModal && (
         <div className="modal-backdrop" onClick={() => setShowNotificationsModal(false)}>
           <div className="modal-box" style={{ width: '560px' }} onClick={(e) => e.stopPropagation()}>
