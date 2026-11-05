@@ -21,34 +21,35 @@ CREATE INDEX IF NOT EXISTS idx_users_email ON users (normalized_email);
 CREATE TABLE IF NOT EXISTS user_profiles (
     user_id TEXT PRIMARY KEY REFERENCES users (id) ON DELETE CASCADE,
     bio TEXT,
-    location TEXT,
-    website TEXT,
     company TEXT,
-    social_links_json TEXT,
+    location TEXT,
+    website_url TEXT,
+    twitter_username TEXT,
+    profile_readme TEXT,
+    pinned_repo_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
     updated_at_nanos BIGINT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS user_sessions (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
-    session_token TEXT NOT NULL UNIQUE,
-    csrf_token TEXT NOT NULL,
-    user_agent TEXT,
+    session_token_hash TEXT NOT NULL UNIQUE,
     ip_address TEXT,
-    expires_at_nanos BIGINT NOT NULL,
+    user_agent TEXT,
     created_at_nanos BIGINT NOT NULL,
-    last_active_nanos BIGINT NOT NULL
+    expires_at_nanos BIGINT NOT NULL,
+    revoked BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON user_sessions (user_id);
-CREATE INDEX IF NOT EXISTS idx_sessions_token ON user_sessions (session_token);
+CREATE INDEX IF NOT EXISTS idx_sessions_token_hash ON user_sessions (session_token_hash);
 
 CREATE TABLE IF NOT EXISTS personal_access_tokens (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
     name TEXT NOT NULL,
     token_hash TEXT NOT NULL UNIQUE,
-    scopes_json TEXT NOT NULL,
+    scopes JSONB NOT NULL DEFAULT '[]'::jsonb,
     expires_at_nanos BIGINT NOT NULL,
     last_used_at_nanos BIGINT,
     created_at_nanos BIGINT NOT NULL,
@@ -77,27 +78,27 @@ CREATE TABLE IF NOT EXISTS password_reset_tokens (
     token_hash TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
     expires_at_nanos BIGINT NOT NULL,
-    created_at_nanos BIGINT NOT NULL,
-    used BOOLEAN NOT NULL DEFAULT FALSE
+    created_at_nanos BIGINT NOT NULL DEFAULT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000000000)::BIGINT,
+    used_at_nanos BIGINT
 );
 
 CREATE TABLE IF NOT EXISTS email_verification_tokens (
     token_hash TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
-    new_email TEXT NOT NULL,
     expires_at_nanos BIGINT NOT NULL,
-    created_at_nanos BIGINT NOT NULL
+    created_at_nanos BIGINT NOT NULL DEFAULT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000000000)::BIGINT,
+    used_at_nanos BIGINT
 );
 
 CREATE TABLE IF NOT EXISTS audit_events (
-    id TEXT PRIMARY KEY,
-    actor_user_id TEXT,
-    event_type TEXT NOT NULL,
-    target_type TEXT NOT NULL,
-    target_id TEXT NOT NULL,
-    metadata_json TEXT,
+    id BIGSERIAL PRIMARY KEY,
+    user_id TEXT,
+    action TEXT NOT NULL,
+    resource_type TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
     ip_address TEXT,
-    created_at_nanos BIGINT NOT NULL
+    metadata JSONB,
+    timestamp_nanos BIGINT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_events (created_at_nanos DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_events (timestamp_nanos DESC);

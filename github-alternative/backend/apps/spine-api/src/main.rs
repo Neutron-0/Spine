@@ -94,9 +94,9 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum BackupCommands {
-    /// Create a full SHA-256 verified backup archive (.tar.gz)
+    /// Create a full SHA-256 verified backup archive (.tar.gz or AEAD encrypted .spinebak)
     Create {
-        /// Destination archive file path (.tar.gz)
+        /// Destination archive file path (.tar.gz or .spinebak)
         #[arg(short, long)]
         output: PathBuf,
 
@@ -107,17 +107,52 @@ enum BackupCommands {
         /// Optional PostgreSQL Database URL
         #[arg(long)]
         database_url: Option<String>,
+
+        /// Optional AEAD encryption passphrase (enables AES-256-GCM + PBKDF2)
+        #[arg(long)]
+        passphrase: Option<String>,
+
+        /// Key rotation version (default: 1)
+        #[arg(long, default_value_t = 1)]
+        key_version: u16,
     },
 
     /// Restore and verify a backup archive into target directory
     Restore {
-        /// Input archive file path (.tar.gz)
+        /// Input archive file path (.tar.gz or .spinebak)
         #[arg(short, long)]
         input: PathBuf,
 
         /// Target storage root directory to restore into
         #[arg(long, default_value = "./.spine-dev-cluster/node-1")]
         target_storage: PathBuf,
+
+        /// AEAD encryption passphrase if restoring an encrypted .spinebak archive
+        #[arg(long)]
+        passphrase: Option<String>,
+    },
+
+    /// Rotate the encryption key/passphrase of an encrypted backup archive without disk writes
+    Rotate {
+        /// Input encrypted archive path
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Output rotated archive path
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Current/old encryption passphrase
+        #[arg(long)]
+        old_passphrase: String,
+
+        /// New encryption passphrase
+        #[arg(long)]
+        new_passphrase: String,
+
+        /// New key rotation version (default: 2)
+        #[arg(long, default_value_t = 2)]
+        key_version: u16,
     },
 }
 
@@ -231,17 +266,30 @@ async fn main() -> anyhow::Result<()> {
                 output,
                 storage_root,
                 database_url: _,
+                passphrase,
+                key_version,
             } => {
                 println!(
                     "Creating coordinated backup from {} to {}",
                     storage_root.display(),
                     output.display()
                 );
-                let manifest = spine_api::backup::BackupManager::create_backup(
-                    &storage_root,
-                    None,
-                    &output,
-                )?;
+                let manifest = if let Some(pass) = passphrase {
+                    println!("Applying AES-256-GCM AEAD encryption (key version {})...", key_version);
+                    spine_api::backup::BackupManager::create_encrypted_backup(
+                        &storage_root,
+                        None,
+                        &output,
+                        &pass,
+                        key_version,
+                    )?
+                } else {
+                    spine_api::backup::BackupManager::create_backup(
+                        &storage_root,
+                        None,
+                        &output,
+                    )?
+                };
                 println!("Backup archive created successfully:");
                 println!("  Backup ID:     {}", manifest.backup_id);
                 println!("  Total files:   {}", manifest.total_files);
@@ -252,16 +300,26 @@ async fn main() -> anyhow::Result<()> {
             BackupCommands::Restore {
                 input,
                 target_storage,
+                passphrase,
             } => {
                 println!(
                     "Restoring backup archive from {} into {}",
                     input.display(),
                     target_storage.display()
                 );
-                let (manifest, report, _) = spine_api::backup::BackupManager::restore_backup(
-                    &input,
-                    &target_storage,
-                )?;
+                let (manifest, report, _) = if let Some(pass) = passphrase {
+                    println!("Decrypting with AEAD passphrase and verifying tag...");
+                    spine_api::backup::BackupManager::restore_encrypted_backup(
+                        &input,
+                        &target_storage,
+                        &pass,
+                    )?
+                } else {
+                    spine_api::backup::BackupManager::restore_backup(
+                        &input,
+                        &target_storage,
+                    )?
+                };
                 println!("Backup restoration completed:");
                 println!("  Backup ID:     {}", manifest.backup_id);
                 println!("  Files restored:{}", report.files_restored);
@@ -274,6 +332,29 @@ async fn main() -> anyhow::Result<()> {
                         "FAILED"
                     }
                 );
+                Ok(())
+            }
+            BackupCommands::Rotate {
+                input,
+                output,
+                old_passphrase,
+                new_passphrase,
+                key_version,
+            } => {
+                println!(
+                    "Rotating backup encryption key from {} to {} (target key version {})...",
+                    input.display(),
+                    output.display(),
+                    key_version
+                );
+                spine_api::backup::BackupManager::rotate_backup_key(
+                    &input,
+                    &output,
+                    &old_passphrase,
+                    &new_passphrase,
+                    key_version,
+                )?;
+                println!("Key rotation completed successfully. New archive written to {}", output.display());
                 Ok(())
             }
         },

@@ -55,3 +55,4 @@ russh.workspace = true
 ssh-key.workspace = true
 flate2.workspace = true
 tar.workspace = true
+ring.workspace = true

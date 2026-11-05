@@ -48,7 +48,38 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ),
 ];
 
+// 64-bit advisory lock ID representing "SPINEMIG" (0x5350494E454D4947)
+const SPINE_MIGRATION_ADVISORY_LOCK_ID: i64 = 0x5350_494E_454D_4947;
+
 pub async fn run_migrations(pool: &PgPool) -> Result<(), ForgeError> {
+    // Acquire a single dedicated connection so the session-level advisory lock stays held
+    let mut conn = pool.acquire().await.map_err(|e| {
+        ForgeError::Internal(format!("Failed to acquire connection for migrations: {}", e))
+    })?;
+
+    // Acquire session-level advisory lock to serialize concurrent API startup migrations
+    tracing::info!("Acquiring cluster-wide schema migration advisory lock...");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(SPINE_MIGRATION_ADVISORY_LOCK_ID)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| ForgeError::Internal(format!("Failed to acquire migration advisory lock: {}", e)))?;
+
+    let res = run_migrations_inner(pool, &mut conn).await;
+
+    // Release advisory lock
+    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(SPINE_MIGRATION_ADVISORY_LOCK_ID)
+        .execute(&mut *conn)
+        .await;
+
+    res
+}
+
+async fn run_migrations_inner(
+    pool: &PgPool,
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+) -> Result<(), ForgeError> {
     // 1. Create _schema_migrations tracking table if not exists
     sqlx::query(
         r#"
@@ -58,7 +89,7 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), ForgeError> {
         )
         "#,
     )
-    .execute(pool)
+    .execute(&mut **conn)
     .await
     .map_err(|e| ForgeError::Internal(format!("Failed to create _schema_migrations table: {}", e)))?;
 
@@ -68,7 +99,7 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), ForgeError> {
             "SELECT EXISTS(SELECT 1 FROM _schema_migrations WHERE version = $1)",
         )
         .bind(name)
-        .fetch_one(pool)
+        .fetch_one(&mut **conn)
         .await
         .map_err(|e| ForgeError::Internal(format!("Failed to check migration status for {}: {}", name, e)))?;
 

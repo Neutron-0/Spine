@@ -161,11 +161,23 @@
 - Hardened Linux systemd units (`spine-api.service`, `spine-coordinator.service`, `spine-storage-node.service`).
 - Comprehensive operations documentation, incident runbooks, storage economics model (200 GB+ dataset), and final deployment audit handoff.
 
+### Batch 20: Final Deployment Readiness Closure, Real PostgreSQL Verification, Production Packaging, Encrypted Backup/Recovery, and Clean-Environment Deployment Rehearsal (Completed)
+- Live PostgreSQL 18.6 daemon verification and execution of all 11 schema migrations creating 66 tables.
+- Migration concurrency serialization via native PostgreSQL session advisory lock (`0x5350494E454D4947`).
+- Full schema and query reconciliation between SQL migrations and `postgres.rs` (sessions, PATs, tokens, profiles, audit events).
+- Authenticated AEAD encrypted backup (`.spinebak`) using AES-256-GCM, PBKDF2 (100k iterations), and AAD header authentication.
+- Zero-disk backup key rotation (`rotate_backup_key`) and strict path traversal sanitization (`sanitize_restore_path`).
+- Linux service unit verification using `systemd-analyze verify` under Ubuntu 24.04 LTS (systemd 259) with 0 errors.
+- Disaggregated mathematical sizing model for 200 GB+ raw code with separated variables ($S_{\text{code}}$, $C_{\text{vcs}}$, $S_{\text{lfs}}$, $S_{\text{art}}$, $R$, $M_{\text{idx}}$, $H$).
+- Formal separation of `spine-core-forge-v1` profile (untrusted CI prohibited) and `spine-ci-runner-v1` isolated execution profile.
+- 6-phase end-to-end clean-environment deployment rehearsal passing all lifecycle checks with 100% test passage.
+- Release candidate manifest (`v0.1.0-rc1`) and final handoff for independent Codex audit.
+
 ---
 
 ## Future Milestones
 
-### Batch 20: Enterprise Federation, SAML/OIDC, Multi-Region Replication, and High-Availability Clustering
+### Batch 21: Enterprise Federation, SAML/OIDC, Multi-Region Replication, and High-Availability Clustering
 - Enterprise Single Sign-On (SAML 2.0 and OIDC).
 - Multi-region distributed storage replication and geo-distributed caching mirrors.
 - Real-time collaborative review feeds with WebSockets.

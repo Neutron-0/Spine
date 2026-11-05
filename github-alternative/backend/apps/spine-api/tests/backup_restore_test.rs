@@ -113,3 +113,157 @@ fn test_restore_tampering_and_corruption_rejection() {
         "Restoration of corrupted archive must be rejected"
     );
 }
+
+#[test]
+fn test_encrypted_backup_creation_and_verified_restoration() {
+    let source_dir = tempdir().expect("source tempdir");
+    let backup_dir = tempdir().expect("backup tempdir");
+    let target_dir = tempdir().expect("target tempdir");
+
+    let file1 = source_dir.path().join("secrets/token.key");
+    fs::create_dir_all(file1.parent().unwrap()).unwrap();
+    fs::write(&file1, b"confidential-ssh-and-database-secrets-123456").unwrap();
+
+    let db_snapshot = r#"{"organizations":[{"id":"org-1","name":"spine-sec"}]}"#;
+    let enc_path = backup_dir.path().join("backup.spinebak");
+    let passphrase = "VerySecureDeploymentPassphrase2026!";
+
+    // 1. Create encrypted backup
+    let manifest = BackupManager::create_encrypted_backup(
+        source_dir.path(),
+        Some(db_snapshot),
+        &enc_path,
+        passphrase,
+        1,
+    )
+    .expect("create_encrypted_backup failed");
+
+    assert_eq!(manifest.integrity_status, "VERIFIED");
+
+    // Verify file header has SPNEBAK magic
+    let raw_bytes = fs::read(&enc_path).unwrap();
+    assert_eq!(&raw_bytes[0..8], b"SPNEBAK\x01");
+
+    // 2. Reject restoration with wrong passphrase
+    let wrong_res = BackupManager::restore_encrypted_backup(
+        &enc_path,
+        target_dir.path(),
+        "WrongIncorrectPassphrase!",
+    );
+    assert!(
+        wrong_res.is_err(),
+        "Restoring with wrong passphrase must fail AEAD authentication"
+    );
+
+    // 3. Reject restoration if ciphertext is tampered
+    let mut tampered_bytes = raw_bytes.clone();
+    let last = tampered_bytes.len() - 5;
+    tampered_bytes[last] ^= 0xAA;
+    let tampered_path = backup_dir.path().join("tampered.spinebak");
+    fs::write(&tampered_path, tampered_bytes).unwrap();
+
+    let tampered_res = BackupManager::restore_encrypted_backup(
+        &tampered_path,
+        target_dir.path(),
+        passphrase,
+    );
+    assert!(
+        tampered_res.is_err(),
+        "Restoring tampered ciphertext must fail AEAD tag validation"
+    );
+
+    // 4. Restore with correct passphrase
+    let (restored_manifest, report, extracted_db) = BackupManager::restore_encrypted_backup(
+        &enc_path,
+        target_dir.path(),
+        passphrase,
+    )
+    .expect("restore_encrypted_backup failed");
+
+    assert_eq!(restored_manifest.backup_id, manifest.backup_id);
+    assert!(report.integrity_verified);
+    assert_eq!(extracted_db, Some(db_snapshot.to_string()));
+
+    let restored_file = fs::read(target_dir.path().join("secrets/token.key")).unwrap();
+    assert_eq!(
+        restored_file,
+        b"confidential-ssh-and-database-secrets-123456"
+    );
+}
+
+#[test]
+fn test_encrypted_backup_key_rotation() {
+    let source_dir = tempdir().expect("source tempdir");
+    let backup_dir = tempdir().expect("backup tempdir");
+    let target_dir = tempdir().expect("target tempdir");
+
+    fs::write(
+        source_dir.path().join("payload.dat"),
+        b"rotation payload test content",
+    )
+    .unwrap();
+
+    let orig_enc_path = backup_dir.path().join("orig.spinebak");
+    let rotated_enc_path = backup_dir.path().join("rotated.spinebak");
+
+    let old_passphrase = "InitialPassphrase_v1!";
+    let new_passphrase = "RotatedPassphrase_v2!987";
+
+    // 1. Create with v1 passphrase
+    BackupManager::create_encrypted_backup(
+        source_dir.path(),
+        None,
+        &orig_enc_path,
+        old_passphrase,
+        1,
+    )
+    .expect("create initial backup");
+
+    // 2. Rotate to v2 passphrase
+    BackupManager::rotate_backup_key(
+        &orig_enc_path,
+        &rotated_enc_path,
+        old_passphrase,
+        new_passphrase,
+        2,
+    )
+    .expect("rotate key");
+
+    // 3. Old passphrase fails on rotated backup
+    let old_attempt = BackupManager::restore_encrypted_backup(
+        &rotated_enc_path,
+        target_dir.path(),
+        old_passphrase,
+    );
+    assert!(old_attempt.is_err(), "Old passphrase must be rejected on rotated backup");
+
+    // 4. New passphrase succeeds
+    let (_, report, _) = BackupManager::restore_encrypted_backup(
+        &rotated_enc_path,
+        target_dir.path(),
+        new_passphrase,
+    )
+    .expect("restore rotated backup");
+
+    assert!(report.integrity_verified);
+    let content = fs::read(target_dir.path().join("payload.dat")).unwrap();
+    assert_eq!(content, b"rotation payload test content");
+}
+
+#[test]
+fn test_path_traversal_hardening() {
+    let dest_root = tempdir().expect("dest tempdir");
+
+    // Valid paths
+    assert!(BackupManager::sanitize_restore_path(dest_root.path(), "valid/file.txt").is_ok());
+    assert!(BackupManager::sanitize_restore_path(dest_root.path(), "nested/deep/repo/HEAD").is_ok());
+
+    // Path traversal attacks
+    assert!(BackupManager::sanitize_restore_path(dest_root.path(), "../evil.txt").is_err());
+    assert!(BackupManager::sanitize_restore_path(dest_root.path(), "foo/../../evil.txt").is_err());
+    assert!(BackupManager::sanitize_restore_path(dest_root.path(), "/root/etc/passwd").is_err());
+    assert!(BackupManager::sanitize_restore_path(dest_root.path(), "\\Windows\\System32").is_err());
+    assert!(BackupManager::sanitize_restore_path(dest_root.path(), "C:\\Windows\\cmd.exe").is_err());
+    assert!(BackupManager::sanitize_restore_path(dest_root.path(), "CON").is_err());
+    assert!(BackupManager::sanitize_restore_path(dest_root.path(), "dir/NUL").is_err());
+}
