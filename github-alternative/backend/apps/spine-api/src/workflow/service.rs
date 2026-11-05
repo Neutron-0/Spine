@@ -13,10 +13,13 @@ use crate::core::types::{
 use crate::db::Database;
 use crate::webhook::WebhookService;
 
+use crate::core::profile::DeploymentProfile;
+
 #[derive(Clone)]
 pub struct WorkflowService {
     db: Arc<dyn Database>,
     webhook_service: Option<WebhookService>,
+    pub profile: DeploymentProfile,
 }
 
 impl WorkflowService {
@@ -24,7 +27,13 @@ impl WorkflowService {
         Self {
             db,
             webhook_service,
+            profile: DeploymentProfile::CoreForge,
         }
+    }
+
+    pub fn with_profile(mut self, profile: DeploymentProfile) -> Self {
+        self.profile = profile;
+        self
     }
 
     /// Sync and validate workflow definitions from repository files (e.g. `.spine/workflows/*.yml`)
@@ -99,18 +108,65 @@ impl WorkflowService {
                     .on
                     .push
                     .as_ref()
-                    .map_or(false, |p| p.matches_branch(branch_clean)),
+                    .is_some_and(|p| p.matches_branch(branch_clean)),
                 "pull_request" => spec
                     .on
                     .pull_request
                     .as_ref()
-                    .map_or(false, |pr| pr.matches_branch(branch_clean)),
+                    .is_some_and(|pr| pr.matches_branch(branch_clean)),
                 "workflow_dispatch" => spec.on.workflow_dispatch.unwrap_or(true),
                 _ => false,
             };
 
             if !matched {
                 continue;
+            }
+
+            let is_untrusted_event = event_type == "pull_request_fork"
+                || event_type == "fork"
+                || event_type.starts_with("untrusted");
+
+            if is_untrusted_event && !self.profile.allow_untrusted_ci() {
+                tracing::warn!(
+                    "Untrusted CI execution is disabled under deployment profile '{}'. Disallowing workflow run for repo {}",
+                    self.profile.name(),
+                    repo_id
+                );
+
+                let run_id = Uuid::new_v4().to_string();
+                let run = WorkflowRun {
+                    id: run_id.clone(),
+                    repo_id: repo_id.to_string(),
+                    workflow_id: def.id.clone(),
+                    workflow_name: spec.name.clone(),
+                    commit_oid: commit_oid.to_string(),
+                    ref_name: ref_name.to_string(),
+                    trigger_event: event_type.to_string(),
+                    actor_id: actor_id.to_string(),
+                    status: "COMPLETED".to_string(),
+                    conclusion: Some("DISALLOWED".to_string()),
+                    definition_yaml: def.yaml_content.clone(),
+                    definition_digest: def.digest.clone(),
+                    created_at_nanos: now_nanos,
+                    started_at_nanos: Some(now_nanos),
+                    completed_at_nanos: Some(now_nanos),
+                };
+
+                let created_run = self.db.create_workflow_run(run).await?;
+
+                let check_result = WorkflowCheckResult {
+                    id: Uuid::new_v4().to_string(),
+                    repo_id: repo_id.to_string(),
+                    commit_oid: commit_oid.to_string(),
+                    check_name: spec.name.clone(),
+                    status: "COMPLETED".to_string(),
+                    run_id: run_id.clone(),
+                    updated_at_nanos: now_nanos,
+                };
+                let _ = self.db.upsert_workflow_check_result(check_result).await;
+
+                triggered_runs.push(created_run);
+                continue; // Disallowed: no jobs are created or queued to runners
             }
 
             let run_id = Uuid::new_v4().to_string();

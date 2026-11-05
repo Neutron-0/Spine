@@ -31,12 +31,9 @@ fn test_backup_creation_and_verified_restoration() {
 
     // 2. Create backup archive (.tar.gz)
     let backup_tar_gz = backup_dir.path().join("backup-2026-11-05.tar.gz");
-    let manifest = BackupManager::create_backup(
-        source_dir.path(),
-        Some(db_snapshot),
-        &backup_tar_gz,
-    )
-    .expect("create_backup failed");
+    let manifest =
+        BackupManager::create_backup(source_dir.path(), Some(db_snapshot), &backup_tar_gz)
+            .expect("create_backup failed");
 
     assert_eq!(manifest.integrity_status, "VERIFIED");
     assert!(manifest.total_files >= 4);
@@ -49,11 +46,9 @@ fn test_backup_creation_and_verified_restoration() {
     assert!(manifest.file_hashes.contains_key("database/snapshot.json"));
 
     // 3. Restore backup into target directory
-    let (restored_manifest, report, extracted_db) = BackupManager::restore_backup(
-        &backup_tar_gz,
-        target_dir.path(),
-    )
-    .expect("restore_backup failed");
+    let (restored_manifest, report, extracted_db) =
+        BackupManager::restore_backup(&backup_tar_gz, target_dir.path())
+            .expect("restore_backup failed");
 
     assert_eq!(restored_manifest.backup_id, manifest.backup_id);
     assert!(report.integrity_verified);
@@ -140,9 +135,9 @@ fn test_encrypted_backup_creation_and_verified_restoration() {
 
     assert_eq!(manifest.integrity_status, "VERIFIED");
 
-    // Verify file header has SPNEBAK magic
+    // Verify file header has SPNEBAK v2 streaming magic
     let raw_bytes = fs::read(&enc_path).unwrap();
-    assert_eq!(&raw_bytes[0..8], b"SPNEBAK\x01");
+    assert_eq!(&raw_bytes[0..8], b"SPNEBAK\x02");
 
     // 2. Reject restoration with wrong passphrase
     let wrong_res = BackupManager::restore_encrypted_backup(
@@ -162,23 +157,17 @@ fn test_encrypted_backup_creation_and_verified_restoration() {
     let tampered_path = backup_dir.path().join("tampered.spinebak");
     fs::write(&tampered_path, tampered_bytes).unwrap();
 
-    let tampered_res = BackupManager::restore_encrypted_backup(
-        &tampered_path,
-        target_dir.path(),
-        passphrase,
-    );
+    let tampered_res =
+        BackupManager::restore_encrypted_backup(&tampered_path, target_dir.path(), passphrase);
     assert!(
         tampered_res.is_err(),
         "Restoring tampered ciphertext must fail AEAD tag validation"
     );
 
     // 4. Restore with correct passphrase
-    let (restored_manifest, report, extracted_db) = BackupManager::restore_encrypted_backup(
-        &enc_path,
-        target_dir.path(),
-        passphrase,
-    )
-    .expect("restore_encrypted_backup failed");
+    let (restored_manifest, report, extracted_db) =
+        BackupManager::restore_encrypted_backup(&enc_path, target_dir.path(), passphrase)
+            .expect("restore_encrypted_backup failed");
 
     assert_eq!(restored_manifest.backup_id, manifest.backup_id);
     assert!(report.integrity_verified);
@@ -235,7 +224,10 @@ fn test_encrypted_backup_key_rotation() {
         target_dir.path(),
         old_passphrase,
     );
-    assert!(old_attempt.is_err(), "Old passphrase must be rejected on rotated backup");
+    assert!(
+        old_attempt.is_err(),
+        "Old passphrase must be rejected on rotated backup"
+    );
 
     // 4. New passphrase succeeds
     let (_, report, _) = BackupManager::restore_encrypted_backup(
@@ -256,14 +248,18 @@ fn test_path_traversal_hardening() {
 
     // Valid paths
     assert!(BackupManager::sanitize_restore_path(dest_root.path(), "valid/file.txt").is_ok());
-    assert!(BackupManager::sanitize_restore_path(dest_root.path(), "nested/deep/repo/HEAD").is_ok());
+    assert!(
+        BackupManager::sanitize_restore_path(dest_root.path(), "nested/deep/repo/HEAD").is_ok()
+    );
 
     // Path traversal attacks
     assert!(BackupManager::sanitize_restore_path(dest_root.path(), "../evil.txt").is_err());
     assert!(BackupManager::sanitize_restore_path(dest_root.path(), "foo/../../evil.txt").is_err());
     assert!(BackupManager::sanitize_restore_path(dest_root.path(), "/root/etc/passwd").is_err());
     assert!(BackupManager::sanitize_restore_path(dest_root.path(), "\\Windows\\System32").is_err());
-    assert!(BackupManager::sanitize_restore_path(dest_root.path(), "C:\\Windows\\cmd.exe").is_err());
+    assert!(
+        BackupManager::sanitize_restore_path(dest_root.path(), "C:\\Windows\\cmd.exe").is_err()
+    );
     assert!(BackupManager::sanitize_restore_path(dest_root.path(), "CON").is_err());
     assert!(BackupManager::sanitize_restore_path(dest_root.path(), "dir/NUL").is_err());
 }

@@ -26,7 +26,7 @@ pub async fn health_liveness() -> impl IntoResponse {
 }
 
 pub async fn health_readiness(State(state): State<AppState>) -> impl IntoResponse {
-    let db_ok = state.db.get_user_by_id("readiness_check").await.is_ok();
+    let db_ok = state.db.ping().await.is_ok();
     let storage_ok = state.vcs.storage_root().exists();
     let coord_ok = match &state.coordinator {
         Some(c) => c.check_health().await,
@@ -55,6 +55,8 @@ pub struct DiagnosticsResponse {
     pub status: &'static str,
     pub service: &'static str,
     pub version: &'static str,
+    pub profile: &'static str,
+    pub untrusted_ci_allowed: bool,
     pub database_connected: bool,
     pub coordinator_connected: bool,
     pub active_runners_count: usize,
@@ -66,7 +68,7 @@ pub struct DiagnosticsResponse {
 
 pub async fn health_diagnostics(State(state): State<AppState>) -> impl IntoResponse {
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-    let db_ok = state.db.get_user_by_id("readiness_check").await.is_ok();
+    let db_ok = state.db.ping().await.is_ok();
     let coord_ok = match &state.coordinator {
         Some(c) => c.check_health().await,
         None => true,
@@ -101,6 +103,8 @@ pub async fn health_diagnostics(State(state): State<AppState>) -> impl IntoRespo
         },
         service: "spine-forge-api",
         version: "0.1.0",
+        profile: state.profile.name(),
+        untrusted_ci_allowed: state.profile.allow_untrusted_ci(),
         database_connected: db_ok,
         coordinator_connected: coord_ok,
         active_runners_count: active_runners,

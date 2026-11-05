@@ -31,6 +31,7 @@ impl ArtifactService {
     }
 
     /// Checks quota and creates a new resumable upload session.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_upload_session(
         &self,
         owner_type: &str,
@@ -286,17 +287,12 @@ impl ArtifactService {
                 let entry = manifest
                     .chunks
                     .get(idx as usize)
-                    .ok_or_else(|| ChunkerError::MissingChunk(idx))?;
+                    .ok_or(ChunkerError::MissingChunk(idx))?;
                 let bytes = self
                     .store
                     .get_chunk(&entry.chunk_hash)
-                    .map_err(|e| {
-                        ChunkerError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            e.to_string(),
-                        ))
-                    })?
-                    .ok_or_else(|| ChunkerError::MissingChunk(idx))?;
+                    .map_err(|e| ChunkerError::Io(std::io::Error::other(e.to_string())))?
+                    .ok_or(ChunkerError::MissingChunk(idx))?;
                 Ok(bytes)
             },
             &mut buffer,

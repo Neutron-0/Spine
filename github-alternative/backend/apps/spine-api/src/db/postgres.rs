@@ -30,6 +30,14 @@ impl PgDatabase {
         super::migrations::run_migrations(&self.pool).await
     }
 
+    pub async fn ping(&self) -> Result<(), ForgeError> {
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|e| ForgeError::ServiceUnavailable(format!("PostgreSQL ping failed: {}", e)))
+    }
+
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
@@ -37,6 +45,14 @@ impl PgDatabase {
 
 #[async_trait]
 impl Database for PgDatabase {
+    async fn ping(&self) -> Result<(), ForgeError> {
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|e| ForgeError::ServiceUnavailable(format!("PostgreSQL ping failed: {}", e)))
+    }
+
     async fn create_user(&self, user: User) -> Result<User, ForgeError> {
         let query = r#"
             INSERT INTO users (id, username, normalized_username, email, normalized_email, display_name, password_hash, account_status, avatar_url, created_at_nanos, updated_at_nanos, last_login_nanos)
@@ -61,9 +77,9 @@ impl Database for PgDatabase {
             .map_err(|e| ForgeError::Internal(e.to_string()))?;
 
         if res.rows_affected() == 0 {
-            return Err(ForgeError::Conflict(format!(
-                "Username or email is already taken"
-            )));
+            return Err(ForgeError::Conflict(
+                "Username or email is already taken".to_string(),
+            ));
         }
         Ok(user)
     }

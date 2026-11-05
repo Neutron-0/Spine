@@ -1,17 +1,16 @@
-use crate::archive_security::{extract_zip_secure, validate_and_sanitize_archive_path, ExtractionLimits};
-use crate::git_exporter::{ExportStats, GitExporter};
+use crate::git_exporter::GitExporter;
 use crate::git_format::read_git_refs;
-use crate::git_importer::{GitImporter, ImportStats};
+use crate::git_importer::GitImporter;
 use crate::platform::attribution::AttributionPolicy;
-use crate::platform::models::{parse_github_metadata_dir, parse_gitlab_metadata_dir, PlatformRepositoryData};
-use crate::platform::sanitization::{is_workflow_file, scan_for_secrets, SanitizationReport};
+use crate::platform::models::{
+    parse_github_metadata_dir, parse_gitlab_metadata_dir, PlatformRepositoryData,
+};
+use crate::platform::sanitization::is_workflow_file;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use spine_core::HashAlgorithm;
-use spine_object_store::FileSystemObjectStore;
 use std::fs::{self, File};
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::Path;
 use std::time::Instant;
 use thiserror::Error;
 use uuid::Uuid;
@@ -138,7 +137,7 @@ impl MigrationEngine {
         let mut warnings = Vec::new();
         let mut workflow_files = Vec::new();
 
-        if p.is_file() && p.extension().map_or(false, |e| e == "zip") {
+        if p.is_file() && p.extension().is_some_and(|e| e == "zip") {
             // ZIP archive inspection
             let file = File::open(p)?;
             let mut archive = zip::ZipArchive::new(file)?;
@@ -175,7 +174,11 @@ impl MigrationEngine {
 
             Ok(MigrationInspection {
                 source_kind,
-                detected_name: p.file_stem().unwrap_or_default().to_string_lossy().to_string(),
+                detected_name: p
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
                 default_branch: "main".to_string(),
                 commit_count: 0,
                 branch_count: 0,
@@ -188,10 +191,15 @@ impl MigrationEngine {
             })
         } else if p.is_dir() {
             let dot_git = p.join(".git");
-            let is_git = dot_git.exists() || (p.join("HEAD").exists() && p.join("objects").exists());
+            let is_git =
+                dot_git.exists() || (p.join("HEAD").exists() && p.join("objects").exists());
 
             if is_git {
-                let git_dir = if dot_git.exists() { dot_git } else { p.to_path_buf() };
+                let git_dir = if dot_git.exists() {
+                    dot_git
+                } else {
+                    p.to_path_buf()
+                };
                 let refs = read_git_refs(&git_dir).unwrap_or_default();
                 let branch_count = refs.branches.len();
                 let tag_count = refs.tags.len();
@@ -216,7 +224,11 @@ impl MigrationEngine {
 
                 Ok(MigrationInspection {
                     source_kind: MigrationSourceKind::GitLocal,
-                    detected_name: p.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                    detected_name: p
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string(),
                     default_branch: "main".to_string(),
                     commit_count: 0,
                     branch_count,
@@ -328,9 +340,15 @@ impl MigrationEngine {
         let manifest_path = spine_dir.join("migration_manifest.json");
         manifest.current_stage = MigrationStage::Completed;
         manifest.completed_stages.push("BlobIngestion".to_string());
-        manifest.completed_stages.push("TreeReconstruction".to_string());
-        manifest.completed_stages.push("CommitDagMapping".to_string());
-        manifest.completed_stages.push("ReferenceResolution".to_string());
+        manifest
+            .completed_stages
+            .push("TreeReconstruction".to_string());
+        manifest
+            .completed_stages
+            .push("CommitDagMapping".to_string());
+        manifest
+            .completed_stages
+            .push("ReferenceResolution".to_string());
         manifest.completed_stages.push("Verification".to_string());
 
         let stats_summary = ImportStatsSummary {

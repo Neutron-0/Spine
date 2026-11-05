@@ -3,10 +3,10 @@ use spine_core::{Commit, FileMode, HashAlgorithm, ObjectId, ObjectType, TreeEntr
 use spine_format::{serialize_commit, serialize_tree};
 use spine_object_store::{FileSystemObjectStore, ObjectStore};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 
-fn setup_test_spine_repo(root: &PathBuf, native_repo_id: &str) -> (PathBuf, ObjectId, ObjectId) {
+fn setup_test_spine_repo(root: &Path, native_repo_id: &str) -> (PathBuf, ObjectId, ObjectId) {
     let repo_dir = root.join("repos").join(native_repo_id);
     let spine_dir = repo_dir.join(".spine");
     fs::create_dir_all(spine_dir.join("objects")).unwrap();
@@ -38,7 +38,7 @@ fn setup_test_spine_repo(root: &PathBuf, native_repo_id: &str) -> (PathBuf, Obje
         "alice@spine.build".to_string(),
         "Alice Developer".to_string(),
         "alice@spine.build".to_string(),
-        1772580000_000_000_000,
+        1_772_580_000_000_000_000,
         "Initial commit\n".to_string(),
     );
     let commit_data = serialize_commit(&commit);

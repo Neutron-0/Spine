@@ -99,9 +99,9 @@ fn tokenize_command(s: &str) -> Result<Vec<String>, DispatchError> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut in_quote: Option<char> = None;
-    let mut chars = s.chars().peekable();
+    let chars = s.chars().peekable();
 
-    while let Some(ch) = chars.next() {
+    for ch in chars {
         match ch {
             '\'' | '"' => {
                 if let Some(q) = in_quote {
@@ -137,13 +137,14 @@ fn tokenize_command(s: &str) -> Result<Vec<String>, DispatchError> {
     }
 
     // Handle "git upload-pack" and "git receive-pack" 2-word commands
-    if tokens.len() >= 2 && tokens[0] == "git" {
-        if tokens[1] == "upload-pack" || tokens[1] == "receive-pack" {
-            let combined = format!("git-{}", tokens[1]);
-            let mut new_tokens = vec![combined];
-            new_tokens.extend(tokens.into_iter().skip(2));
-            return Ok(new_tokens);
-        }
+    if tokens.len() >= 2
+        && tokens[0] == "git"
+        && (tokens[1] == "upload-pack" || tokens[1] == "receive-pack")
+    {
+        let combined = format!("git-{}", tokens[1]);
+        let mut new_tokens = vec![combined];
+        new_tokens.extend(tokens.into_iter().skip(2));
+        return Ok(new_tokens);
     }
 
     Ok(tokens)

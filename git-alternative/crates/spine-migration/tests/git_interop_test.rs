@@ -1,28 +1,24 @@
-use spine_core::{AnnotatedTag, Commit, FileMode, HashAlgorithm, ObjectId, ObjectType, TreeEntry};
-use spine_format::{serialize_annotated_tag, serialize_commit, serialize_tree};
+use spine_core::{Commit, FileMode, HashAlgorithm, ObjectType, TreeEntry};
+use spine_format::{serialize_commit, serialize_tree};
 use spine_migration::archive_security::{
     extract_zip_secure, validate_and_sanitize_archive_path, ArchiveSecurityError, ExtractionLimits,
 };
-use spine_migration::engine::{MigrationEngine, MigrationSourceKind};
+use spine_migration::engine::MigrationEngine;
 use spine_migration::fast_stream::{
     parse_fast_import_stream, write_fast_command, FastBlob, FastCommand, FastCommit, FastFileOp,
     FastReset, FastTag,
 };
 use spine_migration::git_exporter::GitExporter;
 use spine_migration::git_format::{
-    build_pack_and_index, compare_git_tree_entries, parse_git_commit, parse_git_tag,
-    parse_git_tree, parse_loose_object, parse_packfile, read_git_refs, serialize_git_commit,
-    serialize_git_tag, serialize_git_tree, serialize_loose_object, write_git_refs,
-    GitAnnotatedTag, GitCommit, GitHead, GitObjectType, GitOid, GitRefMap, GitTreeEntry,
+    build_pack_and_index, parse_git_commit, parse_git_tag, parse_git_tree, parse_loose_object,
+    parse_packfile, serialize_git_commit, serialize_git_tag, serialize_git_tree,
+    serialize_loose_object, GitAnnotatedTag, GitCommit, GitObjectType, GitOid, GitTreeEntry,
     PackObjectToBuild,
 };
 use spine_migration::git_importer::GitImporter;
 use spine_migration::lfs_interop::GitLfsPointer;
 use spine_migration::platform::attribution::AttributionPolicy;
-use spine_migration::platform::models::{
-    parse_github_metadata_dir, parse_gitlab_metadata_dir, PlatformIssue, PlatformPullRequest,
-    PlatformUser,
-};
+use spine_migration::platform::models::{parse_github_metadata_dir, PlatformUser};
 use spine_migration::platform::sanitization::{is_workflow_file, scan_for_secrets};
 use spine_object_store::{FileSystemObjectStore, ObjectStore};
 use std::fs::{self, File};
@@ -334,8 +330,10 @@ fn test_platform_metadata_and_safe_attribution() {
     assert_eq!(data.issues[0].title, "First issue");
 
     // Attribution policy test
-    let mut policy = AttributionPolicy::default();
-    policy.create_tombstone_placeholders = true;
+    let policy = AttributionPolicy {
+        create_tombstone_placeholders: true,
+        ..Default::default()
+    };
 
     let resolved = policy.resolve_user(&data.issues[0].author);
     assert!(resolved.is_tombstone);
@@ -361,8 +359,8 @@ fn test_roundtrip_spine_to_git_and_official_oracle_verification() {
     // 1. Create a native Spine repository
     let spine_dir = spine_repo.join(".spine");
     fs::create_dir_all(&spine_dir).unwrap();
-    let store =
-        FileSystemObjectStore::new(&spine_dir, HashAlgorithm::Blake3, 3).expect("Store init failed");
+    let store = FileSystemObjectStore::new(&spine_dir, HashAlgorithm::Blake3, 3)
+        .expect("Store init failed");
 
     // Write a blob
     let blob_content = b"Content generated natively in Spine!\n";
@@ -468,9 +466,12 @@ fn test_roundtrip_spine_to_git_and_official_oracle_verification() {
     // 4. Roundtrip back: Import the exported Git repository into a brand new Spine repo!
     let roundtrip_spine = tmp.path().join("roundtrip_spine");
     let rt_spine_dir = roundtrip_spine.join(".spine");
-    let mut importer = GitImporter::new(&exported_git, &rt_spine_dir, Some(roundtrip_spine.clone()))
-        .expect("Importer init failed");
-    importer.load_git_objects().expect("Load git objects failed");
+    let mut importer =
+        GitImporter::new(&exported_git, &rt_spine_dir, Some(roundtrip_spine.clone()))
+            .expect("Importer init failed");
+    importer
+        .load_git_objects()
+        .expect("Load git objects failed");
     let imp_stats = importer.execute_import().expect("Import execute failed");
 
     assert_eq!(imp_stats.commits_count, 1);
@@ -532,7 +533,11 @@ fn test_real_git_repository_import_oracle_roundtrip() {
     .unwrap();
 
     run_git(&["add", "."]);
-    run_git(&["commit", "-m", "feat: root commit with binary and unicode files"]);
+    run_git(&[
+        "commit",
+        "-m",
+        "feat: root commit with binary and unicode files",
+    ]);
 
     // B. Create lightweight tag on root commit
     run_git(&["tag", "v0.9.0"]);
@@ -562,7 +567,13 @@ fn test_real_git_repository_import_oracle_roundtrip() {
     ]);
 
     // E. Create annotated tag
-    run_git(&["tag", "-a", "v1.0.0", "-m", "Release version 1.0.0 annotated tag"]);
+    run_git(&[
+        "tag",
+        "-a",
+        "v1.0.0",
+        "-m",
+        "Release version 1.0.0 annotated tag",
+    ]);
 
     // F. Create merge commit
     run_git(&[
@@ -581,7 +592,9 @@ fn test_real_git_repository_import_oracle_roundtrip() {
     let target_spine_dir = target_spine.join(".spine");
     let mut importer = GitImporter::new(&source_git, &target_spine_dir, Some(target_spine.clone()))
         .expect("GitImporter init failed");
-    importer.load_git_objects().expect("Load git objects failed");
+    importer
+        .load_git_objects()
+        .expect("Load git objects failed");
     let stats = importer.execute_import().expect("Execute import failed");
 
     assert!(stats.commits_count >= 4);
@@ -593,12 +606,15 @@ fn test_real_git_repository_import_oracle_roundtrip() {
     assert!(target_spine.join("README.md").exists());
     assert!(target_spine.join("payload.bin").exists());
     assert!(target_spine.join("build.sh").exists());
-    assert_eq!(fs::read(target_spine.join("payload.bin")).unwrap(), binary_bytes);
+    assert_eq!(
+        fs::read(target_spine.join("payload.bin")).unwrap(),
+        binary_bytes
+    );
 
     // 3. Export back from Spine into standard Git repository
     let exported_git = tmp.path().join("exported_git");
-    let mut exporter = GitExporter::new(&target_spine, &exported_git, false)
-        .expect("GitExporter init failed");
+    let mut exporter =
+        GitExporter::new(&target_spine, &exported_git, false).expect("GitExporter init failed");
     let export_stats = exporter.execute_export().expect("Execute export failed");
 
     assert!(export_stats.commits_count >= 4);
@@ -633,7 +649,10 @@ fn test_real_git_repository_import_oracle_roundtrip() {
     // C. `git rev-list --count --all` -> matches commit count
     let rev_count = run_oracle(&["rev-list", "--count", "--all"]);
     assert!(rev_count.status.success());
-    let count_val: usize = String::from_utf8_lossy(&rev_count.stdout).trim().parse().unwrap();
+    let count_val: usize = String::from_utf8_lossy(&rev_count.stdout)
+        .trim()
+        .parse()
+        .unwrap();
     assert!(count_val >= 4);
 
     // D. `git show` HEAD -> shows merge commit with parents
@@ -815,7 +834,10 @@ fn test_archive_security_adversarial_expansions() {
 
     // C. Valid relative path succeeds
     let valid = validate_and_sanitize_archive_path("safe/path/file.txt").unwrap();
-    assert_eq!(valid.to_str().unwrap().replace('\\', "/"), "safe/path/file.txt");
+    assert_eq!(
+        valid.to_str().unwrap().replace('\\', "/"),
+        "safe/path/file.txt"
+    );
 }
 
 #[test]

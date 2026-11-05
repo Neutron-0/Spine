@@ -21,7 +21,7 @@ pub struct GitTreeEntry {
 
 impl GitTreeEntry {
     pub fn is_tree(&self) -> bool {
-        self.mode == 0o040000 || self.mode == 0o40000
+        self.mode == 0o040000
     }
 
     pub fn is_executable(&self) -> bool {

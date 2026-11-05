@@ -2,7 +2,7 @@ use super::oid::GitOid;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -58,7 +58,8 @@ pub fn read_git_refs<P: AsRef<Path>>(git_dir: P) -> Result<GitRefMap, RefError> 
             }
 
             if let Some(peeled_hex) = line.strip_prefix('^') {
-                if let (Some(tag), Ok(peeled_oid)) = (last_tag.take(), GitOid::from_hex(peeled_hex)) {
+                if let (Some(tag), Ok(peeled_oid)) = (last_tag.take(), GitOid::from_hex(peeled_hex))
+                {
                     ref_map.peeled_tags.insert(tag, peeled_oid);
                 }
                 continue;

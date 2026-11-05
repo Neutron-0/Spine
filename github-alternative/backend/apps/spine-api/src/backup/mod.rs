@@ -3,11 +3,9 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use ring::aead::{
-    Aad, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey, AES_256_GCM,
-    NONCE_LEN,
+    Aad, BoundKey, Nonce, NonceSequence, OpeningKey, UnboundKey, AES_256_GCM, NONCE_LEN,
 };
 use ring::pbkdf2;
-use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -18,7 +16,14 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use uuid::Uuid;
 
+pub mod consistency;
+pub mod v2;
+
+pub use consistency::{ConsistencyBarrier, MaintenanceGuard};
+pub use v2::{BackupHeaderV2, StreamSummary};
+
 const BACKUP_MAGIC: &[u8; 8] = b"SPNEBAK\x01";
+#[allow(dead_code)]
 const DEFAULT_PBKDF2_ITERATIONS: u32 = 100_000;
 const SALT_LEN: usize = 16;
 const HEADER_LEN: usize = 8 + 2 + 4 + SALT_LEN + NONCE_LEN; // 8 magic, 2 key_ver, 4 iterations, 16 salt, 12 nonce = 42
@@ -75,7 +80,10 @@ impl BackupManager {
         Ok(manifest)
     }
 
-    /// Creates an authenticated, AEAD-encrypted backup archive using AES-256-GCM and PBKDF2 key derivation.
+    /// Creates an authenticated, streaming chunked AEAD-encrypted backup archive (SPNEBAK v2)
+    /// using AES-256-GCM, PBKDF2 key derivation, per-chunk nonces, and authenticated manifest.
+    ///
+    /// Memory consumption is strictly bounded to O(chunk_size) (1 MiB), supporting archives >64 GiB.
     pub fn create_encrypted_backup(
         storage_root: &Path,
         db_snapshot_json: Option<&str>,
@@ -93,55 +101,30 @@ impl BackupManager {
             fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
         }
 
-        // 1. Pack tar.gz into memory buffer
-        let mut tar_gz_buf = Vec::new();
-        let enc = GzEncoder::new(&mut tar_gz_buf, Compression::default());
+        // 1. Pack tar.gz into temporary staging file to avoid unbounded RAM consumption
+        let temp_dir = tempfile::tempdir().map_err(|e| {
+            ForgeError::Internal(format!("Failed to create temp staging directory: {}", e))
+        })?;
+        let staging_tar_gz = temp_dir.path().join("staging.tar.gz");
+
+        let file = File::create(&staging_tar_gz)
+            .map_err(|e| ForgeError::Internal(format!("Failed to create staging file: {}", e)))?;
+        let enc = GzEncoder::new(file, Compression::default());
         let (manifest, _) = Self::create_archive_internal(storage_root, db_snapshot_json, enc)?;
 
-        // 2. Generate random salt and nonce
-        let rng = SystemRandom::new();
-        let mut salt = [0u8; SALT_LEN];
-        rng.fill(&mut salt)
-            .map_err(|_| ForgeError::Internal("Failed to generate random salt".to_string()))?;
+        // 2. Stream chunked authenticated encryption (SPNEBAK v2)
+        let reader = File::open(&staging_tar_gz)
+            .map_err(|e| ForgeError::Internal(format!("Failed to open staging file: {}", e)))?;
+        let writer = File::create(output_enc_path)
+            .map_err(|e| ForgeError::Internal(format!("Failed to create output archive: {}", e)))?;
 
-        let mut nonce = [0u8; NONCE_LEN];
-        rng.fill(&mut nonce)
-            .map_err(|_| ForgeError::Internal("Failed to generate random nonce".to_string()))?;
-
-        // 3. Derive 256-bit encryption key
-        let mut key_bytes = [0u8; 32];
-        pbkdf2::derive(
-            pbkdf2::PBKDF2_HMAC_SHA256,
-            NonZeroU32::new(DEFAULT_PBKDF2_ITERATIONS).unwrap(),
-            &salt,
-            passphrase.as_bytes(),
-            &mut key_bytes,
-        );
-
-        // 4. Assemble 42-byte header (authenticated as AAD)
-        let mut header = Vec::with_capacity(HEADER_LEN);
-        header.extend_from_slice(BACKUP_MAGIC);
-        header.extend_from_slice(&key_version.to_be_bytes());
-        header.extend_from_slice(&DEFAULT_PBKDF2_ITERATIONS.to_be_bytes());
-        header.extend_from_slice(&salt);
-        header.extend_from_slice(&nonce);
-
-        // 5. Encrypt with AES-256-GCM
-        let unbound_key = UnboundKey::new(&AES_256_GCM, &key_bytes)
-            .map_err(|e| ForgeError::Internal(format!("AEAD key error: {:?}", e)))?;
-        let mut sealing_key = SealingKey::new(unbound_key, OneNonce(Some(nonce)));
-
-        sealing_key
-            .seal_in_place_append_tag(Aad::from(&header), &mut tar_gz_buf)
-            .map_err(|e| ForgeError::Internal(format!("AEAD encryption failed: {:?}", e)))?;
-
-        // 6. Write [Header][Ciphertext + Tag]
-        let mut final_output = Vec::with_capacity(header.len() + tar_gz_buf.len());
-        final_output.extend_from_slice(&header);
-        final_output.extend_from_slice(&tar_gz_buf);
-
-        fs::write(output_enc_path, final_output)
-            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        v2::encrypt_stream(
+            reader,
+            writer,
+            passphrase,
+            key_version,
+            v2::DEFAULT_CHUNK_SIZE,
+        )?;
 
         Ok(manifest)
     }
@@ -151,30 +134,65 @@ impl BackupManager {
         backup_tar_gz: &Path,
         target_storage_root: &Path,
     ) -> Result<(BackupManifest, RestoreReport, Option<String>), ForgeError> {
-        let file = File::open(backup_tar_gz).map_err(|e| {
-            ForgeError::Internal(format!("Failed to open backup archive: {}", e))
-        })?;
+        let file = File::open(backup_tar_gz)
+            .map_err(|e| ForgeError::Internal(format!("Failed to open backup archive: {}", e)))?;
         let dec = GzDecoder::new(file);
         Self::unpack_archive(dec, target_storage_root)
     }
 
-    /// Restores an authenticated, AEAD-encrypted backup archive, verifying passphrases and tags
+    /// Restores an authenticated, AEAD-encrypted backup archive, verifying passphrases, chunks, and tags.
+    /// Supports both SPNEBAK v2 (streaming chunked) and legacy SPNEBAK v1.
     pub fn restore_encrypted_backup(
         encrypted_path: &Path,
         target_storage_root: &Path,
         passphrase: &str,
     ) -> Result<(BackupManifest, RestoreReport, Option<String>), ForgeError> {
-        let encrypted_bytes = fs::read(encrypted_path).map_err(|e| {
-            ForgeError::Internal(format!("Failed to read encrypted backup: {}", e))
-        })?;
+        let mut file = File::open(encrypted_path)
+            .map_err(|e| ForgeError::Internal(format!("Failed to open encrypted backup: {}", e)))?;
 
-        let decrypted_tar_gz = Self::decrypt_backup_payload(&encrypted_bytes, passphrase)?;
-        let cursor = Cursor::new(decrypted_tar_gz);
-        let dec = GzDecoder::new(cursor);
-        Self::unpack_archive(dec, target_storage_root)
+        let mut magic = [0u8; 8];
+        file.read_exact(&mut magic)
+            .map_err(|e| ForgeError::Internal(format!("Failed to read archive magic: {}", e)))?;
+        drop(file);
+
+        if &magic == v2::MAGIC_V2 {
+            let reader = File::open(encrypted_path).map_err(|e| {
+                ForgeError::Internal(format!("Failed to open encrypted archive: {}", e))
+            })?;
+
+            let temp_dir = tempfile::tempdir().map_err(|e| {
+                ForgeError::Internal(format!("Failed to create temp staging directory: {}", e))
+            })?;
+            let staging_dec_tar_gz = temp_dir.path().join("staging_decrypted.tar.gz");
+            let writer = File::create(&staging_dec_tar_gz).map_err(|e| {
+                ForgeError::Internal(format!("Failed to create staging decrypted file: {}", e))
+            })?;
+
+            v2::decrypt_stream(reader, writer, passphrase)?;
+
+            let dec_file = File::open(&staging_dec_tar_gz).map_err(|e| {
+                ForgeError::Internal(format!("Failed to open staging decrypted file: {}", e))
+            })?;
+            let dec = GzDecoder::new(dec_file);
+            Self::unpack_archive(dec, target_storage_root)
+        } else if &magic == BACKUP_MAGIC {
+            // Legacy v1 single-invocation fallback
+            let encrypted_bytes = fs::read(encrypted_path).map_err(|e| {
+                ForgeError::Internal(format!("Failed to read encrypted backup: {}", e))
+            })?;
+            let decrypted_tar_gz = Self::decrypt_backup_payload(&encrypted_bytes, passphrase)?;
+            let cursor = Cursor::new(decrypted_tar_gz);
+            let dec = GzDecoder::new(cursor);
+            Self::unpack_archive(dec, target_storage_root)
+        } else {
+            Err(ForgeError::Internal(
+                "Unrecognized backup archive format or invalid magic bytes".to_string(),
+            ))
+        }
     }
 
-    /// Rotates the encryption key/passphrase of an existing backup without writing decrypted files to disk
+    /// Rotates the encryption key/passphrase of an existing backup without writing decrypted files to disk.
+    /// Operates in bounded streaming memory O(chunk_size).
     pub fn rotate_backup_key(
         encrypted_path: &Path,
         output_path: &Path,
@@ -188,58 +206,54 @@ impl BackupManager {
             ));
         }
 
-        let encrypted_bytes = fs::read(encrypted_path).map_err(|e| {
-            ForgeError::Internal(format!("Failed to read source encrypted backup: {}", e))
-        })?;
+        let mut file = File::open(encrypted_path)
+            .map_err(|e| ForgeError::Internal(format!("Failed to open encrypted backup: {}", e)))?;
 
-        // 1. Decrypt payload with old passphrase
-        let mut plaintext_tar_gz = Self::decrypt_backup_payload(&encrypted_bytes, old_passphrase)?;
+        let mut magic = [0u8; 8];
+        file.read_exact(&mut magic)
+            .map_err(|e| ForgeError::Internal(format!("Failed to read archive magic: {}", e)))?;
+        drop(file);
 
-        // 2. Generate fresh salt and nonce
-        let rng = SystemRandom::new();
-        let mut new_salt = [0u8; SALT_LEN];
-        rng.fill(&mut new_salt)
-            .map_err(|_| ForgeError::Internal("Failed to generate random salt".to_string()))?;
+        if &magic == v2::MAGIC_V2 {
+            let reader = File::open(encrypted_path).map_err(|e| {
+                ForgeError::Internal(format!("Failed to open source encrypted archive: {}", e))
+            })?;
+            let writer = File::create(output_path).map_err(|e| {
+                ForgeError::Internal(format!("Failed to create output archive: {}", e))
+            })?;
 
-        let mut new_nonce = [0u8; NONCE_LEN];
-        rng.fill(&mut new_nonce)
-            .map_err(|_| ForgeError::Internal("Failed to generate random nonce".to_string()))?;
+            v2::rotate_stream(
+                reader,
+                writer,
+                old_passphrase,
+                new_passphrase,
+                new_key_version,
+            )
+        } else if &magic == BACKUP_MAGIC {
+            // Upgrade legacy v1 archive to streaming v2 format on rotation
+            let encrypted_bytes = fs::read(encrypted_path).map_err(|e| {
+                ForgeError::Internal(format!("Failed to read source encrypted backup: {}", e))
+            })?;
+            let plaintext_tar_gz = Self::decrypt_backup_payload(&encrypted_bytes, old_passphrase)?;
 
-        // 3. Derive new 256-bit encryption key
-        let mut new_key_bytes = [0u8; 32];
-        pbkdf2::derive(
-            pbkdf2::PBKDF2_HMAC_SHA256,
-            NonZeroU32::new(DEFAULT_PBKDF2_ITERATIONS).unwrap(),
-            &new_salt,
-            new_passphrase.as_bytes(),
-            &mut new_key_bytes,
-        );
+            let cursor = Cursor::new(plaintext_tar_gz);
+            let writer = File::create(output_path).map_err(|e| {
+                ForgeError::Internal(format!("Failed to create output archive: {}", e))
+            })?;
 
-        // 4. Assemble new 42-byte header
-        let mut new_header = Vec::with_capacity(HEADER_LEN);
-        new_header.extend_from_slice(BACKUP_MAGIC);
-        new_header.extend_from_slice(&new_key_version.to_be_bytes());
-        new_header.extend_from_slice(&DEFAULT_PBKDF2_ITERATIONS.to_be_bytes());
-        new_header.extend_from_slice(&new_salt);
-        new_header.extend_from_slice(&new_nonce);
-
-        // 5. Seal with new key
-        let unbound_key = UnboundKey::new(&AES_256_GCM, &new_key_bytes)
-            .map_err(|e| ForgeError::Internal(format!("AEAD key error: {:?}", e)))?;
-        let mut sealing_key = SealingKey::new(unbound_key, OneNonce(Some(new_nonce)));
-
-        sealing_key
-            .seal_in_place_append_tag(Aad::from(&new_header), &mut plaintext_tar_gz)
-            .map_err(|e| ForgeError::Internal(format!("AEAD re-encryption failed: {:?}", e)))?;
-
-        // 6. Write out rotated archive
-        let mut rotated_output = Vec::with_capacity(new_header.len() + plaintext_tar_gz.len());
-        rotated_output.extend_from_slice(&new_header);
-        rotated_output.extend_from_slice(&plaintext_tar_gz);
-
-        fs::write(output_path, rotated_output).map_err(|e| ForgeError::Internal(e.to_string()))?;
-
-        Ok(())
+            v2::encrypt_stream(
+                cursor,
+                writer,
+                new_passphrase,
+                new_key_version,
+                v2::DEFAULT_CHUNK_SIZE,
+            )?;
+            Ok(())
+        } else {
+            Err(ForgeError::Internal(
+                "Unrecognized backup archive format or invalid magic bytes".to_string(),
+            ))
+        }
     }
 
     /// Internal helper to decrypt ciphertext buffer using authenticated AEAD
@@ -302,10 +316,7 @@ impl BackupManager {
     }
 
     /// Sanitizes relative archive path to strictly prevent directory traversal attacks
-    pub fn sanitize_restore_path(
-        dest_root: &Path,
-        rel_path: &str,
-    ) -> Result<PathBuf, ForgeError> {
+    pub fn sanitize_restore_path(dest_root: &Path, rel_path: &str) -> Result<PathBuf, ForgeError> {
         if rel_path.trim().is_empty() {
             return Err(ForgeError::Internal(
                 "Empty path in backup entry".to_string(),
@@ -413,7 +424,11 @@ impl BackupManager {
         let ssh_fingerprint = if host_pub_path.exists() {
             if let Ok(pub_str) = fs::read_to_string(&host_pub_path) {
                 if let Ok(parsed) = russh::keys::ssh_key::PublicKey::from_openssh(&pub_str) {
-                    Some(parsed.fingerprint(russh::keys::ssh_key::HashAlg::Sha256).to_string())
+                    Some(
+                        parsed
+                            .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
+                            .to_string(),
+                    )
                 } else {
                     None
                 }
@@ -467,7 +482,9 @@ impl BackupManager {
                 .map_err(|e| ForgeError::Internal(e.to_string()))?;
         }
 
-        let writer = tar.into_inner().map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let writer = tar
+            .into_inner()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
         Ok((manifest, writer))
     }
 
@@ -479,31 +496,42 @@ impl BackupManager {
         let start = Instant::now();
         let mut archive = tar::Archive::new(reader);
 
-        fs::create_dir_all(target_storage_root)
-            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        fs::create_dir_all(target_storage_root).map_err(|e| ForgeError::Internal(e.to_string()))?;
 
         let mut manifest: Option<BackupManifest> = None;
         let mut extracted_db_snapshot: Option<String> = None;
         let mut extracted_files = BTreeMap::new();
 
-        for entry in archive.entries().map_err(|e| ForgeError::Internal(e.to_string()))? {
+        for entry in archive
+            .entries()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?
+        {
             let mut entry = entry.map_err(|e| ForgeError::Internal(e.to_string()))?;
-            let path = entry.path().map_err(|e| ForgeError::Internal(e.to_string()))?.to_path_buf();
+            let path = entry
+                .path()
+                .map_err(|e| ForgeError::Internal(e.to_string()))?
+                .to_path_buf();
             let path_str = path.to_string_lossy().replace('\\', "/");
 
             if path_str == "manifest.json" {
                 let mut content = Vec::new();
-                entry.read_to_end(&mut content).map_err(|e| ForgeError::Internal(e.to_string()))?;
+                entry
+                    .read_to_end(&mut content)
+                    .map_err(|e| ForgeError::Internal(e.to_string()))?;
                 let parsed: BackupManifest = serde_json::from_slice(&content)
                     .map_err(|e| ForgeError::Internal(format!("Corrupt manifest: {}", e)))?;
                 manifest = Some(parsed);
             } else if path_str == "database/snapshot.json" {
                 let mut content = String::new();
-                entry.read_to_string(&mut content).map_err(|e| ForgeError::Internal(e.to_string()))?;
+                entry
+                    .read_to_string(&mut content)
+                    .map_err(|e| ForgeError::Internal(e.to_string()))?;
                 extracted_db_snapshot = Some(content);
             } else {
                 let mut content = Vec::new();
-                entry.read_to_end(&mut content).map_err(|e| ForgeError::Internal(e.to_string()))?;
+                entry
+                    .read_to_end(&mut content)
+                    .map_err(|e| ForgeError::Internal(e.to_string()))?;
                 extracted_files.insert(path_str, content);
             }
         }
@@ -516,9 +544,14 @@ impl BackupManager {
         let mut bytes_restored = 0u64;
 
         if let Some(db_json) = &extracted_db_snapshot {
-            let expected_hash = manifest.file_hashes.get("database/snapshot.json").ok_or_else(|| {
-                ForgeError::Internal("Manifest missing hash for database/snapshot.json".to_string())
-            })?;
+            let expected_hash = manifest
+                .file_hashes
+                .get("database/snapshot.json")
+                .ok_or_else(|| {
+                    ForgeError::Internal(
+                        "Manifest missing hash for database/snapshot.json".to_string(),
+                    )
+                })?;
             let mut hasher = Sha256::new();
             hasher.update(db_json.as_bytes());
             let actual_hash = hex::encode(hasher.finalize());
@@ -534,7 +567,10 @@ impl BackupManager {
 
         for (rel_path, data) in extracted_files {
             let expected_hash = manifest.file_hashes.get(&rel_path).ok_or_else(|| {
-                ForgeError::Internal(format!("Unexpected file in archive not in manifest: {}", rel_path))
+                ForgeError::Internal(format!(
+                    "Unexpected file in archive not in manifest: {}",
+                    rel_path
+                ))
             })?;
 
             let mut hasher = Sha256::new();

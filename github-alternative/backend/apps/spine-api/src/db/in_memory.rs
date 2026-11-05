@@ -543,14 +543,12 @@ impl Database for InMemoryDatabase {
             if r.archived {
                 continue;
             }
-            if r.owner_user_id == user_id {
-                repos.push(r.clone());
-            } else if state
-                .perm_by_repo_user
-                .contains_key(&(r.id.clone(), user_id.to_string()))
+            if r.owner_user_id == user_id
+                || state
+                    .perm_by_repo_user
+                    .contains_key(&(r.id.clone(), user_id.to_string()))
+                || !r.is_private
             {
-                repos.push(r.clone());
-            } else if !r.is_private {
                 repos.push(r.clone());
             }
         }
@@ -810,7 +808,7 @@ impl Database for InMemoryDatabase {
             .read()
             .map_err(|e| ForgeError::Internal(e.to_string()))?;
         let mut orgs = Vec::new();
-        for ((org_id, m_user_id), _) in &state.org_memberships {
+        for (org_id, m_user_id) in state.org_memberships.keys() {
             if m_user_id == user_id {
                 if let Some(o) = state.organizations.get(org_id) {
                     orgs.push(o.clone());
@@ -1143,7 +1141,7 @@ impl Database for InMemoryDatabase {
             .read()
             .map_err(|e| ForgeError::Internal(e.to_string()))?;
         let mut user_teams = Vec::new();
-        for ((team_id, m_user_id), _) in &state.team_memberships {
+        for (team_id, m_user_id) in state.team_memberships.keys() {
             if m_user_id == user_id {
                 if let Some(t) = state.teams.get(team_id) {
                     if t.org_id == org_id {
@@ -1637,10 +1635,8 @@ impl Database for InMemoryDatabase {
             .map_err(|e| ForgeError::Internal(e.to_string()))?;
         // Check exact match or glob wildcard match
         for r in state.branch_protection_rules.values() {
-            if r.repo_id == repo_id {
-                if r.branch_pattern == branch || r.branch_pattern == "*" {
-                    return Ok(Some(r.clone()));
-                }
+            if r.repo_id == repo_id && (r.branch_pattern == branch || r.branch_pattern == "*") {
+                return Ok(Some(r.clone()));
             }
         }
         Ok(None)
@@ -2599,8 +2595,7 @@ impl Database for InMemoryDatabase {
             .filter(|j| {
                 j.status == "QUEUED"
                     || (j.status == "ASSIGNED"
-                        && j.lease_expires_at_nanos
-                            .map_or(false, |exp| exp < now_nanos))
+                        && j.lease_expires_at_nanos.is_some_and(|exp| exp < now_nanos))
             })
             .cloned()
             .collect();
@@ -3043,7 +3038,7 @@ impl Database for InMemoryDatabase {
         let mut list: Vec<Discussion> = state
             .discussions
             .values()
-            .filter(|d| d.repo_id == repo_id && category_id.map_or(true, |c| d.category_id == c))
+            .filter(|d| d.repo_id == repo_id && category_id.is_none_or(|c| d.category_id == c))
             .cloned()
             .collect();
         list.sort_by(|a, b| {
@@ -3300,7 +3295,7 @@ impl Database for InMemoryDatabase {
                 repository_count: count,
             })
             .collect();
-        sorted.sort_by(|a, b| b.repository_count.cmp(&a.repository_count));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.repository_count));
         sorted.truncate(limit);
         Ok(sorted)
     }
@@ -3406,7 +3401,7 @@ impl Database for InMemoryDatabase {
             .filter(|s| s.repo_id == repo_id)
             .cloned()
             .collect();
-        list.sort_by(|a, b| b.started_at_nanos.cmp(&a.started_at_nanos));
+        list.sort_by_key(|b| std::cmp::Reverse(b.started_at_nanos));
         Ok(list)
     }
 
@@ -3436,10 +3431,10 @@ impl Database for InMemoryDatabase {
         let mut list: Vec<SecretScanFinding> = state
             .secret_scan_findings
             .values()
-            .filter(|f| f.repo_id == repo_id && status_filter.map_or(true, |s| f.status == s))
+            .filter(|f| f.repo_id == repo_id && status_filter.is_none_or(|s| f.status == s))
             .cloned()
             .collect();
-        list.sort_by(|a, b| b.created_at_nanos.cmp(&a.created_at_nanos));
+        list.sort_by_key(|b| std::cmp::Reverse(b.created_at_nanos));
         Ok(list)
     }
 
@@ -3551,10 +3546,10 @@ impl Database for InMemoryDatabase {
         let mut list: Vec<DependencyVulnerability> = state
             .dependency_vulnerabilities
             .values()
-            .filter(|v| v.repo_id == repo_id && status_filter.map_or(true, |s| v.status == s))
+            .filter(|v| v.repo_id == repo_id && status_filter.is_none_or(|s| v.status == s))
             .cloned()
             .collect();
-        list.sort_by(|a, b| b.created_at_nanos.cmp(&a.created_at_nanos));
+        list.sort_by_key(|b| std::cmp::Reverse(b.created_at_nanos));
         Ok(list)
     }
 
@@ -3629,7 +3624,7 @@ impl Database for InMemoryDatabase {
             .filter(|k| k.user_id == user_id && !k.revoked)
             .cloned()
             .collect();
-        keys.sort_by(|a, b| b.created_at_nanos.cmp(&a.created_at_nanos));
+        keys.sort_by_key(|b| std::cmp::Reverse(b.created_at_nanos));
         Ok(keys)
     }
 
@@ -3720,7 +3715,7 @@ impl Database for InMemoryDatabase {
             .filter(|k| k.repository_id == repo_id && !k.revoked)
             .cloned()
             .collect();
-        keys.sort_by(|a, b| b.created_at_nanos.cmp(&a.created_at_nanos));
+        keys.sort_by_key(|b| std::cmp::Reverse(b.created_at_nanos));
         Ok(keys)
     }
 
@@ -3821,7 +3816,7 @@ impl Database for InMemoryDatabase {
         let mut locks: Vec<LfsLock> = state
             .lfs_locks
             .values()
-            .filter(|l| l.repository_id == repo_id && path.map_or(true, |p| l.path == p))
+            .filter(|l| l.repository_id == repo_id && path.is_none_or(|p| l.path == p))
             .cloned()
             .collect();
         locks.sort_by(|a, b| a.path.cmp(&b.path));

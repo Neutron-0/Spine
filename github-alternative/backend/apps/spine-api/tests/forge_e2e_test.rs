@@ -17,11 +17,11 @@ async fn test_forge_e2e_full_lifecycle() {
     let storage_root = tmp.path().to_path_buf();
 
     let db = Arc::new(InMemoryDatabase::new());
-    let mailer = Arc::new(DevMailCatcher::new());
+    let _mailer = Arc::new(DevMailCatcher::new());
     let permissions = Arc::new(PermissionService::new(db.clone()));
-    let repo_service = Arc::new(RepositoryService::new(db.clone(), permissions.clone()));
-    let vcs_service = Arc::new(NativeVcsService::new(storage_root.clone()));
-    let rate_limiter = Arc::new(RateLimiter::new());
+    let _repo_service = Arc::new(RepositoryService::new(db.clone(), permissions.clone()));
+    let _vcs_service = Arc::new(NativeVcsService::new(storage_root.clone()));
+    let _rate_limiter = Arc::new(RateLimiter::new());
 
     let artifact_store =
         Arc::new(spine_artifact::LocalArtifactStore::new(storage_root.join("artifacts")).unwrap());
@@ -29,7 +29,7 @@ async fn test_forge_e2e_full_lifecycle() {
         db.clone(),
         artifact_store,
     ));
-    let releases = Arc::new(spine_api::releases::ReleaseService::new(
+    let _releases = Arc::new(spine_api::releases::ReleaseService::new(
         db.clone(),
         artifacts.clone(),
     ));
@@ -37,7 +37,7 @@ async fn test_forge_e2e_full_lifecycle() {
         db.clone(),
         artifacts.clone(),
     ));
-    let cargo = Arc::new(spine_api::packages::CargoRegistryAdapter::new(
+    let _cargo = Arc::new(spine_api::packages::CargoRegistryAdapter::new(
         packages.clone(),
     ));
 

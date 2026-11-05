@@ -5,6 +5,7 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::core::error::ForgeError;
+use crate::core::profile::DeploymentProfile;
 use crate::core::types::{
     RunnerRegistration, WorkflowJob, WorkflowLogChunk, WorkflowSecret, WorkflowStep,
 };
@@ -14,11 +15,21 @@ use crate::workflow::WorkflowScheduler;
 pub struct RunnerService {
     db: Arc<dyn Database>,
     scheduler: WorkflowScheduler,
+    pub profile: DeploymentProfile,
 }
 
 impl RunnerService {
     pub fn new(db: Arc<dyn Database>, scheduler: WorkflowScheduler) -> Self {
-        Self { db, scheduler }
+        Self {
+            db,
+            scheduler,
+            profile: DeploymentProfile::CoreForge,
+        }
+    }
+
+    pub fn with_profile(mut self, profile: DeploymentProfile) -> Self {
+        self.profile = profile;
+        self
     }
 
     /// Register a new build runner and generate a one-time CSPRNG authentication token.
@@ -31,6 +42,17 @@ impl RunnerService {
         labels: Vec<String>,
         max_concurrency: i32,
     ) -> Result<(RunnerRegistration, String), ForgeError> {
+        if !self.profile.allow_untrusted_ci() {
+            let has_untrusted_labels = labels.iter().any(|l| {
+                let lower = l.to_ascii_lowercase();
+                lower == "untrusted" || lower == "shared" || lower == "public"
+            });
+            if has_untrusted_labels {
+                return Err(ForgeError::Forbidden(
+                    "Untrusted or shared runner registration is disallowed under deployment profile 'core-forge-v1'".to_string()
+                ));
+            }
+        }
         let mut raw_token_bytes = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut raw_token_bytes);
         let raw_token = format!("spr_{}", hex::encode(raw_token_bytes));
@@ -137,8 +159,22 @@ impl RunnerService {
             let run = self.db.get_workflow_run(&job.run_id).await?;
             let is_fork_or_untrusted_pr = run
                 .as_ref()
-                .map(|r| r.trigger_event == "pull_request_fork" || r.trigger_event == "fork")
+                .map(|r| {
+                    r.trigger_event == "pull_request_fork"
+                        || r.trigger_event == "fork"
+                        || r.trigger_event.starts_with("untrusted")
+                })
                 .unwrap_or(false);
+
+            if is_fork_or_untrusted_pr && !self.profile.allow_untrusted_ci() {
+                tracing::warn!(
+                    "Runner {} attempted to acquire untrusted job {}, but untrusted CI is disabled under profile '{}'",
+                    runner_id,
+                    job.id,
+                    self.profile.name()
+                );
+                continue;
+            }
 
             let secrets = if is_fork_or_untrusted_pr {
                 // Forked pull-request workflows must not receive repository or organization secrets by default

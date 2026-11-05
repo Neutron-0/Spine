@@ -70,9 +70,9 @@ async fn test_issue_capability_ticket_api_route() {
     let db = Arc::new(InMemoryDatabase::new());
     let perms = Arc::new(PermissionService::new(db.clone()));
     let repos = Arc::new(RepositoryService::new(db.clone(), perms.clone()));
-    let vcs = Arc::new(NativeVcsService::new(tmp.path().to_path_buf()));
-    let rate_limiter = Arc::new(RateLimiter::new());
-    let mail = Arc::new(DevMailCatcher::new());
+    let _vcs = Arc::new(NativeVcsService::new(tmp.path()));
+    let _rate_limiter = Arc::new(RateLimiter::new());
+    let _mail = Arc::new(DevMailCatcher::new());
 
     let artifact_store =
         Arc::new(spine_artifact::LocalArtifactStore::new(tmp.path().join("artifacts")).unwrap());
@@ -80,7 +80,7 @@ async fn test_issue_capability_ticket_api_route() {
         db.clone(),
         artifact_store,
     ));
-    let releases = Arc::new(spine_api::releases::ReleaseService::new(
+    let _releases = Arc::new(spine_api::releases::ReleaseService::new(
         db.clone(),
         artifacts.clone(),
     ));
@@ -88,7 +88,7 @@ async fn test_issue_capability_ticket_api_route() {
         db.clone(),
         artifacts.clone(),
     ));
-    let cargo = Arc::new(spine_api::packages::CargoRegistryAdapter::new(
+    let _cargo = Arc::new(spine_api::packages::CargoRegistryAdapter::new(
         packages.clone(),
     ));
 

@@ -49,37 +49,28 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
 ];
 
 // 64-bit advisory lock ID representing "SPINEMIG" (0x5350494E454D4947)
-const SPINE_MIGRATION_ADVISORY_LOCK_ID: i64 = 0x5350_494E_454D_4947;
+pub const SPINE_MIGRATION_ADVISORY_LOCK_ID: i64 = 0x5350_494E_454D_4947;
 
 pub async fn run_migrations(pool: &PgPool) -> Result<(), ForgeError> {
-    // Acquire a single dedicated connection so the session-level advisory lock stays held
-    let mut conn = pool.acquire().await.map_err(|e| {
-        ForgeError::Internal(format!("Failed to acquire connection for migrations: {}", e))
+    let mut tx = pool.begin().await.map_err(|e| {
+        ForgeError::Internal(format!("Failed to begin transaction for migrations: {}", e))
     })?;
 
-    // Acquire session-level advisory lock to serialize concurrent API startup migrations
-    tracing::info!("Acquiring cluster-wide schema migration advisory lock...");
-    sqlx::query("SELECT pg_advisory_lock($1)")
+    // Acquire transaction-scoped advisory lock (pg_advisory_xact_lock) to serialize concurrent API
+    // startup migrations. This is automatically and instantly released when the transaction commits,
+    // aborts, or is dropped upon future cancellation.
+    tracing::info!("Acquiring cluster-wide schema migration transaction advisory lock...");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(SPINE_MIGRATION_ADVISORY_LOCK_ID)
-        .execute(&mut *conn)
+        .execute(&mut *tx)
         .await
-        .map_err(|e| ForgeError::Internal(format!("Failed to acquire migration advisory lock: {}", e)))?;
+        .map_err(|e| {
+            ForgeError::Internal(format!(
+                "Failed to acquire migration transaction advisory lock: {}",
+                e
+            ))
+        })?;
 
-    let res = run_migrations_inner(pool, &mut conn).await;
-
-    // Release advisory lock
-    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(SPINE_MIGRATION_ADVISORY_LOCK_ID)
-        .execute(&mut *conn)
-        .await;
-
-    res
-}
-
-async fn run_migrations_inner(
-    pool: &PgPool,
-    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
-) -> Result<(), ForgeError> {
     // 1. Create _schema_migrations tracking table if not exists
     sqlx::query(
         r#"
@@ -89,25 +80,28 @@ async fn run_migrations_inner(
         )
         "#,
     )
-    .execute(&mut **conn)
+    .execute(&mut *tx)
     .await
-    .map_err(|e| ForgeError::Internal(format!("Failed to create _schema_migrations table: {}", e)))?;
+    .map_err(|e| {
+        ForgeError::Internal(format!("Failed to create _schema_migrations table: {}", e))
+    })?;
 
-    // 2. Sequentially apply pending migrations within a transaction per migration
+    // 2. Sequentially apply pending migrations within this transaction
     for (name, sql) in MIGRATIONS {
-        let exists: (bool,) = sqlx::query_as(
-            "SELECT EXISTS(SELECT 1 FROM _schema_migrations WHERE version = $1)",
-        )
-        .bind(name)
-        .fetch_one(&mut **conn)
-        .await
-        .map_err(|e| ForgeError::Internal(format!("Failed to check migration status for {}: {}", name, e)))?;
+        let exists: (bool,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM _schema_migrations WHERE version = $1)")
+                .bind(name)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| {
+                    ForgeError::Internal(format!(
+                        "Failed to check migration status for {}: {}",
+                        name, e
+                    ))
+                })?;
 
         if !exists.0 {
             tracing::info!("Applying migration {}...", name);
-            let mut tx = pool.begin().await.map_err(|e| {
-                ForgeError::Internal(format!("Failed to begin migration transaction for {}: {}", name, e))
-            })?;
 
             // Execute DDL batch
             sqlx::raw_sql(sql)
@@ -116,19 +110,25 @@ async fn run_migrations_inner(
                 .map_err(|e| ForgeError::Internal(format!("Migration {} failed: {}", name, e)))?;
 
             let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-            sqlx::query("INSERT INTO _schema_migrations (version, applied_at_nanos) VALUES ($1, $2)")
-                .bind(name)
-                .bind(now)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| ForgeError::Internal(format!("Failed to record migration {}: {}", name, e)))?;
-
-            tx.commit().await.map_err(|e| {
-                ForgeError::Internal(format!("Failed to commit migration transaction for {}: {}", name, e))
+            sqlx::query(
+                "INSERT INTO _schema_migrations (version, applied_at_nanos) VALUES ($1, $2)",
+            )
+            .bind(name)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                ForgeError::Internal(format!("Failed to record migration {}: {}", name, e))
             })?;
+
             tracing::info!("Migration {} applied successfully.", name);
         }
     }
 
+    tx.commit().await.map_err(|e| {
+        ForgeError::Internal(format!("Failed to commit migration transaction: {}", e))
+    })?;
+
+    tracing::info!("All schema migrations applied and transaction committed.");
     Ok(())
 }

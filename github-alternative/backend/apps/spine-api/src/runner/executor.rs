@@ -27,10 +27,13 @@ pub struct StepExecutionResult {
     pub timed_out: bool,
 }
 
+use crate::core::profile::DeploymentProfile;
+
 pub struct IsolatedRunnerExecutor {
     workspace_root: PathBuf,
     default_timeout: Duration,
     sandbox_mode: RunnerSandboxMode,
+    pub profile: DeploymentProfile,
 }
 
 impl IsolatedRunnerExecutor {
@@ -39,7 +42,13 @@ impl IsolatedRunnerExecutor {
             workspace_root,
             default_timeout: Duration::from_secs(60),
             sandbox_mode: RunnerSandboxMode::TrustedLocalDevelopment,
+            profile: DeploymentProfile::CoreForge,
         }
+    }
+
+    pub fn with_profile(mut self, profile: DeploymentProfile) -> Self {
+        self.profile = profile;
+        self
     }
 
     pub fn with_sandbox_mode(mut self, mode: RunnerSandboxMode) -> Self {
@@ -72,6 +81,19 @@ impl IsolatedRunnerExecutor {
         secrets: &[WorkflowSecret],
         is_untrusted: bool,
     ) -> (i32, Vec<StepExecutionResult>) {
+        if is_untrusted && !self.profile.allow_untrusted_ci() {
+            return (
+                1,
+                vec![StepExecutionResult {
+                    step_index: 0,
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: "SECURITY ERROR: Untrusted workflow execution is strictly disabled on this deployment profile ('core-forge-v1').".to_string(),
+                    timed_out: false,
+                }],
+            );
+        }
+
         if is_untrusted && self.sandbox_mode == RunnerSandboxMode::Unsandboxed {
             return (
                 1,

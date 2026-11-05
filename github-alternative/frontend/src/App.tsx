@@ -2739,6 +2739,17 @@ index = "sparse+http://127.0.0.1:3000/index/"
       {/* ---------------------------------------------------------------------- */}
       {activeTab === 'actions' && selectedRepo && (
         <div>
+          <div style={{ background: '#161b22', border: '1px solid #30363d', borderLeft: '4px solid #58a6ff', padding: '0.75rem 1rem', borderRadius: '6px', marginBottom: '1rem', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <div>
+              <span style={{ fontWeight: 600, color: '#f0f6fc' }}>Core Forge Workflow Security Policy</span>
+              <span style={{ marginLeft: '0.75rem', fontSize: '0.85rem', color: '#8b949e' }}>
+                Untrusted CI execution (fork pull-requests, external workflows) is strictly disabled under deployment profile <code>core-forge-v1</code>.
+              </span>
+            </div>
+            <span style={{ background: '#238636', color: '#ffffff', fontSize: '0.75rem', padding: '2px 8px', borderRadius: '12px', fontWeight: 600 }}>
+              Enforced: core-forge-v1
+            </span>
+          </div>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
             <div>
               <h3 style={{ margin: 0 }}>⚙️ Workflows & CI/CD Automation</h3>
@@ -3137,6 +3148,17 @@ index = "sparse+http://127.0.0.1:3000/index/"
       {/* ---------------------------------------------------------------------- */}
       {activeTab === 'runners' && (
         <div>
+          <div style={{ background: '#161b22', border: '1px solid #30363d', borderLeft: '4px solid #58a6ff', padding: '0.75rem 1rem', borderRadius: '6px', marginBottom: '1rem', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <div>
+              <span style={{ fontWeight: 600, color: '#f0f6fc' }}>Core Forge Runner Policy</span>
+              <span style={{ marginLeft: '0.75rem', fontSize: '0.85rem', color: '#8b949e' }}>
+                Untrusted and public/shared runner registration is strictly prohibited under deployment profile <code>core-forge-v1</code>.
+              </span>
+            </div>
+            <span style={{ background: '#238636', color: '#ffffff', fontSize: '0.75rem', padding: '2px 8px', borderRadius: '12px', fontWeight: 600 }}>
+              Enforced: core-forge-v1
+            </span>
+          </div>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
             <div>
               <h3 style={{ margin: 0 }}>🏃 Self-Hosted Build Runners</h3>

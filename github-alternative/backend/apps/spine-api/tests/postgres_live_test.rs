@@ -182,13 +182,9 @@ async fn test_postgres_live_identity_and_auth_lifecycle() {
 
     // Email Tokens
     let email_token_hash = format!("email_tok_{}", &uid[..8]);
-    db.create_email_token(
-        &email_token_hash,
-        &uid,
-        now + 3600 * 1_000_000_000,
-    )
-    .await
-    .expect("create email token");
+    db.create_email_token(&email_token_hash, &uid, now + 3600 * 1_000_000_000)
+        .await
+        .expect("create email token");
 
     let consumed_uid = db
         .consume_email_token(&email_token_hash, now)
@@ -301,11 +297,12 @@ async fn test_postgres_live_repository_and_permissions() {
 
     // SSH Deploy Keys
     let deploy_key_id = Uuid::new_v4().to_string();
+    let fp = format!("SHA256:deploykey_{}", Uuid::new_v4().simple());
     let deploy_key = DeployKey {
         id: deploy_key_id.clone(),
         repository_id: repo_id.clone(),
         title: "Deployment Bot".to_string(),
-        fingerprint: "SHA256:deploykeyfingerprint123".to_string(),
+        fingerprint: fp.clone(),
         public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGenTestKey123".to_string(),
         key_type: "ed25519".to_string(),
         write_enabled: false,
@@ -318,7 +315,7 @@ async fn test_postgres_live_repository_and_permissions() {
         .await
         .expect("create deploy key");
     let fetched_dk = db
-        .get_deploy_key_by_fingerprint("SHA256:deploykeyfingerprint123")
+        .get_deploy_key_by_fingerprint(&fp)
         .await
         .expect("get deploy key")
         .unwrap();
@@ -354,9 +351,7 @@ async fn test_postgres_live_repository_and_permissions() {
     assert_eq!(locks.len(), 1);
     assert_eq!(locks[0].path, "assets/model.bin");
 
-    db.delete_lfs_lock(&lock_id)
-        .await
-        .expect("delete lfs lock");
+    db.delete_lfs_lock(&lock_id).await.expect("delete lfs lock");
     let (locks_after, _) = db
         .list_lfs_locks(&repo_id, None, None, None)
         .await
@@ -368,7 +363,9 @@ async fn test_postgres_live_repository_and_permissions() {
 async fn test_postgres_live_persistence_across_connections() {
     let url = get_db_url();
     // Ensure migrations are applied
-    PgDatabase::connect_and_migrate(&url).await.expect("initial connect and migrate");
+    PgDatabase::connect_and_migrate(&url)
+        .await
+        .expect("initial connect and migrate");
 
     let uid = Uuid::new_v4().to_string();
     let username = format!("persist_{}", &uid[..8]);

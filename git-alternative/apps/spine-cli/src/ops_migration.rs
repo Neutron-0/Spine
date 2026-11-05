@@ -76,7 +76,11 @@ pub enum MigrateAction {
 
 pub fn handle_import(action: ImportAction) -> Result<()> {
     match action {
-        ImportAction::Git { source, bare, dry_run } => {
+        ImportAction::Git {
+            source,
+            bare,
+            dry_run,
+        } => {
             println!("==> Inspecting Git repository at: {}", source.display());
             let inspection = MigrationEngine::inspect(&source)?;
             println!(
@@ -91,7 +95,11 @@ pub fn handle_import(action: ImportAction) -> Result<()> {
 
             let current_dir = std::env::current_dir()?;
             let spine_dir = current_dir.join(".spine");
-            let worktree_dir = if bare { None } else { Some(current_dir.clone()) };
+            let worktree_dir = if bare {
+                None
+            } else {
+                Some(current_dir.clone())
+            };
 
             println!("==> Importing Git objects into Spine CAS...");
             let mut importer = GitImporter::new(&source, &spine_dir, worktree_dir)?;
@@ -169,11 +177,21 @@ pub fn handle_migrate(action: MigrateAction) -> Result<()> {
             println!("  [Stage 3] Tree hierarchy transformation and canonical sorting");
             println!("  [Stage 4] Commit DAG mapping, author normalization & topological order");
             println!("  [Stage 5] Reference heads, tags, and HEAD synchronization");
-            println!("  [Stage 6] Platform metadata ingestion with safe ghost/tombstone attribution");
+            println!(
+                "  [Stage 6] Platform metadata ingestion with safe ghost/tombstone attribution"
+            );
             println!("  [Stage 7] Post-migration integrity verification & fsck audit");
         }
-        MigrateAction::Run { source, target, dry_run } => {
-            println!("==> Beginning migration: {} -> {}", source.display(), target.display());
+        MigrateAction::Run {
+            source,
+            target,
+            dry_run,
+        } => {
+            println!(
+                "==> Beginning migration: {} -> {}",
+                source.display(),
+                target.display()
+            );
             let policy = AttributionPolicy::default();
             let report = MigrationEngine::run_git_import(&source, &target, policy, dry_run)?;
 
@@ -208,10 +226,17 @@ pub fn handle_migrate(action: MigrateAction) -> Result<()> {
                     3,
                 )?;
                 let objects = spine_object_store::ObjectStore::list_objects(&store)?;
-                println!("    All {} objects verified cryptographically.", objects.len());
+                println!(
+                    "    All {} objects verified cryptographically.",
+                    objects.len()
+                );
             } else if repo.join(".git").exists() || repo.join("objects").exists() {
                 println!("    Detected Git repository layout.");
-                let git_dir = if repo.join(".git").exists() { repo.join(".git") } else { repo };
+                let git_dir = if repo.join(".git").exists() {
+                    repo.join(".git")
+                } else {
+                    repo
+                };
                 let refs = spine_migration::git_format::read_git_refs(&git_dir)?;
                 println!(
                     "    Verified {} branches and {} tags.",
@@ -219,7 +244,10 @@ pub fn handle_migrate(action: MigrateAction) -> Result<()> {
                     refs.tags.len()
                 );
             } else {
-                bail!("No recognized version-control repository at {}", repo.display());
+                bail!(
+                    "No recognized version-control repository at {}",
+                    repo.display()
+                );
             }
             println!("==> Verification Passed with Zero Errors.");
         }

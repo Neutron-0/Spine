@@ -141,6 +141,8 @@ pub struct DurabilityVerificationReport {
     pub node_generations: HashMap<String, u64>,
 }
 
+pub type InspectRepoResult = Result<(u64, Vec<String>, bool), WritePipelineError>;
+
 /// Abstraction for communicating with storage nodes (over TCP RPC or local memory/filesystem).
 pub trait StorageDispatcher: Send + Sync {
     #[allow(clippy::too_many_arguments)]
@@ -180,9 +182,7 @@ pub trait StorageDispatcher: Send + Sync {
         &'a self,
         node_id: &'a str,
         repo_id: &'a str,
-    ) -> Pin<
-        Box<dyn Future<Output = Result<(u64, Vec<String>, bool), WritePipelineError>> + Send + 'a>,
-    >;
+    ) -> Pin<Box<dyn Future<Output = InspectRepoResult> + Send + 'a>>;
 }
 
 /// Network-based storage dispatcher communicating over SPWP / Cluster TCP RPC.

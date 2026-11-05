@@ -11,8 +11,7 @@ use spine_core::{HashAlgorithm, ObjectId};
 use spine_history::is_ancestor;
 use spine_migration::{
     advertise_refs_receive_pack, advertise_refs_upload_pack, format_receive_pack_response,
-    handle_upload_pack_request, parse_receive_pack_request, unpack_and_ingest_receive_pack,
-    GitOid,
+    handle_upload_pack_request, parse_receive_pack_request, unpack_and_ingest_receive_pack, GitOid,
 };
 use spine_object_store::CompositeObjectStore;
 use std::fs;
@@ -80,7 +79,10 @@ pub async fn authenticate_git_user(
 ) -> Option<crate::core::types::User> {
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
-    if let Some(auth_val) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+    if let Some(auth_val) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
         let auth_str = auth_val.trim();
         if let Some(basic_part) = auth_str.strip_prefix("Basic ") {
             if let Some((username, password)) = parse_basic_auth(basic_part) {
@@ -247,17 +249,22 @@ pub async fn git_info_refs(
     let caller = authenticate_git_user(&state, &headers).await;
 
     // Resolve repository
-    let repo = match state.db.get_repository_by_owner_name(&owner, repo_name).await {
+    let repo = match state
+        .db
+        .get_repository_by_owner_name(&owner, repo_name)
+        .await
+    {
         Ok(Some(r)) => r,
         _ => return (StatusCode::NOT_FOUND, "Repository not found\n").into_response(),
     };
 
     if service == "git-upload-pack" {
         // Read access check
-        if let Err(_) = state
+        if state
             .permissions
             .check_read_access(caller.as_ref(), &repo)
             .await
+            .is_err()
         {
             if caller.is_none() {
                 return unauthorized_response();
@@ -355,15 +362,20 @@ pub async fn git_upload_pack(
     let repo_name = repo_git.strip_suffix(".git").unwrap_or(&repo_git);
     let caller = authenticate_git_user(&state, &headers).await;
 
-    let repo = match state.db.get_repository_by_owner_name(&owner, repo_name).await {
+    let repo = match state
+        .db
+        .get_repository_by_owner_name(&owner, repo_name)
+        .await
+    {
         Ok(Some(r)) => r,
         _ => return (StatusCode::NOT_FOUND, "Repository not found\n").into_response(),
     };
 
-    if let Err(_) = state
+    if state
         .permissions
         .check_read_access(caller.as_ref(), &repo)
         .await
+        .is_err()
     {
         if caller.is_none() {
             return unauthorized_response();
@@ -400,6 +412,15 @@ pub async fn git_receive_pack(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if state.consistency_barrier.is_maintenance_active() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "5")],
+            "Maintenance in progress. Backups active, repository writes temporarily drained.\n",
+        )
+            .into_response();
+    }
+
     if let Err(resp) = crate::api::routes_lfs::check_transport_security(&state, &headers) {
         return resp;
     }
@@ -410,7 +431,11 @@ pub async fn git_receive_pack(
         None => return unauthorized_response(),
     };
 
-    let repo = match state.db.get_repository_by_owner_name(&owner, repo_name).await {
+    let repo = match state
+        .db
+        .get_repository_by_owner_name(&owner, repo_name)
+        .await
+    {
         Ok(Some(r)) => r,
         _ => return (StatusCode::NOT_FOUND, "Repository not found\n").into_response(),
     };
@@ -486,11 +511,18 @@ pub fn collect_changed_paths_from_commits<S: spine_object_store::ObjectStore>(
             }
         } else {
             for parent_id in &commit.parents {
-                if let Ok((spine_core::ObjectType::Commit, payload)) = store.read_object(parent_id) {
+                if let Ok((spine_core::ObjectType::Commit, payload)) = store.read_object(parent_id)
+                {
                     if let Ok(parent_commit) = spine_format::deserialize_commit(&payload) {
                         let mut parent_tree_files = std::collections::BTreeMap::new();
-                        let _ = flatten_tree_recursive(store, &parent_commit.root_tree, "", &mut parent_tree_files);
-                        let diff = spine_diff::compare_trees(&parent_tree_files, &commit_tree_files);
+                        let _ = flatten_tree_recursive(
+                            store,
+                            &parent_commit.root_tree,
+                            "",
+                            &mut parent_tree_files,
+                        );
+                        let diff =
+                            spine_diff::compare_trees(&parent_tree_files, &commit_tree_files);
                         for change in diff {
                             paths.insert(change.path().to_string());
                         }
@@ -677,7 +709,8 @@ pub async fn process_git_receive_pack(
 
         // CAS Validation against cmd.old_oid
         if cmd.old_oid != GitOid::zero() {
-            let current_git_oid = current_spine_id.and_then(|sid| ingest_res.spine_to_git.get(&sid).copied());
+            let current_git_oid =
+                current_spine_id.and_then(|sid| ingest_res.spine_to_git.get(&sid).copied());
             if let Some(cur_git) = current_git_oid {
                 if cur_git != cmd.old_oid {
                     ref_results.push((
@@ -752,7 +785,10 @@ pub async fn process_git_receive_pack(
             }
 
             // Ensure HEAD is updated if updating main branch or default branch
-            if branch_name == repo.default_branch || branch_name == "main" || branch_name == "master" {
+            if branch_name == repo.default_branch
+                || branch_name == "main"
+                || branch_name == "master"
+            {
                 let head_file = spine_dir.join("HEAD");
                 let symref_target = format!("ref: refs/heads/{}\n", branch_name);
                 let _ = fs::write(head_file, symref_target);

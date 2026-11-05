@@ -262,8 +262,12 @@ pub fn extract_tar_secure<P: AsRef<Path>, D: AsRef<Path>>(
             if let Ok(Some(link_target)) = entry.link_name() {
                 let link_target_str = link_target.to_string_lossy().to_string();
                 let norm_link = link_target_str.replace('\\', "/");
-                if norm_link.starts_with('/') || norm_link.contains(':') || norm_link.contains("..") {
-                    return Err(ArchiveSecurityError::LinkEscapeAttempt(name_str, link_target_str));
+                if norm_link.starts_with('/') || norm_link.contains(':') || norm_link.contains("..")
+                {
+                    return Err(ArchiveSecurityError::LinkEscapeAttempt(
+                        name_str,
+                        link_target_str,
+                    ));
                 }
             }
         }

@@ -249,9 +249,13 @@ mod tests {
 
         // Phase 3: Cargo crate also deleted (m2 omitted). Only m3 active.
         // Chunks A, B, C become candidates. Only D is preserved.
-        let rep3 =
-            ArtifactGcCollector::collect_garbage(&store, &[m3_id.clone()], &all_chunks, false)
-                .unwrap();
+        let rep3 = ArtifactGcCollector::collect_garbage(
+            &store,
+            std::slice::from_ref(&m3_id),
+            &all_chunks,
+            false,
+        )
+        .unwrap();
         assert_eq!(rep3.reachable_chunks, 1); // Only D
         assert_eq!(rep3.candidate_chunks, 3); // A, B, C
         assert_eq!(

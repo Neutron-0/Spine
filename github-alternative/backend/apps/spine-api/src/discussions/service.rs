@@ -100,6 +100,7 @@ impl DiscussionService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_category(
         &self,
         actor_id: &str,
@@ -251,6 +252,7 @@ impl DiscussionService {
         Ok(dtos)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_discussion(
         &self,
         actor_id: &str,

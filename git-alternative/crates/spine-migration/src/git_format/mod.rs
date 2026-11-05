@@ -10,9 +10,7 @@ pub mod tree;
 
 pub use commit::{parse_git_commit, serialize_git_commit, GitCommit};
 pub use delta::{apply_delta, create_delta, DeltaError};
-pub use loose::{
-    parse_loose_object, serialize_loose_object, GitObjectType, LooseObjectError,
-};
+pub use loose::{parse_loose_object, serialize_loose_object, GitObjectType, LooseObjectError};
 pub use oid::{GitOid, GitOidError};
 pub use pack::{parse_packfile, parse_packfile_with_resolver, PackParseError, ParsedPackObject};
 pub use pack_builder::{build_pack_and_index, PackBuildError, PackObjectToBuild};

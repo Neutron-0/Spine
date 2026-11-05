@@ -4,6 +4,7 @@ use crate::auth::pat::hash_pat;
 use crate::auth::rate_limit::RateLimiter;
 use crate::auth::session::hash_session_token;
 use crate::coordinator::CoordinatorClient;
+use crate::core::profile::DeploymentProfile;
 use crate::core::types::*;
 use crate::db::Database;
 use crate::packages::{CargoRegistryAdapter, PackageService};
@@ -21,6 +22,7 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct AppState {
+    pub profile: DeploymentProfile,
     pub db: Arc<dyn Database>,
     pub permissions: Arc<PermissionService>,
     pub repositories: Arc<RepositoryService>,
@@ -43,6 +45,7 @@ pub struct AppState {
     pub discovery: Arc<crate::discovery::DiscoveryService>,
     pub security: Arc<crate::security::SecurityService>,
     pub public_origin: String,
+    pub consistency_barrier: Arc<crate::backup::ConsistencyBarrier>,
 }
 
 impl AppState {
@@ -56,6 +59,15 @@ impl AppState {
     }
 
     pub fn new_with_defaults(
+        db: Arc<dyn Database>,
+        storage_root: &std::path::Path,
+        coordinator: Option<CoordinatorClient>,
+    ) -> Result<Self, anyhow::Error> {
+        Self::new_with_profile(DeploymentProfile::CoreForge, db, storage_root, coordinator)
+    }
+
+    pub fn new_with_profile(
+        profile: DeploymentProfile,
         db: Arc<dyn Database>,
         storage_root: &std::path::Path,
         coordinator: Option<CoordinatorClient>,
@@ -87,22 +99,22 @@ impl AppState {
             Arc::clone(&db),
             ssrf,
         ));
-        let scheduler = Arc::new(crate::workflow::WorkflowScheduler::new(
-            Arc::clone(&db),
-            Some((*webhooks).clone()),
-        ));
-        let workflows = Arc::new(crate::workflow::WorkflowService::new(
-            Arc::clone(&db),
-            Some((*webhooks).clone()),
-        ));
-        let runners = Arc::new(crate::runner::RunnerService::new(
-            Arc::clone(&db),
-            (*scheduler).clone(),
-        ));
+        let scheduler = Arc::new(
+            crate::workflow::WorkflowScheduler::new(Arc::clone(&db), Some((*webhooks).clone()))
+                .with_profile(profile),
+        );
+        let workflows = Arc::new(
+            crate::workflow::WorkflowService::new(Arc::clone(&db), Some((*webhooks).clone()))
+                .with_profile(profile),
+        );
+        let runners = Arc::new(
+            crate::runner::RunnerService::new(Arc::clone(&db), (*scheduler).clone())
+                .with_profile(profile),
+        );
         let runner_workspace_root = storage_root.join("runner_workspaces");
-        let runner_executor = Arc::new(crate::runner::IsolatedRunnerExecutor::new(
-            runner_workspace_root,
-        ));
+        let runner_executor = Arc::new(
+            crate::runner::IsolatedRunnerExecutor::new(runner_workspace_root).with_profile(profile),
+        );
 
         let search = Arc::new(crate::search::SearchService::new(
             Arc::clone(&db),
@@ -128,7 +140,10 @@ impl AppState {
             .or_else(|_| std::env::var("APP_URL"))
             .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
 
+        let consistency_barrier = Arc::new(crate::backup::ConsistencyBarrier::new());
+
         Ok(Self {
+            profile,
             db,
             permissions,
             repositories,
@@ -151,6 +166,7 @@ impl AppState {
             discovery,
             security,
             public_origin,
+            consistency_barrier,
         })
     }
 }
@@ -184,11 +200,9 @@ pub async fn auth_middleware(
         .and_then(|cookies| {
             cookies.split(';').find_map(|c| {
                 let trimmed = c.trim();
-                if let Some(tok) = trimmed.strip_prefix("spine_session=") {
-                    Some(tok.trim().to_string())
-                } else {
-                    None
-                }
+                trimmed
+                    .strip_prefix("spine_session=")
+                    .map(|tok| tok.trim().to_string())
             })
         });
 

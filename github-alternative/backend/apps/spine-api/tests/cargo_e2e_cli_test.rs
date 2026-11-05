@@ -25,14 +25,14 @@ async fn test_live_cargo_cli_publish_against_spine_api() {
 
     let db = Arc::new(InMemoryDatabase::new());
     let perms = Arc::new(PermissionService::new(db.clone()));
-    let repos = Arc::new(RepositoryService::new(db.clone(), perms.clone()));
-    let vcs = Arc::new(NativeVcsService::new(storage_root.clone()));
-    let rate_limiter = Arc::new(RateLimiter::new());
-    let mail = Arc::new(DevMailCatcher::new());
+    let _repos = Arc::new(RepositoryService::new(db.clone(), perms.clone()));
+    let _vcs = Arc::new(NativeVcsService::new(storage_root.clone()));
+    let _rate_limiter = Arc::new(RateLimiter::new());
+    let _mail = Arc::new(DevMailCatcher::new());
 
     let artifact_store = Arc::new(LocalArtifactStore::new(storage_root.join("artifacts")).unwrap());
     let artifacts = Arc::new(ArtifactService::new(db.clone(), artifact_store));
-    let releases = Arc::new(ReleaseService::new(db.clone(), artifacts.clone()));
+    let _releases = Arc::new(ReleaseService::new(db.clone(), artifacts.clone()));
     let packages = Arc::new(PackageService::new(db.clone(), artifacts.clone()));
     let cargo = Arc::new(CargoRegistryAdapter::new(packages.clone()));
 
@@ -199,17 +199,16 @@ index = "sparse+http://127.0.0.1:{}/index/"
     fs::create_dir_all(&consumer_src).unwrap();
     fs::create_dir_all(&consumer_cargo).unwrap();
 
-    let consumer_cargo_toml = format!(
-        r#"
+    let consumer_cargo_toml = r#"
 [package]
 name = "spine-consumer-app"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-spine-test-crate = {{ version = "0.1.0", registry = "spine-live" }}
+spine-test-crate = { version = "0.1.0", registry = "spine-live" }
 "#
-    );
+    .to_string();
     fs::write(consumer_dir.join("Cargo.toml"), consumer_cargo_toml).unwrap();
     fs::write(
         consumer_src.join("main.rs"),

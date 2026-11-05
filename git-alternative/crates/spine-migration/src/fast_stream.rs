@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, Write};
 use thiserror::Error;
 
 #[derive(Error, Debug)]

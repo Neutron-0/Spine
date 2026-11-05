@@ -61,6 +61,7 @@ impl DiscoveryService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_user_profile(
         &self,
         actor_id: &str,
@@ -129,10 +130,9 @@ impl DiscoveryService {
             if clean
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                && !normalized.contains(&clean)
             {
-                if !normalized.contains(&clean) {
-                    normalized.push(clean);
-                }
+                normalized.push(clean);
             }
         }
 
@@ -188,7 +188,7 @@ impl DiscoveryService {
             });
         }
 
-        results.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+        results.sort_by_key(|b| std::cmp::Reverse(b.bytes));
         self.db.set_repository_languages(repo_id, &results).await
     }
 
@@ -257,7 +257,7 @@ impl DiscoveryService {
             });
         }
 
-        cards.sort_by(|a, b| b.updated_at_nanos.cmp(&a.updated_at_nanos));
+        cards.sort_by_key(|b| std::cmp::Reverse(b.updated_at_nanos));
         Ok(cards)
     }
 }

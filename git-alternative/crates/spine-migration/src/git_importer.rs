@@ -1,14 +1,14 @@
 use crate::git_format::{
     parse_git_commit, parse_git_tag, parse_git_tree, parse_loose_object, parse_packfile,
-    read_git_refs, GitHead, GitObjectType, GitOid, GitRefMap,
+    read_git_refs, GitHead, GitObjectType, GitOid,
 };
 use crate::lfs_interop::GitLfsPointer;
 use spine_core::{AnnotatedTag, Commit, FileMode, HashAlgorithm, ObjectId, ObjectType, TreeEntry};
 use spine_format::{serialize_annotated_tag, serialize_commit, serialize_tree};
 use spine_object_store::{FileSystemObjectStore, ObjectStore};
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::collections::HashMap;
+use std::fs::{self};
+use std::io;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -16,7 +16,9 @@ use thiserror::Error;
 pub enum GitImportError {
     #[error("I/O error during Git import: {0}")]
     Io(#[from] io::Error),
-    #[error("Invalid Git repository path: neither .git directory nor bare repository found at {0}")]
+    #[error(
+        "Invalid Git repository path: neither .git directory nor bare repository found at {0}"
+    )]
     NotAGitRepository(PathBuf),
     #[error("Git format parsing error: {0}")]
     GitFormat(String),
@@ -124,7 +126,7 @@ impl GitImporter {
             for entry in fs::read_dir(&pack_dir)? {
                 let entry = entry?;
                 let path = entry.path();
-                if path.is_file() && path.extension().map_or(false, |ext| ext == "pack") {
+                if path.is_file() && path.extension().is_some_and(|ext| ext == "pack") {
                     let pack_data = fs::read(&path)?;
                     if let Ok(pack_objects) = parse_packfile(&pack_data) {
                         for obj in pack_objects {
@@ -143,11 +145,7 @@ impl GitImporter {
     pub fn execute_import(&mut self) -> Result<ImportStats, GitImportError> {
         let mut stats = ImportStats::default();
 
-        let store = FileSystemObjectStore::new(
-            &self.spine_dir,
-            HashAlgorithm::Blake3,
-            3,
-        )?;
+        let store = FileSystemObjectStore::new(&self.spine_dir, HashAlgorithm::Blake3, 3)?;
 
         // Ensure directories exist
         fs::create_dir_all(self.spine_dir.join("refs").join("heads"))?;
@@ -200,8 +198,8 @@ impl GitImporter {
 
         for oid in tag_oids {
             let (_, payload) = self.raw_objects.get(&oid).unwrap();
-            let git_tag = parse_git_tag(payload)
-                .map_err(|e| GitImportError::GitFormat(e.to_string()))?;
+            let git_tag =
+                parse_git_tag(payload).map_err(|e| GitImportError::GitFormat(e.to_string()))?;
 
             let target_spine_oid = self
                 .git_to_spine
@@ -238,17 +236,13 @@ impl GitImporter {
         }
 
         // 5. Fifth Pass: Import References
-        let refs = read_git_refs(&self.git_dir)
-            .map_err(|e| GitImportError::GitFormat(e.to_string()))?;
+        let refs =
+            read_git_refs(&self.git_dir).map_err(|e| GitImportError::GitFormat(e.to_string()))?;
 
         // Write branches
         for (branch_name, git_oid) in &refs.branches {
             if let Some(&spine_oid) = self.git_to_spine.get(git_oid) {
-                let ref_path = self
-                    .spine_dir
-                    .join("refs")
-                    .join("heads")
-                    .join(branch_name);
+                let ref_path = self.spine_dir.join("refs").join("heads").join(branch_name);
                 if let Some(parent) = ref_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -310,8 +304,8 @@ impl GitImporter {
             .ok_or(GitImportError::UnresolvedOid(oid))?
             .clone();
 
-        let entries = parse_git_tree(&payload)
-            .map_err(|e| GitImportError::GitFormat(e.to_string()))?;
+        let entries =
+            parse_git_tree(&payload).map_err(|e| GitImportError::GitFormat(e.to_string()))?;
 
         let mut spine_entries = Vec::with_capacity(entries.len());
 
@@ -367,8 +361,8 @@ impl GitImporter {
             .ok_or(GitImportError::UnresolvedOid(oid))?
             .clone();
 
-        let git_commit = parse_git_commit(&payload)
-            .map_err(|e| GitImportError::GitFormat(e.to_string()))?;
+        let git_commit =
+            parse_git_commit(&payload).map_err(|e| GitImportError::GitFormat(e.to_string()))?;
 
         // Recursively resolve parents first
         let mut spine_parents = Vec::with_capacity(git_commit.parents.len());

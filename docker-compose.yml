@@ -1,16 +1,32 @@
 version: '3.8'
 
+# ==============================================================================
+# Spine Forge - Production Compose Topology (Hardened & Segregated)
+# Enforces Least Privilege, Internal Network Isolation, and Mandatory Secrets
+# ==============================================================================
+
+networks:
+  # Isolated internal network for sensitive backends (PostgreSQL, Coordinator, Storage)
+  spine-internal:
+    internal: true
+    driver: bridge
+
+  # Public ingress network for API, SSH, and Frontend reverse proxies
+  spine-public:
+    driver: bridge
+
 services:
+  # Internal PostgreSQL Database (No host port exposure)
   postgres:
     image: postgres:16-alpine
     container_name: spine-forge-postgres
     restart: unless-stopped
+    networks:
+      - spine-internal
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-spine_forge}
       POSTGRES_USER: ${POSTGRES_USER:-spine_app}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-spine_secure_db_password_change_me}
-    ports:
-      - "5432:5432"
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?CRITICAL SECURITY ERROR: POSTGRES_PASSWORD environment variable must be set in .env}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -19,28 +35,30 @@ services:
       timeout: 5s
       retries: 5
 
+  # Internal Spine Cluster Coordinator (No host port exposure)
   coordinator:
     build:
       context: .
       dockerfile: git-alternative/Dockerfile.coordinator
     container_name: spine-coordinator
     restart: unless-stopped
-    ports:
-      - "8400:8400"
+    networks:
+      - spine-internal
     environment:
       SPINE_COORDINATOR_PORT: "8400"
       SPINE_STORE_PATH: "/var/lib/spine/coordinator.state"
     volumes:
       - coordinator_data:/var/lib/spine
 
+  # Internal Storage Nodes (Zone-distributed, No host port exposure)
   storage-node-1:
     build:
       context: .
       dockerfile: git-alternative/Dockerfile.storage-node
     container_name: spine-storage-node-1
     restart: unless-stopped
-    ports:
-      - "9101:9101"
+    networks:
+      - spine-internal
     environment:
       SPINE_NODE_ID: "node-1"
       SPINE_ZONE: "zone-a"
@@ -58,8 +76,8 @@ services:
       dockerfile: git-alternative/Dockerfile.storage-node
     container_name: spine-storage-node-2
     restart: unless-stopped
-    ports:
-      - "9102:9102"
+    networks:
+      - spine-internal
     environment:
       SPINE_NODE_ID: "node-2"
       SPINE_ZONE: "zone-b"
@@ -77,8 +95,8 @@ services:
       dockerfile: git-alternative/Dockerfile.storage-node
     container_name: spine-storage-node-3
     restart: unless-stopped
-    ports:
-      - "9103:9103"
+    networks:
+      - spine-internal
     environment:
       SPINE_NODE_ID: "node-3"
       SPINE_ZONE: "zone-c"
@@ -90,12 +108,16 @@ services:
     depends_on:
       - coordinator
 
+  # Public-Facing Spine Forge API & Git-over-SSH Server
   spine-api:
     build:
       context: .
       dockerfile: github-alternative/backend/Dockerfile.api
     container_name: spine-forge-api
     restart: unless-stopped
+    networks:
+      - spine-internal
+      - spine-public
     ports:
       - "3000:3000"
       - "2222:2222"
@@ -103,7 +125,8 @@ services:
       BIND: "0.0.0.0"
       PORT: "3000"
       SSH_PORT: "2222"
-      DATABASE_URL: "postgres://${POSTGRES_USER:-spine_app}:${POSTGRES_PASSWORD:-spine_secure_db_password_change_me}@postgres:5432/${POSTGRES_DB:-spine_forge}"
+      SPINE_DEPLOYMENT_PROFILE: "core-forge-v1"
+      DATABASE_URL: "postgres://${POSTGRES_USER:-spine_app}:${POSTGRES_PASSWORD:?CRITICAL: POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-spine_forge}"
       COORDINATOR_ADDR: "coordinator:8400"
       STORAGE_ROOT: "/var/lib/spine/storage"
       FORGE_PUBLIC_ORIGIN: "${FORGE_PUBLIC_ORIGIN:-http://localhost:3000}"
@@ -122,12 +145,15 @@ services:
       coordinator:
         condition: service_started
 
+  # Web User Interface
   spine-frontend:
     build:
       context: github-alternative/frontend
       dockerfile: Dockerfile
     container_name: spine-forge-frontend
     restart: unless-stopped
+    networks:
+      - spine-public
     ports:
       - "5173:80"
     depends_on:

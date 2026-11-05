@@ -829,6 +829,7 @@ impl NativeVcsService {
 
     /// Performs atomic 3-way merge, creates merge commit, and updates target branch ref
     /// through the Authoritative Distributed Write Pipeline.
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute_merge(
         &self,
         native_repo_id: &str,
@@ -951,7 +952,7 @@ impl NativeVcsService {
 
         // Build genuine .spk packfile and .spidx index for the merge objects
         let mut new_objects = vec![merge_commit_oid, root_tree_oid];
-        for (_p, (_m, oid)) in &merged_map {
+        for (_m, oid) in merged_map.values() {
             new_objects.push(*oid);
         }
         new_objects.sort();

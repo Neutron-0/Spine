@@ -1,14 +1,14 @@
 use crate::git_format::{
-    build_pack_and_index, serialize_git_commit, serialize_git_tag, serialize_git_tree,
-    serialize_loose_object, write_git_refs, GitAnnotatedTag, GitCommit, GitHead, GitObjectType,
-    GitOid, GitRefMap, GitTreeEntry, PackObjectToBuild,
+    serialize_git_commit, serialize_git_tag, serialize_git_tree, serialize_loose_object,
+    write_git_refs, GitAnnotatedTag, GitCommit, GitHead, GitObjectType, GitOid, GitRefMap,
+    GitTreeEntry,
 };
 use spine_core::{FileMode, HashAlgorithm, ObjectId, ObjectType};
-use spine_format::{deserialize_annotated_tag, deserialize_commit, deserialize_tree};
-use spine_object_store::{CompositeObjectStore, FileSystemObjectStore, ObjectStore};
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::{self, Write};
+use spine_format::{deserialize_annotated_tag, deserialize_tree};
+use spine_object_store::{FileSystemObjectStore, ObjectStore};
+use std::collections::HashMap;
+use std::fs::{self};
+use std::io;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -157,7 +157,8 @@ impl GitExporter {
                     let branch_name = entry.file_name().to_string_lossy().to_string();
                     let content = fs::read_to_string(&path)?;
                     if let Ok(spine_id) = ObjectId::from_hex(content.trim()) {
-                        let git_oid = self.export_commit_recursive(&store, &spine_id, &mut stats)?;
+                        let git_oid =
+                            self.export_commit_recursive(&store, &spine_id, &mut stats)?;
                         ref_map.branches.insert(branch_name, git_oid);
                         stats.branches_count += 1;
                     }
@@ -233,7 +234,7 @@ impl GitExporter {
 
         let (_obj_type, payload) = store.read_object(id)?;
         let (compressed, git_oid) = serialize_loose_object(GitObjectType::Blob, &payload)
-            .map_err(|e| GitExportError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+            .map_err(|e| GitExportError::Io(io::Error::other(e.to_string())))?;
 
         self.write_loose_object(git_oid, &compressed)?;
         self.spine_to_git.insert(*id, git_oid);
@@ -253,7 +254,7 @@ impl GitExporter {
             return Ok(existing);
         }
 
-        let (obj_type, payload) = store.read_object(tree_id)?;
+        let (_obj_type, payload) = store.read_object(tree_id)?;
         let entries = deserialize_tree(&payload)?;
 
         let mut git_entries = Vec::with_capacity(entries.len());
@@ -285,8 +286,9 @@ impl GitExporter {
         }
 
         let serialized = serialize_git_tree(git_entries);
-        let (compressed, tree_git_oid) = serialize_loose_object(GitObjectType::Tree, &serialized)
-            .map_err(|e| GitExportError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+        let (compressed, tree_git_oid) =
+            serialize_loose_object(GitObjectType::Tree, &serialized)
+                .map_err(|e| GitExportError::Io(io::Error::other(e.to_string())))?;
 
         self.write_loose_object(tree_git_oid, &compressed)?;
         self.spine_to_git.insert(*tree_id, tree_git_oid);
@@ -339,9 +341,8 @@ impl GitExporter {
 
         let serialized = serialize_git_commit(&git_commit);
         let (compressed, commit_git_oid) =
-            serialize_loose_object(GitObjectType::Commit, &serialized).map_err(|e| {
-                GitExportError::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))
-            })?;
+            serialize_loose_object(GitObjectType::Commit, &serialized)
+                .map_err(|e| GitExportError::Io(io::Error::other(e.to_string())))?;
 
         self.write_loose_object(commit_git_oid, &compressed)?;
         self.spine_to_git.insert(*commit_id, commit_git_oid);
@@ -364,7 +365,8 @@ impl GitExporter {
         let (obj_type, payload) = store.read_object(id)?;
         if obj_type == ObjectType::Tag {
             let spine_tag = deserialize_annotated_tag(&payload)?;
-            let target_git_oid = self.export_commit_recursive(store, &spine_tag.target_object, stats)?;
+            let target_git_oid =
+                self.export_commit_recursive(store, &spine_tag.target_object, stats)?;
 
             let timestamp_secs = spine_tag.timestamp_nanos / 1_000_000_000;
             let tagger_line = format!(
@@ -381,10 +383,8 @@ impl GitExporter {
             };
 
             let serialized = serialize_git_tag(&git_tag);
-            let (compressed, tag_git_oid) =
-                serialize_loose_object(GitObjectType::Tag, &serialized).map_err(|e| {
-                    GitExportError::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))
-                })?;
+            let (compressed, tag_git_oid) = serialize_loose_object(GitObjectType::Tag, &serialized)
+                .map_err(|e| GitExportError::Io(io::Error::other(e.to_string())))?;
 
             self.write_loose_object(tag_git_oid, &compressed)?;
             self.spine_to_git.insert(*id, tag_git_oid);

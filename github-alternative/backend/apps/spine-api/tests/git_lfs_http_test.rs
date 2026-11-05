@@ -18,8 +18,16 @@ fn encode_base64(input: &[u8]) -> String {
     let mut i = 0;
     while i < input.len() {
         let b0 = input[i] as usize;
-        let b1 = if i + 1 < input.len() { input[i + 1] as usize } else { 0 };
-        let b2 = if i + 2 < input.len() { input[i + 2] as usize } else { 0 };
+        let b1 = if i + 1 < input.len() {
+            input[i + 1] as usize
+        } else {
+            0
+        };
+        let b2 = if i + 2 < input.len() {
+            input[i + 2] as usize
+        } else {
+            0
+        };
         let triple = (b0 << 16) | (b1 << 8) | b2;
         out.push(CHARS[(triple >> 18) & 0x3F] as char);
         out.push(CHARS[(triple >> 12) & 0x3F] as char);
@@ -63,9 +71,12 @@ async fn setup_test_server() -> (String, Arc<dyn Database>, AppState, tempfile::
 
 fn run_git_cmd(cwd: &std::path::Path, args: &[&str]) -> (bool, String, String) {
     let mut cmd_args = vec![
-        "-c", "credential.helper=",
-        "-c", "core.askPass=echo",
-        "-c", "core.autocrlf=false",
+        "-c",
+        "credential.helper=",
+        "-c",
+        "core.askPass=echo",
+        "-c",
+        "core.autocrlf=false",
     ];
     cmd_args.extend_from_slice(args);
 
@@ -130,13 +141,22 @@ async fn test_git_lfs_batch_api_conformance() {
     };
     db.create_pat(pat).await.unwrap();
 
-    let repo = state
+    let _repo = state
         .repositories
-        .create_repository(&user, "lfs-conformance-repo", Some("LFS".into()), false, None)
+        .create_repository(
+            &user,
+            "lfs-conformance-repo",
+            Some("LFS".into()),
+            false,
+            None,
+        )
         .await
         .unwrap();
 
-    let basic_auth_hdr = format!("Basic {}", encode_base64(format!("alice:{}", pat_secret).as_bytes()));
+    let basic_auth_hdr = format!(
+        "Basic {}",
+        encode_base64(format!("alice:{}", pat_secret).as_bytes())
+    );
 
     // Generate 5 MiB test data (larger than default 4 MiB chunk size)
     let payload_size = 5 * 1024 * 1024; // 5 MiB
@@ -207,11 +227,15 @@ async fn test_git_lfs_batch_api_conformance() {
 
     let upload_href = obj_resp["actions"]["upload"]["href"].as_str().unwrap();
     let upload_path = url::Url::parse(upload_href).unwrap().path().to_string();
-    let upload_auth = obj_resp["actions"]["upload"]["header"]["Authorization"].as_str().unwrap();
+    let upload_auth = obj_resp["actions"]["upload"]["header"]["Authorization"]
+        .as_str()
+        .unwrap();
 
     let verify_href = obj_resp["actions"]["verify"]["href"].as_str().unwrap();
     let verify_path = url::Url::parse(verify_href).unwrap().path().to_string();
-    let verify_auth = obj_resp["actions"]["verify"]["header"]["Authorization"].as_str().unwrap();
+    let verify_auth = obj_resp["actions"]["verify"]["header"]["Authorization"]
+        .as_str()
+        .unwrap();
 
     // Case 4: Execute upload action (PUT) with raw binary payload
     let req = Request::builder()
@@ -359,7 +383,13 @@ async fn test_git_lfs_receive_pack_pre_receive_rejection() {
 
     let repo = state
         .repositories
-        .create_repository(&user, "lfs-reject-repo", Some("LFS Reject".into()), false, None)
+        .create_repository(
+            &user,
+            "lfs-reject-repo",
+            Some("LFS Reject".into()),
+            false,
+            None,
+        )
         .await
         .unwrap();
 
@@ -383,7 +413,10 @@ async fn test_git_lfs_receive_pack_pre_receive_rejection() {
     );
     fs::write(local_repo.join("missing_asset.bin"), fake_pointer).unwrap();
     run_git_cmd(&local_repo, &["add", "missing_asset.bin"]);
-    run_git_cmd(&local_repo, &["commit", "-m", "Commit with missing LFS pointer"]);
+    run_git_cmd(
+        &local_repo,
+        &["commit", "-m", "Commit with missing LFS pointer"],
+    );
 
     // Push should be rejected by pre-receive verification
     let (ok, stdout, stderr) = run_git_cmd(&local_repo, &["push", &auth_remote, "main"]);
@@ -436,7 +469,13 @@ async fn test_official_git_lfs_workflow() {
 
     let repo = state
         .repositories
-        .create_repository(&user, "official-lfs-repo", Some("Official LFS".into()), false, None)
+        .create_repository(
+            &user,
+            "official-lfs-repo",
+            Some("Official LFS".into()),
+            false,
+            None,
+        )
         .await
         .unwrap();
 
@@ -465,7 +504,10 @@ async fn test_official_git_lfs_workflow() {
     fs::write(local_repo.join("model_weights.bin"), &initial_binary).unwrap();
 
     run_git_cmd(&local_repo, &["add", "model_weights.bin"]);
-    run_git_cmd(&local_repo, &["commit", "-m", "Add 5 MiB model weights via LFS"]);
+    run_git_cmd(
+        &local_repo,
+        &["commit", "-m", "Add 5 MiB model weights via LFS"],
+    );
 
     // Verify pointer was committed into local git object database
     let (ok, cat_out, _) = run_git_cmd(&local_repo, &["cat-file", "-p", "HEAD:model_weights.bin"]);

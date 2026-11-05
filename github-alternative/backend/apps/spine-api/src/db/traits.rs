@@ -5,6 +5,13 @@ use async_trait::async_trait;
 #[async_trait]
 pub trait Database: Send + Sync {
     // -------------------------------------------------------------------------
+    // Liveness / Connectivity
+    // -------------------------------------------------------------------------
+    async fn ping(&self) -> Result<(), ForgeError> {
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
     // Users
     // -------------------------------------------------------------------------
     async fn create_user(&self, user: User) -> Result<User, ForgeError>;
@@ -856,11 +863,8 @@ pub trait Database: Send + Sync {
         fingerprint: &str,
     ) -> Result<Option<DeployKey>, ForgeError>;
     async fn list_deploy_keys(&self, repo_id: &str) -> Result<Vec<DeployKey>, ForgeError>;
-    async fn update_deploy_key_last_used(
-        &self,
-        id: &str,
-        now_nanos: i64,
-    ) -> Result<(), ForgeError>;
+    async fn update_deploy_key_last_used(&self, id: &str, now_nanos: i64)
+        -> Result<(), ForgeError>;
     async fn revoke_deploy_key(&self, id: &str, repo_id: &str) -> Result<(), ForgeError>;
 
     // -------------------------------------------------------------------------

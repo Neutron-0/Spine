@@ -3,9 +3,9 @@ pub mod ops_credentials;
 pub mod ops_forge;
 pub mod ops_history;
 pub mod ops_lfs;
+pub mod ops_migration;
 pub mod ops_tag;
 pub mod ops_worktree;
-pub mod ops_migration;
 
 use anyhow::{bail, Context, Result};
 use chrono::{TimeZone, Utc};

@@ -146,7 +146,7 @@ where
         }
 
         match type_num {
-            1 | 2 | 3 | 4 => {
+            1..=4 => {
                 // 1=Commit, 2=Tree, 3=Blob, 4=Tag
                 let obj_type = match type_num {
                     1 => GitObjectType::Commit,
@@ -158,10 +158,12 @@ where
 
                 let mut decoder = ZlibDecoder::new(&pack_data[cursor..content_len]);
                 let mut payload = Vec::with_capacity(size);
-                decoder.read_to_end(&mut payload).map_err(|e| PackParseError::ZlibError {
-                    offset: cursor,
-                    source: e,
-                })?;
+                decoder
+                    .read_to_end(&mut payload)
+                    .map_err(|e| PackParseError::ZlibError {
+                        offset: cursor,
+                        source: e,
+                    })?;
                 let bytes_consumed = decoder.total_in() as usize;
                 cursor += bytes_consumed;
 
@@ -194,9 +196,9 @@ where
                     neg_offset = ((neg_offset + 1) << 7) | ((b & 0x7F) as usize);
                 }
 
-                let base_offset = obj_offset.checked_sub(neg_offset).ok_or(
-                    PackParseError::BaseOffsetNotFound(neg_offset, obj_offset),
-                )?;
+                let base_offset = obj_offset
+                    .checked_sub(neg_offset)
+                    .ok_or(PackParseError::BaseOffsetNotFound(neg_offset, obj_offset))?;
 
                 let mut decoder = ZlibDecoder::new(&pack_data[cursor..content_len]);
                 let mut delta_payload = Vec::new();
@@ -270,12 +272,8 @@ where
                 } => {
                     if let Some((base_type, base_payload, _)) = resolved_by_offset.get(base_offset)
                     {
-                        let target_payload = apply_delta(base_payload, delta_payload).map_err(
-                            |e| PackParseError::DeltaError {
-                                offset,
-                                source: e,
-                            },
-                        )?;
+                        let target_payload = apply_delta(base_payload, delta_payload)
+                            .map_err(|e| PackParseError::DeltaError { offset, source: e })?;
                         let oid = GitOid::compute_object(base_type.as_str(), &target_payload);
                         newly_resolved.push((offset, *base_type, target_payload, oid));
                     }
@@ -289,12 +287,8 @@ where
                         .cloned()
                         .or_else(|| base_resolver(base_oid));
                     if let Some((base_type, base_payload)) = base_opt {
-                        let target_payload = apply_delta(&base_payload, delta_payload).map_err(
-                            |e| PackParseError::DeltaError {
-                                offset,
-                                source: e,
-                            },
-                        )?;
+                        let target_payload = apply_delta(&base_payload, delta_payload)
+                            .map_err(|e| PackParseError::DeltaError { offset, source: e })?;
                         let oid = GitOid::compute_object(base_type.as_str(), &target_payload);
                         newly_resolved.push((offset, base_type, target_payload, oid));
                     }

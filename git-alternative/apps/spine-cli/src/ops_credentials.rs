@@ -53,6 +53,12 @@ pub trait CredentialStorage: Send + Sync {
 pub struct WindowsCredentialStorage;
 
 #[cfg(windows)]
+impl Default for WindowsCredentialStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WindowsCredentialStorage {
     pub fn new() -> Self {
         Self
@@ -73,6 +79,7 @@ impl WindowsCredentialStorage {
 
 #[cfg(windows)]
 #[repr(C)]
+#[allow(clippy::upper_case_acronyms)]
 struct CREDENTIALW {
     flags: u32,
     r#type: u32,

@@ -19,17 +19,9 @@ pub enum SsrfError {
 
 /// SSRF Validator protecting against internal network access, cloud metadata endpoints,
 /// DNS rebinding attacks, and dangerous ports.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SsrfValidator {
     pub allow_localhost: bool,
-}
-
-impl Default for SsrfValidator {
-    fn default() -> Self {
-        Self {
-            allow_localhost: false,
-        }
-    }
 }
 
 impl SsrfValidator {

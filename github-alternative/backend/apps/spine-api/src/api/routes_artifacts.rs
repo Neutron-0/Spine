@@ -96,10 +96,11 @@ pub async fn upload_artifact_version(
         ));
     }
 
-    if let Some(_) = state
+    if state
         .db
         .get_artifact_version(&ns.id, &artifact_name, &version)
         .await?
+        .is_some()
     {
         return Err(ForgeError::Conflict(format!(
             "Version '{}' of artifact '{}' already exists",

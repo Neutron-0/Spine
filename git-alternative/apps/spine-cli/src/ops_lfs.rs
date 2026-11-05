@@ -126,8 +126,8 @@ pub fn ls_files(repo_root: &Path) -> Result<()> {
     };
 
     println!(
-        "{:<40} {:<12} {:<64} {}",
-        "MANIFEST OID", "SIZE", "OBJECT HASH", "PATH"
+        "{:<40} {:<12} {:<64} PATH",
+        "MANIFEST OID", "SIZE", "OBJECT HASH"
     );
     println!("{}", "-".repeat(130));
 
@@ -193,7 +193,7 @@ pub fn verify(repo_root: &Path) -> Result<()> {
     let mut errors = 0;
 
     for entry in walkdir(manifests_dir)? {
-        if entry.is_file() && entry.extension().map_or(false, |ext| ext == "json") {
+        if entry.is_file() && entry.extension().is_some_and(|ext| ext == "json") {
             let content = fs::read_to_string(&entry)?;
             let manifest: ArtifactManifest = match serde_json::from_str(&content) {
                 Ok(m) => m,
@@ -520,16 +520,13 @@ pub fn hydrate_pointer_file(repo_root: &Path, target_path: &Path, content: &[u8]
             let entry = manifest
                 .chunks
                 .get(idx as usize)
-                .ok_or_else(|| spine_artifact::chunker::ChunkerError::MissingChunk(idx))?;
+                .ok_or(spine_artifact::chunker::ChunkerError::MissingChunk(idx))?;
             let bytes = store
                 .get_chunk(&entry.chunk_hash)
                 .map_err(|e| {
-                    spine_artifact::chunker::ChunkerError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    ))
+                    spine_artifact::chunker::ChunkerError::Io(std::io::Error::other(e.to_string()))
                 })?
-                .ok_or_else(|| spine_artifact::chunker::ChunkerError::MissingChunk(idx))?;
+                .ok_or(spine_artifact::chunker::ChunkerError::MissingChunk(idx))?;
             Ok(bytes)
         },
         &mut out_file,
@@ -546,7 +543,7 @@ fn load_all_manifest_ids(artifacts_dir: &Path) -> Result<Vec<String>> {
 
     if manifests_dir.exists() {
         for entry in walkdir(manifests_dir)? {
-            if entry.is_file() && entry.extension().map_or(false, |ext| ext == "json") {
+            if entry.is_file() && entry.extension().is_some_and(|ext| ext == "json") {
                 if let Some(stem) = entry.file_stem().and_then(|s| s.to_str()) {
                     ids.push(stem.to_string());
                 }

@@ -4,9 +4,11 @@ pub mod routes_artifacts;
 pub mod routes_auth;
 pub mod routes_discovery;
 pub mod routes_discussions;
+pub mod routes_git_http;
 pub mod routes_health;
 pub mod routes_issues;
 pub mod routes_lfs;
+pub mod routes_migration;
 pub mod routes_notifications;
 pub mod routes_orgs;
 pub mod routes_packages;
@@ -23,8 +25,6 @@ pub mod routes_teams;
 pub mod routes_users;
 pub mod routes_webhooks;
 pub mod routes_workflows;
-pub mod routes_migration;
-pub mod routes_git_http;
 
 pub use middleware::AppState;
 
@@ -612,9 +612,18 @@ pub fn build_router(state: AppState) -> Router {
             post(routes_migration::export_git),
         )
         // Native Git Smart HTTP endpoints (Batch 16)
-        .route("/:owner/:repo_git/info/refs", get(routes_git_http::git_info_refs))
-        .route("/:owner/:repo_git/git-upload-pack", post(routes_git_http::git_upload_pack))
-        .route("/:owner/:repo_git/git-receive-pack", post(routes_git_http::git_receive_pack))
+        .route(
+            "/:owner/:repo_git/info/refs",
+            get(routes_git_http::git_info_refs),
+        )
+        .route(
+            "/:owner/:repo_git/git-upload-pack",
+            post(routes_git_http::git_upload_pack),
+        )
+        .route(
+            "/:owner/:repo_git/git-receive-pack",
+            post(routes_git_http::git_receive_pack),
+        )
         // Native Git LFS HTTP endpoints (Batch 17)
         .route(
             "/:owner/:repo_git/info/lfs/objects/batch",

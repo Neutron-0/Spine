@@ -64,9 +64,8 @@ impl GitLfsPointer {
             }
         }
 
-        let oid = oid_sha256.ok_or_else(|| {
-            LfsError::InvalidPointer("Missing oid sha256 header".to_string())
-        })?;
+        let oid = oid_sha256
+            .ok_or_else(|| LfsError::InvalidPointer("Missing oid sha256 header".to_string()))?;
         let size = size_bytes
             .ok_or_else(|| LfsError::InvalidPointer("Missing size header".to_string()))?;
 
@@ -147,21 +146,25 @@ impl GitLfsPointer {
         let chunker = StreamChunker::new(None);
         let cursor = Cursor::new(payload);
         let result = chunker
-            .chunk_reader(cursor, &self.oid_sha256, Some("application/octet-stream".to_string()))
-            .map_err(|e| LfsError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+            .chunk_reader(
+                cursor,
+                &self.oid_sha256,
+                Some("application/octet-stream".to_string()),
+            )
+            .map_err(|e| LfsError::Io(io::Error::other(e.to_string())))?;
 
         let store = LocalArtifactStore::new(store_root)
-            .map_err(|e| LfsError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+            .map_err(|e| LfsError::Io(io::Error::other(e.to_string())))?;
 
         for chunk in &result.chunks {
             store
                 .store_chunk(&chunk.entry.chunk_hash, &chunk.bytes)
-                .map_err(|e| LfsError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+                .map_err(|e| LfsError::Io(io::Error::other(e.to_string())))?;
         }
 
         store
             .store_manifest(&result.manifest)
-            .map_err(|e| LfsError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+            .map_err(|e| LfsError::Io(io::Error::other(e.to_string())))?;
 
         Ok(result.manifest)
     }
@@ -173,13 +176,13 @@ impl GitLfsPointer {
         store_root: P,
     ) -> Result<Vec<u8>, LfsError> {
         let store = LocalArtifactStore::new(store_root)
-            .map_err(|e| LfsError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+            .map_err(|e| LfsError::Io(io::Error::other(e.to_string())))?;
 
         let mut payload = Vec::with_capacity(manifest.total_size as usize);
         for chunk_entry in &manifest.chunks {
             let chunk_bytes = store
                 .get_chunk(&chunk_entry.chunk_hash)
-                .map_err(|e| LfsError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?
+                .map_err(|e| LfsError::Io(io::Error::other(e.to_string())))?
                 .ok_or_else(|| {
                     LfsError::Io(io::Error::new(
                         io::ErrorKind::NotFound,

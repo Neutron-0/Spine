@@ -4,10 +4,10 @@ use spine_api::{
     auth::{hash_password, DevMailCatcher, RateLimiter},
     build_router,
     core::types::{AuditEvent, User},
-    AppState, ArtifactService, CargoRegistryAdapter, CoordinatorClient, Database,
-    InMemoryDatabase, IsolatedRunnerExecutor, NativeVcsService, PackageService, PermissionService,
-    PgDatabase, ProvisioningWorker, ReleaseService, RepositoryService, RunnerService,
-    SsrfValidator, WebhookOutboxWorker, WebhookService, WorkflowScheduler, WorkflowService,
+    AppState, ArtifactService, CargoRegistryAdapter, CoordinatorClient, Database, InMemoryDatabase,
+    IsolatedRunnerExecutor, NativeVcsService, PackageService, PermissionService, PgDatabase,
+    ProvisioningWorker, ReleaseService, RepositoryService, RunnerService, SsrfValidator,
+    WebhookOutboxWorker, WebhookService, WorkflowScheduler, WorkflowService,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -40,6 +40,10 @@ struct Cli {
     /// PostgreSQL Database URL (e.g. postgres://spine:spine@127.0.0.1:5432/spine_forge)
     #[arg(long)]
     database_url: Option<String>,
+
+    /// Deployment profile (core-forge-v1, development, test)
+    #[arg(long)]
+    profile: Option<String>,
 
     /// Force in-memory database for local zero-config development and testing
     #[arg(long, default_value_t = false)]
@@ -79,6 +83,10 @@ enum Commands {
         /// PostgreSQL Database URL
         #[arg(long)]
         database_url: Option<String>,
+
+        /// Deployment profile
+        #[arg(long)]
+        profile: Option<String>,
 
         /// Use in-memory database (for testing)
         #[arg(long, default_value_t = false)]
@@ -127,6 +135,10 @@ enum BackupCommands {
         #[arg(long, default_value = "./.spine-dev-cluster/node-1")]
         target_storage: PathBuf,
 
+        /// Target PostgreSQL Database URL for database restoration
+        #[arg(long)]
+        target_database_url: Option<String>,
+
         /// AEAD encryption passphrase if restoring an encrypted .spinebak archive
         #[arg(long)]
         passphrase: Option<String>,
@@ -174,10 +186,32 @@ async fn main() -> anyhow::Result<()> {
             username,
             email,
             database_url,
+            profile,
             in_memory_db,
         }) => {
+            let raw_prof = profile
+                .or_else(|| std::env::var("SPINE_DEPLOYMENT_PROFILE").ok())
+                .unwrap_or_else(|| "core-forge-v1".to_string());
+            let prof = spine_api::DeploymentProfile::from_str_relaxed(&raw_prof)
+                .map_err(|e| anyhow::anyhow!(e))?;
+
             let db_url = database_url.or_else(|| std::env::var("DATABASE_URL").ok());
-            let db: Arc<dyn Database> = if in_memory_db || db_url.is_none() {
+            let db: Arc<dyn Database> = if prof.requires_persistent_database() {
+                if in_memory_db {
+                    anyhow::bail!(
+                        "Admin bootstrap cannot use '--in-memory-db' under deployment profile '{}'.",
+                        prof
+                    );
+                }
+                let url = db_url.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Mandatory database URL missing for admin bootstrap under profile '{}'.",
+                        prof
+                    )
+                })?;
+                println!("Connecting to PostgreSQL database for admin bootstrap...");
+                Arc::new(PgDatabase::connect_and_migrate(&url).await?)
+            } else if in_memory_db || db_url.is_none() {
                 println!("Initializing bootstrap with in-memory database...");
                 Arc::new(InMemoryDatabase::new())
             } else {
@@ -187,13 +221,13 @@ async fn main() -> anyhow::Result<()> {
             };
 
             // Single execution lockout check
-            if let Some(_) = db.get_user_by_username(&username).await? {
+            if db.get_user_by_username(&username).await?.is_some() {
                 anyhow::bail!(
                     "User '{}' already exists. Admin bootstrap can only be executed once.",
                     username
                 );
             }
-            if let Some(_) = db.get_user_by_email(&email).await? {
+            if db.get_user_by_email(&email).await?.is_some() {
                 anyhow::bail!(
                     "Email '{}' is already in use. Admin bootstrap can only be executed once.",
                     email
@@ -246,9 +280,15 @@ async fn main() -> anyhow::Result<()> {
             };
             let _ = db.record_audit_event(audit).await;
 
-            println!("================================================================================");
-            println!("                    SPINE FORGE INITIAL ADMIN BOOTSTRAP                         ");
-            println!("================================================================================");
+            println!(
+                "================================================================================"
+            );
+            println!(
+                "                    SPINE FORGE INITIAL ADMIN BOOTSTRAP                         "
+            );
+            println!(
+                "================================================================================"
+            );
             println!("Administrator account bootstrapped successfully.");
             println!();
             println!("  User ID:   {}", user_id);
@@ -258,27 +298,53 @@ async fn main() -> anyhow::Result<()> {
             println!();
             println!("CRITICAL: Save this temporary generated password securely now.");
             println!("It will NOT be displayed again and bootstrap cannot be re-executed.");
-            println!("================================================================================");
+            println!(
+                "================================================================================"
+            );
             Ok(())
         }
         Some(Commands::Backup { action }) => match action {
             BackupCommands::Create {
                 output,
                 storage_root,
-                database_url: _,
+                database_url,
                 passphrase,
                 key_version,
             } => {
+                let db_url = database_url.or_else(|| std::env::var("DATABASE_URL").ok());
+                let db_snapshot_json = if let Some(url) = db_url {
+                    println!("Connecting to PostgreSQL to capture snapshot: {}...", url);
+                    let pool = sqlx::PgPool::connect(&url).await.map_err(|e| {
+                        anyhow::anyhow!("Failed to connect to PostgreSQL for backup: {}", e)
+                    })?;
+                    let dump = spine_api::dump_database(&pool).await.map_err(|e| {
+                        anyhow::anyhow!("Failed to dump PostgreSQL database: {}", e)
+                    })?;
+                    println!("PostgreSQL database snapshot captured successfully.");
+                    Some(dump)
+                } else {
+                    let prof = std::env::var("SPINE_DEPLOYMENT_PROFILE").unwrap_or_default();
+                    if prof == "core-forge-v1" {
+                        anyhow::bail!(
+                            "Under deployment profile 'core-forge-v1', PostgreSQL database URL is required for complete backups (--database-url or DATABASE_URL)."
+                        );
+                    }
+                    None
+                };
+
                 println!(
                     "Creating coordinated backup from {} to {}",
                     storage_root.display(),
                     output.display()
                 );
                 let manifest = if let Some(pass) = passphrase {
-                    println!("Applying AES-256-GCM AEAD encryption (key version {})...", key_version);
+                    println!(
+                        "Applying SPNEBAK v2 AES-256-GCM AEAD streaming encryption (key version {})...",
+                        key_version
+                    );
                     spine_api::backup::BackupManager::create_encrypted_backup(
                         &storage_root,
-                        None,
+                        db_snapshot_json.as_deref(),
                         &output,
                         &pass,
                         key_version,
@@ -286,7 +352,7 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     spine_api::backup::BackupManager::create_backup(
                         &storage_root,
-                        None,
+                        db_snapshot_json.as_deref(),
                         &output,
                     )?
                 };
@@ -300,6 +366,7 @@ async fn main() -> anyhow::Result<()> {
             BackupCommands::Restore {
                 input,
                 target_storage,
+                target_database_url,
                 passphrase,
             } => {
                 println!(
@@ -307,23 +374,62 @@ async fn main() -> anyhow::Result<()> {
                     input.display(),
                     target_storage.display()
                 );
-                let (manifest, report, _) = if let Some(pass) = passphrase {
-                    println!("Decrypting with AEAD passphrase and verifying tag...");
+                let (manifest, report, db_snapshot) = if let Some(pass) = passphrase {
+                    println!(
+                        "Decrypting with AEAD passphrase and verifying chunk integrity tags..."
+                    );
                     spine_api::backup::BackupManager::restore_encrypted_backup(
                         &input,
                         &target_storage,
                         &pass,
                     )?
                 } else {
-                    spine_api::backup::BackupManager::restore_backup(
-                        &input,
-                        &target_storage,
-                    )?
+                    spine_api::backup::BackupManager::restore_backup(&input, &target_storage)?
                 };
-                println!("Backup restoration completed:");
+                println!("Storage restoration completed:");
                 println!("  Backup ID:     {}", manifest.backup_id);
                 println!("  Files restored:{}", report.files_restored);
                 println!("  Bytes restored:{}", report.bytes_restored);
+
+                let target_db = target_database_url
+                    .or_else(|| std::env::var("TARGET_DATABASE_URL").ok())
+                    .or_else(|| std::env::var("DATABASE_URL").ok());
+
+                if let Some(snapshot_json) = db_snapshot {
+                    if let Some(db_url) = target_db {
+                        println!(
+                            "Restoring database snapshot into target database: {}...",
+                            db_url
+                        );
+                        let pool = sqlx::PgPool::connect(&db_url).await.map_err(|e| {
+                            anyhow::anyhow!(
+                                "Failed to connect to target PostgreSQL for restore: {}",
+                                e
+                            )
+                        })?;
+
+                        let empty = spine_api::is_database_empty(&pool).await.map_err(|e| {
+                            anyhow::anyhow!("Failed to inspect target database state: {}", e)
+                        })?;
+                        if !empty {
+                            anyhow::bail!(
+                                "Target database is not empty. Full database restoration requires a clean, empty target database to prevent data corruption."
+                            );
+                        }
+
+                        let db_report = spine_api::restore_database(&pool, &snapshot_json)
+                            .await
+                            .map_err(|e| {
+                                anyhow::anyhow!("Failed to restore database snapshot: {}", e)
+                            })?;
+                        println!("Database restore completed successfully:");
+                        println!("  Tables restored: {}", db_report.tables_restored);
+                        println!("  Rows restored:   {}", db_report.rows_restored);
+                        println!("  Duration:        {} ms", db_report.duration_ms);
+                    } else {
+                        println!("WARNING: Backup archive contains a database snapshot, but no --target-database-url (or TARGET_DATABASE_URL/DATABASE_URL) was specified. Database was not restored.");
+                    }
+                }
                 println!(
                     "  Integrity:     {}",
                     if report.integrity_verified {
@@ -354,7 +460,10 @@ async fn main() -> anyhow::Result<()> {
                     &new_passphrase,
                     key_version,
                 )?;
-                println!("Key rotation completed successfully. New archive written to {}", output.display());
+                println!(
+                    "Key rotation completed successfully. New archive written to {}",
+                    output.display()
+                );
                 Ok(())
             }
         },
@@ -378,14 +487,77 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
         .coordinator_addr
         .or_else(|| std::env::var("COORDINATOR_ADDR").ok());
 
+    let raw_profile = args
+        .profile
+        .or_else(|| std::env::var("SPINE_DEPLOYMENT_PROFILE").ok())
+        .unwrap_or_else(|| "core-forge-v1".to_string());
+    let profile = spine_api::DeploymentProfile::from_str_relaxed(&raw_profile)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    tracing::info!(
+        "Active deployment profile: {} (Requires PostgreSQL: {}, Untrusted CI: {})",
+        profile,
+        profile.requires_persistent_database(),
+        if profile.allow_untrusted_ci() {
+            "ENABLED"
+        } else {
+            "DISABLED"
+        }
+    );
+
+    // Profile enforcement: CoreForge mandates PostgreSQL and strictly forbids in-memory fallback
+    if profile.requires_persistent_database() {
+        if args.in_memory_db {
+            anyhow::bail!(
+                "CRITICAL STARTUP ERROR: '--in-memory-db' is strictly forbidden under deployment profile '{}'. Real PostgreSQL persistence is required.",
+                profile
+            );
+        }
+        if database_url.is_none() {
+            anyhow::bail!(
+                "CRITICAL STARTUP ERROR: Mandatory PostgreSQL database connection string missing. Under deployment profile '{}', 'DATABASE_URL' (or --database-url) must be provided.",
+                profile
+            );
+        }
+    }
+
     // 1. Initialize Database backend
-    let db: Arc<dyn Database> = if args.in_memory_db || database_url.is_none() {
-        tracing::info!("Initializing Spine Forge with InMemoryDatabase adapter");
-        Arc::new(InMemoryDatabase::new())
-    } else {
-        let db_url = database_url.unwrap();
-        tracing::info!("Connecting to PostgreSQL database and applying migrations...");
-        Arc::new(PgDatabase::connect_and_migrate(&db_url).await?)
+    let db: Arc<dyn Database> = match database_url {
+        Some(db_url) => {
+            tracing::info!(
+                "Connecting to PostgreSQL database and applying migrations under profile '{}'...",
+                profile
+            );
+            let pg_db = PgDatabase::connect_and_migrate(&db_url)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to connect to or migrate PostgreSQL database: {}", e)
+                })?;
+
+            // Immediate connectivity check
+            pg_db.ping().await.map_err(|e| {
+                anyhow::anyhow!(
+                    "PostgreSQL database liveness check failed immediately after connect: {}",
+                    e
+                )
+            })?;
+
+            Arc::new(pg_db)
+        }
+        None => {
+            if profile.permits_in_memory_db() && args.in_memory_db {
+                tracing::warn!(
+                    "Initializing Spine Forge with InMemoryDatabase adapter (PERMITTED ONLY for profile '{}')",
+                    profile
+                );
+                Arc::new(InMemoryDatabase::new())
+            } else {
+                anyhow::bail!(
+                    "CRITICAL CONFIGURATION ERROR: No database backend configured. Under profile '{}', provide DATABASE_URL or set --in-memory-db explicitly.",
+                    profile
+                );
+            }
+        }
     };
 
     // 2. Initialize Coordinator Client
@@ -420,17 +592,17 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
     let ssrf = SsrfValidator::new(false);
     let webhooks = Arc::new(WebhookService::new(Arc::clone(&db), ssrf.clone()));
     let webhook_worker = Arc::new(WebhookOutboxWorker::new(Arc::clone(&db), ssrf));
-    let scheduler = Arc::new(WorkflowScheduler::new(
-        Arc::clone(&db),
-        Some((*webhooks).clone()),
-    ));
-    let workflows = Arc::new(WorkflowService::new(
-        Arc::clone(&db),
-        Some((*webhooks).clone()),
-    ));
-    let runners = Arc::new(RunnerService::new(Arc::clone(&db), (*scheduler).clone()));
+    let scheduler = Arc::new(
+        WorkflowScheduler::new(Arc::clone(&db), Some((*webhooks).clone())).with_profile(profile),
+    );
+    let workflows = Arc::new(
+        WorkflowService::new(Arc::clone(&db), Some((*webhooks).clone())).with_profile(profile),
+    );
+    let runners =
+        Arc::new(RunnerService::new(Arc::clone(&db), (*scheduler).clone()).with_profile(profile));
     let runner_workspace_root = storage_root_canonical.join("runner_workspaces");
-    let runner_executor = Arc::new(IsolatedRunnerExecutor::new(runner_workspace_root));
+    let runner_executor =
+        Arc::new(IsolatedRunnerExecutor::new(runner_workspace_root).with_profile(profile));
 
     let search = Arc::new(spine_api::SearchService::new(
         Arc::clone(&db),
@@ -456,7 +628,10 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
         .or_else(|_| std::env::var("APP_URL"))
         .unwrap_or_else(|_| format!("http://{}:{}", args.bind, args.port));
 
+    let consistency_barrier = Arc::new(spine_api::backup::ConsistencyBarrier::new());
+
     let state = AppState {
+        profile,
         db: Arc::clone(&db),
         permissions: Arc::clone(&permissions),
         repositories: Arc::clone(&repositories),
@@ -479,6 +654,7 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
         discovery,
         security,
         public_origin,
+        consistency_barrier,
     };
 
     // 4. Spawn background provisioning worker
@@ -494,7 +670,8 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
     });
 
     // 5. Start HTTP and SSH servers
-    let ssh_addr_str = std::env::var("SSH_ADDR").unwrap_or_else(|_| format!("{}:{}", args.bind, args.ssh_port));
+    let ssh_addr_str =
+        std::env::var("SSH_ADDR").unwrap_or_else(|_| format!("{}:{}", args.bind, args.ssh_port));
     let ssh_addr: SocketAddr = ssh_addr_str.parse()?;
     let (_bound_ssh, _ssh_handle) = spine_api::start_ssh_server(state.clone(), ssh_addr).await?;
 

@@ -173,11 +173,22 @@
 - 6-phase end-to-end clean-environment deployment rehearsal passing all lifecycle checks with 100% test passage.
 - Release candidate manifest (`v0.1.0-rc1`) and final handoff for independent Codex audit.
 
+### Batch 21: Independent Audit Findings Remediation, Complete Database Backup, Streaming Encryption, Deployment Security and Release Candidate Revalidation (Completed)
+- Resolution of all 7 independent Codex audit findings (F-01 through F-07) with zero open blockers.
+- **F-01:** Complete PostgreSQL database dump & restore engine (`dump_database`, `restore_database`), topological foreign-key restore order, sequence synchronization, clean target database validation, and CLI `--target-database-url`.
+- **F-02:** `SPNEBAK v2` streaming chunked authenticated encryption format (1 MiB chunks, unique 12B nonces derived via 64-bit counter, AAD per chunk, authenticated final manifest, streaming key rotation). $O(1)$ constant memory complexity.
+- **F-03:** Programmatic enforcement of `core-forge-v1` deployment profile across workflow triggers, scheduler, runner registration, claim, capability generation, and execution dispatch; reflected in UI security banners.
+- **F-04:** PostgreSQL least-privilege security hardening (`spine_app` role stripped of `SUPERUSER`, `CREATEDB`, `CREATEROLE`, and `BYPASSRLS`), local/private network binding, and denial of administrative commands verified.
+- **F-05:** Production Docker Compose hardening (`docker-compose.yml`), mandatory `${VAR:?error}` variable enforcement, segregation into `spine-internal` and `spine-public` networks, unmapped internal ports.
+- **F-06:** Complete removal of silent in-memory fallback on missing `DATABASE_URL` under `core-forge-v1`, boot-time ping check, and active database ping in `/health/ready`.
+- **F-07:** Migration concurrency refactored to transaction-scoped `pg_advisory_xact_lock(0x5350494E454D4947)`, guaranteeing automatic lock release upon cancellation, rollback, or panic.
+- Release candidate manifest updated to `v0.1.0-rc2`, ready for second independent Codex audit.
+
 ---
 
 ## Future Milestones
 
-### Batch 21: Enterprise Federation, SAML/OIDC, Multi-Region Replication, and High-Availability Clustering
+### Batch 22: Enterprise Federation, SAML/OIDC, Multi-Region Replication, and High-Availability Clustering
 - Enterprise Single Sign-On (SAML 2.0 and OIDC).
 - Multi-region distributed storage replication and geo-distributed caching mirrors.
 - Real-time collaborative review feeds with WebSockets.

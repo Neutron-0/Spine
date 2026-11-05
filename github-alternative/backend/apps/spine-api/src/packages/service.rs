@@ -78,6 +78,7 @@ impl PackageService {
         Ok(dtos)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn publish_version(
         &self,
         ecosystem: &str,
@@ -96,7 +97,12 @@ impl PackageService {
             .await?;
 
         // Version immutability check
-        if let Some(_) = self.db.get_package_version(&pkg.id, version).await? {
+        if self
+            .db
+            .get_package_version(&pkg.id, version)
+            .await?
+            .is_some()
+        {
             return Err(ForgeError::Conflict(format!(
                 "Version '{}' of package '{}' has already been published",
                 version, name

@@ -7,10 +7,13 @@ use crate::core::types::WorkflowCheckResult;
 use crate::db::Database;
 use crate::webhook::WebhookService;
 
+use crate::core::profile::DeploymentProfile;
+
 #[derive(Clone)]
 pub struct WorkflowScheduler {
     db: Arc<dyn Database>,
     webhook_service: Option<WebhookService>,
+    pub profile: DeploymentProfile,
 }
 
 impl WorkflowScheduler {
@@ -18,7 +21,13 @@ impl WorkflowScheduler {
         Self {
             db,
             webhook_service,
+            profile: DeploymentProfile::CoreForge,
         }
+    }
+
+    pub fn with_profile(mut self, profile: DeploymentProfile) -> Self {
+        self.profile = profile;
+        self
     }
 
     /// Advance active workflow runs, resolve job dependencies, detect timed out leases,
@@ -29,6 +38,29 @@ impl WorkflowScheduler {
 
         for run in runs {
             if run.status == "COMPLETED" || run.status == "CANCELLED" {
+                continue;
+            }
+
+            let is_untrusted_run = run.trigger_event == "pull_request_fork"
+                || run.trigger_event == "fork"
+                || run.trigger_event.starts_with("untrusted");
+
+            if is_untrusted_run && !self.profile.allow_untrusted_ci() {
+                tracing::warn!(
+                    "Scheduler closing untrusted workflow run {} under profile '{}'",
+                    run.id,
+                    self.profile.name()
+                );
+                let _ = self
+                    .db
+                    .update_workflow_run_status(
+                        &run.id,
+                        "COMPLETED",
+                        Some("DISALLOWED"),
+                        None,
+                        Some(now_nanos),
+                    )
+                    .await;
                 continue;
             }
 
@@ -48,7 +80,7 @@ impl WorkflowScheduler {
                 if (job.status == "ASSIGNED" || job.status == "RUNNING")
                     && job
                         .lease_expires_at_nanos
-                        .map_or(false, |exp| exp < now_nanos)
+                        .is_some_and(|exp| exp < now_nanos)
                 {
                     tracing::warn!("Job {} lease expired; marking TIMED_OUT", job.id);
                     self.db

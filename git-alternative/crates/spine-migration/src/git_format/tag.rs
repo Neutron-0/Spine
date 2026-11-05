@@ -48,7 +48,8 @@ pub fn parse_git_tag(payload: &[u8]) -> Result<GitAnnotatedTag, TagFormatError> 
         }
 
         if let Some(o) = line.strip_prefix("object ") {
-            object = Some(GitOid::from_hex(o).map_err(|_| TagFormatError::InvalidOid(o.to_string()))?);
+            object =
+                Some(GitOid::from_hex(o).map_err(|_| TagFormatError::InvalidOid(o.to_string()))?);
         } else if let Some(t) = line.strip_prefix("type ") {
             target_type = Some(t.to_string());
         } else if let Some(n) = line.strip_prefix("tag ") {

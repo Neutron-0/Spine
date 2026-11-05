@@ -95,8 +95,14 @@ pub async fn run_migration(
         policy.fallback_spine_user = u.username;
     }
 
-    let report = MigrationEngine::run_git_import(&req.source_path, &target_dir, policy, req.dry_run)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Migration error: {}", e)))?;
+    let report =
+        MigrationEngine::run_git_import(&req.source_path, &target_dir, policy, req.dry_run)
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Migration error: {}", e),
+                )
+            })?;
 
     Ok(Json(report))
 }
@@ -117,7 +123,12 @@ pub async fn export_git(
     }
 
     let stats = MigrationEngine::run_git_export(&source_spine_repo, &req.target_path, req.is_bare)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Git export error: {}", e)))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Git export error: {}", e),
+            )
+        })?;
 
     Ok(Json(stats))
 }

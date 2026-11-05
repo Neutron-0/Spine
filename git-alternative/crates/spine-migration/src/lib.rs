@@ -27,12 +27,6 @@ pub use fast_stream::{
     FastReset, FastStreamError, FastTag,
 };
 pub use git_exporter::{ExportStats, GitExportError, GitExporter};
-pub use git_transport::{
-    advertise_refs_receive_pack, advertise_refs_receive_pack_raw, advertise_refs_upload_pack,
-    advertise_refs_upload_pack_raw, format_receive_pack_response, handle_upload_pack_request,
-    parse_receive_pack_request, reconcile_git_map, unpack_and_ingest_receive_pack,
-    GitTransportError, IngestPackResult, RefUpdateCommand,
-};
 pub use git_format::{
     build_pack_and_index, parse_git_commit, parse_git_tag, parse_git_tree, parse_loose_object,
     parse_packfile, parse_packfile_with_resolver, read_git_refs, serialize_git_commit,
@@ -40,6 +34,12 @@ pub use git_format::{
     GitHead, GitObjectType, GitOid, GitRefMap, GitTreeEntry,
 };
 pub use git_importer::{GitImportError, GitImporter, ImportStats};
+pub use git_transport::{
+    advertise_refs_receive_pack, advertise_refs_receive_pack_raw, advertise_refs_upload_pack,
+    advertise_refs_upload_pack_raw, format_receive_pack_response, handle_upload_pack_request,
+    parse_receive_pack_request, reconcile_git_map, unpack_and_ingest_receive_pack,
+    GitTransportError, IngestPackResult, RefUpdateCommand,
+};
 pub use lfs_interop::{GitLfsPointer, LfsError};
 pub use pkt_line::{
     encode_delim, encode_end, encode_flush, encode_pkt_line, encode_pkt_line_str, encode_sideband,

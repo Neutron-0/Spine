@@ -57,7 +57,7 @@ async fn test_runner_isolation_fail_closed_on_unsandboxed_untrusted_workflow() {
 
     // 1. Untrusted execution with Unsandboxed mode MUST FAIL CLOSED
     let (exit_code, results) = executor
-        .execute_job_with_trust(&job, &[step.clone()], &scripts, &[], true)
+        .execute_job_with_trust(&job, std::slice::from_ref(&step), &scripts, &[], true)
         .await;
 
     assert_eq!(

@@ -98,7 +98,7 @@ async fn test_authoritative_pr_merge_pipeline() {
     let native_repo_id = "alice_testrepo";
     let (base_id, head_id) = setup_repo_for_merge(&tmp, native_repo_id);
 
-    let vcs = NativeVcsService::new(tmp.path().to_path_buf());
+    let vcs = NativeVcsService::new(tmp.path());
 
     let pr_ctx = PrProtectionContext {
         pr_number: 1,
@@ -149,7 +149,7 @@ async fn test_authoritative_merge_rejects_active_changes_requested() {
     let native_repo_id = "alice_pr_rejected";
     let (_base_id, _head_id) = setup_repo_for_merge(&tmp, native_repo_id);
 
-    let vcs = NativeVcsService::new(tmp.path().to_path_buf());
+    let vcs = NativeVcsService::new(tmp.path());
 
     let pr_ctx = PrProtectionContext {
         pr_number: 2,

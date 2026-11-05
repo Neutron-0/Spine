@@ -3,7 +3,6 @@ use super::oid::GitOid;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use sha1::{Digest, Sha1};
-use std::cmp::Ordering;
 use std::io::Write;
 use thiserror::Error;
 
@@ -119,7 +118,7 @@ pub fn build_pack_and_index(
 
     // 4. Build Index v2 (.idx)
     // Sort index entries by OID lexicographically
-    index_metas.sort_by(|a, b| a.oid.cmp(&b.oid));
+    index_metas.sort_by_key(|a| a.oid);
 
     let mut idx_buf = Vec::new();
     // Magic: \xFFtOc

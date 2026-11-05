@@ -1,4 +1,3 @@
-use std::io;
 use thiserror::Error;
 
 pub const PKT_FLUSH: &[u8; 4] = b"0000";
@@ -41,7 +40,9 @@ impl PktLine {
 
     pub fn to_string_lossy(&self) -> String {
         match self {
-            PktLine::Data(b) => String::from_utf8_lossy(b).trim_end_matches('\n').to_string(),
+            PktLine::Data(b) => String::from_utf8_lossy(b)
+                .trim_end_matches('\n')
+                .to_string(),
             PktLine::Flush => "0000 (flush)".to_string(),
             PktLine::Delimiter => "0001 (delim)".to_string(),
             PktLine::ResponseEnd => "0002 (end)".to_string(),
@@ -172,9 +173,18 @@ mod tests {
 
     #[test]
     fn test_pkt_line_special_packets() {
-        assert_eq!(parse_pkt_line(b"0000").unwrap().unwrap(), (PktLine::Flush, 4));
-        assert_eq!(parse_pkt_line(b"0001").unwrap().unwrap(), (PktLine::Delimiter, 4));
-        assert_eq!(parse_pkt_line(b"0002").unwrap().unwrap(), (PktLine::ResponseEnd, 4));
+        assert_eq!(
+            parse_pkt_line(b"0000").unwrap().unwrap(),
+            (PktLine::Flush, 4)
+        );
+        assert_eq!(
+            parse_pkt_line(b"0001").unwrap().unwrap(),
+            (PktLine::Delimiter, 4)
+        );
+        assert_eq!(
+            parse_pkt_line(b"0002").unwrap().unwrap(),
+            (PktLine::ResponseEnd, 4)
+        );
     }
 
     #[test]

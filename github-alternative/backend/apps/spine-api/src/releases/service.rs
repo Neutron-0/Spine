@@ -28,7 +28,12 @@ impl ReleaseService {
         }
 
         // Check if release with same tag exists
-        if let Some(_) = self.db.get_release_by_tag(repo_id, tag_name).await? {
+        if self
+            .db
+            .get_release_by_tag(repo_id, tag_name)
+            .await?
+            .is_some()
+        {
             return Err(ForgeError::Conflict(format!(
                 "Release for tag '{}' already exists in this repository",
                 tag_name

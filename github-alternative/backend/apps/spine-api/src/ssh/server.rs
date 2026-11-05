@@ -414,10 +414,8 @@ impl Handler for SshHandler {
                     return Ok(());
                 }
 
-                let spine_dir = ensure_repo_spine_dir(
-                    self.state.vcs.storage_root(),
-                    &repo_obj.native_repo_id,
-                );
+                let spine_dir =
+                    ensure_repo_spine_dir(self.state.vcs.storage_root(), &repo_obj.native_repo_id);
                 let adv = match spine_migration::advertise_refs_upload_pack_raw(&spine_dir) {
                     Ok(bytes) => bytes,
                     Err(e) => {
@@ -425,7 +423,9 @@ impl Handler for SshHandler {
                         let _ = session.extended_data(
                             channel,
                             1,
-                            Bytes::from(format!("FATAL: Failed to advertise refs: {}\n", e).into_bytes()),
+                            Bytes::from(
+                                format!("FATAL: Failed to advertise refs: {}\n", e).into_bytes(),
+                            ),
                         );
                         let _ = session.exit_status_request(channel, 1);
                         let _ = session.close(channel);
@@ -449,6 +449,18 @@ impl Handler for SshHandler {
             }
 
             GitSshCommand::ReceivePack { owner, repo } => {
+                if self.state.consistency_barrier.is_maintenance_active() {
+                    let _ = session.channel_success(channel);
+                    let _ = session.extended_data(
+                        channel,
+                        1,
+                        Bytes::from_static(b"FATAL: Maintenance in progress. Backups active, repository writes temporarily drained.\n"),
+                    );
+                    let _ = session.exit_status_request(channel, 1);
+                    let _ = session.close(channel);
+                    return Ok(());
+                }
+
                 let repo_obj = match self
                     .state
                     .db
@@ -476,9 +488,7 @@ impl Handler for SshHandler {
                         .check_write_access(Some(u), &repo_obj)
                         .await
                         .is_ok(),
-                    SshIdentity::DeployKey(d) => {
-                        d.repository_id == repo_obj.id && d.write_enabled
-                    }
+                    SshIdentity::DeployKey(d) => d.repository_id == repo_obj.id && d.write_enabled,
                 };
 
                 if !authorized {
@@ -493,10 +503,8 @@ impl Handler for SshHandler {
                     return Ok(());
                 }
 
-                let spine_dir = ensure_repo_spine_dir(
-                    self.state.vcs.storage_root(),
-                    &repo_obj.native_repo_id,
-                );
+                let spine_dir =
+                    ensure_repo_spine_dir(self.state.vcs.storage_root(), &repo_obj.native_repo_id);
                 let adv = match spine_migration::advertise_refs_receive_pack_raw(&spine_dir) {
                     Ok(bytes) => bytes,
                     Err(e) => {
@@ -504,7 +512,9 @@ impl Handler for SshHandler {
                         let _ = session.extended_data(
                             channel,
                             1,
-                            Bytes::from(format!("FATAL: Failed to advertise refs: {}\n", e).into_bytes()),
+                            Bytes::from(
+                                format!("FATAL: Failed to advertise refs: {}\n", e).into_bytes(),
+                            ),
                         );
                         let _ = session.exit_status_request(channel, 1);
                         let _ = session.close(channel);
@@ -556,10 +566,8 @@ impl Handler for SshHandler {
                 // Check if git client sent "done\n" indicating upload-pack negotiation is complete
                 if in_buf.windows(4).any(|w| w == b"done") {
                     *finished = true;
-                    let spine_dir = ensure_repo_spine_dir(
-                        self.state.vcs.storage_root(),
-                        &repo.native_repo_id,
-                    );
+                    let spine_dir =
+                        ensure_repo_spine_dir(self.state.vcs.storage_root(), &repo.native_repo_id);
                     match spine_migration::handle_upload_pack_request(&spine_dir, in_buf) {
                         Ok(pack_bytes) => {
                             let _ = session.data(channel, Bytes::from(pack_bytes));
@@ -605,10 +613,8 @@ impl Handler for SshHandler {
             } => {
                 if !*finished {
                     *finished = true;
-                    let spine_dir = ensure_repo_spine_dir(
-                        self.state.vcs.storage_root(),
-                        &repo.native_repo_id,
-                    );
+                    let spine_dir =
+                        ensure_repo_spine_dir(self.state.vcs.storage_root(), &repo.native_repo_id);
                     match spine_migration::handle_upload_pack_request(&spine_dir, in_buf) {
                         Ok(pack_bytes) => {
                             let _ = session.data(channel, Bytes::from(pack_bytes));
@@ -636,13 +642,7 @@ impl Handler for SshHandler {
             } => {
                 if !*finished {
                     *finished = true;
-                    let res = process_git_receive_pack(
-                        &self.state,
-                        repo,
-                        actor_id,
-                        in_buf,
-                    )
-                    .await;
+                    let res = process_git_receive_pack(&self.state, repo, actor_id, in_buf).await;
 
                     match res {
                         Ok(report_status) => {
@@ -651,7 +651,11 @@ impl Handler for SshHandler {
                             let _ = session.close(channel);
                         }
                         Err((_code, err_msg)) => {
-                            let _ = session.extended_data(channel, 1, Bytes::from(err_msg.into_bytes()));
+                            let _ = session.extended_data(
+                                channel,
+                                1,
+                                Bytes::from(err_msg.into_bytes()),
+                            );
                             let _ = session.exit_status_request(channel, 1);
                             let _ = session.close(channel);
                         }

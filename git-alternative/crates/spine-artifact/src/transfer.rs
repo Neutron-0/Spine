@@ -60,7 +60,7 @@ impl TransferSession {
         let expected_chunks = if total_size == 0 {
             1
         } else {
-            ((total_size + (chunk_size as u64) - 1) / (chunk_size as u64)) as u32
+            total_size.div_ceil(chunk_size as u64) as u32
         };
 
         let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);

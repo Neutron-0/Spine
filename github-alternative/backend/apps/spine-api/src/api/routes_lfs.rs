@@ -137,7 +137,12 @@ pub fn verify_scoped_token(
         hex::encode(mac.finalize().into_bytes())
     };
 
-    if expected_sig.as_bytes().ct_eq(sig_hex.as_bytes()).unwrap_u8() != 1 {
+    if expected_sig
+        .as_bytes()
+        .ct_eq(sig_hex.as_bytes())
+        .unwrap_u8()
+        != 1
+    {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -192,7 +197,12 @@ pub fn verify_remote_auth_token(secret: &[u8], token_str: &str) -> Option<LfsRem
         hex::encode(mac.finalize().into_bytes())
     };
 
-    if expected_sig.as_bytes().ct_eq(sig_hex.as_bytes()).unwrap_u8() != 1 {
+    if expected_sig
+        .as_bytes()
+        .ct_eq(sig_hex.as_bytes())
+        .unwrap_u8()
+        != 1
+    {
         return None;
     }
 
@@ -208,6 +218,7 @@ pub fn verify_remote_auth_token(secret: &[u8], token_str: &str) -> Option<LfsRem
 }
 
 /// Helper to enforce HTTPS outside local loopback environments.
+#[allow(clippy::result_large_err)]
 pub fn check_transport_security(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
     let require_https = state.public_origin.starts_with("https://")
         || std::env::var("SPINE_REQUIRE_HTTPS").as_deref() == Ok("1");
@@ -223,9 +234,7 @@ pub fn check_transport_security(state: &AppState, headers: &HeaderMap) -> Result
             .get(header::HOST)
             .and_then(|v| v.to_str().ok())
             .map(|h| {
-                h.starts_with("127.0.0.1")
-                    || h.starts_with("localhost")
-                    || h.starts_with("[::1]")
+                h.starts_with("127.0.0.1") || h.starts_with("localhost") || h.starts_with("[::1]")
             })
             .unwrap_or(false);
 
@@ -254,7 +263,11 @@ pub async fn git_lfs_batch(
     }
 
     let repo_name = repo_git.strip_suffix(".git").unwrap_or(&repo_git);
-    let repo = match state.db.get_repository_by_owner_name(&owner, repo_name).await {
+    let repo = match state
+        .db
+        .get_repository_by_owner_name(&owner, repo_name)
+        .await
+    {
         Ok(Some(r)) => r,
         _ => return (StatusCode::NOT_FOUND, "Repository not found\n").into_response(),
     };
@@ -338,7 +351,11 @@ pub async fn git_lfs_batch(
             Some(ref u) => u,
             None => return unauthorized_response(),
         };
-        if let Err(e) = state.permissions.check_write_access(Some(user), &repo).await {
+        if let Err(e) = state
+            .permissions
+            .check_write_access(Some(user), &repo)
+            .await
+        {
             return (
                 StatusCode::FORBIDDEN,
                 [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
@@ -347,10 +364,11 @@ pub async fn git_lfs_batch(
                 .into_response();
         }
     } else {
-        if let Err(_) = state
+        if state
             .permissions
             .check_read_access(caller.as_ref(), &repo)
             .await
+            .is_err()
         {
             if caller.is_none() {
                 return unauthorized_response();
@@ -390,9 +408,15 @@ pub async fn git_lfs_batch(
                 generate_scoped_token(&repo.id, &obj.oid, "verify", obj.size + 4096, 3600);
 
             let mut upload_headers = HashMap::new();
-            upload_headers.insert("Authorization".to_string(), format!("Bearer {}", upload_token));
+            upload_headers.insert(
+                "Authorization".to_string(),
+                format!("Bearer {}", upload_token),
+            );
             let mut verify_headers = HashMap::new();
-            verify_headers.insert("Authorization".to_string(), format!("Bearer {}", verify_token));
+            verify_headers.insert(
+                "Authorization".to_string(),
+                format!("Bearer {}", verify_token),
+            );
 
             let upload_action = LfsAction {
                 href: format!(
@@ -503,18 +527,34 @@ pub async fn git_lfs_upload_object(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if state.consistency_barrier.is_maintenance_active() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "5")],
+            "Maintenance in progress. Backups active, object uploads temporarily drained.\n",
+        )
+            .into_response();
+    }
+
     if let Err(resp) = check_transport_security(&state, &headers) {
         return resp;
     }
 
     let repo_name = repo_git.strip_suffix(".git").unwrap_or(&repo_git);
-    let repo = match state.db.get_repository_by_owner_name(&owner, repo_name).await {
+    let repo = match state
+        .db
+        .get_repository_by_owner_name(&owner, repo_name)
+        .await
+    {
         Ok(Some(r)) => r,
         _ => return (StatusCode::NOT_FOUND, "Repository not found\n").into_response(),
     };
 
     // 1. Authorization: check scoped transfer token or Basic auth write access
-    let authorized = if let Some(auth_val) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+    let authorized = if let Some(auth_val) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
         if let Some(tok) = auth_val.strip_prefix("Bearer ") {
             verify_scoped_token(tok.trim(), &repo.id, &oid, "upload").is_ok()
         } else {
@@ -526,7 +566,11 @@ pub async fn git_lfs_upload_object(
 
     if !authorized {
         let caller = authenticate_git_user(&state, &headers).await;
-        if let Err(e) = state.permissions.check_write_access(caller.as_ref(), &repo).await {
+        if let Err(e) = state
+            .permissions
+            .check_write_access(caller.as_ref(), &repo)
+            .await
+        {
             return (
                 StatusCode::FORBIDDEN,
                 [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
@@ -582,7 +626,11 @@ pub async fn git_lfs_upload_object(
     };
 
     for chunk in &chunk_res.chunks {
-        if let Err(e) = state.artifacts.store().store_chunk(&chunk.entry.chunk_hash, &chunk.bytes) {
+        if let Err(e) = state
+            .artifacts
+            .store()
+            .store_chunk(&chunk.entry.chunk_hash, &chunk.bytes)
+        {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
@@ -643,7 +691,11 @@ pub async fn git_lfs_verify_object(
     }
 
     let repo_name = repo_git.strip_suffix(".git").unwrap_or(&repo_git);
-    let repo = match state.db.get_repository_by_owner_name(&owner, repo_name).await {
+    let repo = match state
+        .db
+        .get_repository_by_owner_name(&owner, repo_name)
+        .await
+    {
         Ok(Some(r)) => r,
         _ => return (StatusCode::NOT_FOUND, "Repository not found\n").into_response(),
     };
@@ -661,7 +713,10 @@ pub async fn git_lfs_verify_object(
     };
 
     // Authenticate: scoped verify token or user Basic auth
-    let authorized = if let Some(auth_val) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+    let authorized = if let Some(auth_val) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
         if let Some(tok) = auth_val.strip_prefix("Bearer ") {
             verify_scoped_token(tok.trim(), &repo.id, &verify_req.oid, "verify").is_ok()
         } else {
@@ -673,7 +728,11 @@ pub async fn git_lfs_verify_object(
 
     if !authorized {
         let caller = authenticate_git_user(&state, &headers).await;
-        if let Err(e) = state.permissions.check_write_access(caller.as_ref(), &repo).await {
+        if let Err(e) = state
+            .permissions
+            .check_write_access(caller.as_ref(), &repo)
+            .await
+        {
             return (
                 StatusCode::FORBIDDEN,
                 [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
@@ -724,13 +783,20 @@ pub async fn git_lfs_download_object(
     headers: HeaderMap,
 ) -> Response {
     let repo_name = repo_git.strip_suffix(".git").unwrap_or(&repo_git);
-    let repo = match state.db.get_repository_by_owner_name(&owner, repo_name).await {
+    let repo = match state
+        .db
+        .get_repository_by_owner_name(&owner, repo_name)
+        .await
+    {
         Ok(Some(r)) => r,
         _ => return (StatusCode::NOT_FOUND, "Repository not found\n").into_response(),
     };
 
     // Authenticate: scoped download token or user Basic auth
-    let authorized = if let Some(auth_val) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+    let authorized = if let Some(auth_val) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
         if let Some(tok) = auth_val.strip_prefix("Bearer ") {
             verify_scoped_token(tok.trim(), &repo.id, &oid, "download").is_ok()
         } else {
@@ -742,10 +808,11 @@ pub async fn git_lfs_download_object(
 
     if !authorized {
         let caller = authenticate_git_user(&state, &headers).await;
-        if let Err(_) = state
+        if state
             .permissions
             .check_read_access(caller.as_ref(), &repo)
             .await
+            .is_err()
         {
             if caller.is_none() && repo.is_private {
                 return unauthorized_response();
@@ -789,7 +856,10 @@ pub async fn git_lfs_download_object(
             _ => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Missing chunk {} during object hydration\n", entry.chunk_hash),
+                    format!(
+                        "Missing chunk {} during object hydration\n",
+                        entry.chunk_hash
+                    ),
                 )
                     .into_response();
             }
@@ -842,7 +912,8 @@ pub async fn lfs_batch(
                 error: None,
             });
         } else if payload.operation == "upload" {
-            let (tok, _) = generate_scoped_token(&repo.id, &obj.oid, "upload", obj.size + 4096, 3600);
+            let (tok, _) =
+                generate_scoped_token(&repo.id, &obj.oid, "upload", obj.size + 4096, 3600);
             let mut actions = HashMap::new();
             actions.insert(
                 "upload".to_string(),
@@ -851,7 +922,10 @@ pub async fn lfs_batch(
                         "{}/{}/{}.git/info/lfs/objects/{}",
                         state.public_origin, owner, repo_name, obj.oid
                     ),
-                    header: HashMap::from([("Authorization".to_string(), format!("Bearer {}", tok))]),
+                    header: HashMap::from([(
+                        "Authorization".to_string(),
+                        format!("Bearer {}", tok),
+                    )]),
                     expires_at: None,
                     expires_in: Some(3600),
                 },
@@ -960,7 +1034,11 @@ pub async fn git_lfs_create_lock(
     }
 
     let repo_name = repo_git.strip_suffix(".git").unwrap_or(&repo_git);
-    let repo = match state.db.get_repository_by_owner_name(&owner, repo_name).await {
+    let repo = match state
+        .db
+        .get_repository_by_owner_name(&owner, repo_name)
+        .await
+    {
         Ok(Some(r)) => r,
         _ => return (StatusCode::NOT_FOUND, "Repository not found\n").into_response(),
     };
@@ -970,7 +1048,11 @@ pub async fn git_lfs_create_lock(
         None => return unauthorized_response(),
     };
 
-    if let Err(e) = state.permissions.check_write_access(Some(&user), &repo).await {
+    if let Err(e) = state
+        .permissions
+        .check_write_access(Some(&user), &repo)
+        .await
+    {
         return (
             StatusCode::FORBIDDEN,
             [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
@@ -989,7 +1071,11 @@ pub async fn git_lfs_create_lock(
             .into_response();
     }
 
-    if let Ok(Some(existing)) = state.db.get_lfs_lock_by_path(&repo.id, &normalized_path).await {
+    if let Ok(Some(existing)) = state
+        .db
+        .get_lfs_lock_by_path(&repo.id, &normalized_path)
+        .await
+    {
         return (
             StatusCode::CONFLICT,
             [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
@@ -1015,7 +1101,11 @@ pub async fn git_lfs_create_lock(
     let created = match state.db.create_lfs_lock(new_lock).await {
         Ok(l) => l,
         Err(ForgeError::Conflict(_)) => {
-            if let Ok(Some(existing)) = state.db.get_lfs_lock_by_path(&repo.id, &normalized_path).await {
+            if let Ok(Some(existing)) = state
+                .db
+                .get_lfs_lock_by_path(&repo.id, &normalized_path)
+                .await
+            {
                 return (
                     StatusCode::CONFLICT,
                     [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
@@ -1080,13 +1170,21 @@ pub async fn git_lfs_list_locks(
     }
 
     let repo_name = repo_git.strip_suffix(".git").unwrap_or(&repo_git);
-    let repo = match state.db.get_repository_by_owner_name(&owner, repo_name).await {
+    let repo = match state
+        .db
+        .get_repository_by_owner_name(&owner, repo_name)
+        .await
+    {
         Ok(Some(r)) => r,
         _ => return (StatusCode::NOT_FOUND, "Repository not found\n").into_response(),
     };
 
     let caller = authenticate_git_user(&state, &headers).await;
-    if let Err(e) = state.permissions.check_read_access(caller.as_ref(), &repo).await {
+    if let Err(e) = state
+        .permissions
+        .check_read_access(caller.as_ref(), &repo)
+        .await
+    {
         return (
             StatusCode::FORBIDDEN,
             [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
@@ -1122,7 +1220,10 @@ pub async fn git_lfs_list_locks(
             .into_response();
     }
 
-    let norm_path = query.path.as_deref().map(|p| p.trim().trim_start_matches('/'));
+    let norm_path = query
+        .path
+        .as_deref()
+        .map(|p| p.trim().trim_start_matches('/'));
     match state
         .db
         .list_lfs_locks(&repo.id, norm_path, query.cursor.as_deref(), query.limit)
@@ -1162,7 +1263,11 @@ pub async fn git_lfs_verify_locks(
     }
 
     let repo_name = repo_git.strip_suffix(".git").unwrap_or(&repo_git);
-    let repo = match state.db.get_repository_by_owner_name(&owner, repo_name).await {
+    let repo = match state
+        .db
+        .get_repository_by_owner_name(&owner, repo_name)
+        .await
+    {
         Ok(Some(r)) => r,
         _ => return (StatusCode::NOT_FOUND, "Repository not found\n").into_response(),
     };
@@ -1172,7 +1277,11 @@ pub async fn git_lfs_verify_locks(
         None => return unauthorized_response(),
     };
 
-    if let Err(e) = state.permissions.check_write_access(Some(&user), &repo).await {
+    if let Err(e) = state
+        .permissions
+        .check_write_access(Some(&user), &repo)
+        .await
+    {
         return (
             StatusCode::FORBIDDEN,
             [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
@@ -1231,7 +1340,11 @@ pub async fn git_lfs_unlock(
     }
 
     let repo_name = repo_git.strip_suffix(".git").unwrap_or(&repo_git);
-    let repo = match state.db.get_repository_by_owner_name(&owner, repo_name).await {
+    let repo = match state
+        .db
+        .get_repository_by_owner_name(&owner, repo_name)
+        .await
+    {
         Ok(Some(r)) => r,
         _ => return (StatusCode::NOT_FOUND, "Repository not found\n").into_response(),
     };
@@ -1241,7 +1354,11 @@ pub async fn git_lfs_unlock(
         None => return unauthorized_response(),
     };
 
-    if let Err(e) = state.permissions.check_write_access(Some(&user), &repo).await {
+    if let Err(e) = state
+        .permissions
+        .check_write_access(Some(&user), &repo)
+        .await
+    {
         return (
             StatusCode::FORBIDDEN,
             [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
@@ -1288,7 +1405,12 @@ pub async fn git_lfs_unlock(
             )
                 .into_response();
         }
-        if let Err(_) = state.permissions.check_admin_access(Some(&user), &repo).await {
+        if state
+            .permissions
+            .check_admin_access(Some(&user), &repo)
+            .await
+            .is_err()
+        {
             return (
                 StatusCode::FORBIDDEN,
                 [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],

@@ -72,10 +72,9 @@ pub fn parse_git_commit(payload: &[u8]) -> Result<GitCommit, CommitFormatError> 
     let mut in_gpgsig = false;
     let mut gpgsig_buf = String::new();
 
-    let mut lines = s.lines();
     let mut body_start_idx = 0;
 
-    while let Some(line) = lines.next() {
+    for line in s.lines() {
         if in_gpgsig {
             if line.starts_with(' ') {
                 gpgsig_buf.push('\n');
@@ -99,9 +98,13 @@ pub fn parse_git_commit(payload: &[u8]) -> Result<GitCommit, CommitFormatError> 
         }
 
         if let Some(t) = line.strip_prefix("tree ") {
-            tree = Some(GitOid::from_hex(t).map_err(|_| CommitFormatError::InvalidOid(t.to_string()))?);
+            tree = Some(
+                GitOid::from_hex(t).map_err(|_| CommitFormatError::InvalidOid(t.to_string()))?,
+            );
         } else if let Some(p) = line.strip_prefix("parent ") {
-            parents.push(GitOid::from_hex(p).map_err(|_| CommitFormatError::InvalidOid(p.to_string()))?);
+            parents.push(
+                GitOid::from_hex(p).map_err(|_| CommitFormatError::InvalidOid(p.to_string()))?,
+            );
         } else if let Some(a) = line.strip_prefix("author ") {
             author = Some(a.to_string());
         } else if let Some(c) = line.strip_prefix("committer ") {

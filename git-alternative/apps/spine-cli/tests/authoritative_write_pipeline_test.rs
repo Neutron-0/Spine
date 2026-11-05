@@ -335,7 +335,7 @@ async fn test_authoritative_write_branch_protection_enforcement() {
         .execute_write(
             repo_id,
             &actor,
-            &[update.clone()],
+            std::slice::from_ref(&update),
             &pack_id,
             &pack_bytes,
             &index_bytes,
@@ -364,7 +364,7 @@ async fn test_authoritative_write_branch_protection_enforcement() {
         .execute_write(
             repo_id,
             &actor,
-            &[update.clone()],
+            std::slice::from_ref(&update),
             &pack_id,
             &pack_bytes,
             &index_bytes,

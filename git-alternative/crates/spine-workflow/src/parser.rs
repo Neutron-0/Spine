@@ -177,13 +177,11 @@ impl WorkflowParser {
                         env.insert(k.to_string(), Self::strip_quotes(v));
                     }
                 }
-                "jobs" => {
+                "jobs" if indent == 2 && trimmed.ends_with(':') => {
                     // Start of a job definition: indent 2: "build:"
-                    if indent == 2 && trimmed.ends_with(':') {
-                        let job_id = trimmed.trim_end_matches(':').trim().to_string();
-                        let job_spec = Self::parse_job_block(&mut lines)?;
-                        jobs.insert(job_id, job_spec);
-                    }
+                    let job_id = trimmed.trim_end_matches(':').trim().to_string();
+                    let job_spec = Self::parse_job_block(&mut lines)?;
+                    jobs.insert(job_id, job_spec);
                 }
                 _ => {}
             }
@@ -369,12 +367,11 @@ impl WorkflowParser {
 
     fn strip_quotes(s: &str) -> String {
         let trimmed = s.trim();
-        if (trimmed.starts_with('"') && trimmed.ends_with('"'))
-            || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+        if ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+            && trimmed.len() >= 2
         {
-            if trimmed.len() >= 2 {
-                return trimmed[1..trimmed.len() - 1].to_string();
-            }
+            return trimmed[1..trimmed.len() - 1].to_string();
         }
         trimmed.to_string()
     }

@@ -30,9 +30,12 @@ async fn setup_test_server() -> (String, Arc<dyn Database>, AppState, tempfile::
 
 fn run_git_cmd(cwd: &std::path::Path, args: &[&str]) -> (bool, String, String) {
     let mut cmd_args = vec![
-        "-c", "credential.helper=",
-        "-c", "core.askPass=echo",
-        "-c", "core.autocrlf=false",
+        "-c",
+        "credential.helper=",
+        "-c",
+        "core.askPass=echo",
+        "-c",
+        "core.autocrlf=false",
     ];
     cmd_args.extend_from_slice(args);
 
@@ -144,7 +147,10 @@ async fn test_git_smart_http_push_clone_roundtrip() {
     let cloned_readme = clone_dir.join("README.md");
     assert!(cloned_readme.exists(), "README.md missing after clone");
     let content = fs::read_to_string(cloned_readme).unwrap();
-    assert_eq!(content.replace("\r\n", "\n"), "# Hello Spine\nThis is native Git Smart HTTP.\n");
+    assert_eq!(
+        content.replace("\r\n", "\n"),
+        "# Hello Spine\nThis is native Git Smart HTTP.\n"
+    );
 
     // 4. Test incremental push from cloned repository
     let license = clone_dir.join("LICENSE");
@@ -168,7 +174,10 @@ async fn test_git_smart_http_push_clone_roundtrip() {
         "git pull failed. stdout: {}, stderr: {}",
         stdout, stderr
     );
-    assert!(local_repo.join("LICENSE").exists(), "LICENSE missing after git pull");
+    assert!(
+        local_repo.join("LICENSE").exists(),
+        "LICENSE missing after git pull"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -287,7 +296,13 @@ async fn test_git_smart_http_branch_protection_rejection() {
 
     let repo = state
         .repositories
-        .create_repository(&user, "protected-repo", Some("Protected".into()), false, None)
+        .create_repository(
+            &user,
+            "protected-repo",
+            Some("Protected".into()),
+            false,
+            None,
+        )
         .await
         .unwrap();
 
@@ -315,7 +330,10 @@ async fn test_git_smart_http_branch_protection_rejection() {
     run_git_cmd(&local_repo, &["init", "-b", "main"]);
     fs::write(local_repo.join("file.txt"), "Protected branch text\n").unwrap();
     run_git_cmd(&local_repo, &["add", "file.txt"]);
-    run_git_cmd(&local_repo, &["commit", "-m", "Direct push to protected branch"]);
+    run_git_cmd(
+        &local_repo,
+        &["commit", "-m", "Direct push to protected branch"],
+    );
 
     let port = url::Url::parse(&base_url).unwrap().port().unwrap();
     let auth_remote = format!(
@@ -465,7 +483,10 @@ async fn test_git_smart_http_url_without_dot_git_and_tags() {
         pat_secret, port, repo.name
     );
 
-    let (ok, stdout, stderr) = run_git_cmd(&local_repo, &["push", &auth_remote_no_git, "main", "--tags"]);
+    let (ok, stdout, stderr) = run_git_cmd(
+        &local_repo,
+        &["push", &auth_remote_no_git, "main", "--tags"],
+    );
     assert!(
         ok,
         "Push without .git suffix failed. stdout: {}, stderr: {}",
@@ -525,7 +546,13 @@ async fn test_git_smart_http_fetch_pull_lifecycle() {
     // 1. Create public repository
     let repo = state
         .repositories
-        .create_repository(&user, "lifecycle-repo", Some("Lifecycle".into()), false, None)
+        .create_repository(
+            &user,
+            "lifecycle-repo",
+            Some("Lifecycle".into()),
+            false,
+            None,
+        )
         .await
         .unwrap();
 
@@ -601,7 +628,10 @@ async fn test_git_smart_http_fetch_pull_lifecycle() {
     assert_eq!(client1_head.trim(), client2_head.trim());
 
     // 8. Fetch newly added tags
-    run_git_cmd(&client2_dir, &["tag", "-a", "v2.0.0", "-m", "Release v2.0.0"]);
+    run_git_cmd(
+        &client2_dir,
+        &["tag", "-a", "v2.0.0", "-m", "Release v2.0.0"],
+    );
     let (ok, stdout, stderr) = run_git_cmd(&client2_dir, &["push", "origin", "v2.0.0"]);
     assert!(ok, "Push tag failed: {} {}", stdout, stderr);
 
@@ -609,7 +639,10 @@ async fn test_git_smart_http_fetch_pull_lifecycle() {
     assert!(ok, "Fetch tags failed: {} {}", stdout, stderr);
     let (ok, tag_list, _) = run_git_cmd(&client1_dir, &["tag", "-l"]);
     assert!(ok);
-    assert!(tag_list.contains("v2.0.0"), "Client 1 should see tag v2.0.0");
+    assert!(
+        tag_list.contains("v2.0.0"),
+        "Client 1 should see tag v2.0.0"
+    );
 
     // 9. Fetch an additional branch
     run_git_cmd(&client2_dir, &["checkout", "-b", "dev"]);
@@ -623,11 +656,18 @@ async fn test_git_smart_http_fetch_pull_lifecycle() {
     assert!(ok, "Fetch dev branch failed: {} {}", stdout, stderr);
     let (ok, branch_list, _) = run_git_cmd(&client1_dir, &["branch", "-l"]);
     assert!(ok);
-    assert!(branch_list.contains("dev"), "Client 1 should have local dev branch");
+    assert!(
+        branch_list.contains("dev"),
+        "Client 1 should have local dev branch"
+    );
 
     // 10. Repeat fetch without new changes
     let (ok, stdout, stderr) = run_git_cmd(&client1_dir, &["fetch", "origin"]);
-    assert!(ok, "Repeated fetch without changes failed: {} {}", stdout, stderr);
+    assert!(
+        ok,
+        "Repeated fetch without changes failed: {} {}",
+        stdout, stderr
+    );
 
     // 11. Verify that no unnecessary ref corruption or duplicate commits occur
     let (ok, fsck_out, fsck_err) = run_git_cmd(&client1_dir, &["fsck", "--full"]);

@@ -248,7 +248,7 @@ impl PermissionService {
         }
 
         if let Some(org_id) = &repo.owner_org_id {
-            if let Ok(_) = self.check_org_admin(user, org_id).await {
+            if self.check_org_admin(user, org_id).await.is_ok() {
                 return Ok(());
             }
             let teams = self

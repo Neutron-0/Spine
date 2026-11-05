@@ -23,7 +23,7 @@ impl JobDag {
         let mut dependencies = HashMap::new();
         let mut dependents = HashMap::new();
 
-        for (job_id, _) in &spec.jobs {
+        for job_id in spec.jobs.keys() {
             jobs.insert(job_id.clone());
             dependencies.insert(job_id.clone(), HashSet::new());
             dependents.insert(job_id.clone(), HashSet::new());
@@ -58,11 +58,11 @@ impl JobDag {
         let mut cycle_path = Vec::new();
 
         for job in &self.jobs {
-            if !visited.contains(job) {
-                if self.dfs_cycle(job, &mut visited, &mut recursion_stack, &mut cycle_path) {
-                    cycle_path.reverse();
-                    return Err(DagError::CycleDetected(cycle_path.join(" -> ")));
-                }
+            if !visited.contains(job)
+                && self.dfs_cycle(job, &mut visited, &mut recursion_stack, &mut cycle_path)
+            {
+                cycle_path.reverse();
+                return Err(DagError::CycleDetected(cycle_path.join(" -> ")));
             }
         }
 

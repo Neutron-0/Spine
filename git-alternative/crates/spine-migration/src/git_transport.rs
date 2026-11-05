@@ -1,23 +1,21 @@
 use crate::git_exporter::{ExportStats, GitExporter};
 use crate::git_format::{
-    build_pack_and_index, parse_git_commit, parse_git_tag, parse_git_tree,
-    parse_packfile_with_resolver, read_git_refs, GitHead, GitObjectType, GitOid, GitRefMap,
-    PackObjectToBuild,
+    build_pack_and_index, parse_git_commit, parse_git_tag, parse_packfile_with_resolver, GitHead,
+    GitObjectType, GitOid, GitRefMap, PackObjectToBuild,
 };
 use crate::pkt_line::{
-    encode_flush, encode_pkt_line, encode_pkt_line_str, encode_sideband, parse_pkt_line,
-    PktLine, PktLineError,
+    encode_flush, encode_pkt_line, encode_pkt_line_str, encode_sideband, parse_pkt_line, PktLine,
+    PktLineError,
 };
 use spine_core::{AnnotatedTag, Commit, FileMode, HashAlgorithm, ObjectId, ObjectType, TreeEntry};
 use spine_format::{
-    deserialize_annotated_tag, deserialize_commit, deserialize_tree, serialize_annotated_tag,
-    serialize_commit, serialize_tree,
+    deserialize_commit, deserialize_tree, serialize_annotated_tag, serialize_commit, serialize_tree,
 };
-use spine_object_store::{CompositeObjectStore, FileSystemObjectStore, ObjectStore};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use spine_object_store::{FileSystemObjectStore, ObjectStore};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -253,10 +251,13 @@ pub fn handle_upload_pack_request(
     Ok(response)
 }
 
+pub type ParsedReceivePack = (Vec<RefUpdateCommand>, Vec<String>, Vec<u8>);
+pub type BidirectionalOidMap = (HashMap<GitOid, ObjectId>, HashMap<ObjectId, GitOid>);
+
 /// Parses the commands and packfile payload from a `POST /git-receive-pack` request.
 pub fn parse_receive_pack_request(
     request_body: &[u8],
-) -> Result<(Vec<RefUpdateCommand>, Vec<String>, Vec<u8>), GitTransportError> {
+) -> Result<ParsedReceivePack, GitTransportError> {
     let mut commands = Vec::new();
     let mut capabilities = Vec::new();
     let mut cursor = 0;
@@ -331,7 +332,8 @@ pub fn unpack_and_ingest_receive_pack(
                 if let Ok(content) = fs::read_to_string(branch_file) {
                     if let Ok(spine_id) = ObjectId::from_hex(content.trim()) {
                         if !spine_to_git.contains_key(&spine_id) {
-                            let _ = exporter.export_commit_recursive_pub(&store, &spine_id, &mut stats);
+                            let _ =
+                                exporter.export_commit_recursive_pub(&store, &spine_id, &mut stats);
                         }
                     }
                 }
@@ -341,7 +343,8 @@ pub fn unpack_and_ingest_receive_pack(
                 if let Ok(content) = fs::read_to_string(tag_file) {
                     if let Ok(spine_id) = ObjectId::from_hex(content.trim()) {
                         if !spine_to_git.contains_key(&spine_id) {
-                            let _ = exporter.export_tag_or_target_pub(&store, &spine_id, &mut stats);
+                            let _ =
+                                exporter.export_tag_or_target_pub(&store, &spine_id, &mut stats);
                         }
                     }
                 }
@@ -405,7 +408,13 @@ pub fn unpack_and_ingest_receive_pack(
         .collect();
 
     for oid in tree_oids {
-        ingest_tree_recursive(oid, &raw_objects, &mut git_to_spine, &mut spine_to_git, &store)?;
+        ingest_tree_recursive(
+            oid,
+            &raw_objects,
+            &mut git_to_spine,
+            &mut spine_to_git,
+            &store,
+        )?;
     }
 
     // 3. Ingest Commits
@@ -512,7 +521,9 @@ fn load_git_map(spine_dir: &Path) -> (HashMap<GitOid, ObjectId>, HashMap<ObjectI
     if let Ok(data) = fs::read_to_string(map_file) {
         if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&data) {
             for (git_hex, spine_hex) in map {
-                if let (Ok(goid), Ok(soid)) = (GitOid::from_hex(&git_hex), ObjectId::from_hex(&spine_hex)) {
+                if let (Ok(goid), Ok(soid)) =
+                    (GitOid::from_hex(&git_hex), ObjectId::from_hex(&spine_hex))
+                {
                     git_to_spine.insert(goid, soid);
                     spine_to_git.insert(soid, goid);
                 }
@@ -538,9 +549,7 @@ fn save_git_map(spine_dir: &Path, git_to_spine: &HashMap<GitOid, ObjectId>) {
 
 /// Scans repository refs and commits, reconciles any missing Git OIDs for native Spine commits,
 /// and atomically persists the updated bidirectional map to `git_map.json`.
-pub fn reconcile_git_map(
-    spine_dir: &Path,
-) -> Result<(HashMap<GitOid, ObjectId>, HashMap<ObjectId, GitOid>), GitTransportError> {
+pub fn reconcile_git_map(spine_dir: &Path) -> Result<BidirectionalOidMap, GitTransportError> {
     let (mut git_to_spine, mut spine_to_git) = load_git_map(spine_dir);
 
     let heads_dir = spine_dir.join("refs").join("heads");
@@ -557,12 +566,14 @@ pub fn reconcile_git_map(
             if path.is_file() {
                 let content = fs::read_to_string(&path)?;
                 if let Ok(spine_id) = ObjectId::from_hex(content.trim()) {
-                    if !spine_to_git.contains_key(&spine_id) {
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        spine_to_git.entry(spine_id)
+                    {
                         if let Ok(git_oid) =
                             exporter.export_commit_recursive_pub(&store, &spine_id, &mut stats)
                         {
                             git_to_spine.insert(git_oid, spine_id);
-                            spine_to_git.insert(spine_id, git_oid);
+                            e.insert(git_oid);
                         }
                     }
                 }
@@ -628,13 +639,23 @@ fn collect_raw_git_objects_recursive(
             GitObjectType::Tree => {
                 if let Ok(entries) = crate::git_format::parse_git_tree(&payload) {
                     for entry in entries {
-                        collect_raw_git_objects_recursive(spine_dir, &entry.oid, pack_objects, visited);
+                        collect_raw_git_objects_recursive(
+                            spine_dir,
+                            &entry.oid,
+                            pack_objects,
+                            visited,
+                        );
                     }
                 }
             }
             GitObjectType::Tag => {
                 if let Ok(tag) = parse_git_tag(&payload) {
-                    collect_raw_git_objects_recursive(spine_dir, &tag.object, pack_objects, visited);
+                    collect_raw_git_objects_recursive(
+                        spine_dir,
+                        &tag.object,
+                        pack_objects,
+                        visited,
+                    );
                 }
             }
             GitObjectType::Blob => {}
@@ -650,9 +671,7 @@ fn collect_raw_git_objects_recursive(
     }
 }
 
-fn resolve_repository_git_refs(
-    spine_dir: &Path,
-) -> Result<(GitRefMap, String), GitTransportError> {
+fn resolve_repository_git_refs(spine_dir: &Path) -> Result<(GitRefMap, String), GitTransportError> {
     let mut ref_map = GitRefMap::default();
     let mut default_branch = "main".to_string();
 
@@ -954,8 +973,8 @@ fn ingest_tree_recursive(
     let (_, payload) = raw_objects
         .get(&oid)
         .ok_or(GitTransportError::UnresolvedOid(oid))?;
-    let git_entries =
-        crate::git_format::parse_git_tree(payload).map_err(|e| GitTransportError::Protocol(e.to_string()))?;
+    let git_entries = crate::git_format::parse_git_tree(payload)
+        .map_err(|e| GitTransportError::Protocol(e.to_string()))?;
 
     let mut spine_entries = Vec::with_capacity(git_entries.len());
     for entry in git_entries {
@@ -1027,13 +1046,7 @@ fn ingest_commit_recursive(
         if let Some(&p_id) = git_to_spine.get(p) {
             parent_spine_ids.push(p_id);
         } else if raw_objects.contains_key(p) {
-            let _ = ingest_commit_recursive(
-                *p,
-                raw_objects,
-                git_to_spine,
-                spine_to_git,
-                store,
-            )?;
+            let _ = ingest_commit_recursive(*p, raw_objects, git_to_spine, spine_to_git, store)?;
             if let Some(&p_id) = git_to_spine.get(p) {
                 parent_spine_ids.push(p_id);
             }
@@ -1051,7 +1064,7 @@ fn ingest_commit_recursive(
 
     let (author_name, author_email, author_ts) =
         crate::git_format::commit::parse_identity_line(&git_commit.author);
-    let (committer_name, committer_email, committer_ts) =
+    let (committer_name, committer_email, _committer_ts) =
         crate::git_format::commit::parse_identity_line(&git_commit.committer);
 
     let spine_commit = Commit::new(
