@@ -1,17 +1,17 @@
-use sqlx::Row;
+mod common;
 
-fn get_db_url() -> String {
-    std::env::var("TEST_DATABASE_URL")
-        .or_else(|_| std::env::var("DATABASE_URL"))
-        .unwrap_or_else(|_| {
-            "postgres://spine_app:spine_secure_dev_password@172.18.77.29:5432/spine_forge?sslmode=disable"
-                .to_string()
-        })
-}
+use common::get_safe_test_db_url;
+use sqlx::Row;
 
 #[tokio::test]
 async fn test_spine_app_role_has_no_superuser_privileges() {
-    let url = get_db_url();
+    let url = match get_safe_test_db_url() {
+        Some(u) => u,
+        None => {
+            eprintln!("SKIPPED: test requires SPINE_TEST_DATABASE_URL to be set.");
+            return;
+        }
+    };
     let pool = match sqlx::PgPool::connect(&url).await {
         Ok(p) => p,
         Err(e) => {

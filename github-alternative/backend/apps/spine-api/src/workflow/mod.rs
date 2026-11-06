@@ -1,3 +1,4 @@
+pub mod provenance;
 pub mod scheduler;
 pub mod service;
 

@@ -1,20 +1,16 @@
+mod common;
+
 use spine_api::{
     backup::BackupManager,
     db::{dump_database, is_database_empty, restore_database},
 };
 
-fn get_db_url() -> String {
-    std::env::var("TEST_DATABASE_URL")
-        .or_else(|_| std::env::var("DATABASE_URL"))
-        .unwrap_or_else(|_| {
-            "postgres://spine_app:spine_secure_dev_password@172.18.77.29:5432/spine_forge?sslmode=disable"
-                .to_string()
-        })
-}
-
 #[tokio::test]
 async fn test_postgres_dump_and_empty_check() {
-    let url = get_db_url();
+    let Some(url) = common::get_safe_test_db_url() else {
+        eprintln!("Skipping postgres_dump_and_empty_check: SPINE_TEST_DATABASE_URL not set");
+        return;
+    };
     let pool = match sqlx::PgPool::connect(&url).await {
         Ok(p) => p,
         Err(e) => {
@@ -25,6 +21,11 @@ async fn test_postgres_dump_and_empty_check() {
             return;
         }
     };
+
+    // Ensure baseline schema is present in test database
+    spine_api::db::migrations::run_migrations(&pool)
+        .await
+        .expect("run_migrations on test database failed");
 
     // 1. Dump database snapshot
     let snapshot_json = dump_database(&pool).await.expect("dump_database failed");
@@ -43,7 +44,7 @@ async fn test_postgres_dump_and_empty_check() {
         .expect("is_database_empty failed");
     assert!(
         !is_empty,
-        "Live spine_forge database has migrated tables/rows, so is_database_empty must be false"
+        "Test database has migrated tables/rows, so is_database_empty must be false"
     );
 
     // 3. Attempting restore on non-empty database must fail with Conflict (Audit Finding F-01 requirement)
@@ -62,7 +63,12 @@ async fn test_postgres_dump_and_empty_check() {
 
 #[tokio::test]
 async fn test_full_archive_backup_restore_roundtrip_with_db_snapshot() {
-    let url = get_db_url();
+    let Some(url) = common::get_safe_test_db_url() else {
+        eprintln!(
+            "Skipping full_archive_backup_restore_roundtrip: SPINE_TEST_DATABASE_URL not set"
+        );
+        return;
+    };
     let pool = match sqlx::PgPool::connect(&url).await {
         Ok(p) => p,
         Err(e) => {

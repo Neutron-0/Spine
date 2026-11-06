@@ -1138,6 +1138,23 @@ pub struct WorkflowDefinition {
     pub updated_at_nanos: i64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TrustClassification {
+    Trusted,
+    Untrusted,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowProvenance {
+    pub target_repo_id: String,
+    pub source_repo_id: Option<String>,
+    pub is_fork: bool,
+    pub actor_id: String,
+    pub is_actor_authorized: bool,
+    pub trust_classification: TrustClassification,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowRun {
     pub id: String,

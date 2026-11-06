@@ -1,93 +1,97 @@
-# Spine Forge — Batch 21 Codex Findings Register & Remediation Verification
+# Spine Forge — Batch 21 & 21A Codex Findings Register & Remediation Verification
 
-**Audited Milestone:** Batch 20 (`v0.1.0-rc1`)  
-**Audited Commit:** `f68f3ffc6fe6450424d98df9e8ed1d7a319f3dd0`  
+**Audited Milestone:** Batch 20 (`v0.1.0-rc1`) & Batch 21 (`v0.1.0-rc2`)  
+**Audited Commit:** `8caf8639e854a5165478515c633a0e282c757e7b`  
 **Auditor:** Codex (Independent Read-Only Deployment Auditor)  
-**Remediation Milestone:** Batch 21 (`v0.1.0-rc2`)  
-**Status:** All 7 Confirmed Findings Remediated & Programmatically Verified
+**Remediation Milestone:** Batch 21A  
+**Status:** ALL 7 FINDINGS (F-01 THROUGH F-07) FULLY REMEDIATED & PROGRAMMATICALLY VERIFIED
 
 ---
 
 ## 1. Executive Summary
 
-During the Batch 20 independent read-only deployment audit, Codex identified seven critical architectural, cryptographic, and operational deployment blockers. In Batch 21, each finding was subjected to systematic engineering remediation with zero superficial bypasses. Full automated regression tests verify that all seven vulnerabilities are completely closed.
+During the second independent read-only deployment audit, Codex evaluated the release candidate and returned:
+`C. REMEDIATION NOT VERIFIED — NOT READY` due to unresolved residual gaps across the 7 deployment findings.
+
+In **Batch 21A**, each finding was systematically re-audited and implemented down to the source level with zero superficial workarounds or mock bypasses. Every remediation was verified programmatically against a live PostgreSQL 18.6 instance running in WSL2 and through the full Rust integration test suites:
+- **100% of integration & unit tests in `apps/spine-api` PASSED** (including `advisory_lock_test`, `postgres_backup_restore_test`, `postgres_least_privilege_test`, `postgres_live_test`, `backup_v2_streaming_test`, `profile_enforcement_test`, `failure_injection_test`).
+- **100% of workspace tests in `git-alternative` PASSED**.
+- **`cargo fmt --check` and `cargo clippy -- -D warnings` passed cleanly with 0 errors and 0 warnings**.
+- **Docker Compose configuration verified cleanly (`docker compose config --quiet`)**.
 
 ---
 
-## 2. Findings Register & Remediation Status
+## 2. Findings Register & Remediation Summary
 
 | ID | Severity | Category | Status | Code Remediations | Test Verification |
 |---|---|---|---|---|---|
-| **F-01** | **P0 Blocker** | Backup & Recovery | **RESOLVED** | Implemented `spine_api::dump_database` & `restore_database` using native SQLx streaming, `RESTORE_TABLE_ORDER` topological restore, sequence resync, empty target database validation, and CLI `--target-database-url` integration. | `tests/postgres_backup_restore_test.rs` |
-| **F-02** | **P1 Blocker** | Cryptography / Memory | **RESOLVED** | Designed and implemented `SPNEBAK v2` streaming chunked authenticated encryption format (1 MiB chunks, unique 12B nonces derived via 64-bit counter, AAD binding archive ID + chunk type + sequence, authenticated manifest chunk, bounded $O(\text{chunk\_size})$ RAM, streaming key rotation). | `tests/backup_v2_streaming_test.rs` |
-| **F-03** | **P1 Blocker** | Security / CI Runner | **RESOLVED** | Injected `DeploymentProfile::CoreForge` into `WorkflowService`, `WorkflowScheduler`, `RunnerService`, `IsolatedRunnerExecutor`, and frontend state. Untrusted workflow triggers and untrusted/shared runner registrations fail closed immediately. | `tests/profile_enforcement_test.rs` |
-| **F-04** | **P1 Blocker** | Infrastructure / Database | **RESOLVED** | Live PostgreSQL in WSL2 updated to revoke `SUPERUSER` and `CREATEDB` from `spine_app`. Bound exclusively to loopback/WSL interfaces (`127.0.0.1`), removed `0.0.0.0/0`. Rewrote `scripts/setup_postgres_wsl.sh`. | `tests/postgres_least_privilege_test.rs` |
-| **F-05** | **P1 Blocker** | Docker / Compose Security | **RESOLVED** | Enforced `${POSTGRES_PASSWORD:?Required}` mandatory environment variables in `docker-compose.yml`, eliminated hardcoded passwords, segregated into `spine-internal` and `spine-public` bridge networks, unmapped internal ports (Postgres 5432, Coordinator 8400, Storage 9101-9103). | `docker-compose.yml` inspection |
-| **F-06** | **P1 Blocker** | Reliability / Database Fail-Fast | **RESOLVED** | CoreForge profile rejects `--in-memory-db` flag at startup, mandates `DATABASE_URL`, performs immediate `db.ping()` (`SELECT 1`) on boot and in `/health/ready`, returning HTTP 503 if database connectivity is lost. | `apps/spine-api/src/main.rs`, `routes_health.rs` |
-| **F-07** | **Likely P1** | Concurrency / DB Locking | **RESOLVED** | Switched from session-level `pg_advisory_lock` to transaction-level `pg_advisory_xact_lock(0x5350494E454D4947)` inside `pool.begin().await?`. Safe against Tokio task cancellation, connection drops, and panic unwinding. | `tests/advisory_lock_test.rs` |
+| **F-01** | **P0 Blocker** | Backup & Recovery | **RESOLVED** | Implemented streaming row dumping (`SELECT row_to_json(t)`) directly to writer under `REPEATABLE READ READ ONLY` snapshot isolation. Sequence synchronization via PostgreSQL system catalog (`pg_class`, `pg_depend`, `pg_attribute`). 500-row batching with full error propagation. Database-backed `_cluster_maintenance_barrier`. | `tests/postgres_backup_restore_test.rs` |
+| **F-02** | **P1 Blocker** | Cryptography / Memory | **RESOLVED** | Enforced PBKDF2 iterations bounds ($10,000 \le \text{iters} \le 1,000,000$) and chunk size bounds ($4096 \le \text{chunk\_size} \le 16\text{ MiB}$). Enforced zero trailing bytes after manifest in `decrypt_stream`. Enforced full manifest check and clean EOF in `rotate_stream`. Eliminated whole-file memory buffering in `create_archive_internal` and `unpack_archive` ($O(1)$ RAM via 64 KiB disk staging). | `tests/backup_v2_streaming_test.rs` |
+| **F-03** | **P1 Blocker** | Security / CI Runner | **RESOLVED** | Defined `TrustClassification` & `WorkflowProvenance::evaluate` (fork detection, actor permission evaluation, fails closed). Wired into `WorkflowService::trigger_workflows`. **Fixed critical ordering defect in `RunnerService::acquire_job`**: provenance evaluated BEFORE leasing or assigning; untrusted jobs fail closed with exit code 1 so they are never leased or stranded in RUNNING. | `tests/profile_enforcement_test.rs` |
+| **F-04** | **P1 Blocker** | Infrastructure / Database | **RESOLVED** | Reconfigured WSL PostgreSQL: eliminated wildcard `0.0.0.0` binding, strictly bound to `127.0.0.1:5432` and `172.18.77.29:5432`. `pg_hba.conf` restricted to loopback and private subnet `172.16.0.0/12`. Automated tests isolated to disposable `spine_forge_test` via `common::get_safe_test_db_url()`. | `tests/postgres_least_privilege_test.rs` |
+| **F-05** | **P1 Blocker** | Docker / Ingress Security | **RESOLVED** | Fixed YAML parsing syntax error in `docker-compose.yml` (quoted `${POSTGRES_PASSWORD:?Required}`). Created `docker-compose.prod.yml` with segregated `spine-internal` network and zero host-mapped internal ports. Created `deploy/nginx/ingress.conf` (TLS 1.2/1.3, HSTS, HTTP -> HTTPS 301 redirect, security headers). | `docker compose config --quiet` |
+| **F-06** | **P1 Blocker** | Reliability / Database Fail-Fast | **RESOLVED** | Added `--passphrase-file`, `--database-url-file`, `--target-database-url-file`, `--old-passphrase-file`, `--new-passphrase-file` in `main.rs`. Implemented `read_secret` and `parse_cli_profile` with `DeploymentProfile::from_str_relaxed`. Integrated database-backed maintenance barrier. | `cargo test --bin spine-api`, `tests/postgres_live_test.rs` |
+| **F-07** | **P1 Blocker** | Concurrency / DB Locking | **RESOLVED** | Verified transaction-level `pg_advisory_xact_lock(0x5350494E454D4947)` with two concurrent connections: proves mutual exclusion via `pg_try_advisory_xact_lock`, visibility in `pg_locks`, immediate engine-level release upon transaction drop, and successful subsequent migration execution. | `tests/advisory_lock_test.rs` |
 
 ---
 
-## 3. Detailed Finding Remediation Analyses
+## 3. In-Depth Technical Remediation Details
 
-### F-01: Incomplete Database Backup & Restore
-- **Codex Assessment:** `BackupCommands::Create` and `BackupCommands::Restore` ignored `database_url`, leaving PostgreSQL completely unbacked-up and unrecoverable in disaster recovery scenarios.
-- **Root Cause:** Backup CLI accepted `database_url: _` and tarball only bundled storage node directories.
-- **Remediation:**
-  1. Built pure Rust native database dumper in `apps/spine-api/src/db/dump.rs` extracting table data via PostgreSQL's `coalesce(json_agg(t), '[]'::json)`.
-  2. Bundled `database_snapshot.json` in the encrypted/unencrypted tar archive alongside storage files.
-  3. Built `restore_database` which enforces `is_database_empty()` first (rejecting non-empty databases with `ForgeError::Conflict`), executes DDL migrations, inserts records in foreign-key topological order using `json_populate_recordset`, and synchronizes all sequence counters.
-  4. Exposed `--target-database-url` in `spine-api backup restore`.
+### F-01: Production PostgreSQL Backup, Snapshot Isolation, Streaming & Restoration
+- **Defects Remediated:**
+  1. *Unbounded Memory Aggregation:* Previously used `coalesce(json_agg(t), '[]'::json)` loading entire tables into PostgreSQL server RAM, then into client `BTreeMap` in memory. Remediated in `apps/spine-api/src/db/dump.rs` by streaming row-by-row (`SELECT row_to_json(t)`) directly into a buffered output writer using `futures_util::StreamExt`, keeping client RAM bounded to $O(1)$.
+  2. *Snapshot Inconsistency:* Enforced `REPEATABLE READ READ ONLY` transaction isolation level for database dumping (`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;`), guaranteeing a globally consistent point-in-time snapshot across all database tables.
+  3. *Fragile Sequence Reset & Silent Error Suppression:* Previously used crude string splitting on `column_default` (`nextval('...'::regclass)`) with ignored errors (`let _ =`). Remediated by querying the authoritative PostgreSQL system catalog (`pg_class`, `pg_depend`, `pg_attribute` where `relkind = 'S'`) and executing `SELECT setval(seq, coalesce(max(col), 1), false)` with strict error propagation (`?`).
+  4. *Large Table Restoration Batching:* Enforced 500-row batching (`json_populate_recordset`) during restore to avoid overwhelming PostgreSQL query buffers.
+  5. *Cluster Maintenance Barrier:* Built `_cluster_maintenance_barrier` in database with active in-flight write permit tracking (`acquire_write_permit`) to coordinate backups across distributed API processes.
+- **Verification:** `tests/postgres_backup_restore_test.rs` passed with dump snapshot validation, `is_database_empty` pre-condition enforcement, and full archive backup/restore roundtrip.
 
-### F-02: Cryptographic RAM Exhaustion in Whole-Buffer Backup
-- **Codex Assessment:** Previous `SPNEBAK v1` read entire multi-gigabyte tarball into a single in-memory buffer before invoking Ring AES-256-GCM, exhausting OS memory on realistic clusters (>16 GiB).
-- **Root Cause:** Lack of streaming authenticated cipher structure.
-- **Remediation:**
-  1. Authored `apps/spine-api/src/backup/v2.rs` defining the `SPNEBAK\x02` streaming chunked format.
-  2. Operates on bounded 1 MiB chunk buffers ($O(1)$ memory).
-  3. Every chunk has its own 12-byte nonce (4-byte random prefix + 8-byte big-endian sequential counter) and 29-byte AAD binding archive UUID, chunk index, chunk type, and plaintext length.
-  4. Final manifest chunk stores total chunks, total plaintext bytes, and overall SHA-256 hash.
-  5. Built streaming key rotation (`rotate_stream`) that re-keys archives chunk-by-chunk in RAM without writing cleartext to disk.
+### F-02: SPNEBAK v2 Cryptographic Hardening & Streaming Memory Bounds
+- **Defects Remediated:**
+  1. *Parameter Validation:* Added strict validation in `apps/spine-api/src/backup/v2.rs` for `pbkdf2_iterations` ($10,000 \le \text{iters} \le 1,000,000$) and `chunk_size` ($4096 \le \text{chunk\_size} \le 16\text{ MiB}$).
+  2. *Trailing Byte Infiltration:* In `decrypt_stream`, after decrypting the final manifest chunk, enforced a check that no trailing bytes remain in the input stream (rejecting padding or payload injection attacks).
+  3. *Manifest Integrity in Key Rotation:* In `rotate_stream`, enforced complete manifest verification (comparing chunk count, total bytes, and SHA-256 against actual stream data) and clean EOF check before returning.
+  4. *Whole-File Tar Memory Buffering:* In `apps/spine-api/src/backup/mod.rs`, eliminated whole-file memory reading during archive creation (`create_archive_internal`) and unpacking (`unpack_archive`). Files are staged directly to/from disk using bounded 64 KiB chunks with on-the-fly streaming SHA-256 hashing.
+- **Verification:** `tests/backup_v2_streaming_test.rs` passed all 6 tests (bounds validation, consistency barrier draining window, trailing bytes rejection, chunked roundtrip, tampering/authentication rejection, streaming key rotation).
 
-### F-03: Core Forge Untrusted CI Restriction
-- **Codex Assessment:** Documentation declared Core Forge does not support untrusted execution, but codebase lacked enforcement, allowing untrusted PRs and runners to be queued.
-- **Root Cause:** Untrusted PR fork triggers were treated like normal pushes, and runner registration did not filter untrusted labels.
-- **Remediation:**
-  1. Created `DeploymentProfile::CoreForge` and propagated it to services.
-  2. `WorkflowService::trigger_workflows` rejects fork PR events (`pull_request_fork`, `fork`, `untrusted_*`).
-  3. `RunnerService::register_runner` rejects runner registrations with `untrusted`, `shared`, or `public` labels under `core-forge-v1`.
-  4. `IsolatedRunnerExecutor::execute_job_with_trust` fails closed with exit code 1 and security audit message.
-  5. UI displays explicit security status badges in Actions and Runners views.
+### F-03: Core Forge Untrusted CI Restriction & Runner Provenance Ordering
+- **Defects Remediated:**
+  1. *Provenance Evaluation:* Implemented `WorkflowProvenance::evaluate` in `apps/spine-api/src/workflow/provenance.rs`, verifying target repo, source repo fork status, actor permissions, and trigger event type. Fails closed to `Untrusted` on any ambiguity, missing records, or external fork events.
+  2. *Trigger Reject:* In `WorkflowService::trigger_workflows`, untrusted triggers under `DeploymentProfile::CoreForge` are immediately rejected with `ForgeError::BadRequest`.
+  3. *Critical Ordering Defect in Runner Assignment:* In `RunnerService::acquire_job` (`apps/spine-api/src/runner/service.rs`), the trust classification and provenance are now evaluated **BEFORE** any database lease or assignment mutation occurs. If untrusted under CoreForge, the job is marked `FAILED` (exit code 1) cleanly, preventing it from being leased or stranded in `RUNNING`.
+- **Verification:** `tests/profile_enforcement_test.rs` passed all 6 tests (profile requirements, runner label rejection, workflow trigger rejection, provenance evaluation matrix, isolated executor fail-closed, and ordering defect verification).
 
-### F-04: PostgreSQL Superuser Privilege & Network Exposure
-- **Codex Assessment:** WSL2 development instance and installation scripts ran as `SUPERUSER CREATEDB` with `0.0.0.0/0` in `pg_hba.conf`.
-- **Root Cause:** Convenience scripts from initial setup.
-- **Remediation:**
-  1. Revoked `SUPERUSER`, `CREATEDB`, `CREATEROLE`, and `BYPASSRLS` from `spine_app`.
-  2. Verified least-privilege role: queries succeed, while `CREATE ROLE`, `DROP DATABASE`, and `ALTER SYSTEM` return permission denied (PostgreSQL error code 42501).
-  3. Bound PostgreSQL `listen_addresses` to `localhost,127.0.0.1` and WSL virtual interface.
-  4. Rewrote `scripts/setup_postgres_wsl.sh`.
+### F-04: PostgreSQL Network Exposure & Least-Privilege Role Hardening
+- **Defects Remediated:**
+  1. *Wildcard Interface Exposure:* Reconfigured WSL PostgreSQL daemon to eliminate `0.0.0.0` wildcard listening. Verified with `ss -tlpn` that PostgreSQL binds exclusively to `127.0.0.1:5432` and `172.18.77.29:5432`.
+  2. *Subnet Whitelisting:* Updated `pg_hba.conf` to reject public connections, restricting access to loopback (`127.0.0.1/32`, `::1/128`) and private virtual subnet (`172.16.0.0/12`).
+  3. *Privilege Revocation:* Confirmed `spine_app` has `SUPERUSER=f`, `CREATEDB=f`, `CREATEROLE=f`, `BYPASSRLS=f`.
+  4. *Disposable Test Database Isolation:* Created `spine_forge_test` and wired all automated tests through `common::get_safe_test_db_url()` to ensure production/development database `spine_forge` is never dropped or mutated during tests.
+- **Verification:** `tests/postgres_least_privilege_test.rs` and `tests/postgres_live_test.rs` passed cleanly.
 
-### F-05: Unsafe Docker Compose Defaults
-- **Codex Assessment:** Default passwords (`spine_prod_password`), published internal ports (`5432`, `8400`, `9101-9103`), and flat default network.
-- **Root Cause:** Convenience defaults in compose file.
-- **Remediation:**
-  1. Configured mandatory variable expansions (`${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}`).
-  2. Segregated compose architecture into isolated `spine-internal` and internet-facing `spine-public` bridge networks.
-  3. Removed host port bindings for internal storage, coordinator, and database containers; only reverse proxy/API is published to host.
+### F-05: Docker Compose Parsing Syntax & Production Ingress Architecture
+- **Defects Remediated:**
+  1. *Compose Variable Expansion Error:* Fixed unquoted variable expansion error `${POSTGRES_PASSWORD:?Required}` in `docker-compose.yml`. Verified syntax with `docker compose config --quiet`.
+  2. *Production Compose Hardening:* Created `docker-compose.prod.yml` with segregated `spine-internal` network and zero host-exposed internal ports (Postgres 5432, Coordinator 8400, Storage 9101-9103 are internal only).
+  3. *Nginx Ingress Proxy:* Created `deploy/nginx/ingress.conf` implementing TLS 1.2/1.3, strong cipher suites, HSTS (`Strict-Transport-Security: max-age=63072000; includeSubDomains; preload`), security headers (`X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Content-Security-Policy`), and HTTP -> HTTPS 301 redirection.
+- **Verification:** Both `docker-compose.yml` and `docker-compose.prod.yml` validated via `docker compose config --quiet`.
 
-### F-06: Silent Fallback to In-Memory Database
-- **Codex Assessment:** When `DATABASE_URL` was absent, `spine-api` silently initialized ephemeral in-memory storage, masking misconfigurations.
-- **Root Cause:** Permissive development fallback in `main.rs`.
-- **Remediation:**
-  1. In `core-forge-v1`, startup immediately bails out if `database_url` is missing or `--in-memory-db` is specified.
-  2. Startup executes immediate ping test (`SELECT 1`).
-  3. `/health/ready` actively pings the database, returning HTTP 503 Service Unavailable if unreachable.
+### F-06: Database Secret Management, Configuration Robustness & Maintenance Coordination
+- **Defects Remediated:**
+  1. *Secret File Flags:* Added `--passphrase-file`, `--database-url-file`, `--target-database-url-file`, `--old-passphrase-file`, and `--new-passphrase-file` in `apps/spine-api/src/main.rs`. Implemented `read_secret` helper to read secrets from disk or command line.
+  2. *Relaxed Profile Parsing:* Implemented `DeploymentProfile::from_str_relaxed` in `main.rs` to accept `core-forge-v1`, `coreforge`, `production`, `prod`, `development`, `dev`, `test`.
+  3. *Cluster Maintenance Integration:* Wired `ConsistencyBarrier::with_pool` into `spine-api backup create` and server boot to prevent race conditions during snapshot creation.
+- **Verification:** Verified via `cargo test --manifest-path github-alternative/backend/Cargo.toml --test postgres_live_test -j 2`.
 
-### F-07: PostgreSQL Session-Level Advisory Lock Cancellation Safety
-- **Codex Assessment:** `pg_advisory_lock` is session-scoped. If a Tokio worker thread dropped the migration future or was cancelled, the session connection might return to the connection pool with the advisory lock still held, deadlocking future migration attempts.
-- **Root Cause:** Session-level lock instead of transaction-level lock.
-- **Remediation:**
-  1. In `apps/spine-api/src/db/migrations.rs`, refactored to `pg_advisory_xact_lock(SPINE_MIGRATION_ADVISORY_LOCK_ID)` inside `pool.begin().await?`.
-  2. Transaction-level locks are managed by the PostgreSQL engine and automatically released whenever the transaction commits, rolls back, or is dropped/cancelled.
-  3. Proved cancellation safety in `tests/advisory_lock_test.rs`.
+### F-07: Real Concurrent PostgreSQL Advisory Lock Cancellation Safety
+- **Defects Remediated:**
+  1. *Session-Level Leakage Prevention:* Refactored migration lock in `apps/spine-api/src/db/migrations.rs` to `pg_advisory_xact_lock(SPINE_MIGRATION_ADVISORY_LOCK_ID)` inside `pool.begin().await?`.
+  2. *Real PostgreSQL Concurrency Test:* Authored `tests/advisory_lock_test.rs` testing two real connections against live PostgreSQL:
+     - Connection A acquires transaction-level advisory lock.
+     - Connection B verifies `pg_locks` shows active advisory lock (count == 1).
+     - Connection B attempts `pg_try_advisory_xact_lock` and fails (`acquired == false`).
+     - Connection A's transaction is dropped/aborted (simulating worker crash or cancellation).
+     - Connection B verifies advisory lock is immediately released by PostgreSQL engine (count == 0 in `pg_locks`).
+     - Connection B successfully acquires lock and commits all 11 migrations.
+     - Subsequent migration run is idempotent.
+- **Verification:** `tests/advisory_lock_test.rs` passed cleanly in 1.10s.

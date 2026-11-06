@@ -20,6 +20,7 @@ use spine_api::{
 async fn test_runner_isolation_fail_closed_on_unsandboxed_untrusted_workflow() {
     let tmp = tempdir().unwrap();
     let executor = IsolatedRunnerExecutor::new(tmp.path().to_path_buf())
+        .with_profile(spine_api::core::profile::DeploymentProfile::Development)
         .with_sandbox_mode(RunnerSandboxMode::Unsandboxed);
 
     let job = WorkflowJob {
@@ -106,6 +107,45 @@ async fn test_stale_fencing_token_and_runner_lease_invalidation() {
         )
         .await
         .unwrap();
+
+    let repo = ForgeRepository {
+        id: "repo-01".to_string(),
+        owner_user_id: "user-1".to_string(),
+        owner_username: "user1".to_string(),
+        owner_org_id: None,
+        name: "test-repo".to_string(),
+        normalized_name: "test-repo".to_string(),
+        description: "test repo".to_string(),
+        is_private: true,
+        default_branch: "main".to_string(),
+        native_repo_id: "repo-01".to_string(),
+        durability_policy: spine_cluster::durability::DurabilityPolicy::SingleCopy,
+        provisioning_status: ProvisioningStatus::Ready,
+        created_at_nanos: 1,
+        updated_at_nanos: 1,
+        archived: false,
+    };
+    db.create_repository(repo).await.unwrap();
+
+    let run = WorkflowRun {
+        id: "run-01".to_string(),
+        repo_id: "repo-01".to_string(),
+        workflow_id: "wf-1".to_string(),
+        workflow_name: "test".to_string(),
+        commit_oid: "0000000000000000000000000000000000000001".to_string(),
+        ref_name: "refs/heads/main".to_string(),
+        trigger_event: "push".to_string(),
+        actor_id: "user-1".to_string(),
+        status: "RUNNING".to_string(),
+        conclusion: None,
+        definition_yaml: "name: test\non: [push]\njobs:\n  test:\n    runs-on: [windows]\n"
+            .to_string(),
+        definition_digest: "digest1".to_string(),
+        created_at_nanos: 1,
+        started_at_nanos: Some(1),
+        completed_at_nanos: None,
+    };
+    db.create_workflow_run(run).await.unwrap();
 
     let job = WorkflowJob {
         id: "job-lease-01".to_string(),

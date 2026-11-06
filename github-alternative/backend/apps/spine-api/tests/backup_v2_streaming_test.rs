@@ -146,3 +146,72 @@ async fn test_consistency_barrier_draining_window() {
         "Maintenance mode must be inactive once guard is dropped"
     );
 }
+
+#[test]
+fn test_spnebak_v2_rejects_trailing_bytes_after_final_manifest() {
+    let passphrase = "test_passphrase_for_trailing_bytes_detection";
+    let data = b"Valid payload that must not have trailing data appended.";
+
+    let mut enc = Vec::new();
+    v2::encrypt_stream(Cursor::new(data), &mut enc, passphrase, 1, 64 * 1024).unwrap();
+
+    // Append 5 malicious trailing bytes after final manifest chunk
+    enc.extend_from_slice(b"EXTRA");
+
+    let mut dec = Vec::new();
+    let res = v2::decrypt_stream(Cursor::new(&enc), &mut dec, passphrase);
+    assert!(res.is_err(), "Must reject stream with trailing data");
+    let err = res.unwrap_err().to_string();
+    assert!(
+        err.contains("trailing data"),
+        "Error message must specify trailing data: {}",
+        err
+    );
+}
+
+#[test]
+fn test_spnebak_v2_header_bounds_validation() {
+    // 1. Valid header
+    let valid_header = v2::BackupHeaderV2 {
+        key_version: 1,
+        pbkdf2_iterations: 100_000,
+        salt: [0u8; v2::SALT_LEN],
+        archive_id: [0u8; 16],
+        nonce_prefix: [0u8; v2::NONCE_PREFIX_LEN],
+        chunk_size: 1024 * 1024,
+    };
+    let bytes = valid_header.to_bytes();
+    assert!(v2::BackupHeaderV2::from_bytes(&bytes).is_ok());
+
+    // 2. PBKDF2 iterations too low (< 10,000)
+    let mut low_iter_header = valid_header.clone();
+    low_iter_header.pbkdf2_iterations = 5_000;
+    let bytes = low_iter_header.to_bytes();
+    let res = v2::BackupHeaderV2::from_bytes(&bytes);
+    assert!(res.is_err());
+    assert!(res.unwrap_err().to_string().contains("PBKDF2 iterations"));
+
+    // 3. PBKDF2 iterations too high (> 1,000,000)
+    let mut high_iter_header = valid_header.clone();
+    high_iter_header.pbkdf2_iterations = 2_000_000;
+    let bytes = high_iter_header.to_bytes();
+    let res = v2::BackupHeaderV2::from_bytes(&bytes);
+    assert!(res.is_err());
+    assert!(res.unwrap_err().to_string().contains("PBKDF2 iterations"));
+
+    // 4. Chunk size too small (< 4096)
+    let mut small_chunk_header = valid_header.clone();
+    small_chunk_header.chunk_size = 2048;
+    let bytes = small_chunk_header.to_bytes();
+    let res = v2::BackupHeaderV2::from_bytes(&bytes);
+    assert!(res.is_err());
+    assert!(res.unwrap_err().to_string().contains("chunk size"));
+
+    // 5. Chunk size too large (> 16 MiB)
+    let mut large_chunk_header = valid_header.clone();
+    large_chunk_header.chunk_size = 32 * 1024 * 1024;
+    let bytes = large_chunk_header.to_bytes();
+    let res = v2::BackupHeaderV2::from_bytes(&bytes);
+    assert!(res.is_err());
+    assert!(res.unwrap_err().to_string().contains("chunk size"));
+}

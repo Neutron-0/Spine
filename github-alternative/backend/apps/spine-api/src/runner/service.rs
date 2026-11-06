@@ -141,7 +141,55 @@ impl RunnerService {
                 continue;
             }
 
-            // Assign job with lease and incremented fencing token
+            // CRITICAL ORDERING FIX: Inspect provenance and evaluate trust BEFORE
+            // leasing, assigning, or mutating database state.
+            let run = match self.db.get_workflow_run(&job.run_id).await? {
+                Some(r) => r,
+                None => {
+                    tracing::warn!(
+                        "Workflow run {} for job {} not found; skipping",
+                        job.run_id,
+                        job.id
+                    );
+                    continue;
+                }
+            };
+
+            let provenance = crate::core::types::WorkflowProvenance::evaluate(
+                self.db.as_ref(),
+                &job.repo_id,
+                None,
+                &run.actor_id,
+                &run.trigger_event,
+            )
+            .await;
+
+            let is_untrusted = provenance.trust_classification
+                == crate::core::types::TrustClassification::Untrusted;
+
+            if is_untrusted && !self.profile.allow_untrusted_ci() {
+                tracing::warn!(
+                    "Runner {} skipped untrusted job {} ({}). Untrusted CI disabled under profile '{}'. Failing job cleanly.",
+                    runner_id,
+                    job.id,
+                    provenance.reason,
+                    self.profile.name()
+                );
+                // Mark job as FAILED cleanly so it does not remain queued or stranded in RUNNING
+                let _ = self
+                    .db
+                    .update_workflow_job_status(
+                        &job.id,
+                        "FAILED",
+                        Some(1),
+                        Some(now_nanos),
+                        Some(now_nanos),
+                    )
+                    .await;
+                continue;
+            }
+
+            // Assign job with lease and incremented fencing token ONLY after trust verification
             let fencing_token = job.fencing_token + 1;
             // 5 minute initial lease
             let lease_expires_at = now_nanos + (5 * 60 * 1_000_000_000);
@@ -156,28 +204,9 @@ impl RunnerService {
             job.lease_expires_at_nanos = Some(lease_expires_at);
 
             let steps = self.db.list_workflow_steps(&job.id).await?;
-            let run = self.db.get_workflow_run(&job.run_id).await?;
-            let is_fork_or_untrusted_pr = run
-                .as_ref()
-                .map(|r| {
-                    r.trigger_event == "pull_request_fork"
-                        || r.trigger_event == "fork"
-                        || r.trigger_event.starts_with("untrusted")
-                })
-                .unwrap_or(false);
 
-            if is_fork_or_untrusted_pr && !self.profile.allow_untrusted_ci() {
-                tracing::warn!(
-                    "Runner {} attempted to acquire untrusted job {}, but untrusted CI is disabled under profile '{}'",
-                    runner_id,
-                    job.id,
-                    self.profile.name()
-                );
-                continue;
-            }
-
-            let secrets = if is_fork_or_untrusted_pr {
-                // Forked pull-request workflows must not receive repository or organization secrets by default
+            let secrets = if is_untrusted {
+                // Forked/untrusted workflows must not receive repository or organization secrets
                 vec![]
             } else {
                 self.db.list_workflow_secrets("REPO", &job.repo_id).await?

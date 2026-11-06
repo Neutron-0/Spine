@@ -184,6 +184,17 @@
 - **F-07:** Migration concurrency refactored to transaction-scoped `pg_advisory_xact_lock(0x5350494E454D4947)`, guaranteeing automatic lock release upon cancellation, rollback, or panic.
 - Release candidate manifest updated to `v0.1.0-rc2`, ready for second independent Codex audit.
 
+### Batch 21A: Second Codex Audit Remediation: Database Integrity, Backup Consistency, Encryption, Runner Provenance, PostgreSQL Security and Production Ingress (Completed)
+- Full resolution and regression verification of all 7 findings from the second independent Codex audit with zero open blockers.
+- **F-01 (Database Backup & Restore):** Implemented row-by-row streaming (`SELECT row_to_json(t)`) directly to output writer under `REPEATABLE READ READ ONLY` snapshot isolation. Sequences synchronized via PostgreSQL system catalog (`pg_class`, `pg_depend`, `pg_attribute`). 500-row batched insertion with strict error propagation. Database-backed maintenance barrier (`_cluster_maintenance_barrier`) with in-flight write permit tracking (`acquire_write_permit`).
+- **F-02 (SPNEBAK v2 Hardening):** Added strict bounds on PBKDF2 iterations and chunk sizes; enforced clean EOF and zero trailing bytes after manifest in `decrypt_stream`; verified manifest integrity and EOF in `rotate_stream`; eliminated whole-file memory buffering in `create_archive_internal` and `unpack_archive` ($O(1)$ RAM via 64 KiB disk staging).
+- **F-03 (Runner Provenance Ordering):** Implemented `WorkflowProvenance::evaluate` verifying fork status and actor permissions. In `RunnerService::acquire_job`, evaluated trust BEFORE database leasing/assignment; untrusted jobs fail closed with exit code 1 to prevent leasing or stranding in `RUNNING`.
+- **F-04 (PostgreSQL Security):** Reconfigured WSL PostgreSQL to eliminate `0.0.0.0` wildcard listening, strictly binding to `127.0.0.1:5432` and `172.18.77.29:5432`. `pg_hba.conf` restricted to loopback and private subnet `172.16.0.0/12`. Automated tests isolated to disposable `spine_forge_test`.
+- **F-05 (Compose & Ingress):** Fixed Docker Compose variable syntax; created `docker-compose.prod.yml` with segregated `spine-internal` network; created `deploy/nginx/ingress.conf` (TLS 1.2/1.3, HSTS, HTTP -> HTTPS 301 redirection).
+- **F-06 (Config & Startup):** Added file-based secret ingestion (`--passphrase-file`, `--database-url-file`, etc.); relaxed profile parsing; integrated database-backed maintenance barrier into backup CLI and server boot.
+- **F-07 (Advisory Lock Concurrency):** Verified transaction-level `pg_advisory_xact_lock` mutual exclusion, `pg_locks` visibility, immediate engine-level release upon transaction drop, and successful subsequent migration execution against live PostgreSQL.
+- Release candidate manifest updated for Batch 21A; codebase fully prepared for third independent Codex deployment audit.
+
 ---
 
 ## Future Milestones

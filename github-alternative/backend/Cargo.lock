@@ -2881,6 +2881,7 @@ dependencies = [
  "chrono",
  "clap",
  "flate2",
+ "futures-util",
  "hex",
  "hmac 0.12.1",
  "rand 0.8.8",

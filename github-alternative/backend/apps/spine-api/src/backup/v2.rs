@@ -71,9 +71,16 @@ impl BackupHeaderV2 {
         nonce_prefix.copy_from_slice(&buf[46..50]);
         let chunk_size = u32::from_be_bytes([buf[50], buf[51], buf[52], buf[53]]);
 
-        if chunk_size == 0 || chunk_size > 64 * 1024 * 1024 {
+        if !(10_000..=1_000_000).contains(&pbkdf2_iterations) {
             return Err(ForgeError::Internal(format!(
-                "Invalid chunk size in backup header: {} bytes",
+                "Invalid PBKDF2 iterations in backup header: {} (must be between 10,000 and 1,000,000)",
+                pbkdf2_iterations
+            )));
+        }
+
+        if !(4096..=16 * 1024 * 1024).contains(&chunk_size) {
+            return Err(ForgeError::Internal(format!(
+                "Invalid chunk size in backup header: {} bytes (must be between 4096 and 16,777,216 bytes)",
                 chunk_size
             )));
         }
@@ -404,6 +411,25 @@ pub fn decrypt_stream<R: Read, W: Write>(
                 .flush()
                 .map_err(|e| ForgeError::Internal(format!("Flush error: {}", e)))?;
 
+            // Security check: enforce strictly zero trailing bytes after final manifest
+            let mut trailing_buf = [0u8; 1];
+            match reader.read(&mut trailing_buf) {
+                Ok(0) => {} // Clean EOF
+                Ok(_) => {
+                    return Err(ForgeError::Internal(
+                        "Security violation: unexpected trailing data after final manifest chunk"
+                            .to_string(),
+                    ));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+                Err(e) => {
+                    return Err(ForgeError::Internal(format!(
+                        "Error checking for trailing data: {}",
+                        e
+                    )));
+                }
+            }
+
             return Ok(StreamSummary {
                 total_chunks: reported_chunks,
                 total_plaintext_bytes: total_bytes,
@@ -482,6 +508,8 @@ pub fn rotate_stream<R: Read, W: Write>(
     let new_key = derive_key(new_passphrase, &new_salt, DEFAULT_PBKDF2_ITERATIONS);
 
     let mut expected_chunk_index = 0u64;
+    let mut total_bytes = 0u64;
+    let mut stream_hasher = Sha256::new();
 
     loop {
         let mut type_buf = [0u8; 1];
@@ -568,12 +596,69 @@ pub fn rotate_stream<R: Read, W: Write>(
             .map_err(|e| ForgeError::Internal(e.to_string()))?;
 
         if chunk_type == CHUNK_TYPE_FINAL {
+            // Verify final manifest contents
+            if decrypted.len() != (8 + 8 + 32) {
+                return Err(ForgeError::Internal(
+                    "Corrupt final manifest chunk in rotation: invalid size".to_string(),
+                ));
+            }
+            let reported_chunks = u64::from_be_bytes(decrypted[0..8].try_into().unwrap());
+            let reported_bytes = u64::from_be_bytes(decrypted[8..16].try_into().unwrap());
+            let reported_hash: [u8; 32] = decrypted[16..48].try_into().unwrap();
+
+            if reported_chunks != expected_chunk_index {
+                return Err(ForgeError::Internal(format!(
+                    "Rotation manifest validation error: chunk count mismatch (reported: {}, actual: {})",
+                    reported_chunks, expected_chunk_index
+                )));
+            }
+
+            if reported_bytes != total_bytes {
+                return Err(ForgeError::Internal(format!(
+                    "Rotation manifest validation error: byte count mismatch (reported: {}, actual: {})",
+                    reported_bytes, total_bytes
+                )));
+            }
+
+            let actual_hash: [u8; 32] = stream_hasher.finalize().into();
+            if actual_hash != reported_hash {
+                return Err(ForgeError::Internal(
+                    "Rotation manifest validation error: stream SHA-256 hash mismatch".to_string(),
+                ));
+            }
+
             writer
                 .flush()
                 .map_err(|e| ForgeError::Internal(format!("Flush error: {}", e)))?;
-            return Ok(());
-        }
 
-        expected_chunk_index += 1;
+            // Check for trailing bytes
+            let mut trailing_buf = [0u8; 1];
+            match reader.read(&mut trailing_buf) {
+                Ok(0) => {} // Clean EOF
+                Ok(_) => {
+                    return Err(ForgeError::Internal(
+                        "Security violation: unexpected trailing data after final manifest chunk in rotation".to_string(),
+                    ));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+                Err(e) => {
+                    return Err(ForgeError::Internal(format!(
+                        "Error checking for trailing data: {}",
+                        e
+                    )));
+                }
+            }
+
+            return Ok(());
+        } else if chunk_type == CHUNK_TYPE_DATA {
+            total_bytes += decrypted.len() as u64;
+            stream_hasher.update(&*decrypted);
+            expected_chunk_index += 1;
+        } else {
+            return Err(ForgeError::Internal(format!(
+                "Unknown chunk type during rotation: {}",
+                chunk_type
+            )));
+        }
     }
 }

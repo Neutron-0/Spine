@@ -68,6 +68,10 @@ enum Commands {
         /// PostgreSQL Database URL
         #[arg(long)]
         database_url: Option<String>,
+
+        /// Path to file containing PostgreSQL Database URL
+        #[arg(long)]
+        database_url_file: Option<PathBuf>,
     },
 
     /// One-time bootstrap of the initial system administrator
@@ -116,13 +120,25 @@ enum BackupCommands {
         #[arg(long)]
         database_url: Option<String>,
 
+        /// Path to file containing PostgreSQL Database URL
+        #[arg(long)]
+        database_url_file: Option<PathBuf>,
+
         /// Optional AEAD encryption passphrase (enables AES-256-GCM + PBKDF2)
         #[arg(long)]
         passphrase: Option<String>,
 
+        /// Path to file containing AEAD encryption passphrase
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+
         /// Key rotation version (default: 1)
         #[arg(long, default_value_t = 1)]
         key_version: u16,
+
+        /// Deployment profile (core-forge-v1, development, test)
+        #[arg(long)]
+        profile: Option<String>,
     },
 
     /// Restore and verify a backup archive into target directory
@@ -139,9 +155,21 @@ enum BackupCommands {
         #[arg(long)]
         target_database_url: Option<String>,
 
+        /// Path to file containing target PostgreSQL Database URL
+        #[arg(long)]
+        target_database_url_file: Option<PathBuf>,
+
         /// AEAD encryption passphrase if restoring an encrypted .spinebak archive
         #[arg(long)]
         passphrase: Option<String>,
+
+        /// Path to file containing AEAD encryption passphrase
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+
+        /// Deployment profile (core-forge-v1, development, test)
+        #[arg(long)]
+        profile: Option<String>,
     },
 
     /// Rotate the encryption key/passphrase of an encrypted backup archive without disk writes
@@ -156,11 +184,19 @@ enum BackupCommands {
 
         /// Current/old encryption passphrase
         #[arg(long)]
-        old_passphrase: String,
+        old_passphrase: Option<String>,
+
+        /// Path to file containing current/old encryption passphrase
+        #[arg(long)]
+        old_passphrase_file: Option<PathBuf>,
 
         /// New encryption passphrase
         #[arg(long)]
-        new_passphrase: String,
+        new_passphrase: Option<String>,
+
+        /// Path to file containing new encryption passphrase
+        #[arg(long)]
+        new_passphrase_file: Option<PathBuf>,
 
         /// New key rotation version (default: 2)
         #[arg(long, default_value_t = 2)]
@@ -168,15 +204,62 @@ enum BackupCommands {
     },
 }
 
+fn read_secret(
+    direct_arg: Option<String>,
+    file_path: Option<&std::path::Path>,
+    env_vars: &[&str],
+) -> Option<String> {
+    if let Some(val) = direct_arg {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(path) = file_path {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    for var in env_vars {
+        if let Ok(val) = std::env::var(var) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn parse_cli_profile(
+    profile_arg: Option<&str>,
+) -> Result<spine_api::DeploymentProfile, anyhow::Error> {
+    let raw = profile_arg
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("SPINE_DEPLOYMENT_PROFILE").ok())
+        .unwrap_or_else(|| "core-forge-v1".to_string());
+    spine_api::DeploymentProfile::from_str_relaxed(&raw)
+        .map_err(|e| anyhow::anyhow!("Invalid deployment profile '{}': {}", raw, e))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Migrate { database_url }) => {
-            let db_url = database_url
-                .or_else(|| std::env::var("DATABASE_URL").ok())
-                .ok_or_else(|| anyhow::anyhow!("DATABASE_URL must be provided for migration"))?;
+        Some(Commands::Migrate {
+            database_url,
+            database_url_file,
+        }) => {
+            let db_url = read_secret(
+                database_url,
+                database_url_file.as_deref(),
+                &["DATABASE_URL", "SPINE_DATABASE_URL"],
+            )
+            .ok_or_else(|| anyhow::anyhow!("DATABASE_URL must be provided for migration"))?;
             println!("Connecting to PostgreSQL database: {}", db_url);
             let _pg = PgDatabase::connect_and_migrate(&db_url).await?;
             println!("PostgreSQL schema migrations executed and verified successfully.");
@@ -308,25 +391,46 @@ async fn main() -> anyhow::Result<()> {
                 output,
                 storage_root,
                 database_url,
+                database_url_file,
                 passphrase,
+                passphrase_file,
                 key_version,
+                profile,
             } => {
-                let db_url = database_url.or_else(|| std::env::var("DATABASE_URL").ok());
+                let prof = parse_cli_profile(profile.as_deref())?;
+                let db_url = read_secret(
+                    database_url,
+                    database_url_file.as_deref(),
+                    &["DATABASE_URL", "SPINE_DATABASE_URL"],
+                );
+                let pass = read_secret(
+                    passphrase,
+                    passphrase_file.as_deref(),
+                    &["SPINE_BACKUP_PASSPHRASE", "BACKUP_PASSPHRASE"],
+                );
+
                 let db_snapshot_json = if let Some(url) = db_url {
                     println!("Connecting to PostgreSQL to capture snapshot: {}...", url);
                     let pool = sqlx::PgPool::connect(&url).await.map_err(|e| {
                         anyhow::anyhow!("Failed to connect to PostgreSQL for backup: {}", e)
                     })?;
+
+                    // Coordinate with cluster via database-backed maintenance barrier
+                    let barrier = spine_api::backup::ConsistencyBarrier::with_pool(pool.clone());
+                    let _maintenance_guard = barrier
+                        .enter_maintenance(std::time::Duration::from_secs(5))
+                        .await;
+
                     let dump = spine_api::dump_database(&pool).await.map_err(|e| {
                         anyhow::anyhow!("Failed to dump PostgreSQL database: {}", e)
                     })?;
                     println!("PostgreSQL database snapshot captured successfully.");
                     Some(dump)
                 } else {
-                    let prof = std::env::var("SPINE_DEPLOYMENT_PROFILE").unwrap_or_default();
-                    if prof == "core-forge-v1" {
+                    if prof.requires_persistent_database() {
                         anyhow::bail!(
-                            "Under deployment profile 'core-forge-v1', PostgreSQL database URL is required for complete backups (--database-url or DATABASE_URL)."
+                            "Under deployment profile '{}', a PostgreSQL database URL is required for complete backups (--database-url, --database-url-file, or DATABASE_URL).",
+                            prof
                         );
                     }
                     None
@@ -337,7 +441,7 @@ async fn main() -> anyhow::Result<()> {
                     storage_root.display(),
                     output.display()
                 );
-                let manifest = if let Some(pass) = passphrase {
+                let manifest = if let Some(pass_str) = pass {
                     println!(
                         "Applying SPNEBAK v2 AES-256-GCM AEAD streaming encryption (key version {})...",
                         key_version
@@ -346,7 +450,7 @@ async fn main() -> anyhow::Result<()> {
                         &storage_root,
                         db_snapshot_json.as_deref(),
                         &output,
-                        &pass,
+                        &pass_str,
                         key_version,
                     )?
                 } else {
@@ -367,21 +471,36 @@ async fn main() -> anyhow::Result<()> {
                 input,
                 target_storage,
                 target_database_url,
+                target_database_url_file,
                 passphrase,
+                passphrase_file,
+                profile,
             } => {
+                let prof = parse_cli_profile(profile.as_deref())?;
+                let pass = read_secret(
+                    passphrase,
+                    passphrase_file.as_deref(),
+                    &["SPINE_BACKUP_PASSPHRASE", "BACKUP_PASSPHRASE"],
+                );
+                let target_db = read_secret(
+                    target_database_url,
+                    target_database_url_file.as_deref(),
+                    &["TARGET_DATABASE_URL", "DATABASE_URL"],
+                );
+
                 println!(
                     "Restoring backup archive from {} into {}",
                     input.display(),
                     target_storage.display()
                 );
-                let (manifest, report, db_snapshot) = if let Some(pass) = passphrase {
+                let (manifest, report, db_snapshot) = if let Some(pass_str) = pass {
                     println!(
                         "Decrypting with AEAD passphrase and verifying chunk integrity tags..."
                     );
                     spine_api::backup::BackupManager::restore_encrypted_backup(
                         &input,
                         &target_storage,
-                        &pass,
+                        &pass_str,
                     )?
                 } else {
                     spine_api::backup::BackupManager::restore_backup(&input, &target_storage)?
@@ -390,10 +509,6 @@ async fn main() -> anyhow::Result<()> {
                 println!("  Backup ID:     {}", manifest.backup_id);
                 println!("  Files restored:{}", report.files_restored);
                 println!("  Bytes restored:{}", report.bytes_restored);
-
-                let target_db = target_database_url
-                    .or_else(|| std::env::var("TARGET_DATABASE_URL").ok())
-                    .or_else(|| std::env::var("DATABASE_URL").ok());
 
                 if let Some(snapshot_json) = db_snapshot {
                     if let Some(db_url) = target_db {
@@ -426,8 +541,13 @@ async fn main() -> anyhow::Result<()> {
                         println!("  Tables restored: {}", db_report.tables_restored);
                         println!("  Rows restored:   {}", db_report.rows_restored);
                         println!("  Duration:        {} ms", db_report.duration_ms);
+                    } else if prof.requires_persistent_database() {
+                        anyhow::bail!(
+                            "Under deployment profile '{}', a target PostgreSQL database URL is required for restoring backups containing database snapshots (--target-database-url, --target-database-url-file, or TARGET_DATABASE_URL).",
+                            prof
+                        );
                     } else {
-                        println!("WARNING: Backup archive contains a database snapshot, but no --target-database-url (or TARGET_DATABASE_URL/DATABASE_URL) was specified. Database was not restored.");
+                        println!("WARNING: Backup archive contains a database snapshot, but no --target-database-url was specified. Database was not restored.");
                     }
                 }
                 println!(
@@ -444,9 +564,29 @@ async fn main() -> anyhow::Result<()> {
                 input,
                 output,
                 old_passphrase,
+                old_passphrase_file,
                 new_passphrase,
+                new_passphrase_file,
                 key_version,
             } => {
+                let old_pass = read_secret(
+                    old_passphrase,
+                    old_passphrase_file.as_deref(),
+                    &["SPINE_BACKUP_OLD_PASSPHRASE", "BACKUP_OLD_PASSPHRASE"],
+                )
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Current/old passphrase required (--old-passphrase, --old-passphrase-file, or SPINE_BACKUP_OLD_PASSPHRASE)")
+                })?;
+
+                let new_pass = read_secret(
+                    new_passphrase,
+                    new_passphrase_file.as_deref(),
+                    &["SPINE_BACKUP_NEW_PASSPHRASE", "BACKUP_NEW_PASSPHRASE"],
+                )
+                .ok_or_else(|| {
+                    anyhow::anyhow!("New passphrase required (--new-passphrase, --new-passphrase-file, or SPINE_BACKUP_NEW_PASSPHRASE)")
+                })?;
+
                 println!(
                     "Rotating backup encryption key from {} to {} (target key version {})...",
                     input.display(),
@@ -456,8 +596,8 @@ async fn main() -> anyhow::Result<()> {
                 spine_api::backup::BackupManager::rotate_backup_key(
                     &input,
                     &output,
-                    &old_passphrase,
-                    &new_passphrase,
+                    &old_pass,
+                    &new_pass,
                     key_version,
                 )?;
                 println!(
@@ -522,7 +662,7 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
     }
 
     // 1. Initialize Database backend
-    let db: Arc<dyn Database> = match database_url {
+    let (db, pg_pool): (Arc<dyn Database>, Option<sqlx::PgPool>) = match database_url {
         Some(db_url) => {
             tracing::info!(
                 "Connecting to PostgreSQL database and applying migrations under profile '{}'...",
@@ -542,7 +682,8 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
                 )
             })?;
 
-            Arc::new(pg_db)
+            let pool = pg_db.pool().clone();
+            (Arc::new(pg_db), Some(pool))
         }
         None => {
             if profile.permits_in_memory_db() && args.in_memory_db {
@@ -550,7 +691,7 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
                     "Initializing Spine Forge with InMemoryDatabase adapter (PERMITTED ONLY for profile '{}')",
                     profile
                 );
-                Arc::new(InMemoryDatabase::new())
+                (Arc::new(InMemoryDatabase::new()), None)
             } else {
                 anyhow::bail!(
                     "CRITICAL CONFIGURATION ERROR: No database backend configured. Under profile '{}', provide DATABASE_URL or set --in-memory-db explicitly.",
@@ -628,7 +769,10 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
         .or_else(|_| std::env::var("APP_URL"))
         .unwrap_or_else(|_| format!("http://{}:{}", args.bind, args.port));
 
-    let consistency_barrier = Arc::new(spine_api::backup::ConsistencyBarrier::new());
+    let consistency_barrier = Arc::new(match pg_pool {
+        Some(pool) => spine_api::backup::ConsistencyBarrier::with_pool(pool),
+        None => spine_api::backup::ConsistencyBarrier::new(),
+    });
 
     let state = AppState {
         profile,

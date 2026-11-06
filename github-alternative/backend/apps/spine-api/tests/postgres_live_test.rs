@@ -1,3 +1,5 @@
+mod common;
+
 use spine_api::{
     core::types::*,
     db::{Database, PgDatabase},
@@ -6,18 +8,12 @@ use spine_cluster::durability::DurabilityPolicy;
 use std::sync::Arc;
 use uuid::Uuid;
 
-fn get_db_url() -> String {
-    std::env::var("TEST_DATABASE_URL")
-        .or_else(|_| std::env::var("DATABASE_URL"))
-        .unwrap_or_else(|_| {
-            "postgres://spine_app:spine_secure_dev_password@172.18.77.29:5432/spine_forge?sslmode=disable"
-                .to_string()
-        })
-}
-
 #[tokio::test]
 async fn test_postgres_live_migrations_and_concurrency() {
-    let url = get_db_url();
+    let Some(url) = common::get_safe_test_db_url() else {
+        eprintln!("Skipping test_postgres_live_migrations_and_concurrency: SPINE_TEST_DATABASE_URL not set");
+        return;
+    };
     let db = PgDatabase::connect_and_migrate(&url)
         .await
         .expect("connect_and_migrate failed on live PostgreSQL");
@@ -49,7 +45,10 @@ async fn test_postgres_live_migrations_and_concurrency() {
 
 #[tokio::test]
 async fn test_postgres_live_identity_and_auth_lifecycle() {
-    let url = get_db_url();
+    let Some(url) = common::get_safe_test_db_url() else {
+        eprintln!("Skipping test_postgres_live_identity_and_auth_lifecycle: SPINE_TEST_DATABASE_URL not set");
+        return;
+    };
     let db: Arc<dyn Database> = Arc::new(
         PgDatabase::connect_and_migrate(&url)
             .await
@@ -202,7 +201,10 @@ async fn test_postgres_live_identity_and_auth_lifecycle() {
 
 #[tokio::test]
 async fn test_postgres_live_repository_and_permissions() {
-    let url = get_db_url();
+    let Some(url) = common::get_safe_test_db_url() else {
+        eprintln!("Skipping test_postgres_live_repository_and_permissions: SPINE_TEST_DATABASE_URL not set");
+        return;
+    };
     let db: Arc<dyn Database> = Arc::new(
         PgDatabase::connect_and_migrate(&url)
             .await
@@ -361,7 +363,10 @@ async fn test_postgres_live_repository_and_permissions() {
 
 #[tokio::test]
 async fn test_postgres_live_persistence_across_connections() {
-    let url = get_db_url();
+    let Some(url) = common::get_safe_test_db_url() else {
+        eprintln!("Skipping test_postgres_live_persistence_across_connections: SPINE_TEST_DATABASE_URL not set");
+        return;
+    };
     // Ensure migrations are applied
     PgDatabase::connect_and_migrate(&url)
         .await

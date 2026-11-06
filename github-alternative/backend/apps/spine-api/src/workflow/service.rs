@@ -91,9 +91,37 @@ impl WorkflowService {
         event_type: &str,
         actor_id: &str,
     ) -> Result<Vec<WorkflowRun>, ForgeError> {
+        self.trigger_workflows_with_provenance(
+            repo_id, None, commit_oid, ref_name, event_type, actor_id,
+        )
+        .await
+    }
+
+    /// Trigger workflows with full provenance verification (target repository, source repository, actor authorization).
+    pub async fn trigger_workflows_with_provenance(
+        &self,
+        repo_id: &str,
+        source_repo_id: Option<&str>,
+        commit_oid: &str,
+        ref_name: &str,
+        event_type: &str,
+        actor_id: &str,
+    ) -> Result<Vec<WorkflowRun>, ForgeError> {
         let definitions = self.db.list_workflow_definitions(repo_id).await?;
         let mut triggered_runs = Vec::new();
         let now_nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+        let provenance = crate::core::types::WorkflowProvenance::evaluate(
+            self.db.as_ref(),
+            repo_id,
+            source_repo_id,
+            actor_id,
+            event_type,
+        )
+        .await;
+
+        let is_untrusted =
+            provenance.trust_classification == crate::core::types::TrustClassification::Untrusted;
 
         for def in definitions {
             let spec = match WorkflowParser::parse(&def.yaml_content) {
@@ -109,7 +137,7 @@ impl WorkflowService {
                     .push
                     .as_ref()
                     .is_some_and(|p| p.matches_branch(branch_clean)),
-                "pull_request" => spec
+                "pull_request" | "pull_request_fork" => spec
                     .on
                     .pull_request
                     .as_ref()
@@ -122,13 +150,10 @@ impl WorkflowService {
                 continue;
             }
 
-            let is_untrusted_event = event_type == "pull_request_fork"
-                || event_type == "fork"
-                || event_type.starts_with("untrusted");
-
-            if is_untrusted_event && !self.profile.allow_untrusted_ci() {
+            if is_untrusted && !self.profile.allow_untrusted_ci() {
                 tracing::warn!(
-                    "Untrusted CI execution is disabled under deployment profile '{}'. Disallowing workflow run for repo {}",
+                    "Untrusted CI execution ({}) is disabled under deployment profile '{}'. Disallowing workflow run for repo {}",
+                    provenance.reason,
                     self.profile.name(),
                     repo_id
                 );

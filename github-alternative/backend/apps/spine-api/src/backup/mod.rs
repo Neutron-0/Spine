@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -404,10 +404,22 @@ impl BackupManager {
         }
 
         for (rel_path, abs_path) in &file_paths {
-            let data = fs::read(abs_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
-            total_bytes += data.len() as u64;
+            let mut f =
+                fs::File::open(abs_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
             let mut hasher = Sha256::new();
-            hasher.update(&data);
+            let mut buf = [0u8; 64 * 1024];
+            let mut f_len = 0u64;
+            loop {
+                let n = f
+                    .read(&mut buf)
+                    .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                f_len += n as u64;
+            }
+            total_bytes += f_len;
             let digest = hex::encode(hasher.finalize());
             file_hashes.insert(rel_path.clone(), digest);
         }
@@ -473,12 +485,15 @@ impl BackupManager {
         }
 
         for (rel_path, abs_path) in file_paths {
-            let data = fs::read(&abs_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
+            let metadata =
+                fs::metadata(&abs_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
+            let mut f =
+                fs::File::open(&abs_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
             let mut f_header = tar::Header::new_gnu();
-            f_header.set_size(data.len() as u64);
+            f_header.set_size(metadata.len());
             f_header.set_mode(0o644);
             f_header.set_cksum();
-            tar.append_data(&mut f_header, &rel_path, &data[..])
+            tar.append_data(&mut f_header, &rel_path, &mut f)
                 .map_err(|e| ForgeError::Internal(e.to_string()))?;
         }
 
@@ -500,7 +515,9 @@ impl BackupManager {
 
         let mut manifest: Option<BackupManifest> = None;
         let mut extracted_db_snapshot: Option<String> = None;
-        let mut extracted_files = BTreeMap::new();
+        let staging_dir = tempfile::tempdir_in(target_storage_root)
+            .map_err(|e| ForgeError::Internal(format!("Failed to create staging dir: {}", e)))?;
+        let mut files_to_verify: Vec<(String, PathBuf)> = Vec::new();
 
         for entry in archive
             .entries()
@@ -528,11 +545,28 @@ impl BackupManager {
                     .map_err(|e| ForgeError::Internal(e.to_string()))?;
                 extracted_db_snapshot = Some(content);
             } else {
-                let mut content = Vec::new();
-                entry
-                    .read_to_end(&mut content)
+                // Stream entry directly to a disk file in staging_dir (bounded 64 KiB chunks)
+                let staged_file_name = format!("stage_{}.dat", files_to_verify.len());
+                let staged_path = staging_dir.path().join(&staged_file_name);
+                let mut out_file = fs::File::create(&staged_path)
                     .map_err(|e| ForgeError::Internal(e.to_string()))?;
-                extracted_files.insert(path_str, content);
+
+                let mut buf = [0u8; 64 * 1024];
+                loop {
+                    let n = entry
+                        .read(&mut buf)
+                        .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                    if n == 0 {
+                        break;
+                    }
+                    out_file
+                        .write_all(&buf[..n])
+                        .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                }
+                out_file
+                    .flush()
+                    .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                files_to_verify.push((path_str, staged_path));
             }
         }
 
@@ -565,7 +599,7 @@ impl BackupManager {
             bytes_restored += db_json.len() as u64;
         }
 
-        for (rel_path, data) in extracted_files {
+        for (rel_path, staged_path) in files_to_verify {
             let expected_hash = manifest.file_hashes.get(&rel_path).ok_or_else(|| {
                 ForgeError::Internal(format!(
                     "Unexpected file in archive not in manifest: {}",
@@ -573,8 +607,22 @@ impl BackupManager {
                 ))
             })?;
 
+            // Compute hash streaming from disk in bounded chunks
+            let mut f =
+                fs::File::open(&staged_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
             let mut hasher = Sha256::new();
-            hasher.update(&data);
+            let mut buf = [0u8; 64 * 1024];
+            let mut file_len = 0u64;
+            loop {
+                let n = f
+                    .read(&mut buf)
+                    .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                file_len += n as u64;
+            }
             let actual_hash = hex::encode(hasher.finalize());
             if actual_hash != *expected_hash {
                 return Err(ForgeError::Internal(format!(
@@ -588,10 +636,18 @@ impl BackupManager {
             if let Some(parent) = dest_path.parent() {
                 fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
             }
-            fs::write(&dest_path, &data).map_err(|e| ForgeError::Internal(e.to_string()))?;
+            // Move staged file to destination
+            if fs::rename(&staged_path, &dest_path).is_err() {
+                let mut src = fs::File::open(&staged_path)
+                    .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                let mut dst = fs::File::create(&dest_path)
+                    .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                std::io::copy(&mut src, &mut dst)
+                    .map_err(|e| ForgeError::Internal(e.to_string()))?;
+            }
 
             files_restored += 1;
-            bytes_restored += data.len() as u64;
+            bytes_restored += file_len;
         }
 
         let duration_ms = start.elapsed().as_millis() as u64;

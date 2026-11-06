@@ -53,3 +53,4 @@ ssh-key = { version = "0.7.0-rc.11", features = ["ed25519", "rsa", "std"] }
 flate2 = "1.0"
 tar = "0.4"
 ring = { version = "0.17", default-features = false, features = ["std"] }
+futures-util = "0.3"
