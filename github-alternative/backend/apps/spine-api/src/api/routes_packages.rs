@@ -64,6 +64,7 @@ pub async fn cargo_publish(
     user: Option<Extension<User>>,
     body: Bytes,
 ) -> Result<Json<CargoPublishResponse>, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let current_user = user
         .ok_or_else(|| {
             ForgeError::Unauthorized("Authentication required to publish crate".to_string())

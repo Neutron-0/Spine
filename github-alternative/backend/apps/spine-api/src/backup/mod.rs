@@ -76,7 +76,25 @@ impl BackupManager {
 
         let file = File::create(output_tar_gz).map_err(|e| ForgeError::Internal(e.to_string()))?;
         let enc = GzEncoder::new(file, Compression::default());
-        let (manifest, _) = Self::create_archive_internal(storage_root, db_snapshot_json, enc)?;
+        let (manifest, _) =
+            Self::create_archive_internal(storage_root, db_snapshot_json, None, enc)?;
+        Ok(manifest)
+    }
+
+    /// Creates an unencrypted backup archive with database snapshot streamed from a disk file
+    pub fn create_backup_from_file(
+        storage_root: &Path,
+        db_snapshot_file: Option<&Path>,
+        output_tar_gz: &Path,
+    ) -> Result<BackupManifest, ForgeError> {
+        if let Some(parent) = output_tar_gz.parent() {
+            fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
+        }
+
+        let file = File::create(output_tar_gz).map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let enc = GzEncoder::new(file, Compression::default());
+        let (manifest, _) =
+            Self::create_archive_internal(storage_root, None, db_snapshot_file, enc)?;
         Ok(manifest)
     }
 
@@ -87,6 +105,42 @@ impl BackupManager {
     pub fn create_encrypted_backup(
         storage_root: &Path,
         db_snapshot_json: Option<&str>,
+        output_enc_path: &Path,
+        passphrase: &str,
+        key_version: u16,
+    ) -> Result<BackupManifest, ForgeError> {
+        Self::create_encrypted_backup_internal(
+            storage_root,
+            db_snapshot_json,
+            None,
+            output_enc_path,
+            passphrase,
+            key_version,
+        )
+    }
+
+    /// Creates an encrypted backup archive with database snapshot streamed directly from a disk file.
+    pub fn create_encrypted_backup_from_file(
+        storage_root: &Path,
+        db_snapshot_file: Option<&Path>,
+        output_enc_path: &Path,
+        passphrase: &str,
+        key_version: u16,
+    ) -> Result<BackupManifest, ForgeError> {
+        Self::create_encrypted_backup_internal(
+            storage_root,
+            None,
+            db_snapshot_file,
+            output_enc_path,
+            passphrase,
+            key_version,
+        )
+    }
+
+    fn create_encrypted_backup_internal(
+        storage_root: &Path,
+        db_snapshot_json: Option<&str>,
+        db_snapshot_file: Option<&Path>,
         output_enc_path: &Path,
         passphrase: &str,
         key_version: u16,
@@ -110,7 +164,8 @@ impl BackupManager {
         let file = File::create(&staging_tar_gz)
             .map_err(|e| ForgeError::Internal(format!("Failed to create staging file: {}", e)))?;
         let enc = GzEncoder::new(file, Compression::default());
-        let (manifest, _) = Self::create_archive_internal(storage_root, db_snapshot_json, enc)?;
+        let (manifest, _) =
+            Self::create_archive_internal(storage_root, db_snapshot_json, db_snapshot_file, enc)?;
 
         // 2. Stream chunked authenticated encryption (SPNEBAK v2)
         let reader = File::open(&staging_tar_gz)
@@ -140,6 +195,17 @@ impl BackupManager {
         Self::unpack_archive(dec, target_storage_root)
     }
 
+    /// Restores a backup archive, staging the database snapshot directly to a file on disk (O(1) memory)
+    pub fn restore_backup_staged(
+        backup_tar_gz: &Path,
+        target_storage_root: &Path,
+    ) -> Result<(BackupManifest, RestoreReport, Option<PathBuf>), ForgeError> {
+        let file = File::open(backup_tar_gz)
+            .map_err(|e| ForgeError::Internal(format!("Failed to open backup archive: {}", e)))?;
+        let dec = GzDecoder::new(file);
+        Self::unpack_archive_staged(dec, target_storage_root)
+    }
+
     /// Restores an authenticated, AEAD-encrypted backup archive, verifying passphrases, chunks, and tags.
     /// Supports both SPNEBAK v2 (streaming chunked) and legacy SPNEBAK v1.
     pub fn restore_encrypted_backup(
@@ -147,6 +213,23 @@ impl BackupManager {
         target_storage_root: &Path,
         passphrase: &str,
     ) -> Result<(BackupManifest, RestoreReport, Option<String>), ForgeError> {
+        let (manifest, report, db_path) =
+            Self::restore_encrypted_backup_staged(encrypted_path, target_storage_root, passphrase)?;
+        let db_str = match db_path {
+            Some(ref p) => {
+                Some(fs::read_to_string(p).map_err(|e| ForgeError::Internal(e.to_string()))?)
+            }
+            None => None,
+        };
+        Ok((manifest, report, db_str))
+    }
+
+    /// Restores an encrypted backup archive, staging the database snapshot directly to a file on disk (O(1) memory).
+    pub fn restore_encrypted_backup_staged(
+        encrypted_path: &Path,
+        target_storage_root: &Path,
+        passphrase: &str,
+    ) -> Result<(BackupManifest, RestoreReport, Option<PathBuf>), ForgeError> {
         let mut file = File::open(encrypted_path)
             .map_err(|e| ForgeError::Internal(format!("Failed to open encrypted backup: {}", e)))?;
 
@@ -174,7 +257,7 @@ impl BackupManager {
                 ForgeError::Internal(format!("Failed to open staging decrypted file: {}", e))
             })?;
             let dec = GzDecoder::new(dec_file);
-            Self::unpack_archive(dec, target_storage_root)
+            Self::unpack_archive_staged(dec, target_storage_root)
         } else if &magic == BACKUP_MAGIC {
             // Legacy v1 single-invocation fallback
             let encrypted_bytes = fs::read(encrypted_path).map_err(|e| {
@@ -183,7 +266,7 @@ impl BackupManager {
             let decrypted_tar_gz = Self::decrypt_backup_payload(&encrypted_bytes, passphrase)?;
             let cursor = Cursor::new(decrypted_tar_gz);
             let dec = GzDecoder::new(cursor);
-            Self::unpack_archive(dec, target_storage_root)
+            Self::unpack_archive_staged(dec, target_storage_root)
         } else {
             Err(ForgeError::Internal(
                 "Unrecognized backup archive format or invalid magic bytes".to_string(),
@@ -192,7 +275,7 @@ impl BackupManager {
     }
 
     /// Rotates the encryption key/passphrase of an existing backup without writing decrypted files to disk.
-    /// Operates in bounded streaming memory O(chunk_size).
+    /// Operates in bounded streaming memory O(chunk_size), with failure-atomic publication and aliasing protection.
     pub fn rotate_backup_key(
         encrypted_path: &Path,
         output_path: &Path,
@@ -206,6 +289,25 @@ impl BackupManager {
             ));
         }
 
+        // 1. Path aliasing verification: reject identical or aliased source and destination
+        let canon_src =
+            fs::canonicalize(encrypted_path).unwrap_or_else(|_| encrypted_path.to_path_buf());
+        let canon_dst = if output_path.exists() {
+            fs::canonicalize(output_path).unwrap_or_else(|_| output_path.to_path_buf())
+        } else if let Some(parent) = output_path.parent() {
+            let p = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+            p.join(output_path.file_name().unwrap_or_default())
+        } else {
+            output_path.to_path_buf()
+        };
+
+        if canon_src == canon_dst {
+            return Err(ForgeError::Internal(
+                "Source and output backup paths cannot be identical (in-place rotation prohibited to prevent data loss)"
+                    .to_string(),
+            ));
+        }
+
         let mut file = File::open(encrypted_path)
             .map_err(|e| ForgeError::Internal(format!("Failed to open encrypted backup: {}", e)))?;
 
@@ -214,46 +316,80 @@ impl BackupManager {
             .map_err(|e| ForgeError::Internal(format!("Failed to read archive magic: {}", e)))?;
         drop(file);
 
-        if &magic == v2::MAGIC_V2 {
-            let reader = File::open(encrypted_path).map_err(|e| {
-                ForgeError::Internal(format!("Failed to open source encrypted archive: {}", e))
+        let output_parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(output_parent).map_err(|e| {
+            ForgeError::Internal(format!("Failed to create destination directory: {}", e))
+        })?;
+
+        let tmp_output = output_parent.join(format!(".tmp_rot_{}.spnebak", Uuid::new_v4()));
+
+        let rotation_result = (|| -> Result<(), ForgeError> {
+            if &magic == v2::MAGIC_V2 {
+                let reader = File::open(encrypted_path).map_err(|e| {
+                    ForgeError::Internal(format!("Failed to open source encrypted archive: {}", e))
+                })?;
+                let writer = File::create(&tmp_output).map_err(|e| {
+                    ForgeError::Internal(format!("Failed to create output archive: {}", e))
+                })?;
+
+                v2::rotate_stream(
+                    reader,
+                    writer,
+                    old_passphrase,
+                    new_passphrase,
+                    new_key_version,
+                )?;
+            } else if &magic == BACKUP_MAGIC {
+                // Upgrade legacy v1 archive to streaming v2 format on rotation
+                let encrypted_bytes = fs::read(encrypted_path).map_err(|e| {
+                    ForgeError::Internal(format!("Failed to read source encrypted backup: {}", e))
+                })?;
+                let plaintext_tar_gz =
+                    Self::decrypt_backup_payload(&encrypted_bytes, old_passphrase)?;
+
+                let cursor = Cursor::new(plaintext_tar_gz);
+                let writer = File::create(&tmp_output).map_err(|e| {
+                    ForgeError::Internal(format!("Failed to create output archive: {}", e))
+                })?;
+
+                v2::encrypt_stream(
+                    cursor,
+                    writer,
+                    new_passphrase,
+                    new_key_version,
+                    v2::DEFAULT_CHUNK_SIZE,
+                )?;
+            } else {
+                return Err(ForgeError::Internal(
+                    "Unrecognized backup archive format or invalid magic bytes".to_string(),
+                ));
+            }
+
+            // Verify temporary rotated output can be opened and its header is valid
+            let mut verify_file = File::open(&tmp_output).map_err(|e| {
+                ForgeError::Internal(format!(
+                    "Failed to reopen rotated archive for verification: {}",
+                    e
+                ))
             })?;
-            let writer = File::create(output_path).map_err(|e| {
-                ForgeError::Internal(format!("Failed to create output archive: {}", e))
+            let _ = v2::BackupHeaderV2::read_from(&mut verify_file)?;
+
+            // Atomically publish rotated output to output_path
+            fs::rename(&tmp_output, output_path).map_err(|e| {
+                ForgeError::Internal(format!(
+                    "Failed to atomically publish rotated archive: {}",
+                    e
+                ))
             })?;
 
-            v2::rotate_stream(
-                reader,
-                writer,
-                old_passphrase,
-                new_passphrase,
-                new_key_version,
-            )
-        } else if &magic == BACKUP_MAGIC {
-            // Upgrade legacy v1 archive to streaming v2 format on rotation
-            let encrypted_bytes = fs::read(encrypted_path).map_err(|e| {
-                ForgeError::Internal(format!("Failed to read source encrypted backup: {}", e))
-            })?;
-            let plaintext_tar_gz = Self::decrypt_backup_payload(&encrypted_bytes, old_passphrase)?;
-
-            let cursor = Cursor::new(plaintext_tar_gz);
-            let writer = File::create(output_path).map_err(|e| {
-                ForgeError::Internal(format!("Failed to create output archive: {}", e))
-            })?;
-
-            v2::encrypt_stream(
-                cursor,
-                writer,
-                new_passphrase,
-                new_key_version,
-                v2::DEFAULT_CHUNK_SIZE,
-            )?;
             Ok(())
-        } else {
-            Err(ForgeError::Internal(
-                "Unrecognized backup archive format or invalid magic bytes".to_string(),
-            ))
+        })();
+
+        if rotation_result.is_err() && tmp_output.exists() {
+            let _ = fs::remove_file(&tmp_output);
         }
+
+        rotation_result
     }
 
     /// Internal helper to decrypt ciphertext buffer using authenticated AEAD
@@ -390,6 +526,7 @@ impl BackupManager {
     fn create_archive_internal<W: std::io::Write>(
         storage_root: &Path,
         db_snapshot_json: Option<&str>,
+        db_snapshot_file: Option<&Path>,
         writer: W,
     ) -> Result<(BackupManifest, W), ForgeError> {
         let backup_id = Uuid::new_v4().to_string();
@@ -424,7 +561,25 @@ impl BackupManager {
             file_hashes.insert(rel_path.clone(), digest);
         }
 
-        if let Some(db_json) = db_snapshot_json {
+        if let Some(db_file) = db_snapshot_file {
+            let mut f = fs::File::open(db_file).map_err(|e| ForgeError::Internal(e.to_string()))?;
+            let mut hasher = Sha256::new();
+            let mut buf = [0u8; 64 * 1024];
+            let mut f_len = 0u64;
+            loop {
+                let n = f
+                    .read(&mut buf)
+                    .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                f_len += n as u64;
+            }
+            total_bytes += f_len;
+            let digest = hex::encode(hasher.finalize());
+            file_hashes.insert("database/snapshot.jsonl".to_string(), digest);
+        } else if let Some(db_json) = db_snapshot_json {
             let mut hasher = Sha256::new();
             hasher.update(db_json.as_bytes());
             let digest = hex::encode(hasher.finalize());
@@ -475,7 +630,17 @@ impl BackupManager {
         tar.append_data(&mut header, "manifest.json", &manifest_bytes[..])
             .map_err(|e| ForgeError::Internal(e.to_string()))?;
 
-        if let Some(db_json) = db_snapshot_json {
+        if let Some(db_file) = db_snapshot_file {
+            let metadata =
+                fs::metadata(db_file).map_err(|e| ForgeError::Internal(e.to_string()))?;
+            let mut f = fs::File::open(db_file).map_err(|e| ForgeError::Internal(e.to_string()))?;
+            let mut db_header = tar::Header::new_gnu();
+            db_header.set_size(metadata.len());
+            db_header.set_mode(0o600);
+            db_header.set_cksum();
+            tar.append_data(&mut db_header, "database/snapshot.jsonl", &mut f)
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        } else if let Some(db_json) = db_snapshot_json {
             let mut db_header = tar::Header::new_gnu();
             db_header.set_size(db_json.len() as u64);
             db_header.set_mode(0o600);
@@ -503,18 +668,19 @@ impl BackupManager {
         Ok((manifest, writer))
     }
 
-    /// Internal shared logic to unpack tar archive, validating traversal limits and hashes
-    fn unpack_archive<R: Read>(
+    /// Internal shared logic to unpack tar archive, validating traversal limits and hashes.
+    /// Streams extracted files to temporary staging on disk, returning Option<PathBuf> for database snapshot.
+    fn unpack_archive_staged<R: Read>(
         reader: R,
         target_storage_root: &Path,
-    ) -> Result<(BackupManifest, RestoreReport, Option<String>), ForgeError> {
+    ) -> Result<(BackupManifest, RestoreReport, Option<PathBuf>), ForgeError> {
         let start = Instant::now();
         let mut archive = tar::Archive::new(reader);
 
         fs::create_dir_all(target_storage_root).map_err(|e| ForgeError::Internal(e.to_string()))?;
 
         let mut manifest: Option<BackupManifest> = None;
-        let mut extracted_db_snapshot: Option<String> = None;
+        let mut extracted_db_staged_path: Option<PathBuf> = None;
         let staging_dir = tempfile::tempdir_in(target_storage_root)
             .map_err(|e| ForgeError::Internal(format!("Failed to create staging dir: {}", e)))?;
         let mut files_to_verify: Vec<(String, PathBuf)> = Vec::new();
@@ -538,14 +704,29 @@ impl BackupManager {
                 let parsed: BackupManifest = serde_json::from_slice(&content)
                     .map_err(|e| ForgeError::Internal(format!("Corrupt manifest: {}", e)))?;
                 manifest = Some(parsed);
-            } else if path_str == "database/snapshot.json" {
-                let mut content = String::new();
-                entry
-                    .read_to_string(&mut content)
+            } else if path_str == "database/snapshot.jsonl" || path_str == "database/snapshot.json"
+            {
+                let staged_db_path = staging_dir.path().join("database_snapshot.jsonl");
+                let mut out_file = fs::File::create(&staged_db_path)
                     .map_err(|e| ForgeError::Internal(e.to_string()))?;
-                extracted_db_snapshot = Some(content);
+                let mut buf = [0u8; 64 * 1024];
+                loop {
+                    let n = entry
+                        .read(&mut buf)
+                        .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                    if n == 0 {
+                        break;
+                    }
+                    out_file
+                        .write_all(&buf[..n])
+                        .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                }
+                out_file
+                    .flush()
+                    .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                files_to_verify.push((path_str.clone(), staged_db_path.clone()));
+                extracted_db_staged_path = Some(staged_db_path);
             } else {
-                // Stream entry directly to a disk file in staging_dir (bounded 64 KiB chunks)
                 let staged_file_name = format!("stage_{}.dat", files_to_verify.len());
                 let staged_path = staging_dir.path().join(&staged_file_name);
                 let mut out_file = fs::File::create(&staged_path)
@@ -577,28 +758,6 @@ impl BackupManager {
         let mut files_restored = 0usize;
         let mut bytes_restored = 0u64;
 
-        if let Some(db_json) = &extracted_db_snapshot {
-            let expected_hash = manifest
-                .file_hashes
-                .get("database/snapshot.json")
-                .ok_or_else(|| {
-                    ForgeError::Internal(
-                        "Manifest missing hash for database/snapshot.json".to_string(),
-                    )
-                })?;
-            let mut hasher = Sha256::new();
-            hasher.update(db_json.as_bytes());
-            let actual_hash = hex::encode(hasher.finalize());
-            if actual_hash != *expected_hash {
-                return Err(ForgeError::Internal(format!(
-                    "Integrity verification failed for database/snapshot.json: expected {}, got {}",
-                    expected_hash, actual_hash
-                )));
-            }
-            files_restored += 1;
-            bytes_restored += db_json.len() as u64;
-        }
-
         for (rel_path, staged_path) in files_to_verify {
             let expected_hash = manifest.file_hashes.get(&rel_path).ok_or_else(|| {
                 ForgeError::Internal(format!(
@@ -607,7 +766,6 @@ impl BackupManager {
                 ))
             })?;
 
-            // Compute hash streaming from disk in bounded chunks
             let mut f =
                 fs::File::open(&staged_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
             let mut hasher = Sha256::new();
@@ -631,27 +789,27 @@ impl BackupManager {
                 )));
             }
 
-            // Path traversal defense
-            let dest_path = Self::sanitize_restore_path(target_storage_root, &rel_path)?;
-            if let Some(parent) = dest_path.parent() {
-                fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
-            }
-            // Move staged file to destination
-            if fs::rename(&staged_path, &dest_path).is_err() {
-                let mut src = fs::File::open(&staged_path)
-                    .map_err(|e| ForgeError::Internal(e.to_string()))?;
-                let mut dst = fs::File::create(&dest_path)
-                    .map_err(|e| ForgeError::Internal(e.to_string()))?;
-                std::io::copy(&mut src, &mut dst)
-                    .map_err(|e| ForgeError::Internal(e.to_string()))?;
+            if rel_path != "database/snapshot.jsonl" && rel_path != "database/snapshot.json" {
+                let dest = Self::sanitize_restore_path(target_storage_root, &rel_path)?;
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
+                }
+                fs::rename(&staged_path, &dest).map_err(|e| ForgeError::Internal(e.to_string()))?;
             }
 
             files_restored += 1;
             bytes_restored += file_len;
         }
 
-        let duration_ms = start.elapsed().as_millis() as u64;
+        let final_db_path = if let Some(staged_db) = extracted_db_staged_path {
+            let final_path = target_storage_root.join(".spine_extracted_db.jsonl");
+            fs::rename(&staged_db, &final_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
+            Some(final_path)
+        } else {
+            None
+        };
 
+        let duration_ms = start.elapsed().as_millis() as u64;
         let report = RestoreReport {
             backup_id: manifest.backup_id.clone(),
             files_restored,
@@ -659,8 +817,22 @@ impl BackupManager {
             duration_ms,
             integrity_verified: true,
         };
+        Ok((manifest, report, final_db_path))
+    }
 
-        Ok((manifest, report, extracted_db_snapshot))
+    /// Internal shared logic to unpack tar archive, validating traversal limits and hashes
+    fn unpack_archive<R: Read>(
+        reader: R,
+        target_storage_root: &Path,
+    ) -> Result<(BackupManifest, RestoreReport, Option<String>), ForgeError> {
+        let (manifest, report, db_path) = Self::unpack_archive_staged(reader, target_storage_root)?;
+        let db_str = match db_path {
+            Some(ref p) => {
+                Some(fs::read_to_string(p).map_err(|e| ForgeError::Internal(e.to_string()))?)
+            }
+            None => None,
+        };
+        Ok((manifest, report, db_str))
     }
 
     fn collect_files_recursive(

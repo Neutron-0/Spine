@@ -155,24 +155,15 @@ impl RunnerService {
                 }
             };
 
-            let provenance = crate::core::types::WorkflowProvenance::evaluate(
-                self.db.as_ref(),
-                &job.repo_id,
-                None,
-                &run.actor_id,
-                &run.trigger_event,
-            )
-            .await;
-
-            let is_untrusted = provenance.trust_classification
-                == crate::core::types::TrustClassification::Untrusted;
+            let is_untrusted =
+                run.trust_classification == crate::core::types::TrustClassification::Untrusted;
 
             if is_untrusted && !self.profile.allow_untrusted_ci() {
                 tracing::warn!(
                     "Runner {} skipped untrusted job {} ({}). Untrusted CI disabled under profile '{}'. Failing job cleanly.",
                     runner_id,
                     job.id,
-                    provenance.reason,
+                    run.provenance_reason,
                     self.profile.name()
                 );
                 // Mark job as FAILED cleanly so it does not remain queued or stranded in RUNNING

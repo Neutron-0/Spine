@@ -3604,7 +3604,7 @@ impl Database for PgDatabase {
     }
 
     async fn create_workflow_run(&self, run: WorkflowRun) -> Result<WorkflowRun, ForgeError> {
-        let query = "INSERT INTO workflow_runs (id, repo_id, workflow_id, workflow_name, commit_oid, ref_name, trigger_event, actor_id, status, conclusion, definition_yaml, definition_digest, created_at_nanos, started_at_nanos, completed_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)";
+        let query = "INSERT INTO workflow_runs (id, repo_id, workflow_id, workflow_name, commit_oid, ref_name, trigger_event, actor_id, status, conclusion, definition_yaml, definition_digest, source_repo_id, is_fork, trust_classification, provenance_reason, created_at_nanos, started_at_nanos, completed_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)";
         sqlx::query(query)
             .bind(&run.id)
             .bind(&run.repo_id)
@@ -3618,6 +3618,10 @@ impl Database for PgDatabase {
             .bind(&run.conclusion)
             .bind(&run.definition_yaml)
             .bind(&run.definition_digest)
+            .bind(&run.source_repo_id)
+            .bind(run.is_fork)
+            .bind(run.trust_classification.as_str())
+            .bind(&run.provenance_reason)
             .bind(run.created_at_nanos)
             .bind(run.started_at_nanos)
             .bind(run.completed_at_nanos)
@@ -3628,7 +3632,7 @@ impl Database for PgDatabase {
     }
 
     async fn get_workflow_run(&self, id: &str) -> Result<Option<WorkflowRun>, ForgeError> {
-        let query = "SELECT id, repo_id, workflow_id, workflow_name, commit_oid, ref_name, trigger_event, actor_id, status, conclusion, definition_yaml, definition_digest, created_at_nanos, started_at_nanos, completed_at_nanos FROM workflow_runs WHERE id = $1";
+        let query = "SELECT id, repo_id, workflow_id, workflow_name, commit_oid, ref_name, trigger_event, actor_id, status, conclusion, definition_yaml, definition_digest, source_repo_id, is_fork, trust_classification, provenance_reason, created_at_nanos, started_at_nanos, completed_at_nanos FROM workflow_runs WHERE id = $1";
         let row = sqlx::query(query)
             .bind(id)
             .fetch_optional(&self.pool)
@@ -3648,9 +3652,13 @@ impl Database for PgDatabase {
             conclusion: r.get(9),
             definition_yaml: r.get(10),
             definition_digest: r.get(11),
-            created_at_nanos: r.get(12),
-            started_at_nanos: r.get(13),
-            completed_at_nanos: r.get(14),
+            source_repo_id: r.get(12),
+            is_fork: r.get(13),
+            trust_classification: TrustClassification::from_str_lossy(&r.get::<String, _>(14)),
+            provenance_reason: r.get(15),
+            created_at_nanos: r.get(16),
+            started_at_nanos: r.get(17),
+            completed_at_nanos: r.get(18),
         }))
     }
 
@@ -3659,7 +3667,7 @@ impl Database for PgDatabase {
         repo_id: &str,
         limit: i64,
     ) -> Result<Vec<WorkflowRun>, ForgeError> {
-        let query = "SELECT id, repo_id, workflow_id, workflow_name, commit_oid, ref_name, trigger_event, actor_id, status, conclusion, definition_yaml, definition_digest, created_at_nanos, started_at_nanos, completed_at_nanos FROM workflow_runs WHERE repo_id = $1 ORDER BY created_at_nanos DESC LIMIT $2";
+        let query = "SELECT id, repo_id, workflow_id, workflow_name, commit_oid, ref_name, trigger_event, actor_id, status, conclusion, definition_yaml, definition_digest, source_repo_id, is_fork, trust_classification, provenance_reason, created_at_nanos, started_at_nanos, completed_at_nanos FROM workflow_runs WHERE repo_id = $1 ORDER BY created_at_nanos DESC LIMIT $2";
         let rows = sqlx::query(query)
             .bind(repo_id)
             .bind(limit)
@@ -3682,9 +3690,13 @@ impl Database for PgDatabase {
                 conclusion: r.get(9),
                 definition_yaml: r.get(10),
                 definition_digest: r.get(11),
-                created_at_nanos: r.get(12),
-                started_at_nanos: r.get(13),
-                completed_at_nanos: r.get(14),
+                source_repo_id: r.get(12),
+                is_fork: r.get(13),
+                trust_classification: TrustClassification::from_str_lossy(&r.get::<String, _>(14)),
+                provenance_reason: r.get(15),
+                created_at_nanos: r.get(16),
+                started_at_nanos: r.get(17),
+                completed_at_nanos: r.get(18),
             })
             .collect();
         Ok(list)

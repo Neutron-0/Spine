@@ -38,6 +38,7 @@ pub async fn create_namespace(
     user: Option<Extension<User>>,
     Json(payload): Json<CreateNamespaceRequest>,
 ) -> Result<(StatusCode, Json<ArtifactNamespaceDto>), ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let current_user = user
         .ok_or_else(|| ForgeError::Unauthorized("Authentication required".to_string()))?
         .0;
@@ -80,6 +81,7 @@ pub async fn upload_artifact_version(
     user: Option<Extension<User>>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<ArtifactVersionDto>), ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let current_user = user
         .ok_or_else(|| ForgeError::Unauthorized("Authentication required".to_string()))?
         .0;

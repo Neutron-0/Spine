@@ -1,29 +1,20 @@
 mod common;
 
-use common::get_safe_test_db_url;
-use spine_api::db::migrations::{run_migrations, SPINE_MIGRATION_ADVISORY_LOCK_ID};
+use common::require_safe_test_db_url;
+use spine_api::db::migrations::{
+    run_migrations, run_migrations_with_pause, SPINE_MIGRATION_ADVISORY_LOCK_ID,
+};
 use sqlx::Row;
+use std::sync::Arc;
+use tokio::sync::Notify;
 
 #[tokio::test]
 async fn test_actual_run_migrations_cancellation_and_recovery() {
-    let url = match get_safe_test_db_url() {
-        Some(u) => u,
-        None => {
-            eprintln!("SKIPPED: test requires SPINE_TEST_DATABASE_URL to be set.");
-            return;
-        }
-    };
+    let url = require_safe_test_db_url();
 
-    let pool = match sqlx::PgPool::connect(&url).await {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "Skipping advisory lock test: PostgreSQL unreachable ({})",
-                e
-            );
-            return;
-        }
-    };
+    let pool = sqlx::PgPool::connect(&url)
+        .await
+        .expect("connect to test database");
 
     // Clean existing tables in the disposable test database
     let tables: Vec<(String,)> = sqlx::query_as(
@@ -43,15 +34,31 @@ async fn test_actual_run_migrations_cancellation_and_recovery() {
     let pool_a = sqlx::PgPool::connect(&url).await.expect("connect worker A");
     let pool_b = sqlx::PgPool::connect(&url).await.expect("connect worker B");
 
-    // 1. Worker A acquires transaction-level advisory lock
-    let mut tx_a = pool_a.begin().await.expect("begin tx_a");
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(SPINE_MIGRATION_ADVISORY_LOCK_ID)
-        .execute(&mut *tx_a)
-        .await
-        .expect("acquire pg_advisory_xact_lock");
+    let pause = Arc::new(Notify::new());
+    let resume = Arc::new(Notify::new());
 
-    // 2. Verify from separate connection that Worker A's transaction-level advisory lock is active
+    let pause_clone = pause.clone();
+    let resume_clone = resume.clone();
+
+    let (tx_abort, mut rx_abort) = tokio::sync::oneshot::channel::<()>();
+    let pool_a_task = pool_a.clone();
+    let task_thread = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            tokio::select! {
+                res = run_migrations_with_pause(pool_a_task, Some(pause_clone), Some(resume_clone)) => res,
+                _ = &mut rx_abort => Err(spine_api::core::error::ForgeError::Internal("aborted".into())),
+            }
+        })
+    });
+
+    // Wait until Task A has entered its transaction and actively acquired the advisory lock
+    pause.notified().await;
+
+    // 2. Verify from separate connection that Worker A's transaction-level advisory lock is actively held in pg_locks
     let lock_row = sqlx::query(
         r#"
         SELECT count(*) as cnt 
@@ -69,10 +76,10 @@ async fn test_actual_run_migrations_cancellation_and_recovery() {
     let count: i64 = lock_row.get("cnt");
     assert_eq!(
         count, 1,
-        "Transaction-level advisory lock must be actively held in pg_locks"
+        "Transaction-level advisory lock must be actively held in pg_locks by actual run_migrations"
     );
 
-    // 3. Verify that Worker B cannot acquire the lock concurrently
+    // 3. Verify that Worker B cannot acquire the advisory lock concurrently
     let mut tx_b = pool_b.begin().await.expect("begin tx_b");
     let try_lock: (bool,) = sqlx::query_as("SELECT pg_try_advisory_xact_lock($1)")
         .bind(SPINE_MIGRATION_ADVISORY_LOCK_ID)
@@ -82,17 +89,25 @@ async fn test_actual_run_migrations_cancellation_and_recovery() {
 
     assert!(
         !try_lock.0,
-        "Worker B must fail to acquire advisory lock while Worker A holds it"
+        "Worker B must fail to acquire advisory lock while actual run_migrations in Task A holds it"
     );
     tx_b.rollback().await.expect("rollback tx_b");
 
-    // 4. Abort Worker A task/transaction (simulating crash or connection drop)
-    drop(tx_a);
+    // 4. Cancel/abort the running task executing run_migrations
+    let _ = tx_abort.send(());
+    let thread_res = task_thread.join().expect("join worker A thread");
+    assert!(
+        thread_res.is_err(),
+        "Task A must have been aborted/cancelled"
+    );
 
-    // Small yield to let PostgreSQL engine finish rolling back the dropped transaction
+    // Close Worker A pool connection so PostgreSQL terminates the backend session and cleans up transaction
+    pool_a.close().await;
+
+    // Small yield to let PostgreSQL engine finish rolling back the aborted transaction
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // 5. Verify transaction-level advisory lock was instantly released upon drop
+    // 5. Verify transaction-level advisory lock was instantly and cleanly released upon task abortion
     let final_lock_row = sqlx::query(
         r#"
         SELECT count(*) as cnt 
@@ -118,15 +133,15 @@ async fn test_actual_run_migrations_cancellation_and_recovery() {
         .await
         .expect("Worker B must acquire lock and complete all migrations after Worker A abort");
 
-    // 7. Verify all 11 migrations are applied and committed
+    // 7. Verify all 12 migrations are applied and committed
     let final_migrations: (i64,) = sqlx::query_as("SELECT count(*) FROM _schema_migrations")
         .fetch_one(&pool)
         .await
         .expect("count completed migrations");
 
     assert_eq!(
-        final_migrations.0, 11,
-        "Worker B must have committed all 11 migrations"
+        final_migrations.0, 12,
+        "Worker B must have committed all 12 migrations"
     );
 
     // 8. Verify idempotent re-run

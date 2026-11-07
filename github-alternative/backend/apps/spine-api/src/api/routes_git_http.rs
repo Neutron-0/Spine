@@ -412,14 +412,17 @@ pub async fn git_receive_pack(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if state.consistency_barrier.is_maintenance_active() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [(axum::http::header::RETRY_AFTER, "5")],
-            "Maintenance in progress. Backups active, repository writes temporarily drained.\n",
-        )
-            .into_response();
-    }
+    let _write_permit = match state.consistency_barrier.acquire_write_permit().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(axum::http::header::RETRY_AFTER, "5")],
+                "Maintenance in progress. Backups active, repository writes temporarily drained.\n",
+            )
+                .into_response();
+        }
+    };
 
     if let Err(resp) = crate::api::routes_lfs::check_transport_security(&state, &headers) {
         return resp;

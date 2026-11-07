@@ -449,17 +449,25 @@ impl Handler for SshHandler {
             }
 
             GitSshCommand::ReceivePack { owner, repo } => {
-                if self.state.consistency_barrier.is_maintenance_active() {
-                    let _ = session.channel_success(channel);
-                    let _ = session.extended_data(
-                        channel,
-                        1,
-                        Bytes::from_static(b"FATAL: Maintenance in progress. Backups active, repository writes temporarily drained.\n"),
-                    );
-                    let _ = session.exit_status_request(channel, 1);
-                    let _ = session.close(channel);
-                    return Ok(());
-                }
+                let _write_permit = match self
+                    .state
+                    .consistency_barrier
+                    .acquire_write_permit()
+                    .await
+                {
+                    Ok(p) => p,
+                    Err(_) => {
+                        let _ = session.channel_success(channel);
+                        let _ = session.extended_data(
+                            channel,
+                            1,
+                            Bytes::from_static(b"FATAL: Maintenance in progress. Backups active, repository writes temporarily drained.\n"),
+                        );
+                        let _ = session.exit_status_request(channel, 1);
+                        let _ = session.close(channel);
+                        return Ok(());
+                    }
+                };
 
                 let repo_obj = match self
                     .state

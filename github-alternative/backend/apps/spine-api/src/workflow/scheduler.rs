@@ -41,9 +41,8 @@ impl WorkflowScheduler {
                 continue;
             }
 
-            let is_untrusted_run = run.trigger_event == "pull_request_fork"
-                || run.trigger_event == "fork"
-                || run.trigger_event.starts_with("untrusted");
+            let is_untrusted_run =
+                run.trust_classification == crate::core::types::TrustClassification::Untrusted;
 
             if is_untrusted_run && !self.profile.allow_untrusted_ci() {
                 tracing::warn!(

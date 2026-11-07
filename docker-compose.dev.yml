@@ -1,20 +1,31 @@
 version: '3.8'
 
+# Development overlay configuration
+# Use with: docker compose -f docker-compose.yml -f docker-compose.dev.yml up
 services:
+  spine-api:
+    ports:
+      - "3000:3000"
+      - "2222:2222"
+
+  spine-frontend:
+    ports:
+      - "5173:80"
+
   spine-api-dev:
     build:
       context: .
       dockerfile: github-alternative/backend/Dockerfile.api
     container_name: spine-forge-dev
     ports:
-      - "3000:3000"
-      - "2222:2222"
+      - "3001:3000"
+      - "2223:2222"
     environment:
       BIND: "0.0.0.0"
       PORT: "3000"
       SSH_PORT: "2222"
       STORAGE_ROOT: "/var/lib/spine/storage"
-      FORGE_PUBLIC_ORIGIN: "http://localhost:3000"
+      FORGE_PUBLIC_ORIGIN: "http://localhost:3001"
       RUST_LOG: "debug,spine_api=debug"
     command: ["serve", "--in-memory-db", "--bind", "0.0.0.0", "--port", "3000", "--ssh-port", "2222"]
     volumes:

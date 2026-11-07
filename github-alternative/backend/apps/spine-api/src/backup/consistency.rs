@@ -52,9 +52,53 @@ impl ConsistencyBarrier {
         }
     }
 
-    /// Acquire an in-flight write permit.
+    /// Check whether the cluster or node is currently in a maintenance barrier window asynchronously.
+    pub async fn is_maintenance_active_async(&self) -> bool {
+        if self.is_maintenance_active() {
+            return true;
+        }
+        if let Ok(active) = self.is_maintenance_active_in_db().await {
+            if active {
+                self.in_maintenance.store(true, Ordering::SeqCst);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Acquire an in-flight write permit asynchronously.
+    /// Checks local atomic flag AND queries the database-backed barrier if a PgPool is configured.
     /// Fails with ServiceUnavailable if the cluster is in maintenance mode.
-    pub fn acquire_write_permit(&self) -> Result<WritePermit, ForgeError> {
+    pub async fn acquire_write_permit(&self) -> Result<WritePermit, ForgeError> {
+        if self.is_maintenance_active() {
+            return Err(ForgeError::ServiceUnavailable(
+                "Cluster write pipeline is currently paused for coordinated maintenance"
+                    .to_string(),
+            ));
+        }
+
+        if self.pool.is_some() {
+            if let Ok(active) = self.is_maintenance_active_in_db().await {
+                if active {
+                    self.in_maintenance.store(true, Ordering::SeqCst);
+                    return Err(ForgeError::ServiceUnavailable(
+                        "Cluster write pipeline is currently paused for coordinated maintenance"
+                            .to_string(),
+                    ));
+                } else if self.in_maintenance.load(Ordering::SeqCst) {
+                    self.in_maintenance.store(false, Ordering::SeqCst);
+                }
+            }
+        }
+
+        self.in_flight_writes.fetch_add(1, Ordering::SeqCst);
+        Ok(WritePermit {
+            counter: self.in_flight_writes.clone(),
+        })
+    }
+
+    /// Synchronous version for non-async contexts
+    pub fn acquire_write_permit_sync(&self) -> Result<WritePermit, ForgeError> {
         if self.is_maintenance_active() {
             return Err(ForgeError::ServiceUnavailable(
                 "Cluster write pipeline is currently paused for coordinated maintenance"

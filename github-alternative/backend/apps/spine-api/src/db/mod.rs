@@ -5,7 +5,8 @@ pub mod postgres;
 pub mod traits;
 
 pub use dump::{
-    dump_database, is_database_empty, restore_database, DatabaseRestoreReport, DatabaseSnapshot,
+    dump_database, dump_database_to_writer, is_database_empty, restore_database,
+    restore_database_from_reader, DatabaseRestoreReport, DatabaseSnapshot,
 };
 pub use in_memory::InMemoryDatabase;
 pub use migrations::run_migrations;

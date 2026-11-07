@@ -55,6 +55,14 @@ impl BackupHeaderV2 {
         buf
     }
 
+    pub fn read_from<R: std::io::Read>(mut reader: R) -> Result<Self, ForgeError> {
+        let mut buf = [0u8; HEADER_V2_LEN];
+        reader
+            .read_exact(&mut buf)
+            .map_err(|e| ForgeError::Internal(format!("Failed to read backup header: {}", e)))?;
+        Self::from_bytes(&buf)
+    }
+
     pub fn from_bytes(buf: &[u8; HEADER_V2_LEN]) -> Result<Self, ForgeError> {
         if &buf[0..8] != MAGIC_V2 {
             return Err(ForgeError::Internal(
@@ -543,6 +551,13 @@ pub fn rotate_stream<R: Read, W: Write>(
             .read_exact(&mut len_buf)
             .map_err(|e| ForgeError::Internal(format!("Failed to read chunk length: {}", e)))?;
         let ct_len = u32::from_be_bytes(len_buf) as usize;
+
+        if ct_len < TAG_LEN || ct_len > (old_header.chunk_size as usize + TAG_LEN + 1024) {
+            return Err(ForgeError::Internal(format!(
+                "Invalid chunk ciphertext length in rotation: {} bytes (exceeds chunk bound)",
+                ct_len
+            )));
+        }
 
         let mut payload = vec![0u8; ct_len];
         reader

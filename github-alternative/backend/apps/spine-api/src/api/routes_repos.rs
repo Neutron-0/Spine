@@ -34,6 +34,7 @@ pub async fn create_repository(
     user: Option<Extension<User>>,
     Json(payload): Json<CreateRepoApiRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let creator = user.ok_or_else(|| {
         ForgeError::Unauthorized("Authentication required to create repository".into())
     })?;
@@ -328,6 +329,7 @@ pub async fn create_deploy_key(
     Path((owner, name)): Path<(String, String)>,
     Json(payload): Json<CreateDeployKeyRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.map(|Extension(u)| u);
     let repo = state
         .repositories
@@ -380,6 +382,7 @@ pub async fn delete_deploy_key(
     user: Option<Extension<User>>,
     Path((owner, name, key_id)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.map(|Extension(u)| u);
     let repo = state
         .repositories

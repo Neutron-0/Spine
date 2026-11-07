@@ -27,8 +27,9 @@ pub use coordinator::CoordinatorClient;
 pub use core::profile::DeploymentProfile;
 pub use core::types::*;
 pub use db::{
-    dump_database, is_database_empty, restore_database, Database, DatabaseRestoreReport,
-    DatabaseSnapshot, InMemoryDatabase, PgDatabase,
+    dump_database, dump_database_to_writer, is_database_empty, restore_database,
+    restore_database_from_reader, Database, DatabaseRestoreReport, DatabaseSnapshot,
+    InMemoryDatabase, PgDatabase,
 };
 pub use discovery::DiscoveryService;
 pub use discussions::DiscussionService;

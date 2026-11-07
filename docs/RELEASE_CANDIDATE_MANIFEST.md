@@ -1,8 +1,8 @@
-# Spine Release Candidate Manifest (Batch 21A Deployment Candidate)
+# Spine Release Candidate Manifest (Batch 21B Deployment Candidate)
 
-**Milestone:** Spine Batch 21A — Second Independent Audit Findings Remediation & Full-Stack Hardening  
-**Audited Baseline:** `8caf8639e854a5165478515c633a0e282c757e7b` (`v0.1.0-rc2`)  
-**Target Next Release:** `v0.1.0-rc3` (Pending Codex Re-Audit Certification)  
+**Milestone:** Spine Batch 21B — Third Independent Audit Findings Remediation & Release Candidate Hardening<br>
+**Baseline Commit:** `a3d44568d1e3333a82e0a983970929a37fb3f37d`<br>
+**Target Release:** Deployment Candidate for Independent Codex Re-Audit<br>
 **Target Platform:** Linux x86_64, Windows x86_64  
 
 ---
@@ -16,20 +16,23 @@
 - **`spine`**: Native CLI version-control tool for developers (commits, branches, snapshots, diffs, remotes).
 
 ### 1.2. Frontend Web Assets
-- **`github-alternative/frontend/dist/`**: Production-optimized Single Page Application (Vite + TypeScript + React/Tailwind), compiled cleanly with zero TypeScript errors. Includes explicit security status badges for Core Forge profile restrictions.
+- **`github-alternative/frontend/dist/`**: Production-optimized Single Page Application (Vite 6.4.5 + TypeScript + React/Tailwind), compiled cleanly with zero TypeScript errors and 0 vulnerabilities from `npm audit`.
 
 ### 1.3. Systemd Service Definitions & Production Compose
 - `systemd/spine-api.service`: Hardened systemd unit for API and SSH daemon.
 - `systemd/spine-coordinator.service`: Hardened systemd unit for coordinator daemon.
 - `systemd/spine-storage-node.service`: Hardened systemd unit for storage node daemon.
-- `docker-compose.prod.yml`: Production Compose file with isolated `spine-internal` bridge network and unmapped internal ports.
+- `docker-compose.yml`: Base Compose configuration with zero internal service host port pollution.
+- `docker-compose.dev.yml`: Local developer override exposing `3000:3000` and `5173:80`.
+- `docker-compose.prod.yml`: Production Compose override with isolated `spine-internal` bridge network, exposing ONLY ports `80`, `443`, and `2222`.
 - `deploy/nginx/ingress.conf`: Production Nginx reverse-proxy ingress configuration with TLS 1.2/1.3, HSTS, and HTTP -> HTTPS 301 redirection.
 
 ### 1.4. PostgreSQL Migrations & Consistency Barrier
 - Directory: `github-alternative/backend/apps/spine-api/migrations/`
-  - `0001_core_identity.sql` through `0011_security_center.sql`
-  - Fully transactional migration execution with transaction-scoped advisory locking (`pg_advisory_xact_lock(0x5350494E454D4947)`).
+  - `0001_core_identity.sql` through `0012_workflow_provenance.sql`.
+  - Transaction-level advisory lock (`pg_advisory_xact_lock(0x5350494E454D4947)`).
   - Database-backed cluster maintenance barrier (`_cluster_maintenance_barrier`) coordinating point-in-time backups across distributed nodes.
+  - Granular privilege model: `spine_migrator` (DDL `CREATE` permissions) and `spine_app` (runtime DML permissions with `REVOKE CREATE ON SCHEMA public`).
 
 ---
 
@@ -37,26 +40,27 @@
 
 - **Hash Algorithm:** BLAKE3 (Authoritative object store), SHA-256 (Git remote transport, LFS objects, backup manifests).
 - **Password Hashing:** Argon2id with random 16-byte salt.
-- **Backup Encryption:** `SPNEBAK v2` streaming chunked AES-256-GCM AEAD encryption with PBKDF2-HMAC-SHA256 key derivation ($10,000 \le \text{iters} \le 1,000,000$), 12-byte per-chunk nonces, 29-byte AAD binding, and authenticated final manifest. Memory usage strictly bounded to $O(1)$ (1 MiB RAM). Strict rejection of trailing bytes and full manifest verification on rotation.
+- **Backup Encryption:** `SPNEBAK v2` streaming chunked AES-256-GCM AEAD encryption with PBKDF2-HMAC-SHA256 key derivation ($10,000 \le \text{iters} \le 1,000,000$), 12-byte per-chunk nonces, 29-byte AAD binding, and authenticated final manifest. Memory usage strictly bounded to $O(1)$ (1 MiB RAM). Strict rejection of trailing bytes, full manifest verification on rotation, canonical same-path collision rejection, and failure-atomic publish via unique temporary staging.
+- **Database Dump/Restore Format:** Version 3.0 streaming JSON Lines (`metadata`, `table_start`, `row`, `table_end`) with `serde_json` arbitrary precision feature ensuring exact numeric precision roundtrip without IEEE-754 precision loss.
 - **SSH Protocol:** Pure Rust implementation via `russh`, supporting `ed25519` host keys, user public keys, and repository deploy keys.
-- **Database Engine:** PostgreSQL 18.6+ with SCRAM-SHA-256 authentication, least-privilege `spine_app` role (`NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS`), loopback/private network binding, and transaction-scoped advisory locking.
+- **Database Engine:** PostgreSQL 18.6+ with SCRAM-SHA-256 authentication, least-privilege `spine_app` role (`NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS`), local/WSL subnet binding (`172.18.64.0/20`), and transaction-scoped advisory locking.
 
 ---
 
 ## 3. Verified Deployment Profiles
 
-1. **`core-forge-v1`**: Control plane, web UI, Git remotes, persistent PostgreSQL. Untrusted external CI execution and shared/public runners strictly prohibited at API, scheduler, runner assignment, and executor layers.
+1. **`core-forge-v1`**: Control plane, web UI, Git remotes, persistent PostgreSQL. Untrusted external CI execution and shared/public runners strictly prohibited at API, scheduler, runner assignment, and executor layers. Authenticated workflow provenance persisted in PostgreSQL.
 2. **`development`**: Local developer evaluation profile permitting ephemeral in-memory storage.
 
 ---
 
 ## 4. Remediation Certification Status
 
-All seven findings from the second Codex deployment audit (F-01 through F-07) have been remediated down to the source code and programmatically verified against real PostgreSQL:
-- F-01: Native streaming SQLx row dumper, `REPEATABLE READ READ ONLY` snapshot isolation, catalog-based sequence sync, 500-row batching.
-- F-02: Cryptographically bounded SPNEBAK v2 parameters, zero trailing bytes check, full manifest rotation check, bounded $O(1)$ disk staging during archive pack/unpack.
-- F-03: Provenance-based trust evaluation; critical ordering defect resolved in runner assignment (evaluates trust BEFORE lease/mutation).
-- F-04: WSL2 PostgreSQL service bound strictly to local/private interfaces; least privilege verified.
-- F-05: Compose variable syntax fixed; `docker-compose.prod.yml` and `deploy/nginx/ingress.conf` created.
-- F-06: File-based secret ingestion; robust relaxed profile parsing; database-backed maintenance barrier.
-- F-07: Real concurrent two-connection cancellation safety verified for transaction-level advisory locks.
+All findings from the third Codex deployment audit (F-01 through F-07) have been remediated down to the source code and programmatically verified against real PostgreSQL:
+- **F-01**: Version 3.0 streaming JSON Lines dumper/restorer, exact JSONB arbitrary numeric precision, cluster write maintenance barrier wired to all mutation endpoints.
+- **F-02**: Canonical same-path rejection, failure-atomic staging with `.tmp_rot_<uuid>.spnebak`, pre-publish header verification, zero residual disk files on failure.
+- **F-03**: Persisted workflow provenance (`source_repo_id`, `is_fork`, `trust_classification`, `provenance_reason`), direct inspection by scheduler and runner lease without unauthenticated re-evaluations.
+- **F-04**: Dedicated DDL migration role `spine_migrator` and runtime least-privilege role `spine_app`; verified schema `CREATE` rejection (`42501`) under `spine_app`; narrowed `pg_hba.conf` subnet to WSL-only.
+- **F-05**: Host port `3000` segregated from production compose; `validate_public_origin` enforces HTTPS scheme, non-empty host, and rejects userinfo credentials.
+- **F-06**: Masked database passwords (`***`) across all logs; strict secret file validation; fail-fast target database connectivity and empty state pre-flight check.
+- **F-07**: Verified `test_actual_run_migrations_cancellation_and_recovery` in `tests/advisory_lock_test.rs` demonstrating real `run_migrations` transaction-level advisory lock, mutual exclusion, task cancellation, engine-level lock cleanup, and recovery.

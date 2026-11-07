@@ -28,6 +28,7 @@ pub async fn create_release(
     user: Option<Extension<User>>,
     Json(payload): Json<CreateReleaseRequest>,
 ) -> Result<(StatusCode, Json<ReleaseDto>), ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let current_user = user
         .ok_or_else(|| {
             ForgeError::Unauthorized("Authentication required to create release".to_string())

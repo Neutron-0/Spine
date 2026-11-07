@@ -293,6 +293,10 @@ async fn test_ordering_defect_untrusted_job_not_leased_and_not_stranded() {
         created_at_nanos: now,
         started_at_nanos: Some(now),
         completed_at_nanos: None,
+        source_repo_id: Some("fork-repo-1".to_string()),
+        is_fork: true,
+        trust_classification: spine_api::core::types::TrustClassification::Untrusted,
+        provenance_reason: "Untrusted external fork pull request".to_string(),
     };
     db.create_workflow_run(run).await.unwrap();
 

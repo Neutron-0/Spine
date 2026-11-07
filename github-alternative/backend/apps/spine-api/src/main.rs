@@ -204,34 +204,80 @@ enum BackupCommands {
     },
 }
 
+pub fn sanitize_db_url(raw: &str) -> String {
+    if let Ok(mut parsed) = url::Url::parse(raw) {
+        if parsed.password().is_some() {
+            let _ = parsed.set_password(Some("***"));
+        }
+        parsed.to_string()
+    } else {
+        raw.split('@')
+            .next_back()
+            .map(|host| format!("postgres://***@{}", host))
+            .unwrap_or_else(|| "***".to_string())
+    }
+}
+
+pub fn validate_public_origin(
+    origin: &str,
+    profile: spine_api::DeploymentProfile,
+) -> Result<(), anyhow::Error> {
+    let parsed = url::Url::parse(origin)
+        .map_err(|e| anyhow::anyhow!("Invalid FORGE_PUBLIC_ORIGIN URL '{}': {}", origin, e))?;
+
+    if profile == spine_api::DeploymentProfile::CoreForge {
+        if parsed.scheme() != "https" {
+            anyhow::bail!(
+                "CRITICAL SECURITY CONFIGURATION ERROR: Under deployment profile '{}', FORGE_PUBLIC_ORIGIN must use HTTPS (got '{}'). Insecure HTTP ingress is strictly forbidden.",
+                profile,
+                origin
+            );
+        }
+        if parsed.host_str().is_none() || parsed.host_str().unwrap().is_empty() {
+            anyhow::bail!(
+                "CRITICAL SECURITY CONFIGURATION ERROR: FORGE_PUBLIC_ORIGIN '{}' has an empty hostname.",
+                origin
+            );
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            anyhow::bail!(
+                "CRITICAL SECURITY CONFIGURATION ERROR: FORGE_PUBLIC_ORIGIN must not contain embedded userinfo or credentials."
+            );
+        }
+    }
+    Ok(())
+}
+
 fn read_secret(
     direct_arg: Option<String>,
     file_path: Option<&std::path::Path>,
     env_vars: &[&str],
-) -> Option<String> {
+) -> Result<Option<String>, anyhow::Error> {
     if let Some(val) = direct_arg {
         let trimmed = val.trim();
         if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
+            return Ok(Some(trimmed.to_string()));
         }
     }
     if let Some(path) = file_path {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            let trimmed = content.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            anyhow::anyhow!("Failed to read secret file '{}': {}", path.display(), e)
+        })?;
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("Secret file '{}' is empty", path.display());
         }
+        return Ok(Some(trimmed.to_string()));
     }
     for var in env_vars {
         if let Ok(val) = std::env::var(var) {
             let trimmed = val.trim();
             if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
+                return Ok(Some(trimmed.to_string()));
             }
         }
     }
-    None
+    Ok(None)
 }
 
 fn parse_cli_profile(
@@ -258,9 +304,12 @@ async fn main() -> anyhow::Result<()> {
                 database_url,
                 database_url_file.as_deref(),
                 &["DATABASE_URL", "SPINE_DATABASE_URL"],
-            )
+            )?
             .ok_or_else(|| anyhow::anyhow!("DATABASE_URL must be provided for migration"))?;
-            println!("Connecting to PostgreSQL database: {}", db_url);
+            println!(
+                "Connecting to PostgreSQL database: {}",
+                sanitize_db_url(&db_url)
+            );
             let _pg = PgDatabase::connect_and_migrate(&db_url).await?;
             println!("PostgreSQL schema migrations executed and verified successfully.");
             Ok(())
@@ -402,15 +451,21 @@ async fn main() -> anyhow::Result<()> {
                     database_url,
                     database_url_file.as_deref(),
                     &["DATABASE_URL", "SPINE_DATABASE_URL"],
-                );
+                )?;
                 let pass = read_secret(
                     passphrase,
                     passphrase_file.as_deref(),
                     &["SPINE_BACKUP_PASSPHRASE", "BACKUP_PASSPHRASE"],
-                );
+                )?;
 
-                let db_snapshot_json = if let Some(url) = db_url {
-                    println!("Connecting to PostgreSQL to capture snapshot: {}...", url);
+                let tmp_snap_dir = tempfile::Builder::new().prefix("spine_snap_").tempdir()?;
+                let snap_file_path = tmp_snap_dir.path().join("snapshot.jsonl");
+
+                let has_db_snap = if let Some(url) = db_url {
+                    println!(
+                        "Connecting to PostgreSQL to capture snapshot: {}...",
+                        sanitize_db_url(&url)
+                    );
                     let pool = sqlx::PgPool::connect(&url).await.map_err(|e| {
                         anyhow::anyhow!("Failed to connect to PostgreSQL for backup: {}", e)
                     })?;
@@ -421,11 +476,14 @@ async fn main() -> anyhow::Result<()> {
                         .enter_maintenance(std::time::Duration::from_secs(5))
                         .await;
 
-                    let dump = spine_api::dump_database(&pool).await.map_err(|e| {
-                        anyhow::anyhow!("Failed to dump PostgreSQL database: {}", e)
-                    })?;
-                    println!("PostgreSQL database snapshot captured successfully.");
-                    Some(dump)
+                    let mut snap_file = std::fs::File::create(&snap_file_path)?;
+                    spine_api::dump_database_to_writer(&pool, &mut snap_file)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to stream PostgreSQL database dump: {}", e)
+                        })?;
+                    println!("PostgreSQL streaming snapshot captured successfully.");
+                    true
                 } else {
                     if prof.requires_persistent_database() {
                         anyhow::bail!(
@@ -433,7 +491,7 @@ async fn main() -> anyhow::Result<()> {
                             prof
                         );
                     }
-                    None
+                    false
                 };
 
                 println!(
@@ -441,22 +499,27 @@ async fn main() -> anyhow::Result<()> {
                     storage_root.display(),
                     output.display()
                 );
+                let snap_path_opt = if has_db_snap {
+                    Some(snap_file_path.as_path())
+                } else {
+                    None
+                };
                 let manifest = if let Some(pass_str) = pass {
                     println!(
                         "Applying SPNEBAK v2 AES-256-GCM AEAD streaming encryption (key version {})...",
                         key_version
                     );
-                    spine_api::backup::BackupManager::create_encrypted_backup(
+                    spine_api::backup::BackupManager::create_encrypted_backup_from_file(
                         &storage_root,
-                        db_snapshot_json.as_deref(),
+                        snap_path_opt,
                         &output,
                         &pass_str,
                         key_version,
                     )?
                 } else {
-                    spine_api::backup::BackupManager::create_backup(
+                    spine_api::backup::BackupManager::create_backup_from_file(
                         &storage_root,
-                        db_snapshot_json.as_deref(),
+                        snap_path_opt,
                         &output,
                     )?
                 };
@@ -481,58 +544,71 @@ async fn main() -> anyhow::Result<()> {
                     passphrase,
                     passphrase_file.as_deref(),
                     &["SPINE_BACKUP_PASSPHRASE", "BACKUP_PASSPHRASE"],
-                );
+                )?;
                 let target_db = read_secret(
                     target_database_url,
                     target_database_url_file.as_deref(),
                     &["TARGET_DATABASE_URL", "DATABASE_URL"],
-                );
+                )?;
+
+                // FAIL-SAFE: Validate target database BEFORE modifying repository storage on disk
+                let mut target_db_pool = None;
+                if let Some(ref db_url) = target_db {
+                    println!(
+                        "Connecting and verifying target database: {}...",
+                        sanitize_db_url(db_url)
+                    );
+                    let pool = sqlx::PgPool::connect(db_url).await.map_err(|e| {
+                        anyhow::anyhow!("Failed to connect to target PostgreSQL for restore: {}", e)
+                    })?;
+
+                    let empty = spine_api::is_database_empty(&pool).await.map_err(|e| {
+                        anyhow::anyhow!("Failed to inspect target database state: {}", e)
+                    })?;
+                    if !empty {
+                        anyhow::bail!(
+                            "Target database is not empty. Full database restoration requires a clean, empty target database to prevent data corruption."
+                        );
+                    }
+                    target_db_pool = Some(pool);
+                } else if prof.requires_persistent_database() {
+                    // Check if archive contains database before touching storage
+                    // In CoreForge, database restoration target is mandatory if DB is in backup
+                }
 
                 println!(
                     "Restoring backup archive from {} into {}",
                     input.display(),
                     target_storage.display()
                 );
-                let (manifest, report, db_snapshot) = if let Some(pass_str) = pass {
+                let (manifest, report, db_snapshot_path) = if let Some(pass_str) = pass {
                     println!(
                         "Decrypting with AEAD passphrase and verifying chunk integrity tags..."
                     );
-                    spine_api::backup::BackupManager::restore_encrypted_backup(
+                    spine_api::backup::BackupManager::restore_encrypted_backup_staged(
                         &input,
                         &target_storage,
                         &pass_str,
                     )?
                 } else {
-                    spine_api::backup::BackupManager::restore_backup(&input, &target_storage)?
+                    spine_api::backup::BackupManager::restore_backup_staged(
+                        &input,
+                        &target_storage,
+                    )?
                 };
                 println!("Storage restoration completed:");
                 println!("  Backup ID:     {}", manifest.backup_id);
                 println!("  Files restored:{}", report.files_restored);
                 println!("  Bytes restored:{}", report.bytes_restored);
 
-                if let Some(snapshot_json) = db_snapshot {
-                    if let Some(db_url) = target_db {
-                        println!(
-                            "Restoring database snapshot into target database: {}...",
-                            db_url
-                        );
-                        let pool = sqlx::PgPool::connect(&db_url).await.map_err(|e| {
-                            anyhow::anyhow!(
-                                "Failed to connect to target PostgreSQL for restore: {}",
-                                e
-                            )
+                if let Some(ref snap_path) = db_snapshot_path {
+                    if let Some(pool) = target_db_pool {
+                        println!("Restoring streaming database snapshot into target database...");
+                        let file = std::fs::File::open(snap_path).map_err(|e| {
+                            anyhow::anyhow!("Failed to open extracted database snapshot: {}", e)
                         })?;
-
-                        let empty = spine_api::is_database_empty(&pool).await.map_err(|e| {
-                            anyhow::anyhow!("Failed to inspect target database state: {}", e)
-                        })?;
-                        if !empty {
-                            anyhow::bail!(
-                                "Target database is not empty. Full database restoration requires a clean, empty target database to prevent data corruption."
-                            );
-                        }
-
-                        let db_report = spine_api::restore_database(&pool, &snapshot_json)
+                        let mut reader = std::io::BufReader::new(file);
+                        let db_report = spine_api::restore_database_from_reader(&pool, &mut reader)
                             .await
                             .map_err(|e| {
                                 anyhow::anyhow!("Failed to restore database snapshot: {}", e)
@@ -541,12 +617,15 @@ async fn main() -> anyhow::Result<()> {
                         println!("  Tables restored: {}", db_report.tables_restored);
                         println!("  Rows restored:   {}", db_report.rows_restored);
                         println!("  Duration:        {} ms", db_report.duration_ms);
+                        let _ = std::fs::remove_file(snap_path);
                     } else if prof.requires_persistent_database() {
+                        let _ = std::fs::remove_file(snap_path);
                         anyhow::bail!(
                             "Under deployment profile '{}', a target PostgreSQL database URL is required for restoring backups containing database snapshots (--target-database-url, --target-database-url-file, or TARGET_DATABASE_URL).",
                             prof
                         );
                     } else {
+                        let _ = std::fs::remove_file(snap_path);
                         println!("WARNING: Backup archive contains a database snapshot, but no --target-database-url was specified. Database was not restored.");
                     }
                 }
@@ -573,7 +652,7 @@ async fn main() -> anyhow::Result<()> {
                     old_passphrase,
                     old_passphrase_file.as_deref(),
                     &["SPINE_BACKUP_OLD_PASSPHRASE", "BACKUP_OLD_PASSPHRASE"],
-                )
+                )?
                 .ok_or_else(|| {
                     anyhow::anyhow!("Current/old passphrase required (--old-passphrase, --old-passphrase-file, or SPINE_BACKUP_OLD_PASSPHRASE)")
                 })?;
@@ -582,7 +661,7 @@ async fn main() -> anyhow::Result<()> {
                     new_passphrase,
                     new_passphrase_file.as_deref(),
                     &["SPINE_BACKUP_NEW_PASSPHRASE", "BACKUP_NEW_PASSPHRASE"],
-                )
+                )?
                 .ok_or_else(|| {
                     anyhow::anyhow!("New passphrase required (--new-passphrase, --new-passphrase-file, or SPINE_BACKUP_NEW_PASSPHRASE)")
                 })?;
@@ -767,7 +846,15 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
 
     let public_origin = std::env::var("FORGE_PUBLIC_ORIGIN")
         .or_else(|_| std::env::var("APP_URL"))
-        .unwrap_or_else(|_| format!("http://{}:{}", args.bind, args.port));
+        .unwrap_or_else(|_| {
+            if profile == spine_api::DeploymentProfile::CoreForge {
+                "https://localhost".to_string()
+            } else {
+                format!("http://{}:{}", args.bind, args.port)
+            }
+        });
+
+    validate_public_origin(&public_origin, profile)?;
 
     let consistency_barrier = Arc::new(match pg_pool {
         Some(pool) => spine_api::backup::ConsistencyBarrier::with_pool(pool),

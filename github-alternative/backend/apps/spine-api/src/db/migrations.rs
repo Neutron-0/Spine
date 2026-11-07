@@ -46,32 +46,24 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0011_security_center",
         include_str!("../../migrations/0011_security_center.sql"),
     ),
+    (
+        "0012_workflow_provenance",
+        include_str!("../../migrations/0012_workflow_provenance.sql"),
+    ),
 ];
 
 // 64-bit advisory lock ID representing "SPINEMIG" (0x5350494E454D4947)
 pub const SPINE_MIGRATION_ADVISORY_LOCK_ID: i64 = 0x5350_494E_454D_4947;
 
-pub async fn run_migrations(pool: &PgPool) -> Result<(), ForgeError> {
-    let mut tx = pool.begin().await.map_err(|e| {
-        ForgeError::Internal(format!("Failed to begin transaction for migrations: {}", e))
-    })?;
-
-    // Acquire transaction-scoped advisory lock (pg_advisory_xact_lock) to serialize concurrent API
-    // startup migrations. This is automatically and instantly released when the transaction commits,
-    // aborts, or is dropped upon future cancellation.
-    tracing::info!("Acquiring cluster-wide schema migration transaction advisory lock...");
+async fn acquire_lock(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(SPINE_MIGRATION_ADVISORY_LOCK_ID)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            ForgeError::Internal(format!(
-                "Failed to acquire migration transaction advisory lock: {}",
-                e
-            ))
-        })?;
+        .execute(conn)
+        .await?;
+    Ok(())
+}
 
-    // 1. Create _schema_migrations tracking table if not exists
+async fn create_migrations_table(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS _schema_migrations (
@@ -80,47 +72,85 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), ForgeError> {
         )
         "#,
     )
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+async fn migration_exists(conn: &mut sqlx::PgConnection, name: &str) -> Result<bool, sqlx::Error> {
+    let row: (bool,) =
+        sqlx::query_as("SELECT EXISTS(SELECT 1 FROM _schema_migrations WHERE version = $1)")
+            .bind(name)
+            .fetch_one(conn)
+            .await?;
+    Ok(row.0)
+}
+
+async fn execute_migration(
+    conn: &mut sqlx::PgConnection,
+    name: &str,
+    sql: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::raw_sql(sql).execute(&mut *conn).await?;
+    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    sqlx::query("INSERT INTO _schema_migrations (version, applied_at_nanos) VALUES ($1, $2)")
+        .bind(name)
+        .bind(now)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+pub async fn run_migrations(pool: &PgPool) -> Result<(), ForgeError> {
+    run_migrations_with_pause(pool.clone(), None, None).await
+}
+
+pub async fn run_migrations_with_pause(
+    pool: PgPool,
+    pause_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
+    resume_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
+) -> Result<(), ForgeError> {
+    let mut tx = pool.begin().await.map_err(|e| {
+        ForgeError::Internal(format!("Failed to begin transaction for migrations: {}", e))
+    })?;
+
+    // Acquire transaction-scoped advisory lock (pg_advisory_xact_lock) to serialize concurrent API
+    // startup migrations. This is automatically and instantly released when the transaction commits,
+    // aborts, or is dropped upon future cancellation.
+    tracing::info!("Acquiring cluster-wide schema migration transaction advisory lock...");
+    acquire_lock(&mut tx).await.map_err(|e| {
+        ForgeError::Internal(format!(
+            "Failed to acquire migration transaction advisory lock: {}",
+            e
+        ))
+    })?;
+
+    if let Some(pause) = pause_notify {
+        pause.notify_one();
+    }
+    if let Some(resume) = resume_notify {
+        resume.notified().await;
+    }
+
+    // 1. Create _schema_migrations tracking table if not exists
+    create_migrations_table(&mut tx).await.map_err(|e| {
         ForgeError::Internal(format!("Failed to create _schema_migrations table: {}", e))
     })?;
 
     // 2. Sequentially apply pending migrations within this transaction
     for (name, sql) in MIGRATIONS {
-        let exists: (bool,) =
-            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM _schema_migrations WHERE version = $1)")
-                .bind(name)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|e| {
-                    ForgeError::Internal(format!(
-                        "Failed to check migration status for {}: {}",
-                        name, e
-                    ))
-                })?;
+        let exists = migration_exists(&mut tx, name).await.map_err(|e| {
+            ForgeError::Internal(format!(
+                "Failed to check migration status for {}: {}",
+                name, e
+            ))
+        })?;
 
-        if !exists.0 {
+        if !exists {
             tracing::info!("Applying migration {}...", name);
-
-            // Execute DDL batch
-            sqlx::raw_sql(sql)
-                .execute(&mut *tx)
+            execute_migration(&mut tx, name, sql)
                 .await
                 .map_err(|e| ForgeError::Internal(format!("Migration {} failed: {}", name, e)))?;
-
-            let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-            sqlx::query(
-                "INSERT INTO _schema_migrations (version, applied_at_nanos) VALUES ($1, $2)",
-            )
-            .bind(name)
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                ForgeError::Internal(format!("Failed to record migration {}: {}", name, e))
-            })?;
-
             tracing::info!("Migration {} applied successfully.", name);
         }
     }

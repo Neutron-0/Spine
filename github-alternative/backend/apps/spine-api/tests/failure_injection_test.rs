@@ -144,6 +144,10 @@ async fn test_stale_fencing_token_and_runner_lease_invalidation() {
         created_at_nanos: 1,
         started_at_nanos: Some(1),
         completed_at_nanos: None,
+        source_repo_id: Some("repo-01".to_string()),
+        is_fork: false,
+        trust_classification: spine_api::core::types::TrustClassification::Trusted,
+        provenance_reason: "Same-repository push".to_string(),
     };
     db.create_workflow_run(run).await.unwrap();
 

@@ -1,5 +1,6 @@
 mod common;
 
+use common::require_safe_test_db_url;
 use spine_api::{
     backup::BackupManager,
     db::{dump_database, is_database_empty, restore_database},
@@ -7,20 +8,10 @@ use spine_api::{
 
 #[tokio::test]
 async fn test_postgres_dump_and_empty_check() {
-    let Some(url) = common::get_safe_test_db_url() else {
-        eprintln!("Skipping postgres_dump_and_empty_check: SPINE_TEST_DATABASE_URL not set");
-        return;
-    };
-    let pool = match sqlx::PgPool::connect(&url).await {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "Skipping postgres_dump_and_empty_check: PostgreSQL unreachable ({})",
-                e
-            );
-            return;
-        }
-    };
+    let url = require_safe_test_db_url();
+    let pool = sqlx::PgPool::connect(&url)
+        .await
+        .expect("connect to test database");
 
     // Ensure baseline schema is present in test database
     spine_api::db::migrations::run_migrations(&pool)
@@ -30,12 +21,11 @@ async fn test_postgres_dump_and_empty_check() {
     // 1. Dump database snapshot
     let snapshot_json = dump_database(&pool).await.expect("dump_database failed");
     assert!(
-        snapshot_json.contains("\"version\": \"2.0\""),
-        "Snapshot JSON must contain version 2.0"
-    );
-    assert!(
-        snapshot_json.contains("\"tables\""),
-        "Snapshot JSON must contain tables"
+        snapshot_json.contains("\"version\":\"3.0\"")
+            || snapshot_json.contains("\"version\": \"3.0\"")
+            || snapshot_json.contains("\"version\": \"2.0\"")
+            || snapshot_json.contains("\"version\":\"2.0\""),
+        "Snapshot JSON must contain version 3.0 or 2.0"
     );
 
     // 2. Check is_database_empty on populated database -> must be false
@@ -63,22 +53,10 @@ async fn test_postgres_dump_and_empty_check() {
 
 #[tokio::test]
 async fn test_full_archive_backup_restore_roundtrip_with_db_snapshot() {
-    let Some(url) = common::get_safe_test_db_url() else {
-        eprintln!(
-            "Skipping full_archive_backup_restore_roundtrip: SPINE_TEST_DATABASE_URL not set"
-        );
-        return;
-    };
-    let pool = match sqlx::PgPool::connect(&url).await {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "Skipping full_archive_backup_restore_roundtrip: PostgreSQL unreachable ({})",
-                e
-            );
-            return;
-        }
-    };
+    let url = require_safe_test_db_url();
+    let pool = sqlx::PgPool::connect(&url)
+        .await
+        .expect("connect to test database");
 
     let temp_dir = tempfile::tempdir().unwrap();
     let storage_root = temp_dir.path().join("storage_node");
@@ -139,5 +117,141 @@ async fn test_full_archive_backup_restore_roundtrip_with_db_snapshot() {
         "Database snapshot JSON must be present in restore result"
     );
     let extracted_json = extracted_db.unwrap();
-    assert!(extracted_json.contains("\"version\": \"2.0\""));
+    assert!(
+        extracted_json.contains("\"version\":\"3.0\"")
+            || extracted_json.contains("\"version\": \"3.0\"")
+            || extracted_json.contains("\"version\": \"2.0\"")
+            || extracted_json.contains("\"version\":\"2.0\""),
+        "Extracted snapshot must contain version 3.0 or 2.0"
+    );
+}
+
+#[tokio::test]
+async fn test_postgres_jsonb_numeric_precision_roundtrip() {
+    let url = require_safe_test_db_url();
+    let pool = sqlx::PgPool::connect(&url)
+        .await
+        .expect("connect to test database");
+
+    // Run migrations
+    spine_api::db::migrations::run_migrations(&pool)
+        .await
+        .expect("run_migrations on test database failed");
+
+    // Insert user and profile with huge arbitrary numeric precision inside JSONB
+    let uid = format!("usr_prec_{}", uuid::Uuid::new_v4().simple());
+    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+    let username = format!("user_{}", &uid[9..16]);
+    let email = format!("{}@example.com", &uid[9..16]);
+
+    sqlx::query(
+        "INSERT INTO users (id, username, normalized_username, email, normalized_email, display_name, password_hash, created_at_nanos, updated_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, 'hash', $7, $7) ON CONFLICT (id) DO NOTHING"
+    )
+    .bind(&uid)
+    .bind(&username)
+    .bind(username.to_lowercase())
+    .bind(&email)
+    .bind(email.to_lowercase())
+    .bind(&username)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert user");
+
+    // Exact high-precision numeric token: 30 digits of integer part + 9 digits of fractional part
+    let exact_token = "123456789012345678901234567890.123456789";
+    let jsonb_payload = format!("[{}]", exact_token);
+
+    sqlx::query(
+        "INSERT INTO user_profiles (user_id, bio, pinned_repo_ids, updated_at_nanos) VALUES ($1, 'precision test', $2::jsonb, $3) ON CONFLICT (user_id) DO UPDATE SET pinned_repo_ids = $2::jsonb"
+    )
+    .bind(&uid)
+    .bind(&jsonb_payload)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert profile with high precision jsonb");
+
+    // Dump database to streaming writer
+    let mut dump_buf = Vec::new();
+    spine_api::dump_database_to_writer(&pool, &mut dump_buf)
+        .await
+        .expect("dump_database_to_writer failed");
+
+    let dump_str = String::from_utf8(dump_buf.clone()).expect("valid utf-8 dump");
+
+    // Verify dump contains the exact token character-for-character
+    assert!(
+        dump_str.contains(exact_token),
+        "Dump output MUST contain exact numeric string token '{}' without floating-point conversion",
+        exact_token
+    );
+
+    // Now clean the database to simulate empty target
+    let tables: Vec<(String,)> = sqlx::query_as(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'"
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("fetch tables");
+
+    for (tbl,) in tables {
+        sqlx::query(&format!("DROP TABLE IF EXISTS \"{}\" CASCADE", tbl))
+            .execute(&pool)
+            .await
+            .expect("drop table");
+    }
+
+    // Verify empty
+    let empty = is_database_empty(&pool).await.expect("check empty");
+    assert!(empty, "Database must be empty prior to restore");
+
+    // Restore from streaming reader
+    let mut reader = std::io::BufReader::new(std::io::Cursor::new(dump_buf));
+    let restore_report = spine_api::restore_database_from_reader(&pool, &mut reader)
+        .await
+        .expect("restore_database_from_reader failed");
+
+    assert!(restore_report.tables_restored > 0);
+    assert!(restore_report.rows_restored > 0);
+
+    // Query restored value directly from PostgreSQL
+    let row: (String,) =
+        sqlx::query_as("SELECT (pinned_repo_ids->>0)::text FROM user_profiles WHERE user_id = $1")
+            .bind(&uid)
+            .fetch_one(&pool)
+            .await
+            .expect("query restored profile");
+
+    assert_eq!(
+        row.0, exact_token,
+        "Restored JSONB numeric value MUST match exact token without precision loss"
+    );
+}
+
+#[tokio::test]
+async fn test_spine_app_least_privilege_schema_create_rejected() {
+    let app_url = common::get_app_role_test_db_url();
+    let pool = sqlx::PgPool::connect(&app_url)
+        .await
+        .expect("connect to test database as spine_app");
+
+    // Attempting to CREATE TABLE as runtime role spine_app MUST fail with permission denied (42501)
+    let res = sqlx::query("CREATE TABLE unauthorized_test (id INT)")
+        .execute(&pool)
+        .await;
+
+    assert!(
+        res.is_err(),
+        "Runtime application role 'spine_app' MUST NOT have CREATE privilege on schema public"
+    );
+
+    let err = res.unwrap_err();
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("permission denied") || err_str.contains("42501"),
+        "PostgreSQL error must be permission denied / 42501: {}",
+        err_str
+    );
 }

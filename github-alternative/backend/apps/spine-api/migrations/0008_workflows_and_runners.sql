@@ -28,6 +28,10 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
     conclusion TEXT,
     definition_yaml TEXT NOT NULL,
     definition_digest TEXT NOT NULL,
+    source_repo_id TEXT,
+    is_fork BOOLEAN NOT NULL DEFAULT FALSE,
+    trust_classification TEXT NOT NULL DEFAULT 'Untrusted',
+    provenance_reason TEXT NOT NULL DEFAULT '',
     created_at_nanos BIGINT NOT NULL,
     started_at_nanos BIGINT,
     completed_at_nanos BIGINT

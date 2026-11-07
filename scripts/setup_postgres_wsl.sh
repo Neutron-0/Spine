@@ -10,6 +10,8 @@ POSTGRES_VERSION="18"
 CONF_DIR="/etc/postgresql/${POSTGRES_VERSION}/main"
 DB_NAME="${SPINE_POSTGRES_DB:-spine_forge}"
 TEST_DB_NAME="${SPINE_TEST_POSTGRES_DB:-spine_forge_test}"
+MIGRATOR_USER="${SPINE_MIGRATOR_USER:-spine_migrator}"
+MIGRATOR_PASSWORD="${SPINE_MIGRATOR_PASSWORD:-spine_secure_dev_password}"
 APP_USER="${SPINE_POSTGRES_USER:-spine_app}"
 APP_PASSWORD="${SPINE_POSTGRES_PASSWORD:-spine_secure_dev_password}"
 
@@ -37,8 +39,13 @@ if [ -f "${CONF_DIR}/pg_hba.conf" ]; then
         echo "host    all             all             ::1/128                 scram-sha-256" >> "${CONF_DIR}/pg_hba.conf"
     fi
 
-    if [ -n "${WSL_IP}" ] && ! grep -q "172.16.0.0/12.*scram-sha-256" "${CONF_DIR}/pg_hba.conf"; then
-        echo "host    all             all             172.16.0.0/12           scram-sha-256" >> "${CONF_DIR}/pg_hba.conf"
+    WSL_SUBNET=$(ip route show dev eth0 proto kernel 2>/dev/null | grep -oP '\d+(\.\d+){3}/\d+' | head -n1 || true)
+    if [ -z "${WSL_SUBNET}" ] && [ -n "${WSL_IP}" ]; then
+        WSL_SUBNET="${WSL_IP}/32"
+    fi
+
+    if [ -n "${WSL_SUBNET}" ] && ! grep -q "${WSL_SUBNET}.*scram-sha-256" "${CONF_DIR}/pg_hba.conf"; then
+        echo "host    all             all             ${WSL_SUBNET}           scram-sha-256" >> "${CONF_DIR}/pg_hba.conf"
     fi
 fi
 
@@ -50,6 +57,10 @@ su - postgres -c "psql -tc \"SELECT 1 FROM pg_database WHERE datname = '${DB_NAM
 echo "[INFO] Creating dedicated test database '${TEST_DB_NAME}' if not exists..."
 su - postgres -c "psql -tc \"SELECT 1 FROM pg_database WHERE datname = '${TEST_DB_NAME}'\" | grep -q 1 || psql -c \"CREATE DATABASE ${TEST_DB_NAME};\""
 
+echo "[INFO] Creating dedicated migration role '${MIGRATOR_USER}'..."
+su - postgres -c "psql -tc \"SELECT 1 FROM pg_roles WHERE rolname = '${MIGRATOR_USER}'\" | grep -q 1 || psql -c \"CREATE USER ${MIGRATOR_USER} WITH PASSWORD '${MIGRATOR_PASSWORD}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;\""
+su - postgres -c "psql -c \"ALTER USER ${MIGRATOR_USER} WITH PASSWORD '${MIGRATOR_PASSWORD}';\""
+
 echo "[INFO] Creating or configuring least-privilege application role '${APP_USER}'..."
 # Ensure user exists without SUPERUSER, CREATEDB, CREATEROLE, or BYPASSRLS privileges
 su - postgres -c "psql -tc \"SELECT 1 FROM pg_roles WHERE rolname = '${APP_USER}'\" | grep -q 1 || psql -c \"CREATE USER ${APP_USER} WITH PASSWORD '${APP_PASSWORD}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;\""
@@ -57,8 +68,16 @@ su - postgres -c "psql -c \"ALTER USER ${APP_USER} WITH PASSWORD '${APP_PASSWORD
 
 echo "[INFO] Applying least-privilege grants on '${DB_NAME}'..."
 su - postgres -c "psql -d ${DB_NAME} <<EOF
+GRANT CONNECT ON DATABASE ${DB_NAME} TO ${MIGRATOR_USER};
+GRANT USAGE, CREATE ON SCHEMA public TO ${MIGRATOR_USER};
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ${MIGRATOR_USER};
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ${MIGRATOR_USER};
+ALTER DEFAULT PRIVILEGES FOR ROLE ${MIGRATOR_USER} IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO ${APP_USER};
+ALTER DEFAULT PRIVILEGES FOR ROLE ${MIGRATOR_USER} IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO ${APP_USER};
+
 GRANT CONNECT ON DATABASE ${DB_NAME} TO ${APP_USER};
-GRANT USAGE, CREATE ON SCHEMA public TO ${APP_USER};
+GRANT USAGE ON SCHEMA public TO ${APP_USER};
+REVOKE CREATE ON SCHEMA public FROM ${APP_USER};
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${APP_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO ${APP_USER};
 GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO ${APP_USER};
@@ -67,8 +86,16 @@ EOF"
 
 echo "[INFO] Applying least-privilege grants on '${TEST_DB_NAME}'..."
 su - postgres -c "psql -d ${TEST_DB_NAME} <<EOF
+GRANT CONNECT ON DATABASE ${TEST_DB_NAME} TO ${MIGRATOR_USER};
+GRANT USAGE, CREATE ON SCHEMA public TO ${MIGRATOR_USER};
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ${MIGRATOR_USER};
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ${MIGRATOR_USER};
+ALTER DEFAULT PRIVILEGES FOR ROLE ${MIGRATOR_USER} IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO ${APP_USER};
+ALTER DEFAULT PRIVILEGES FOR ROLE ${MIGRATOR_USER} IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO ${APP_USER};
+
 GRANT CONNECT ON DATABASE ${TEST_DB_NAME} TO ${APP_USER};
-GRANT USAGE, CREATE ON SCHEMA public TO ${APP_USER};
+GRANT USAGE ON SCHEMA public TO ${APP_USER};
+REVOKE CREATE ON SCHEMA public FROM ${APP_USER};
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${APP_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO ${APP_USER};
 GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO ${APP_USER};

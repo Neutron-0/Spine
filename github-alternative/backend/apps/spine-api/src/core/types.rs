@@ -1144,6 +1144,22 @@ pub enum TrustClassification {
     Untrusted,
 }
 
+impl TrustClassification {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Trusted => "Trusted",
+            Self::Untrusted => "Untrusted",
+        }
+    }
+
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "trusted" => Self::Trusted,
+            _ => Self::Untrusted,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowProvenance {
     pub target_repo_id: String,
@@ -1169,6 +1185,10 @@ pub struct WorkflowRun {
     pub conclusion: Option<String>,
     pub definition_yaml: String,
     pub definition_digest: String,
+    pub source_repo_id: Option<String>,
+    pub is_fork: bool,
+    pub trust_classification: TrustClassification,
+    pub provenance_reason: String,
     pub created_at_nanos: i64,
     pub started_at_nanos: Option<i64>,
     pub completed_at_nanos: Option<i64>,

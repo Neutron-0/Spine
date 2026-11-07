@@ -116,7 +116,6 @@ services:
       - spine-internal
       - spine-public
     ports:
-      - "3000:3000"
       - "2222:2222"
     environment:
       BIND: "0.0.0.0"
@@ -151,8 +150,6 @@ services:
     restart: unless-stopped
     networks:
       - spine-public
-    ports:
-      - "5173:80"
     depends_on:
       - spine-api
 

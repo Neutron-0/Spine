@@ -248,3 +248,37 @@
   - `GIT_OBJECT_MAPPING_DURABILITY.md`
   - `GIT_REMOTE_HTTPS_CONFIGURATION.md`
   - `GIT_REMOTE_TEST_MATRIX.md`
+
+---
+
+## Milestone 18: Native Git-over-SSH, Key Management & File Locking (Batch 18 - Completed)
+- [x] Pure Rust Git-over-SSH transport engine via `russh` (`spine_api::ssh`).
+- [x] Public key authentication, deploy keys with read/write scoping, and constant-time signature verification.
+- [x] Git LFS SSH authentication and locking protocol integration.
+- [x] Verification with official Git CLI and Git LFS over SSH.
+
+---
+
+## Milestone 19: Production Packaging & Real PostgreSQL Verification (Batch 19 - Completed)
+- [x] PostgreSQL database migration engine with transactional execution.
+- [x] Deployment profiles (`core-forge-v1`, `development`).
+- [x] Backup and restore subsystem (`SPNEBAK v1`).
+- [x] Packaging and deployment rehearsal runbooks.
+
+---
+
+## Milestone 20: Release Candidate & First Codex Audit Closure (Batch 20 - Completed)
+- [x] Session advisory locking in `run_migrations`.
+- [x] Systemd unit files and Docker Compose configurations.
+- [x] Production deployment rehearsals in clean environment.
+
+---
+
+## Milestone 21: Independent Codex Audit Remediation (Batches 21, 21A, 21B - Completed)
+- [x] **F-01**: Streaming JSON Lines database dump and restore (Version 3.0), exact JSONB arbitrary numeric precision without floating point loss, database-backed cluster maintenance barrier wired to all mutation routes.
+- [x] **F-02**: SPNEBAK v2 streaming encryption and failure-atomic key rotation with canonical same-path collision check, temporary staging, pre-publish header validation, and zero residual disk residue.
+- [x] **F-03**: Persisted authenticated workflow provenance in PostgreSQL, enforced across trigger, scheduler, and runner assignment layers.
+- [x] **F-04**: Narrowed PostgreSQL network subnet, established granular role separation (`spine_migrator` / `spine_app`), and verified runtime schema creation rejection.
+- [x] **F-05**: Production Compose port segregation, HTTPS public origin enforcement, and credential userinfo rejection.
+- [x] **F-06**: Password masking across all logs, strict secret file validation, and fail-fast empty target database checks.
+- [x] **F-07**: Verified real PostgreSQL transaction-level advisory lock mutual exclusion, task cancellation, and recovery.
