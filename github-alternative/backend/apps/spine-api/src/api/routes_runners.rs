@@ -88,6 +88,9 @@ pub async fn register_runner(
     let Extension(_caller) =
         user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
 
+    let mut permit = state.consistency_barrier.acquire_write_permit().await?;
+    permit.verify_active().await?;
+
     let (runner, raw_token) = state
         .runners
         .register_runner(
@@ -133,6 +136,9 @@ pub async fn heartbeat(
         return Err(ForgeError::Unauthorized("Runner ID mismatch".into()));
     }
 
+    let mut permit = state.consistency_barrier.acquire_write_permit().await?;
+    permit.verify_active().await?;
+
     state.runners.authenticate_runner(runner_id, token).await?;
     state
         .runners
@@ -151,6 +157,9 @@ pub async fn acquire_job(
     if runner_id != payload.runner_id {
         return Err(ForgeError::Unauthorized("Runner ID mismatch".into()));
     }
+
+    let mut permit = state.consistency_barrier.acquire_write_permit().await?;
+    permit.verify_active().await?;
 
     state.runners.authenticate_runner(runner_id, token).await?;
     let acquired = state
@@ -179,6 +188,9 @@ pub async fn ingest_logs(
         return Err(ForgeError::Unauthorized("Runner ID mismatch".into()));
     }
 
+    let mut permit = state.consistency_barrier.acquire_write_permit().await?;
+    permit.verify_active().await?;
+
     state.runners.authenticate_runner(runner_id, token).await?;
     state
         .runners
@@ -205,6 +217,9 @@ pub async fn complete_job(
     if runner_id != payload.runner_id {
         return Err(ForgeError::Unauthorized("Runner ID mismatch".into()));
     }
+
+    let mut permit = state.consistency_barrier.acquire_write_permit().await?;
+    permit.verify_active().await?;
 
     state.runners.authenticate_runner(runner_id, token).await?;
     state

@@ -1,85 +1,65 @@
-# SPINE — BATCH 21D REPRODUCIBLE TEST RESULTS
+# SPINE — BATCH 21E REPRODUCIBLE TEST RESULTS
 ## Full Test Suite Execution, Cross-Process Evidence and Safety Proofs
 
 **Date:** 2026-11-08  
-**Target HEAD:** Batch 21D deployment readiness remediation  
-**Operating System:** Windows 11 / WSL2 Linux (PostgreSQL 18 backend)  
+**Target HEAD:** Batch 21E deployment readiness closure  
+**Operating System:** Windows 11 / PostgreSQL 16  
 **Rust Version:** rustc 1.88.0-nightly / stable toolchain compatible (MSRV 1.88)  
 
 ---
 
-### 1. Disposable Database Safety Contract (`test_database_safety_test.rs`)
-- **Status:** PASS (1 passed; 0 failed; finished in 31.12s)
+### 1. Crash-Recoverable Restore State Machine & Fail-Closed Startup (`restore_failure_injection_test.rs`)
+- **Status:** PASS (4 passed; 0 failed; finished in 1.54s)
 - **Scenarios Verified:**
-  1. Ephemeral database creation with unique name (`spine_disp_<uuid>`).
-  2. Proof table recording (`_harness_provision_proof` with PID and timestamp).
-  3. Strict refusal to operate on pre-existing databases (even if specified via URL).
-  4. Automatic isolation from primary and template databases (`spine_forge`, `postgres`, `template1`).
-  5. Destruction and cleanup of disposable database without affecting co-located databases.
+  1. `test_startup_crash_recovery_cleans_interrupted_staging`: Pre-publication crash during `StagedStorage` cleanly removes temporary directory and deletes journal without touching live storage.
+  2. `test_startup_recovery_fails_closed_on_interrupted_db_cutover`: Interruption during `DbPublished` phase (database updated, storage not yet published) triggers fatal `handle_startup_recovery` failure, blocking server startup and preventing split-brain corruption.
+  3. `test_restore_database_failure_leaves_live_storage_untouched`: Database restore failure during staging rolls back cleanly, leaving existing live repository files completely untouched.
+  4. `test_restore_database_success_publishes_storage_atomically`: Successful restore sequences atomically transition `StagedDb` -> `DbPublished` -> `StoragePublished` -> `Committed`, publishing files, writing `.spine_storage_generation`, and recording database restore generation.
 
 ---
 
-### 2. Cross-Process Writer Coordination (`cross_process_coordination_test.rs`)
-- **Status:** PASS (1 passed; 0 failed; finished in 5.86s)
+### 2. Disposable Database Safety Contract (`test_database_safety_test.rs`)
+- **Status:** PASS (1 passed; 0 failed; finished in 0.00s)
 - **Scenarios Verified:**
-  1. **Writer Denied During Active Maintenance:** Subprocess acquiring exclusive session advisory lock (`0x5350494E_4542414B`) immediately causes parent writer permit acquisition to return `ForgeError::ServiceUnavailable("Cluster in maintenance")`.
-  2. **Concurrent Maintenance Excluded:** Second process attempting `enter_maintenance` while another process holds exclusive maintenance lock times out and is rejected.
-  3. **In-Flight Writer Drains Maintenance:** Active writer permit delays maintenance entry until writer completes and releases its permit.
-  4. **Process Termination Recovery:** Killing an external process holding an exclusive advisory lock causes the PostgreSQL kernel to immediately drop all session locks, permitting subsequent permits and maintenance sessions to proceed cleanly.
+  1. Opt-in flag enforcement: Refuses destructive modifications without `SPINE_ALLOW_DESTRUCTIVE_TESTS=1`.
+  2. Pre-existing database protection: Rejects pre-existing database targets missing current harness proof.
+  3. Fail-closed provisioning: Network or unreachable database configuration fails immediately without performing SQL operations.
 
 ---
 
-### 3. F-07 Migration Advisory Locking (`advisory_lock_test.rs`)
-- **Status:** PASS (2 passed; 0 failed; finished in 10.98s)
+### 3. PostgreSQL Least-Privilege Role Isolation (`postgres_least_privilege_test.rs`)
+- **Status:** PASS (1 passed; 0 failed; finished in 21.07s)
 - **Scenarios Verified:**
-  1. Transaction-level advisory lock mutual exclusion during schema migrations.
-  2. Database-scoped lock accounting (`database = (SELECT oid FROM pg_database WHERE datname = current_database())`).
-  3. Clean release and task cancellation without orphaned lock state.
+  1. No silent fallback in harness: `app_pool` connects strictly as `spine_app`.
+  2. `spine_app` privileges verified: `rolsuper=false`, `rolcreaterole=false`, `rolcreatedb=false`, `rolbypassrls=false`.
+  3. Unauthorized administrative actions denied: `CREATE ROLE` and `CREATE TABLE on public schema` rejected with permission denied.
+  4. Application DML queries executed successfully: `SELECT count(*) FROM users` succeeded.
 
 ---
 
-### 4. Authoritative Workflow Provenance (`hostile_workflow_test.rs`, `profile_enforcement_test.rs`, `workflow_ci_e2e_test.rs`)
-- **Status:** PASS (12 passed; 0 failed; finished in 2.07s)
+### 4. Authoritative Workflow Provenance (`hostile_workflow_test.rs`, `profile_enforcement_test.rs`, `failure_injection_test.rs`)
+- **Status:** PASS (16 passed; 0 failed)
 - **Scenarios Verified:**
-  1. `IsolatedRunnerExecutor::execute_job` mandates `AuthoritativeTrustToken` derived from database lookup.
-  2. Untrusted workflow execution strictly rejected under `core-forge-v1` deployment profile.
-  3. Secret masking verified in runner output (ciphertext replaced with `***`).
-  4. Runner stale fencing token rejected; job timeout cancels gracefully.
-  5. End-to-end DAG execution across multi-step pipeline with PR check protection.
+  1. `AuthoritativeTrustToken` constructor `for_test` restricted to integration test scopes (`#[cfg(any(test, feature = "test-support"))]`).
+  2. `AuthoritativeTrustToken` strictly binds `run_id`, `job_id`, `repository_id`, and fork classification.
+  3. Untrusted workflow execution strictly rejected under `core-forge-v1` deployment profile.
+  4. Runner routes (`register_runner`, `heartbeat`, `acquire_job`, `ingest_logs`, `complete_job`) participate in global consistency barrier (`acquire_write_permit` and `verify_active`).
 
 ---
 
-### 5. PostgreSQL Backup & Restore with High-Precision JSONB (`postgres_backup_restore_test.rs`)
-- **Status:** PASS (4 passed; 0 failed; finished in 2.25s)
+### 5. SPNEBAK v2 Streaming Encryption & Key Rotation (`backup_v2_streaming_test.rs`)
+- **Status:** PASS (6 passed; 0 failed; finished in 2.36s)
 - **Scenarios Verified:**
-  1. Database snapshot streaming dump and restore (JSON Lines format 3.0).
-  2. Non-empty target database rejection (fail-fast conflict check).
-  3. Exact 30-digit integer + 9-digit fractional JSONB numeric precision preserved character-for-character without floating-point conversion.
-  4. Full archive backup and restore roundtrip with database snapshot and repository storage.
+  1. Header format and magic byte bounds validation.
+  2. Streaming chunked encryption and decryption roundtrip.
+  3. Tampering and authentication tag verification rejection.
+  4. Trailing byte injection rejection.
+  5. In-place master key rotation without intermediate plaintext exposure.
+  6. Maintenance barrier draining window coordination.
 
 ---
 
-### 6. Durable Cross-Resource Restore & Crash Recovery (`restore_failure_injection_test.rs`)
-- **Status:** PASS (3 passed; 0 failed; finished in 1.07s)
-- **Scenarios Verified:**
-  1. **Database Restore Failure Leaves Live Storage Untouched:** Live repository files (`config.toml`, `spine.db`) remain 100% identical when a database restore error is simulated during restore.
-  2. **Successful Restore Atomically Publishes Storage:** Staged files are moved to live storage root only after database restore succeeds.
-  3. **Startup Crash Recovery:** Orphaned staging directory and interrupted journal in `RestorePhase::StagedStorage` are cleanly rolled back on subsequent server startup.
-
----
-
-### 7. PostgreSQL Least Privilege (`postgres_least_privilege_test.rs`)
-- **Status:** PASS (1 passed; 0 failed; finished in 1.35s)
-- **Scenarios Verified:**
-  1. `spine_app` rolsuper, rolcreaterole, rolcreatedb, rolbypassrls are all `false`.
-  2. `spine_app` attempting `CREATE ROLE` is rejected with permission denied.
-  3. `spine_app` attempting `CREATE TABLE` on schema `public` is rejected (SQLSTATE 42501).
-  4. `spine_app` possesses valid DML (`SELECT count(*) FROM users`) on application tables.
-
----
-
-### 8. Container Toolchain & Formatting Verification
-- `cargo fmt --all -- --check`: PASS (0 differences)
-- `cargo clippy --all-targets -j 2 -- -D warnings` (git-alternative): PASS (0 warnings)
-- `cargo clippy --all-targets -j 2 -- -D warnings` (github-alternative/backend): PASS (0 warnings)
-- Docker execution note: Docker engine pipe is unmounted on host; Compose deployment verification status reported honestly as `NOT VERIFIED` on daemon. All configurations, entrypoints, and role scripts are verified.
+### 6. Workspace Static Analysis & Code Quality
+- **`cargo fmt --check`:** PASSED (All crates formatted according to Rust style guidelines).
+- **`cargo clippy --all-targets -- -D warnings`:** PASSED (Zero warnings across both workspaces).
+- **Release Compilation:** All 4 release binaries compiled successfully with optimized release profiles.

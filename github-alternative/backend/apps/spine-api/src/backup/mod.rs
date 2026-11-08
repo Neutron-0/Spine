@@ -84,8 +84,6 @@ impl StagedRestoreSession {
     /// Commits the staged files to live storage root.
     /// This MUST only be called after target database restore is successful.
     pub fn publish_storage(mut self) -> Result<RestoreReport, ForgeError> {
-        self.journal.persist(RestorePhase::DatabaseRestored)?;
-
         let mut files_restored = 0usize;
         let mut bytes_restored = 0u64;
 
@@ -105,8 +103,13 @@ impl StagedRestoreSession {
             }
         }
 
+        RestoreJournal::write_storage_generation(
+            &self.target_storage_root,
+            &self.journal.target_generation,
+        )?;
+
         self.journal.persist(RestorePhase::StoragePublished)?;
-        self.journal.persist(RestorePhase::Completed)?;
+        self.journal.persist(RestorePhase::Committed)?;
         let _ = RestoreJournal::remove(&self.target_storage_root);
 
         self.report.files_restored = files_restored;
@@ -861,8 +864,12 @@ impl BackupManager {
         staging_dir: tempfile::TempDir,
     ) -> Result<StagedRestoreSession, ForgeError> {
         let start = Instant::now();
-        let mut journal =
-            RestoreJournal::new(input_archive, target_storage_root, staging_dir.path());
+        let mut journal = RestoreJournal::new(
+            input_archive,
+            target_storage_root,
+            staging_dir.path(),
+            "pending",
+        );
         journal.persist(RestorePhase::Initialized)?;
 
         let mut archive = tar::Archive::new(reader);
@@ -1014,7 +1021,18 @@ impl BackupManager {
             verified_files_list.push((rel_path, staged_path, size));
         }
 
-        journal.persist(RestorePhase::StagedStorage)?;
+        journal.backup_id = manifest.backup_id.clone();
+        journal.target_generation = format!(
+            "gen_{}_{}",
+            manifest.backup_id,
+            uuid::Uuid::new_v4().simple()
+        );
+        if extracted_db_staged_path.is_some() {
+            journal.db_snapshot_staged = extracted_db_staged_path.clone();
+            journal.persist(RestorePhase::StagedDb)?;
+        } else {
+            journal.persist(RestorePhase::StagedStorage)?;
+        }
 
         let report = RestoreReport {
             backup_id: manifest.backup_id.clone(),

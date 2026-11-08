@@ -102,6 +102,11 @@ impl HarnessDisposableDb {
 
         let mut parsed_app = parsed_migrator.clone();
         let _ = parsed_app.set_username("spine_app");
+        if let Ok(app_pass) = std::env::var("SPINE_APP_PASSWORD")
+            .or_else(|_| std::env::var("SPINE_TEST_APP_PASSWORD"))
+        {
+            let _ = parsed_app.set_password(Some(&app_pass));
+        }
         let app_url = parsed_app.to_string();
 
         let pool = PgPool::connect(&migrator_url)
@@ -182,10 +187,12 @@ impl HarnessDisposableDb {
             .await
             .map_err(|e| format!("Failed to configure spine_app permissions: {}", e))?;
 
-        let app_pool = match PgPool::connect(&app_url).await {
-            Ok(p) => p,
-            Err(_) => pool.clone(),
-        };
+        let app_pool = PgPool::connect(&app_url).await.map_err(|e| {
+            format!(
+                "Failed to connect to test database as spine_app ({}): {}",
+                app_url, e
+            )
+        })?;
 
         Ok(Self {
             db_name,
@@ -255,11 +262,16 @@ impl HarnessDisposableDb {
     pub async fn verify_preexisting_rejected(preexisting_url: &str) -> Result<(), String> {
         let pool = match PgPool::connect(preexisting_url).await {
             Ok(p) => p,
-            Err(_) => return Ok(()), // Unreachable is also rejected
+            Err(e) => {
+                return Err(format!(
+                    "SAFETY ABORT: Pre-existing database '{}' rejected: Missing harness creation proof: {}",
+                    preexisting_url, e
+                ));
+            }
         };
 
         // Check if it lacks the current process's harness proof
-        let query = "SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1";
+        let query = "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1)";
         let exists: (bool,) = sqlx::query_as(query)
             .bind(HARNESS_PROOF_TABLE)
             .fetch_one(&pool)
@@ -273,7 +285,10 @@ impl HarnessDisposableDb {
             ));
         }
 
-        Err("SAFETY ABORT: Pre-existing database rejected.".to_string())
+        Err(
+            "SAFETY ABORT: Pre-existing database rejected: Missing harness creation proof."
+                .to_string(),
+        )
     }
 
     /// Cleanly drops the provisioned database using the administrative connection.

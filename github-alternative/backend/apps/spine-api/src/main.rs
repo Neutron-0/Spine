@@ -614,7 +614,7 @@ async fn main() -> anyhow::Result<()> {
                     input.display(),
                     target_storage.display()
                 );
-                let session = spine_api::backup::BackupManager::prepare_restore_session(
+                let mut session = spine_api::backup::BackupManager::prepare_restore_session(
                     &input,
                     &target_storage,
                     pass.as_deref(),
@@ -636,7 +636,24 @@ async fn main() -> anyhow::Result<()> {
                         )
                         .await
                         {
-                            Ok(r) => r,
+                            Ok(r) => {
+                                spine_api::backup::RestoreJournal::record_db_generation(
+                                    pool,
+                                    &session.journal.target_generation,
+                                    &session.manifest.backup_id,
+                                )
+                                .await
+                                .map_err(|e| {
+                                    anyhow::anyhow!("Failed to record database generation: {}", e)
+                                })?;
+                                session
+                                    .journal
+                                    .persist(spine_api::backup::RestorePhase::DbPublished)
+                                    .map_err(|e| {
+                                        anyhow::anyhow!("Failed to update restore journal: {}", e)
+                                    })?;
+                                r
+                            }
                             Err(e) => {
                                 let _ = session.abort(&format!("Database restore failed: {}", e));
                                 anyhow::bail!("Failed to restore database snapshot: {}. Target repository storage was left untouched.", e);
@@ -877,10 +894,13 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
     let storage_root_canonical = std::fs::canonicalize(&args.storage_root)?;
     tracing::info!("Storage root: {}", storage_root_canonical.display());
 
-    // 3.1 Restore state machine crash recovery
-    if let Some(msg) =
-        spine_api::backup::RestoreJournal::handle_startup_recovery(&storage_root_canonical)
-            .map_err(|e| anyhow::anyhow!("Failed restore crash recovery check: {}", e))?
+    // 3.1 Restore state machine crash recovery & generation validation
+    if let Some(msg) = spine_api::backup::RestoreJournal::handle_startup_recovery(
+        &storage_root_canonical,
+        pg_pool.as_ref(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("FATAL RESTORE RECOVERY FAILURE: {}", e))?
     {
         tracing::warn!("Restore state machine recovery: {}", msg);
     }

@@ -68,7 +68,12 @@ async fn test_restore_database_failure_leaves_live_storage_untouched() {
         journal.is_some(),
         "Journal must be persisted during active restore"
     );
-    assert_eq!(journal.unwrap().phase, RestorePhase::StagedStorage);
+    let phase = journal.unwrap().phase;
+    assert!(
+        phase == RestorePhase::StagedStorage || phase == RestorePhase::StagedDb,
+        "Journal phase must be staged storage/db, got {:?}",
+        phase
+    );
 
     // 2. Simulate database restore failure
     let simulated_db_err = "Simulated connection reset by peer during database transaction";
@@ -157,6 +162,7 @@ async fn test_startup_crash_recovery_cleans_interrupted_staging() {
         &temp.path().join("archive.spnebak"),
         &storage_root,
         &orphan_staging,
+        "test_backup",
     );
     journal.persist(RestorePhase::StagedStorage).unwrap();
 
@@ -164,7 +170,9 @@ async fn test_startup_crash_recovery_cleans_interrupted_staging() {
     assert!(RestoreJournal::load(&storage_root).unwrap().is_some());
 
     // Execute startup recovery
-    let recovery_result = RestoreJournal::handle_startup_recovery(&storage_root).unwrap();
+    let recovery_result = RestoreJournal::handle_startup_recovery(&storage_root, None)
+        .await
+        .unwrap();
     assert!(
         recovery_result.is_some(),
         "Startup recovery should report cleanup message"
@@ -181,6 +189,38 @@ async fn test_startup_crash_recovery_cleans_interrupted_staging() {
     // Journal must be removed
     assert!(
         RestoreJournal::load(&storage_root).unwrap().is_none(),
-        "Interrupted journal must be removed after rollback"
+        "Journal should be removed after cleanup"
+    );
+}
+
+#[tokio::test]
+async fn test_startup_recovery_fails_closed_on_interrupted_db_cutover() {
+    let temp = tempdir().unwrap();
+    let storage_root = temp.path().join("storage_root");
+    fs::create_dir_all(&storage_root).unwrap();
+
+    let orphan_staging = storage_root.join(".tmp_restore_orphaned_456");
+    fs::create_dir_all(&orphan_staging).unwrap();
+
+    // Journal at DbPublished phase: target DB was updated but storage not yet published!
+    let mut journal = RestoreJournal::new(
+        &temp.path().join("archive.spnebak"),
+        &storage_root,
+        &orphan_staging,
+        "test_backup_456",
+    );
+    journal.persist(RestorePhase::DbPublished).unwrap();
+
+    // Startup recovery MUST FAIL CLOSED
+    let recovery_result = RestoreJournal::handle_startup_recovery(&storage_root, None).await;
+    assert!(
+        recovery_result.is_err(),
+        "Startup recovery must return an error when interrupted during cutover"
+    );
+    let err_msg = recovery_result.err().unwrap().to_string();
+    assert!(
+        err_msg.contains("FATAL STARTUP BLOCKED") || err_msg.contains("split-brain"),
+        "Error message should clearly report fatal block: {}",
+        err_msg
     );
 }

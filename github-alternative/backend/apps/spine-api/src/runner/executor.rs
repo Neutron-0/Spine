@@ -36,7 +36,10 @@ use crate::core::profile::DeploymentProfile;
 pub struct AuthoritativeTrustToken {
     pub(crate) run_id: String,
     pub(crate) job_id: String,
+    pub(crate) repository_id: String,
     pub(crate) classification: TrustClassification,
+    pub(crate) is_fork: bool,
+    pub(crate) source_repo_id: Option<String>,
 }
 
 impl AuthoritativeTrustToken {
@@ -50,19 +53,61 @@ impl AuthoritativeTrustToken {
             ForgeError::NotFound(format!("Workflow run '{}' not found", job.run_id))
         })?;
 
+        if run.id != job.run_id {
+            return Err(ForgeError::Unauthorized(
+                "Job run_id mismatch with workflow run".to_string(),
+            ));
+        }
+        if run.repo_id != job.repo_id {
+            return Err(ForgeError::Unauthorized(
+                "Job repo_id mismatch with workflow run".to_string(),
+            ));
+        }
+        if run.is_fork && run.trust_classification != TrustClassification::Untrusted {
+            return Err(ForgeError::Unauthorized(
+                "Fork repository runs must be classified as untrusted".to_string(),
+            ));
+        }
+
         Ok(Self {
             run_id: run.id,
             job_id: job.id.clone(),
+            repository_id: run.repo_id,
             classification: run.trust_classification,
+            is_fork: run.is_fork,
+            source_repo_id: run.source_repo_id,
         })
     }
 
     /// Factory method for test harnesses ONLY.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn for_test(run_id: &str, job_id: &str, classification: TrustClassification) -> Self {
         Self {
             run_id: run_id.to_string(),
             job_id: job_id.to_string(),
+            repository_id: String::new(),
             classification,
+            is_fork: classification == TrustClassification::Untrusted,
+            source_repo_id: None,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test_full(
+        run_id: &str,
+        job_id: &str,
+        repository_id: &str,
+        classification: TrustClassification,
+        is_fork: bool,
+        source_repo_id: Option<String>,
+    ) -> Self {
+        Self {
+            run_id: run_id.to_string(),
+            job_id: job_id.to_string(),
+            repository_id: repository_id.to_string(),
+            classification,
+            is_fork,
+            source_repo_id,
         }
     }
 
@@ -80,6 +125,18 @@ impl AuthoritativeTrustToken {
 
     pub fn job_id(&self) -> &str {
         &self.job_id
+    }
+
+    pub fn repository_id(&self) -> &str {
+        &self.repository_id
+    }
+
+    pub fn is_fork(&self) -> bool {
+        self.is_fork
+    }
+
+    pub fn source_repo_id(&self) -> Option<&str> {
+        self.source_repo_id.as_deref()
     }
 }
 
@@ -123,15 +180,20 @@ impl IsolatedRunnerExecutor {
         secrets: &[WorkflowSecret],
         trust_token: &AuthoritativeTrustToken,
     ) -> (i32, Vec<StepExecutionResult>) {
-        if trust_token.job_id() != job.id || trust_token.run_id() != job.run_id {
+        if trust_token.job_id() != job.id
+            || trust_token.run_id() != job.run_id
+            || (!trust_token.repository_id().is_empty()
+                && trust_token.repository_id() != job.repo_id)
+        {
             return (
                 1,
                 vec![StepExecutionResult {
                     step_index: 0,
                     exit_code: 1,
                     stdout: String::new(),
-                    stderr: "SECURITY ERROR: Trust token does not match job/run identity"
-                        .to_string(),
+                    stderr:
+                        "SECURITY ERROR: Trust token does not match job/run/repository identity"
+                            .to_string(),
                     timed_out: false,
                 }],
             );

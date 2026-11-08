@@ -157,7 +157,6 @@ services:
     restart: unless-stopped
     networks:
       - spine-ingress-proxy
-      - spine-public
     depends_on:
       - spine-api
 
