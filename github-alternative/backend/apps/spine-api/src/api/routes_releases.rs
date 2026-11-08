@@ -109,6 +109,7 @@ pub async fn update_release(
     user: Option<Extension<User>>,
     Json(payload): Json<UpdateReleaseRequest>,
 ) -> Result<Json<ReleaseDto>, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let current_user = user
         .ok_or_else(|| {
             ForgeError::Unauthorized("Authentication required to update release".to_string())
@@ -134,6 +135,7 @@ pub async fn delete_release(
     Path((owner, repo_name, release_id)): Path<(String, String, String)>,
     user: Option<Extension<User>>,
 ) -> Result<StatusCode, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let current_user = user
         .ok_or_else(|| {
             ForgeError::Unauthorized("Authentication required to delete release".to_string())
@@ -161,6 +163,7 @@ pub async fn upload_release_asset(
     user: Option<Extension<User>>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<ReleaseAssetDto>), ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let current_user = user
         .ok_or_else(|| {
             ForgeError::Unauthorized("Authentication required to upload asset".to_string())
@@ -215,6 +218,7 @@ pub async fn delete_release_asset(
     Path((owner, repo_name, _release_id, asset_id)): Path<(String, String, String, String)>,
     user: Option<Extension<User>>,
 ) -> Result<StatusCode, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let current_user = user
         .ok_or_else(|| {
             ForgeError::Unauthorized("Authentication required to delete asset".to_string())

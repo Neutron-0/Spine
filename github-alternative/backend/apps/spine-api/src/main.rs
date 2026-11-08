@@ -9,6 +9,7 @@ use spine_api::{
     ProvisioningWorker, ReleaseService, RepositoryService, RunnerService, SsrfValidator,
     WebhookOutboxWorker, WebhookService, WorkflowScheduler, WorkflowService,
 };
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,6 +42,14 @@ struct Cli {
     #[arg(long)]
     database_url: Option<String>,
 
+    /// Path to file containing PostgreSQL Database URL
+    #[arg(long)]
+    database_url_file: Option<PathBuf>,
+
+    /// Path to file containing PostgreSQL Migration Database URL (DDL role)
+    #[arg(long)]
+    migration_database_url_file: Option<PathBuf>,
+
     /// Deployment profile (core-forge-v1, development, test)
     #[arg(long)]
     profile: Option<String>,
@@ -72,6 +81,10 @@ enum Commands {
         /// Path to file containing PostgreSQL Database URL
         #[arg(long)]
         database_url_file: Option<PathBuf>,
+
+        /// Path to file containing PostgreSQL Migration Database URL (DDL role)
+        #[arg(long)]
+        migration_database_url_file: Option<PathBuf>,
     },
 
     /// One-time bootstrap of the initial system administrator
@@ -124,10 +137,6 @@ enum BackupCommands {
         #[arg(long)]
         database_url_file: Option<PathBuf>,
 
-        /// Optional AEAD encryption passphrase (enables AES-256-GCM + PBKDF2)
-        #[arg(long)]
-        passphrase: Option<String>,
-
         /// Path to file containing AEAD encryption passphrase
         #[arg(long)]
         passphrase_file: Option<PathBuf>,
@@ -159,10 +168,6 @@ enum BackupCommands {
         #[arg(long)]
         target_database_url_file: Option<PathBuf>,
 
-        /// AEAD encryption passphrase if restoring an encrypted .spinebak archive
-        #[arg(long)]
-        passphrase: Option<String>,
-
         /// Path to file containing AEAD encryption passphrase
         #[arg(long)]
         passphrase_file: Option<PathBuf>,
@@ -182,17 +187,9 @@ enum BackupCommands {
         #[arg(short, long)]
         output: PathBuf,
 
-        /// Current/old encryption passphrase
-        #[arg(long)]
-        old_passphrase: Option<String>,
-
         /// Path to file containing current/old encryption passphrase
         #[arg(long)]
         old_passphrase_file: Option<PathBuf>,
-
-        /// New encryption passphrase
-        #[arg(long)]
-        new_passphrase: Option<String>,
 
         /// Path to file containing new encryption passphrase
         #[arg(long)]
@@ -299,18 +296,36 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Migrate {
             database_url,
             database_url_file,
+            migration_database_url_file,
         }) => {
             let db_url = read_secret(
                 database_url,
-                database_url_file.as_deref(),
-                &["DATABASE_URL", "SPINE_DATABASE_URL"],
+                migration_database_url_file
+                    .as_deref()
+                    .or(database_url_file.as_deref()),
+                &[
+                    "MIGRATION_DATABASE_URL",
+                    "SPINE_MIGRATION_DATABASE_URL",
+                    "DATABASE_URL",
+                    "SPINE_DATABASE_URL",
+                ],
             )?
-            .ok_or_else(|| anyhow::anyhow!("DATABASE_URL must be provided for migration"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DATABASE_URL or MIGRATION_DATABASE_URL must be provided for migration"
+                )
+            })?;
             println!(
-                "Connecting to PostgreSQL database: {}",
+                "Connecting to PostgreSQL database for migration: {}",
                 sanitize_db_url(&db_url)
             );
-            let _pg = PgDatabase::connect_and_migrate(&db_url).await?;
+            let pool = sqlx::PgPool::connect(&db_url).await.map_err(|e| {
+                anyhow::anyhow!("Failed to connect to PostgreSQL for migration: {}", e)
+            })?;
+            spine_api::db::migrations::run_migrations(&pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to execute schema migrations: {}", e))?;
+            pool.close().await;
             println!("PostgreSQL schema migrations executed and verified successfully.");
             Ok(())
         }
@@ -441,7 +456,6 @@ async fn main() -> anyhow::Result<()> {
                 storage_root,
                 database_url,
                 database_url_file,
-                passphrase,
                 passphrase_file,
                 key_version,
                 profile,
@@ -453,7 +467,7 @@ async fn main() -> anyhow::Result<()> {
                     &["DATABASE_URL", "SPINE_DATABASE_URL"],
                 )?;
                 let pass = read_secret(
-                    passphrase,
+                    None,
                     passphrase_file.as_deref(),
                     &["SPINE_BACKUP_PASSPHRASE", "BACKUP_PASSPHRASE"],
                 )?;
@@ -461,9 +475,9 @@ async fn main() -> anyhow::Result<()> {
                 let tmp_snap_dir = tempfile::Builder::new().prefix("spine_snap_").tempdir()?;
                 let snap_file_path = tmp_snap_dir.path().join("snapshot.jsonl");
 
-                let has_db_snap = if let Some(url) = db_url {
+                let (_guard_barrier, _maintenance_guard) = if let Some(url) = db_url {
                     println!(
-                        "Connecting to PostgreSQL to capture snapshot: {}...",
+                        "Connecting to PostgreSQL to coordinate maintenance barrier: {}...",
                         sanitize_db_url(&url)
                     );
                     let pool = sqlx::PgPool::connect(&url).await.map_err(|e| {
@@ -472,9 +486,12 @@ async fn main() -> anyhow::Result<()> {
 
                     // Coordinate with cluster via database-backed maintenance barrier
                     let barrier = spine_api::backup::ConsistencyBarrier::with_pool(pool.clone());
-                    let _maintenance_guard = barrier
-                        .enter_maintenance(std::time::Duration::from_secs(5))
-                        .await;
+                    let guard = barrier
+                        .enter_maintenance(std::time::Duration::from_secs(30))
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to enter cluster maintenance: {}", e)
+                        })?;
 
                     let mut snap_file = std::fs::File::create(&snap_file_path)?;
                     spine_api::dump_database_to_writer(&pool, &mut snap_file)
@@ -483,7 +500,7 @@ async fn main() -> anyhow::Result<()> {
                             anyhow::anyhow!("Failed to stream PostgreSQL database dump: {}", e)
                         })?;
                     println!("PostgreSQL streaming snapshot captured successfully.");
-                    true
+                    (Some(barrier), Some(guard))
                 } else {
                     if prof.requires_persistent_database() {
                         anyhow::bail!(
@@ -491,8 +508,10 @@ async fn main() -> anyhow::Result<()> {
                             prof
                         );
                     }
-                    false
+                    (None, None)
                 };
+
+                let has_db_snap = _maintenance_guard.is_some();
 
                 println!(
                     "Creating coordinated backup from {} to {}",
@@ -535,13 +554,17 @@ async fn main() -> anyhow::Result<()> {
                 target_storage,
                 target_database_url,
                 target_database_url_file,
-                passphrase,
                 passphrase_file,
                 profile,
             } => {
                 let prof = parse_cli_profile(profile.as_deref())?;
+
+                if !input.exists() {
+                    anyhow::bail!("Input backup archive '{}' does not exist", input.display());
+                }
+
                 let pass = read_secret(
-                    passphrase,
+                    None,
                     passphrase_file.as_deref(),
                     &["SPINE_BACKUP_PASSPHRASE", "BACKUP_PASSPHRASE"],
                 )?;
@@ -550,6 +573,30 @@ async fn main() -> anyhow::Result<()> {
                     target_database_url_file.as_deref(),
                     &["TARGET_DATABASE_URL", "DATABASE_URL"],
                 )?;
+
+                // Check magic bytes of input archive before touching target storage
+                let mut magic_buf = [0u8; 8];
+                let mut f_chk = std::fs::File::open(&input).map_err(|e| {
+                    anyhow::anyhow!("Failed to open archive '{}': {}", input.display(), e)
+                })?;
+                f_chk
+                    .read_exact(&mut magic_buf)
+                    .map_err(|e| anyhow::anyhow!("Failed to read archive magic bytes: {}", e))?;
+                drop(f_chk);
+
+                let is_encrypted = &magic_buf == b"SPNEBAK\x01" || &magic_buf == b"SPNEBAK\x02";
+                if is_encrypted && pass.is_none() {
+                    anyhow::bail!(
+                        "Input archive is encrypted (SPNEBAK format), but no passphrase was provided (--passphrase-file, or SPINE_BACKUP_PASSPHRASE)."
+                    );
+                }
+
+                if prof.requires_persistent_database() && target_db.is_none() {
+                    anyhow::bail!(
+                        "Under deployment profile '{}', a target PostgreSQL database URL is required for restore (--target-database-url-file, or TARGET_DATABASE_URL).",
+                        prof
+                    );
+                }
 
                 // FAIL-SAFE: Validate target database BEFORE modifying repository storage on disk
                 let mut target_db_pool = None;
@@ -571,9 +618,6 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
                     target_db_pool = Some(pool);
-                } else if prof.requires_persistent_database() {
-                    // Check if archive contains database before touching storage
-                    // In CoreForge, database restoration target is mandatory if DB is in backup
                 }
 
                 println!(
@@ -642,28 +686,26 @@ async fn main() -> anyhow::Result<()> {
             BackupCommands::Rotate {
                 input,
                 output,
-                old_passphrase,
                 old_passphrase_file,
-                new_passphrase,
                 new_passphrase_file,
                 key_version,
             } => {
                 let old_pass = read_secret(
-                    old_passphrase,
+                    None,
                     old_passphrase_file.as_deref(),
                     &["SPINE_BACKUP_OLD_PASSPHRASE", "BACKUP_OLD_PASSPHRASE"],
                 )?
                 .ok_or_else(|| {
-                    anyhow::anyhow!("Current/old passphrase required (--old-passphrase, --old-passphrase-file, or SPINE_BACKUP_OLD_PASSPHRASE)")
+                    anyhow::anyhow!("Current/old passphrase required (--old-passphrase-file, or SPINE_BACKUP_OLD_PASSPHRASE)")
                 })?;
 
                 let new_pass = read_secret(
-                    new_passphrase,
+                    None,
                     new_passphrase_file.as_deref(),
                     &["SPINE_BACKUP_NEW_PASSPHRASE", "BACKUP_NEW_PASSPHRASE"],
                 )?
                 .ok_or_else(|| {
-                    anyhow::anyhow!("New passphrase required (--new-passphrase, --new-passphrase-file, or SPINE_BACKUP_NEW_PASSPHRASE)")
+                    anyhow::anyhow!("New passphrase required (--new-passphrase-file, or SPINE_BACKUP_NEW_PASSPHRASE)")
                 })?;
 
                 println!(
@@ -699,9 +741,18 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let database_url = args
-        .database_url
-        .or_else(|| std::env::var("DATABASE_URL").ok());
+    let database_url = read_secret(
+        args.database_url,
+        args.database_url_file.as_deref(),
+        &["DATABASE_URL", "SPINE_DATABASE_URL"],
+    )?;
+
+    let migration_database_url = read_secret(
+        None,
+        args.migration_database_url_file.as_deref(),
+        &["MIGRATION_DATABASE_URL", "SPINE_MIGRATION_DATABASE_URL"],
+    )?;
+
     let coordinator_addr = args
         .coordinator_addr
         .or_else(|| std::env::var("COORDINATOR_ADDR").ok());
@@ -734,7 +785,7 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
         }
         if database_url.is_none() {
             anyhow::bail!(
-                "CRITICAL STARTUP ERROR: Mandatory PostgreSQL database connection string missing. Under deployment profile '{}', 'DATABASE_URL' (or --database-url) must be provided.",
+                "CRITICAL STARTUP ERROR: Mandatory PostgreSQL database connection string missing. Under deployment profile '{}', 'DATABASE_URL' (or --database-url / --database-url-file) must be provided.",
                 profile
             );
         }
@@ -743,26 +794,67 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
     // 1. Initialize Database backend
     let (db, pg_pool): (Arc<dyn Database>, Option<sqlx::PgPool>) = match database_url {
         Some(db_url) => {
-            tracing::info!(
-                "Connecting to PostgreSQL database and applying migrations under profile '{}'...",
-                profile
-            );
-            let pg_db = PgDatabase::connect_and_migrate(&db_url)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to connect to or migrate PostgreSQL database: {}", e)
+            if let Some(mig_url) = migration_database_url {
+                tracing::info!(
+                    "Running baseline schema migrations using dedicated migration credentials ({}) under profile '{}'...",
+                    sanitize_db_url(&mig_url),
+                    profile
+                );
+                let migrator_pool = sqlx::PgPool::connect(&mig_url).await.map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to connect to PostgreSQL with migration credentials: {}",
+                        e
+                    )
+                })?;
+                spine_api::db::migrations::run_migrations(&migrator_pool)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to execute schema migrations: {}", e))?;
+                migrator_pool.close().await;
+                tracing::info!(
+                    "Migrations complete. Dedicated migration connection closed and discarded."
+                );
+
+                tracing::info!(
+                    "Connecting to PostgreSQL as runtime application role ({}) under profile '{}'...",
+                    sanitize_db_url(&db_url),
+                    profile
+                );
+                let pg_db = PgDatabase::connect(&db_url).await.map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to connect to PostgreSQL application database: {}",
+                        e
+                    )
+                })?;
+                pg_db.ping().await.map_err(|e| {
+                    anyhow::anyhow!("PostgreSQL application role liveness check failed: {}", e)
+                })?;
+                let pool = pg_db.pool().clone();
+                (Arc::new(pg_db), Some(pool))
+            } else {
+                tracing::info!(
+                    "Connecting to PostgreSQL database and applying migrations under profile '{}'...",
+                    profile
+                );
+                let pg_db = PgDatabase::connect_and_migrate(&db_url)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Failed to connect to or migrate PostgreSQL database: {}",
+                            e
+                        )
+                    })?;
+
+                // Immediate connectivity check
+                pg_db.ping().await.map_err(|e| {
+                    anyhow::anyhow!(
+                        "PostgreSQL database liveness check failed immediately after connect: {}",
+                        e
+                    )
                 })?;
 
-            // Immediate connectivity check
-            pg_db.ping().await.map_err(|e| {
-                anyhow::anyhow!(
-                    "PostgreSQL database liveness check failed immediately after connect: {}",
-                    e
-                )
-            })?;
-
-            let pool = pg_db.pool().clone();
-            (Arc::new(pg_db), Some(pool))
+                let pool = pg_db.pool().clone();
+                (Arc::new(pg_db), Some(pool))
+            }
         }
         None => {
             if profile.permits_in_memory_db() && args.in_memory_db {

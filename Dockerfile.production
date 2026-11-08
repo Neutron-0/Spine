@@ -1,7 +1,7 @@
 # Production Container Image for Spine Forge Control Plane & Storage Node
 # Multi-stage build with zero build tools in final unprivileged runtime
 
-FROM rust:1.80-bullseye AS builder
+FROM rust:1.85-bookworm AS builder
 
 WORKDIR /usr/src/spine
 
@@ -10,7 +10,7 @@ COPY github-alternative/backend ./github-alternative/backend
 
 RUN cargo build --release --manifest-path github-alternative/backend/Cargo.toml -p spine-api
 
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \

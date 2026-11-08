@@ -5,7 +5,7 @@ use tempfile::tempdir;
 use uuid::Uuid;
 
 use spine_api::core::types::{
-    BranchProtectionRule, ForgeRepository, PullRequest, User, WorkflowSecret,
+    BranchProtectionRule, ForgeRepository, PullRequest, TrustClassification, User, WorkflowSecret,
 };
 use spine_api::db::InMemoryDatabase;
 use spine_api::permissions::PermissionService;
@@ -214,7 +214,13 @@ jobs:
     let mut step_scripts = HashMap::new();
     step_scripts.insert(0, "echo Compiling Spine...".to_string());
     let (exit1, results1) = executor
-        .execute_job(&job1, &steps1, &step_scripts, &secrets1)
+        .execute_job(
+            &job1,
+            &steps1,
+            &step_scripts,
+            &secrets1,
+            TrustClassification::Trusted,
+        )
         .await;
     assert_eq!(exit1, 0);
 
@@ -262,7 +268,13 @@ jobs:
         "echo Testing Spine with secret %SPINE_API_SECRET%".to_string(),
     );
     let (exit2, results2) = executor
-        .execute_job(&job2, &steps2, &step_scripts2, &secrets2)
+        .execute_job(
+            &job2,
+            &steps2,
+            &step_scripts2,
+            &secrets2,
+            TrustClassification::Trusted,
+        )
         .await;
     assert_eq!(exit2, 0);
 

@@ -120,6 +120,7 @@ pub async fn create_pull_request(
     Path((owner, repo_name)): Path<(String, String)>,
     Json(payload): Json<CreatePullRequestRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user
         .ok_or_else(|| ForgeError::Unauthorized("Authentication required to create PR".into()))?;
     let repo = state
@@ -260,6 +261,7 @@ pub async fn update_pull_request(
     Path((owner, repo_name, number)): Path<(String, String, i64)>,
     Json(payload): Json<UpdatePullRequestRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo = state
         .repositories
@@ -361,6 +363,7 @@ pub async fn execute_pull_request_merge(
     Path((owner, repo_name, number)): Path<(String, String, i64)>,
     Json(payload): Json<MergePullRequestRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller =
         user.ok_or_else(|| ForgeError::Unauthorized("Authentication required to merge PR".into()))?;
     let repo = state

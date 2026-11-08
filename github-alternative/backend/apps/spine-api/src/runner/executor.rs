@@ -6,7 +6,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use crate::core::types::{WorkflowJob, WorkflowSecret, WorkflowStep};
+use crate::core::types::{TrustClassification, WorkflowJob, WorkflowSecret, WorkflowStep};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunnerSandboxMode {
@@ -60,15 +60,17 @@ impl IsolatedRunnerExecutor {
         self.sandbox_mode
     }
 
-    /// Execute all steps in an isolated workspace with sanitized environment and timeout enforcement.
+    /// Execute all steps in an isolated workspace with sanitized environment and explicit provenance trust level.
     pub async fn execute_job(
         &self,
         job: &WorkflowJob,
         steps: &[WorkflowStep],
         step_scripts: &HashMap<i32, String>,
         secrets: &[WorkflowSecret],
+        trust: TrustClassification,
     ) -> (i32, Vec<StepExecutionResult>) {
-        self.execute_job_with_trust(job, steps, step_scripts, secrets, false)
+        let is_untrusted = trust == TrustClassification::Untrusted;
+        self.execute_job_with_trust(job, steps, step_scripts, secrets, is_untrusted)
             .await
     }
 

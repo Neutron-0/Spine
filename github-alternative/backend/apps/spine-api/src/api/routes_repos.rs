@@ -91,6 +91,7 @@ pub async fn delete_repository(
     user: Option<Extension<User>>,
     Path((owner, name)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     state
         .repositories

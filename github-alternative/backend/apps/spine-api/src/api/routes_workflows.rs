@@ -108,8 +108,9 @@ pub async fn dispatch_workflow(
 
     let runs = state
         .workflows
-        .trigger_workflows(
+        .trigger_workflows_with_provenance(
             &repo.id,
+            Some(&repo.id),
             &commit_oid,
             &ref_name,
             "workflow_dispatch",

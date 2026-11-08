@@ -19,7 +19,7 @@ use uuid::Uuid;
 pub mod consistency;
 pub mod v2;
 
-pub use consistency::{ConsistencyBarrier, MaintenanceGuard};
+pub use consistency::{ConsistencyBarrier, MaintenanceGuard, SPINE_CLUSTER_MAINTENANCE_LOCK_ID};
 pub use v2::{BackupHeaderV2, StreamSummary};
 
 const BACKUP_MAGIC: &[u8; 8] = b"SPNEBAK\x01";
@@ -70,15 +70,25 @@ impl BackupManager {
         db_snapshot_json: Option<&str>,
         output_tar_gz: &Path,
     ) -> Result<BackupManifest, ForgeError> {
-        if let Some(parent) = output_tar_gz.parent() {
-            fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
-        }
+        let parent = output_tar_gz.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let tmp_output = parent.join(format!(".tmp_bak_{}.tar.gz", Uuid::new_v4()));
 
-        let file = File::create(output_tar_gz).map_err(|e| ForgeError::Internal(e.to_string()))?;
-        let enc = GzEncoder::new(file, Compression::default());
-        let (manifest, _) =
-            Self::create_archive_internal(storage_root, db_snapshot_json, None, enc)?;
-        Ok(manifest)
+        let res = (|| {
+            let file =
+                File::create(&tmp_output).map_err(|e| ForgeError::Internal(e.to_string()))?;
+            let enc = GzEncoder::new(file, Compression::default());
+            let (manifest, _) =
+                Self::create_archive_internal(storage_root, db_snapshot_json, None, enc)?;
+            fs::rename(&tmp_output, output_tar_gz)
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+            Ok(manifest)
+        })();
+
+        if res.is_err() && tmp_output.exists() {
+            let _ = fs::remove_file(&tmp_output);
+        }
+        res
     }
 
     /// Creates an unencrypted backup archive with database snapshot streamed from a disk file
@@ -87,15 +97,25 @@ impl BackupManager {
         db_snapshot_file: Option<&Path>,
         output_tar_gz: &Path,
     ) -> Result<BackupManifest, ForgeError> {
-        if let Some(parent) = output_tar_gz.parent() {
-            fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
-        }
+        let parent = output_tar_gz.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let tmp_output = parent.join(format!(".tmp_bak_{}.tar.gz", Uuid::new_v4()));
 
-        let file = File::create(output_tar_gz).map_err(|e| ForgeError::Internal(e.to_string()))?;
-        let enc = GzEncoder::new(file, Compression::default());
-        let (manifest, _) =
-            Self::create_archive_internal(storage_root, None, db_snapshot_file, enc)?;
-        Ok(manifest)
+        let res = (|| {
+            let file =
+                File::create(&tmp_output).map_err(|e| ForgeError::Internal(e.to_string()))?;
+            let enc = GzEncoder::new(file, Compression::default());
+            let (manifest, _) =
+                Self::create_archive_internal(storage_root, None, db_snapshot_file, enc)?;
+            fs::rename(&tmp_output, output_tar_gz)
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+            Ok(manifest)
+        })();
+
+        if res.is_err() && tmp_output.exists() {
+            let _ = fs::remove_file(&tmp_output);
+        }
+        res
     }
 
     /// Creates an authenticated, streaming chunked AEAD-encrypted backup archive (SPNEBAK v2)
@@ -151,37 +171,61 @@ impl BackupManager {
             ));
         }
 
-        if let Some(parent) = output_enc_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let output_parent = output_enc_path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(output_parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let tmp_output = output_parent.join(format!(".tmp_bak_{}.spnebak", Uuid::new_v4()));
+
+        let res = (|| {
+            // 1. Pack tar.gz into temporary staging file to avoid unbounded RAM consumption
+            let temp_dir = tempfile::tempdir().map_err(|e| {
+                ForgeError::Internal(format!("Failed to create temp staging directory: {}", e))
+            })?;
+            let staging_tar_gz = temp_dir.path().join("staging.tar.gz");
+
+            let file = File::create(&staging_tar_gz).map_err(|e| {
+                ForgeError::Internal(format!("Failed to create staging file: {}", e))
+            })?;
+            let enc = GzEncoder::new(file, Compression::default());
+            let (manifest, _) = Self::create_archive_internal(
+                storage_root,
+                db_snapshot_json,
+                db_snapshot_file,
+                enc,
+            )?;
+
+            // 2. Stream chunked authenticated encryption (SPNEBAK v2)
+            let reader = File::open(&staging_tar_gz)
+                .map_err(|e| ForgeError::Internal(format!("Failed to open staging file: {}", e)))?;
+            let writer = File::create(&tmp_output).map_err(|e| {
+                ForgeError::Internal(format!("Failed to create output archive: {}", e))
+            })?;
+
+            v2::encrypt_stream(
+                reader,
+                writer,
+                passphrase,
+                key_version,
+                v2::DEFAULT_CHUNK_SIZE,
+            )?;
+
+            // 3. Verify temporary encrypted output completely before publication
+            let verify_file = File::open(&tmp_output).map_err(|e| {
+                ForgeError::Internal(format!("Failed to reopen archive for verification: {}", e))
+            })?;
+            v2::decrypt_stream(verify_file, std::io::sink(), passphrase)?;
+
+            // 4. Atomically publish to final destination
+            fs::rename(&tmp_output, output_enc_path).map_err(|e| {
+                ForgeError::Internal(format!("Failed to publish encrypted archive: {}", e))
+            })?;
+
+            Ok(manifest)
+        })();
+
+        if res.is_err() && tmp_output.exists() {
+            let _ = fs::remove_file(&tmp_output);
         }
-
-        // 1. Pack tar.gz into temporary staging file to avoid unbounded RAM consumption
-        let temp_dir = tempfile::tempdir().map_err(|e| {
-            ForgeError::Internal(format!("Failed to create temp staging directory: {}", e))
-        })?;
-        let staging_tar_gz = temp_dir.path().join("staging.tar.gz");
-
-        let file = File::create(&staging_tar_gz)
-            .map_err(|e| ForgeError::Internal(format!("Failed to create staging file: {}", e)))?;
-        let enc = GzEncoder::new(file, Compression::default());
-        let (manifest, _) =
-            Self::create_archive_internal(storage_root, db_snapshot_json, db_snapshot_file, enc)?;
-
-        // 2. Stream chunked authenticated encryption (SPNEBAK v2)
-        let reader = File::open(&staging_tar_gz)
-            .map_err(|e| ForgeError::Internal(format!("Failed to open staging file: {}", e)))?;
-        let writer = File::create(output_enc_path)
-            .map_err(|e| ForgeError::Internal(format!("Failed to create output archive: {}", e)))?;
-
-        v2::encrypt_stream(
-            reader,
-            writer,
-            passphrase,
-            key_version,
-            v2::DEFAULT_CHUNK_SIZE,
-        )?;
-
-        Ok(manifest)
+        res
     }
 
     /// Restores a verified unencrypted backup archive (.tar.gz) into target storage root
@@ -365,14 +409,14 @@ impl BackupManager {
                 ));
             }
 
-            // Verify temporary rotated output can be opened and its header is valid
-            let mut verify_file = File::open(&tmp_output).map_err(|e| {
+            // Verify temporary rotated output can be opened and decrypted completely with new passphrase
+            let verify_file = File::open(&tmp_output).map_err(|e| {
                 ForgeError::Internal(format!(
                     "Failed to reopen rotated archive for verification: {}",
                     e
                 ))
             })?;
-            let _ = v2::BackupHeaderV2::read_from(&mut verify_file)?;
+            v2::decrypt_stream(verify_file, std::io::sink(), new_passphrase)?;
 
             // Atomically publish rotated output to output_path
             fs::rename(&tmp_output, output_path).map_err(|e| {
@@ -755,11 +799,10 @@ impl BackupManager {
             ForgeError::Internal("Backup archive missing manifest.json".to_string())
         })?;
 
-        let mut files_restored = 0usize;
-        let mut bytes_restored = 0u64;
-
-        for (rel_path, staged_path) in files_to_verify {
-            let expected_hash = manifest.file_hashes.get(&rel_path).ok_or_else(|| {
+        // Phase 1: Verify all extracted files against manifest hashes and verify inventory completeness
+        let mut verified_sizes = std::collections::HashMap::new();
+        for (rel_path, staged_path) in &files_to_verify {
+            let expected_hash = manifest.file_hashes.get(rel_path).ok_or_else(|| {
                 ForgeError::Internal(format!(
                     "Unexpected file in archive not in manifest: {}",
                     rel_path
@@ -767,7 +810,7 @@ impl BackupManager {
             })?;
 
             let mut f =
-                fs::File::open(&staged_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
+                fs::File::open(staged_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
             let mut hasher = Sha256::new();
             let mut buf = [0u8; 64 * 1024];
             let mut file_len = 0u64;
@@ -788,7 +831,25 @@ impl BackupManager {
                     rel_path, expected_hash, actual_hash
                 )));
             }
+            verified_sizes.insert(rel_path.clone(), file_len);
+        }
 
+        // Verify that every file declared in the manifest exists in the extracted archive
+        for manifest_file in manifest.file_hashes.keys() {
+            if !files_to_verify.iter().any(|(p, _)| p == manifest_file) {
+                return Err(ForgeError::Internal(format!(
+                    "Missing file declared in manifest: {}",
+                    manifest_file
+                )));
+            }
+        }
+
+        // Phase 2: Failure-atomic publication of verified files to target storage root
+        let mut files_restored = 0usize;
+        let mut bytes_restored = 0u64;
+
+        for (rel_path, staged_path) in files_to_verify {
+            let file_len = verified_sizes.get(&rel_path).copied().unwrap_or(0);
             if rel_path != "database/snapshot.jsonl" && rel_path != "database/snapshot.json" {
                 let dest = Self::sanitize_restore_path(target_storage_root, &rel_path)?;
                 if let Some(parent) = dest.parent() {

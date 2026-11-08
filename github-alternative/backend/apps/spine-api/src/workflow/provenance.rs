@@ -18,16 +18,20 @@ impl WorkflowProvenance {
         event_type: &str,
     ) -> Self {
         let is_fork = match source_repo_id {
-            Some(s) => s != target_repo_id,
-            None => event_type.contains("fork"),
+            Some(s) if !s.trim().is_empty() => s != target_repo_id,
+            _ => event_type.contains("fork") || event_type.contains("pull_request"),
         };
+
+        let effective_source_repo_id = source_repo_id
+            .filter(|s| !s.trim().is_empty())
+            .or(if !is_fork { Some(target_repo_id) } else { None });
 
         let repo = match db.get_repository_by_id(target_repo_id).await {
             Ok(Some(r)) => r,
             _ => {
                 return Self {
                     target_repo_id: target_repo_id.to_string(),
-                    source_repo_id: source_repo_id.map(str::to_string),
+                    source_repo_id: effective_source_repo_id.map(str::to_string),
                     is_fork,
                     actor_id: actor_id.to_string(),
                     is_actor_authorized: false,
@@ -50,12 +54,13 @@ impl WorkflowProvenance {
         if is_fork {
             return Self {
                 target_repo_id: target_repo_id.to_string(),
-                source_repo_id: source_repo_id.map(str::to_string),
+                source_repo_id: effective_source_repo_id.map(str::to_string),
                 is_fork: true,
                 actor_id: actor_id.to_string(),
                 is_actor_authorized,
                 trust_classification: TrustClassification::Untrusted,
-                reason: "Workflow originates from a forked repository".to_string(),
+                reason: "Workflow originates from a forked repository or ambiguous source"
+                    .to_string(),
             };
         }
 

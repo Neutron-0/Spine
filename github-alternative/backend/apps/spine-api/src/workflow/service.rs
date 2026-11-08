@@ -92,7 +92,12 @@ impl WorkflowService {
         actor_id: &str,
     ) -> Result<Vec<WorkflowRun>, ForgeError> {
         self.trigger_workflows_with_provenance(
-            repo_id, None, commit_oid, ref_name, event_type, actor_id,
+            repo_id,
+            Some(repo_id),
+            commit_oid,
+            ref_name,
+            event_type,
+            actor_id,
         )
         .await
     }

@@ -1,8 +1,12 @@
 mod common;
 
-use common::require_safe_test_db_url;
+use common::{
+    ensure_disposable_marker, require_safe_test_db_url, verify_disposable_database,
+    DISPOSABLE_MARKER_TABLE,
+};
 use spine_api::db::migrations::{
-    run_migrations, run_migrations_with_pause, SPINE_MIGRATION_ADVISORY_LOCK_ID,
+    run_migrations, run_migrations_with_pause, run_migrations_with_pause_after_step,
+    SPINE_MIGRATION_ADVISORY_LOCK_ID,
 };
 use sqlx::Row;
 use std::sync::Arc;
@@ -16,10 +20,18 @@ async fn test_actual_run_migrations_cancellation_and_recovery() {
         .await
         .expect("connect to test database");
 
-    // Clean existing tables in the disposable test database
+    ensure_disposable_marker(&pool)
+        .await
+        .expect("ensure disposable marker");
+    verify_disposable_database(&pool)
+        .await
+        .expect("verify disposable database before cleaning");
+
+    // Clean existing tables in the disposable test database (preserving disposable marker)
     let tables: Vec<(String,)> = sqlx::query_as(
-        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'"
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name != $1"
     )
+    .bind(DISPOSABLE_MARKER_TABLE)
     .fetch_all(&pool)
     .await
     .expect("fetch tables");
@@ -148,4 +160,126 @@ async fn test_actual_run_migrations_cancellation_and_recovery() {
     run_migrations(&pool_b)
         .await
         .expect("Subsequent migration run must be idempotent");
+}
+
+#[tokio::test]
+async fn test_repeated_migration_cancellation_during_real_ddl_and_inserts() {
+    let url = require_safe_test_db_url();
+    let pool = sqlx::PgPool::connect(&url)
+        .await
+        .expect("connect to test db");
+
+    ensure_disposable_marker(&pool)
+        .await
+        .expect("ensure disposable marker");
+    verify_disposable_database(&pool)
+        .await
+        .expect("verify disposable database");
+
+    // Repeat the transactional cancellation and recovery workflow 5 times
+    for cycle in 1..=5 {
+        println!(
+            "Starting transactional migration cancellation cycle {} of 5...",
+            cycle
+        );
+
+        // Clean existing tables (preserving disposable marker)
+        let tables: Vec<(String,)> = sqlx::query_as(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name != $1"
+        )
+        .bind(DISPOSABLE_MARKER_TABLE)
+        .fetch_all(&pool)
+        .await
+        .expect("fetch tables");
+
+        for (tbl,) in tables {
+            sqlx::query(&format!("DROP TABLE IF EXISTS \"{}\" CASCADE", tbl))
+                .execute(&pool)
+                .await
+                .expect("drop table");
+        }
+
+        let pool_a = sqlx::PgPool::connect(&url).await.expect("connect worker A");
+        let pool_b = sqlx::PgPool::connect(&url).await.expect("connect worker B");
+
+        let pause = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let pause_clone = pause.clone();
+        let resume_clone = resume.clone();
+
+        let (tx_abort, mut rx_abort) = tokio::sync::oneshot::channel::<()>();
+        let pool_a_task = pool_a.clone();
+
+        // Worker A executes real DDL and pauses mid-migration (after step 0: 0001_core_schema)
+        let task_thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                tokio::select! {
+                    res = run_migrations_with_pause_after_step(pool_a_task, 0, Some(pause_clone), Some(resume_clone)) => res,
+                    _ = &mut rx_abort => Err(spine_api::core::error::ForgeError::Internal("aborted".into())),
+                }
+            })
+        });
+
+        // Wait until Worker A has applied step 0 DDL and is paused
+        pause.notified().await;
+
+        // Worker B attempts migration concurrently; it must block on Worker A's transaction advisory lock
+        let pool_b_task = pool_b.clone();
+        let (done_b_tx, mut done_b_rx) =
+            tokio::sync::oneshot::channel::<Result<(), spine_api::core::error::ForgeError>>();
+        let worker_b_thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let res = rt.block_on(async move { run_migrations(&pool_b_task).await });
+            let _ = done_b_tx.send(res);
+        });
+
+        // Assert Worker B is blocked waiting for advisory lock
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            done_b_rx.try_recv().is_err(),
+            "Worker B must be blocked waiting on advisory lock"
+        );
+
+        // Cancel Worker A: abort the task and close connection pool
+        let _ = tx_abort.send(());
+        let _ = task_thread.join().expect("join worker A");
+        pool_a.close().await;
+
+        // Worker B unblocks automatically and completes all migrations
+        let worker_b_res = tokio::time::timeout(std::time::Duration::from_secs(15), &mut done_b_rx)
+            .await
+            .expect("Worker B should complete within timeout")
+            .expect("Worker B channel should receive result");
+
+        assert!(
+            worker_b_res.is_ok(),
+            "Worker B must succeed after Worker A cancellation: {:?}",
+            worker_b_res
+        );
+        worker_b_thread.join().expect("join worker B thread");
+
+        // Verify all 12 migrations were cleanly committed
+        let final_count: (i64,) = sqlx::query_as("SELECT count(*) FROM _schema_migrations")
+            .fetch_one(&pool)
+            .await
+            .expect("count completed migrations");
+        assert_eq!(
+            final_count.0, 12,
+            "Cycle {}: All 12 migrations must be committed",
+            cycle
+        );
+
+        pool_b.close().await;
+        println!(
+            "Transactional migration cancellation cycle {} of 5 PASSED cleanly.",
+            cycle
+        );
+    }
 }

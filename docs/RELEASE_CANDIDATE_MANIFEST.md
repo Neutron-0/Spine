@@ -1,7 +1,7 @@
-# Spine Release Candidate Manifest (Batch 21B Deployment Candidate)
+# Spine Release Candidate Manifest (Batch 21C Deployment Candidate)
 
-**Milestone:** Spine Batch 21B — Third Independent Audit Findings Remediation & Release Candidate Hardening<br>
-**Baseline Commit:** `a3d44568d1e3333a82e0a983970929a37fb3f37d`<br>
+**Milestone:** Spine Batch 21C — Critical Backup Consistency, Restore Atomicity, Database Roles, and Deployment Remediation<br>
+**Baseline Commit:** `cc075d488dc78a506545465eb59a5d2e927d892e`<br>
 **Target Release:** Deployment Candidate for Independent Codex Re-Audit<br>
 **Target Platform:** Linux x86_64, Windows x86_64  
 
@@ -24,14 +24,14 @@
 - `systemd/spine-storage-node.service`: Hardened systemd unit for storage node daemon.
 - `docker-compose.yml`: Base Compose configuration with zero internal service host port pollution.
 - `docker-compose.dev.yml`: Local developer override exposing `3000:3000` and `5173:80`.
-- `docker-compose.prod.yml`: Production Compose override with isolated `spine-internal` bridge network, exposing ONLY ports `80`, `443`, and `2222`.
+- `docker-compose.prod.yml`: Production Compose override with isolated `spine-internal` network and `spine-ingress-proxy` network, exposing ONLY ports `80`, `443`, and `2222`.
 - `deploy/nginx/ingress.conf`: Production Nginx reverse-proxy ingress configuration with TLS 1.2/1.3, HSTS, and HTTP -> HTTPS 301 redirection.
 
 ### 1.4. PostgreSQL Migrations & Consistency Barrier
 - Directory: `github-alternative/backend/apps/spine-api/migrations/`
   - `0001_core_identity.sql` through `0012_workflow_provenance.sql`.
   - Transaction-level advisory lock (`pg_advisory_xact_lock(0x5350494E454D4947)`).
-  - Database-backed cluster maintenance barrier (`_cluster_maintenance_barrier`) coordinating point-in-time backups across distributed nodes.
+  - Globally atomic cluster maintenance advisory lock (`0x5350494E_4542414B`) coordinating point-in-time backups across distributed OS processes.
   - Granular privilege model: `spine_migrator` (DDL `CREATE` permissions) and `spine_app` (runtime DML permissions with `REVOKE CREATE ON SCHEMA public`).
 
 ---
@@ -40,8 +40,8 @@
 
 - **Hash Algorithm:** BLAKE3 (Authoritative object store), SHA-256 (Git remote transport, LFS objects, backup manifests).
 - **Password Hashing:** Argon2id with random 16-byte salt.
-- **Backup Encryption:** `SPNEBAK v2` streaming chunked AES-256-GCM AEAD encryption with PBKDF2-HMAC-SHA256 key derivation ($10,000 \le \text{iters} \le 1,000,000$), 12-byte per-chunk nonces, 29-byte AAD binding, and authenticated final manifest. Memory usage strictly bounded to $O(1)$ (1 MiB RAM). Strict rejection of trailing bytes, full manifest verification on rotation, canonical same-path collision rejection, and failure-atomic publish via unique temporary staging.
-- **Database Dump/Restore Format:** Version 3.0 streaming JSON Lines (`metadata`, `table_start`, `row`, `table_end`) with `serde_json` arbitrary precision feature ensuring exact numeric precision roundtrip without IEEE-754 precision loss.
+- **Backup Encryption:** `SPNEBAK v2` streaming chunked AES-256-GCM AEAD encryption with PBKDF2-HMAC-SHA256 key derivation ($10,000 \le \text{iters} \le 1,000,000$), 12-byte per-chunk nonces, 29-byte AAD binding, and authenticated final manifest. Memory usage strictly bounded to $O(1)$ (1 MiB RAM). Strict rejection of trailing bytes, full stream decryption verification on rotation against `sink()`, canonical same-path collision rejection, staged archive creation (`.tmp_bak_<uuid>`), and failure-atomic publish.
+- **Database Dump/Restore Format:** Version 3.0 streaming JSON Lines (`metadata`, `table_start`, `row`, `table_end`) with `serde_json` arbitrary precision feature ensuring exact numeric precision roundtrip without IEEE-754 precision loss. Bounded line length (16 MiB max). Exact sequence `last_value` and `is_called` state resync.
 - **SSH Protocol:** Pure Rust implementation via `russh`, supporting `ed25519` host keys, user public keys, and repository deploy keys.
 - **Database Engine:** PostgreSQL 18.6+ with SCRAM-SHA-256 authentication, least-privilege `spine_app` role (`NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS`), local/WSL subnet binding (`172.18.64.0/20`), and transaction-scoped advisory locking.
 
@@ -56,11 +56,11 @@
 
 ## 4. Remediation Certification Status
 
-All findings from the third Codex deployment audit (F-01 through F-07) have been remediated down to the source code and programmatically verified against real PostgreSQL:
-- **F-01**: Version 3.0 streaming JSON Lines dumper/restorer, exact JSONB arbitrary numeric precision, cluster write maintenance barrier wired to all mutation endpoints.
-- **F-02**: Canonical same-path rejection, failure-atomic staging with `.tmp_rot_<uuid>.spnebak`, pre-publish header verification, zero residual disk files on failure.
-- **F-03**: Persisted workflow provenance (`source_repo_id`, `is_fork`, `trust_classification`, `provenance_reason`), direct inspection by scheduler and runner lease without unauthenticated re-evaluations.
-- **F-04**: Dedicated DDL migration role `spine_migrator` and runtime least-privilege role `spine_app`; verified schema `CREATE` rejection (`42501`) under `spine_app`; narrowed `pg_hba.conf` subnet to WSL-only.
-- **F-05**: Host port `3000` segregated from production compose; `validate_public_origin` enforces HTTPS scheme, non-empty host, and rejects userinfo credentials.
-- **F-06**: Masked database passwords (`***`) across all logs; strict secret file validation; fail-fast target database connectivity and empty state pre-flight check.
-- **F-07**: Verified `test_actual_run_migrations_cancellation_and_recovery` in `tests/advisory_lock_test.rs` demonstrating real `run_migrations` transaction-level advisory lock, mutual exclusion, task cancellation, engine-level lock cleanup, and recovery.
+All findings from the Codex deployment audit (F-01 through F-07) have been remediated down to the source code and programmatically verified against real PostgreSQL:
+- **F-01**: PostgreSQL session advisory lock (`0x5350494E_4542414B`) providing cross-process atomic maintenance coordination, write permit wiring across all routes, maintenance held across full snapshot and validation, exact sequence resync, bounded lines.
+- **F-02**: Staged backup creation, key rotation full stream decryption verification, failure-atomic storage extraction with validation and rollback.
+- **F-03**: Explicit `TrustClassification` in executor; fail-closed provenance evaluation.
+- **F-04**: Role split between DDL migrator and runtime DML application role.
+- **F-05**: Dockerfile modern Rust alignment, ingress network isolation.
+- **F-06**: Preflight archive format, keys, and database empty checks before touching disk.
+- **F-07**: Migration cancellation safety verified during active DDL and inserts across 5 cycles.

@@ -6,7 +6,7 @@ use uuid::Uuid;
 use spine_workflow::dag::JobDag;
 use spine_workflow::parser::WorkflowParser;
 
-use spine_api::core::types::{WorkflowJob, WorkflowSecret, WorkflowStep};
+use spine_api::core::types::{TrustClassification, WorkflowJob, WorkflowSecret, WorkflowStep};
 use spine_api::db::InMemoryDatabase;
 use spine_api::runner::{IsolatedRunnerExecutor, RunnerService};
 use spine_api::webhook::{SsrfValidator, WebhookService};
@@ -165,7 +165,15 @@ async fn test_step_timeout_and_process_tree_termination() {
     // To keep the test suite rapid, execute an intentional fast script and verify execution and secret masking
     let mut fast_scripts = HashMap::new();
     fast_scripts.insert(0, "echo Normal execution finished".to_string());
-    let (exit, results) = executor.execute_job(&job, &steps, &fast_scripts, &[]).await;
+    let (exit, results) = executor
+        .execute_job(
+            &job,
+            &steps,
+            &fast_scripts,
+            &[],
+            TrustClassification::Trusted,
+        )
+        .await;
     assert_eq!(exit, 0);
     assert!(results[0].stdout.contains("Normal execution finished"));
 }
@@ -221,7 +229,15 @@ async fn test_secret_masking_in_runner_output() {
     #[cfg(not(target_os = "windows"))]
     scripts.insert(0, "echo Value of secret is $SUPER_SECRET".to_string());
 
-    let (exit, results) = executor.execute_job(&job, &steps, &scripts, &secrets).await;
+    let (exit, results) = executor
+        .execute_job(
+            &job,
+            &steps,
+            &scripts,
+            &secrets,
+            TrustClassification::Trusted,
+        )
+        .await;
     assert_eq!(exit, 0);
 
     // The secret string must NEVER appear in the stdout

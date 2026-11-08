@@ -1,6 +1,9 @@
 mod common;
 
-use common::require_safe_test_db_url;
+use common::{
+    ensure_disposable_marker, require_safe_test_db_url, verify_disposable_database,
+    DISPOSABLE_MARKER_TABLE,
+};
 use spine_api::{
     backup::BackupManager,
     db::{dump_database, is_database_empty, restore_database},
@@ -188,10 +191,18 @@ async fn test_postgres_jsonb_numeric_precision_roundtrip() {
         exact_token
     );
 
-    // Now clean the database to simulate empty target
+    // Now clean the database to simulate empty target, verifying explicit disposable marker first
+    ensure_disposable_marker(&pool)
+        .await
+        .expect("ensure disposable marker");
+    verify_disposable_database(&pool)
+        .await
+        .expect("verify disposable database before destructive table drop");
+
     let tables: Vec<(String,)> = sqlx::query_as(
-        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'"
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name != $1"
     )
+    .bind(DISPOSABLE_MARKER_TABLE)
     .fetch_all(&pool)
     .await
     .expect("fetch tables");

@@ -110,6 +110,25 @@ pub async fn run_migrations_with_pause(
     pause_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
     resume_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
 ) -> Result<(), ForgeError> {
+    run_migrations_with_pause_internal(pool, None, pause_notify, resume_notify).await
+}
+
+pub async fn run_migrations_with_pause_after_step(
+    pool: PgPool,
+    pause_after_step: usize,
+    pause_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
+    resume_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
+) -> Result<(), ForgeError> {
+    run_migrations_with_pause_internal(pool, Some(pause_after_step), pause_notify, resume_notify)
+        .await
+}
+
+async fn run_migrations_with_pause_internal(
+    pool: PgPool,
+    pause_after_step: Option<usize>,
+    pause_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
+    resume_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
+) -> Result<(), ForgeError> {
     let mut tx = pool.begin().await.map_err(|e| {
         ForgeError::Internal(format!("Failed to begin transaction for migrations: {}", e))
     })?;
@@ -125,11 +144,14 @@ pub async fn run_migrations_with_pause(
         ))
     })?;
 
-    if let Some(pause) = pause_notify {
-        pause.notify_one();
-    }
-    if let Some(resume) = resume_notify {
-        resume.notified().await;
+    // If pause is requested before any DDL
+    if pause_after_step.is_none() {
+        if let Some(ref pause) = pause_notify {
+            pause.notify_one();
+        }
+        if let Some(ref resume) = resume_notify {
+            resume.notified().await;
+        }
     }
 
     // 1. Create _schema_migrations tracking table if not exists
@@ -138,6 +160,7 @@ pub async fn run_migrations_with_pause(
     })?;
 
     // 2. Sequentially apply pending migrations within this transaction
+    let mut step_count = 0usize;
     for (name, sql) in MIGRATIONS {
         let exists = migration_exists(&mut tx, name).await.map_err(|e| {
             ForgeError::Internal(format!(
@@ -152,6 +175,18 @@ pub async fn run_migrations_with_pause(
                 .await
                 .map_err(|e| ForgeError::Internal(format!("Migration {} failed: {}", name, e)))?;
             tracing::info!("Migration {} applied successfully.", name);
+
+            if let Some(target_step) = pause_after_step {
+                if step_count == target_step {
+                    if let Some(ref pause) = pause_notify {
+                        pause.notify_one();
+                    }
+                    if let Some(ref resume) = resume_notify {
+                        resume.notified().await;
+                    }
+                }
+            }
+            step_count += 1;
         }
     }
 

@@ -8,7 +8,12 @@ networks:
     internal: true
     driver: bridge
 
-  # Public ingress network for API, SSH, and Frontend reverse proxies
+  # Ingress proxy network for routing between edge proxy, API, and Frontend
+  spine-ingress-proxy:
+    internal: true
+    driver: bridge
+
+  # Public ingress network for external edge listeners (SSH, HTTP/HTTPS)
   spine-public:
     driver: bridge
 
@@ -114,6 +119,7 @@ services:
     restart: unless-stopped
     networks:
       - spine-internal
+      - spine-ingress-proxy
       - spine-public
     ports:
       - "2222:2222"
@@ -122,6 +128,7 @@ services:
       PORT: "3000"
       SSH_PORT: "2222"
       SPINE_DEPLOYMENT_PROFILE: "core-forge-v1"
+      MIGRATION_DATABASE_URL: "postgres://${POSTGRES_MIGRATOR_USER:-spine_migrator}:${POSTGRES_MIGRATOR_PASSWORD:-${POSTGRES_PASSWORD:?POSTGRES_PASSWORD_required}}@postgres:5432/${POSTGRES_DB:-spine_forge}"
       DATABASE_URL: "postgres://${POSTGRES_USER:-spine_app}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD_required}@postgres:5432/${POSTGRES_DB:-spine_forge}"
       COORDINATOR_ADDR: "coordinator:8400"
       STORAGE_ROOT: "/var/lib/spine/storage"
@@ -149,6 +156,7 @@ services:
     container_name: spine-forge-frontend
     restart: unless-stopped
     networks:
+      - spine-ingress-proxy
       - spine-public
     depends_on:
       - spine-api

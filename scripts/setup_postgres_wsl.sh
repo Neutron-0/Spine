@@ -11,9 +11,16 @@ CONF_DIR="/etc/postgresql/${POSTGRES_VERSION}/main"
 DB_NAME="${SPINE_POSTGRES_DB:-spine_forge}"
 TEST_DB_NAME="${SPINE_TEST_POSTGRES_DB:-spine_forge_test}"
 MIGRATOR_USER="${SPINE_MIGRATOR_USER:-spine_migrator}"
-MIGRATOR_PASSWORD="${SPINE_MIGRATOR_PASSWORD:-spine_secure_dev_password}"
 APP_USER="${SPINE_POSTGRES_USER:-spine_app}"
-APP_PASSWORD="${SPINE_POSTGRES_PASSWORD:-spine_secure_dev_password}"
+
+# Enforce explicit credentials: fixed fallback secrets prohibited in setup scripts
+if [ -z "${SPINE_MIGRATOR_PASSWORD:-}" ] || [ -z "${SPINE_POSTGRES_PASSWORD:-}" ]; then
+    echo "[ERROR] SPINE_MIGRATOR_PASSWORD and SPINE_POSTGRES_PASSWORD must be explicitly provided in environment." >&2
+    echo "Example: SPINE_MIGRATOR_PASSWORD='...' SPINE_POSTGRES_PASSWORD='...' bash scripts/setup_postgres_wsl.sh" >&2
+    exit 1
+fi
+MIGRATOR_PASSWORD="${SPINE_MIGRATOR_PASSWORD}"
+APP_PASSWORD="${SPINE_POSTGRES_PASSWORD}"
 
 # Detect WSL internal IPv4 address if running in WSL
 WSL_IP=$(ip -4 addr show eth0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' || true)
@@ -29,10 +36,11 @@ if [ -f "${CONF_DIR}/postgresql.conf" ]; then
 fi
 
 # Configure host-based authentication (pg_hba.conf) with least privilege
-# Disallow 0.0.0.0/0 and ::0/0 broad network exposure. Only permit loopback and private host virtual subnet.
+# Disallow 0.0.0.0/0, ::0/0, and broad subnets. Only permit loopback and private host virtual subnet.
 if [ -f "${CONF_DIR}/pg_hba.conf" ]; then
     sed -i '/0\.0\.0\.0\/0/d' "${CONF_DIR}/pg_hba.conf"
     sed -i '/::0\/0/d' "${CONF_DIR}/pg_hba.conf"
+    sed -i '/172\.16\./d' "${CONF_DIR}/pg_hba.conf"
 
     if ! grep -q "127.0.0.1/32.*scram-sha-256" "${CONF_DIR}/pg_hba.conf"; then
         echo "host    all             all             127.0.0.1/32            scram-sha-256" >> "${CONF_DIR}/pg_hba.conf"

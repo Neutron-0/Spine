@@ -4,8 +4,13 @@
 # ==============================================================================
 
 networks:
-  # Strictly internal network (no external route, completely isolated from internet)
+  # Strictly internal network (no external route, completely isolated from internet and ingress)
   spine-internal:
+    internal: true
+    driver: bridge
+
+  # Ingress proxy network (routes between edge ingress proxy, API, and Frontend)
+  spine-ingress-proxy:
     internal: true
     driver: bridge
 
@@ -24,7 +29,7 @@ services:
     restart: unless-stopped
     networks:
       - spine-public
-      - spine-internal
+      - spine-ingress-proxy
     ports:
       - "80:80"     # HTTP -> HTTPS mandatory 301 redirect
       - "443:443"   # Hardened TLS 1.2/1.3 listener
@@ -147,6 +152,7 @@ services:
     restart: unless-stopped
     networks:
       - spine-internal
+      - spine-ingress-proxy
       - spine-public
     # Only SSH port is published to host; HTTP is routed exclusively via internal ingress
     ports:
@@ -156,6 +162,7 @@ services:
       PORT: "3000"
       SSH_PORT: "2222"
       SPINE_DEPLOYMENT_PROFILE: "core-forge-v1"
+      MIGRATION_DATABASE_URL: "postgres://${POSTGRES_MIGRATOR_USER:-spine_migrator}:${POSTGRES_MIGRATOR_PASSWORD:-${POSTGRES_PASSWORD:?POSTGRES_PASSWORD_required}}@postgres:5432/${POSTGRES_DB:-spine_forge}"
       DATABASE_URL: "postgres://${POSTGRES_USER:-spine_app}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD_required}@postgres:5432/${POSTGRES_DB:-spine_forge}"
       COORDINATOR_ADDR: "coordinator:8400"
       STORAGE_ROOT: "/var/lib/spine/storage"
@@ -185,7 +192,7 @@ services:
     container_name: spine-forge-frontend
     restart: unless-stopped
     networks:
-      - spine-internal
+      - spine-ingress-proxy
     # No host port exposed; routed strictly via ingress on port 443
     depends_on:
       - spine-api

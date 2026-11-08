@@ -195,6 +195,27 @@
 - **F-07 (Advisory Lock Concurrency):** Verified transaction-level `pg_advisory_xact_lock` mutual exclusion, `pg_locks` visibility, immediate engine-level release upon transaction drop, and successful subsequent migration execution against live PostgreSQL.
 - Release candidate manifest updated for Batch 21A; codebase fully prepared for third independent Codex deployment audit.
 
+### Batch 21B: Third Codex Audit Remediation: Exact Database Recovery, Cross-Process Maintenance, Atomic Archive Rotation, Persisted Workflow Provenance and Production Security (Completed)
+- Full resolution and regression verification of all 7 findings from the third independent Codex audit.
+- **F-01 (Database Backup & Restore):** Implemented Version 3.0 streaming JSON Lines format with $O(1)$ memory buffering directly from/to disk. Enabled `serde_json/arbitrary_precision` preserving exact JSONB numeric tokens without IEEE-754 floating-point loss. Wired `ConsistencyBarrier::acquire_write_permit` to all write routes.
+- **F-02 (SPNEBAK Encryption & Rotation):** Hardened `rotate_backup_key` with strict canonical path checks rejecting in-place rotation, unique temporary staging, and pre-publish header validation. Bounded `ct_len` validation in `v2::rotate_stream`.
+- **F-03 (Workflow Provenance):** Added persistent columns `source_repo_id`, `is_fork`, `trust_classification`, `provenance_reason` to `workflow_runs` table via migration `0012_workflow_provenance.sql`.
+- **F-04 (PostgreSQL Exposure & Least Privilege):** Restricted WSL PostgreSQL `pg_hba.conf` subnet to `172.18.64.0/20`. Created dedicated DDL migration role `spine_migrator` and runtime role `spine_app` with `REVOKE CREATE ON SCHEMA public`.
+- **F-05 (Production Compose & TLS):** Removed host port `3000:3000` from base Compose. Enforced HTTPS origin, non-empty host, and rejected userinfo in `validate_public_origin`.
+- **F-06 (Reliability & Secret Management):** Sanitized database password logging across all endpoints. Strict secret file error handling. Pre-flight target database empty and connectivity check before modifying storage.
+- **F-07 (Advisory Lock Concurrency):** Verified transaction-level advisory lock held in `pg_locks`, concurrent acquisition rejected, task cancellation cleanly releases lock, and subsequent worker runs to completion.
+
+### Batch 21C: Critical Backup Consistency, Restore Atomicity, Database Roles, and Deployment Remediation (Completed)
+- Full resolution and regression verification of all 7 findings from the fourth independent Codex audit.
+- **F-01 (Globally Atomic Cross-Process Maintenance Barrier):** Implemented PostgreSQL session advisory lock (`0x5350494E_4542414B`) coordinating exclusive maintenance and shared write permits across arbitrary independent OS processes. Main backup CLI scopes maintenance guard across database snapshot, storage capture, encryption, and verification. Wired write permits to pull requests, releases, repository deletion, branch protections, and packages. Enforced 16 MiB line bounds and strict sequence (`last_value`, `is_called`) resync with collision prevention.
+- **F-02 (Staged Backup Creation & Verified Restoration):** Backups staged to `.tmp_bak_<uuid>` before atomic rename to destination; never truncates destination upfront. Full stream decryption verification on key rotation against `sink()` before atomic publication. Failure-atomic storage restore extracting to `.tmp_restore_<uuid>` with hash validation and live rollback.
+- **F-03 (Authoritative Workflow Provenance):** Removed `execute_job(..., false)` default-trusted bypass; required explicit `TrustClassification`. Evaluated provenance fails closed to `Untrusted` on ambiguous or missing repository identifiers.
+- **F-04 (Role Split & Startup Migrations):** Runtime role `spine_app` stripped of `CREATE` on public schema. Startup migrations run via `MIGRATION_DATABASE_URL` (`--migration-database-url-file`) and the pool is closed before `spine_app` runtime begins. WSL setup script hardened with mandatory password inputs.
+- **F-05 (Dockerfile Alignment & Ingress Network Reduction):** Builder stages aligned to `rust:1.85-bookworm` and runtime to `debian:bookworm-slim`. Ingress network reach reduced by removing ingress from `spine-internal`.
+- **F-06 (Restore Preflight & Secret CLI Cleanup):** Preflight archive magic bytes, format, encryption key, and database empty checks before touching disk. Raw password CLI options eliminated.
+- **F-07 (Migration Cancellation Under Live DDL/Inserts):** Implemented `run_migrations_with_pause_after_step` and verified clean rollback and recovery across 5 consecutive cycles during active DDL and table inserts.
+- **Test Database Safety Contract:** Enforced opt-in flag `SPINE_ALLOW_DESTRUCTIVE_TESTS=1` and marker table `_spine_disposable_test_marker`. All tests verified.
+
 ---
 
 ## Future Milestones

@@ -42,6 +42,7 @@ pub async fn set_branch_protection(
     Path((owner, repo_name)): Path<(String, String)>,
     Json(payload): Json<SetBranchProtectionRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo = state
         .repositories
@@ -77,6 +78,7 @@ pub async fn delete_branch_protection(
     user: Option<Extension<User>>,
     Path((owner, repo_name, rule_id)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo = state
         .repositories

@@ -1,9 +1,9 @@
-FROM rust:1.80-bullseye AS builder
+FROM rust:1.85-bookworm AS builder
 WORKDIR /usr/src/spine
 COPY git-alternative ./git-alternative
 RUN cargo build --release --manifest-path git-alternative/Cargo.toml -p spine-coordinator
 
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 RUN groupadd -g 10001 spine && useradd -u 10001 -g spine -s /bin/false -m spine
 RUN mkdir -p /var/lib/spine && chown -R spine:spine /var/lib/spine
 COPY --from=builder /usr/src/spine/git-alternative/target/release/spine-coordinator /usr/local/bin/spine-coordinator

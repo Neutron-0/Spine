@@ -4,6 +4,51 @@ use sqlx::{PgPool, Row};
 use std::collections::BTreeMap;
 use std::io::BufRead;
 
+pub const MAX_SNAPSHOT_LINE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+
+/// Reads a line from a BufRead source with a strict length limit (16 MiB) to prevent unbounded memory allocation.
+pub fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    buf: &mut String,
+) -> Result<usize, ForgeError> {
+    buf.clear();
+    let mut total_read = 0;
+    loop {
+        let available = reader
+            .fill_buf()
+            .map_err(|e| ForgeError::Internal(format!("Failed to read snapshot line: {}", e)))?;
+        if available.is_empty() {
+            return Ok(total_read);
+        }
+        if let Some(newline_pos) = available.iter().position(|&b| b == b'\n') {
+            let chunk_len = newline_pos + 1;
+            if total_read + chunk_len > MAX_SNAPSHOT_LINE_BYTES {
+                return Err(ForgeError::Internal(
+                    "Snapshot line exceeds maximum allowed size (16 MiB)".to_string(),
+                ));
+            }
+            let s = std::str::from_utf8(&available[..chunk_len])
+                .map_err(|e| ForgeError::Internal(format!("Invalid UTF-8 in snapshot: {}", e)))?;
+            buf.push_str(s);
+            reader.consume(chunk_len);
+            total_read += chunk_len;
+            return Ok(total_read);
+        } else {
+            let chunk_len = available.len();
+            if total_read + chunk_len > MAX_SNAPSHOT_LINE_BYTES {
+                return Err(ForgeError::Internal(
+                    "Snapshot line exceeds maximum allowed size (16 MiB)".to_string(),
+                ));
+            }
+            let s = std::str::from_utf8(available)
+                .map_err(|e| ForgeError::Internal(format!("Invalid UTF-8 in snapshot: {}", e)))?;
+            buf.push_str(s);
+            reader.consume(chunk_len);
+            total_read += chunk_len;
+        }
+    }
+}
+
 /// Tables in topological insertion order for foreign-key constraint compliance during restore.
 pub const RESTORE_TABLE_ORDER: &[&str] = &[
     "users",
@@ -105,6 +150,7 @@ pub async fn is_database_empty(pool: &PgPool) -> Result<bool, ForgeError> {
         WHERE schemaname = 'public' 
           AND tablename != '_schema_migrations'
           AND tablename != '_cluster_maintenance_barrier'
+          AND tablename != '_spine_disposable_test_marker'
         "#,
     )
     .fetch_one(pool)
@@ -143,28 +189,49 @@ pub async fn dump_database_to_writer<W: std::io::Write>(
         .map_err(|e| ForgeError::Internal(format!("Failed to set REPEATABLE READ: {}", e)))?;
 
     // 2. Query applied migrations for schema compatibility verification
-    let migration_rows: Vec<(String, i64)> =
+    let migrations_table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = '_schema_migrations')"
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| ForgeError::Internal(format!("Failed to check _schema_migrations existence: {}", e)))?;
+
+    let migration_rows: Vec<(String, i64)> = if migrations_table_exists {
         sqlx::query_as("SELECT version, applied_at_nanos FROM _schema_migrations ORDER BY version")
             .fetch_all(&mut *tx)
             .await
-            .unwrap_or_default();
+            .map_err(|e| {
+                ForgeError::Internal(format!("Failed to query _schema_migrations: {}", e))
+            })?
+    } else {
+        Vec::new()
+    };
 
-    // 3. Query current sequence states
-    let seq_state_rows = sqlx::query(
-        "SELECT sequencename, last_value FROM pg_sequences WHERE schemaname = 'public'",
+    // 3. Query current sequence states with exact authoritative last_value and is_called
+    let seq_names: Vec<String> = sqlx::query(
+        "SELECT sequencename FROM pg_sequences WHERE schemaname = 'public' ORDER BY sequencename",
     )
     .fetch_all(&mut *tx)
     .await
-    .unwrap_or_default();
+    .map_err(|e| ForgeError::Internal(format!("Failed to query pg_sequences: {}", e)))?
+    .into_iter()
+    .map(|r| r.get("sequencename"))
+    .collect();
 
     let mut recorded_sequences = Vec::new();
-    for row in seq_state_rows {
-        let name: String = row.get("sequencename");
-        let last_value: Option<i64> = row.try_get("last_value").ok();
+    for name in seq_names {
+        let row = sqlx::query(&format!("SELECT last_value, is_called FROM \"{}\"", name))
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| {
+                ForgeError::Internal(format!("Failed to query sequence '{}': {}", name, e))
+            })?;
+        let last_val: i64 = row.get("last_value");
+        let is_called: bool = row.get("is_called");
         recorded_sequences.push(SequenceEntry {
             name,
-            last_value: last_value.unwrap_or(1),
-            is_called: last_value.is_some(),
+            last_value: last_val,
+            is_called,
         });
     }
 
@@ -176,6 +243,7 @@ pub async fn dump_database_to_writer<W: std::io::Write>(
         WHERE schemaname = 'public' 
           AND tablename != '_cluster_maintenance_barrier'
           AND tablename != '_schema_migrations'
+          AND tablename != '_spine_disposable_test_marker'
         ORDER BY tablename
         "#,
     )
@@ -297,7 +365,12 @@ pub async fn dump_database_to_writer<W: std::io::Write>(
         .flush()
         .map_err(|e| ForgeError::Internal(e.to_string()))?;
 
-    let _ = tx.commit().await;
+    tx.commit().await.map_err(|e| {
+        ForgeError::Internal(format!(
+            "Failed to commit database snapshot transaction: {}",
+            e
+        ))
+    })?;
 
     Ok(())
 }
@@ -320,11 +393,8 @@ pub async fn restore_database_from_reader<R: BufRead>(
 
     // 2. Read first line to detect format and validate header
     let mut first_line = String::new();
-    reader
-        .read_line(&mut first_line)
-        .map_err(|e| ForgeError::Internal(format!("Failed to read snapshot header line: {}", e)))?;
-
-    if first_line.trim().is_empty() {
+    let bytes_read = read_bounded_line(&mut reader, &mut first_line)?;
+    if bytes_read == 0 || first_line.trim().is_empty() {
         return Err(ForgeError::Internal(
             "Database snapshot is empty".to_string(),
         ));
@@ -385,13 +455,14 @@ pub async fn restore_database_from_reader<R: BufRead>(
             if let Some(arr) = m.as_array() {
                 if arr.len() == 2 {
                     if let (Some(ver), Some(ts)) = (arr[0].as_str(), arr[1].as_i64()) {
-                        let _ = sqlx::query(
+                        sqlx::query(
                             "INSERT INTO _schema_migrations (version, applied_at_nanos) VALUES ($1, $2) ON CONFLICT (version) DO UPDATE SET applied_at_nanos = $2"
                         )
                         .bind(ver)
                         .bind(ts)
                         .execute(&mut *tx)
-                        .await;
+                        .await
+                        .map_err(|e| ForgeError::Internal(format!("Failed to restore schema migration {}: {}", ver, e)))?;
                     }
                 }
             }
@@ -403,12 +474,11 @@ pub async fn restore_database_from_reader<R: BufRead>(
     let mut current_table: Option<String> = None;
     let mut row_batch: Vec<String> = Vec::with_capacity(500);
 
+    let mut found_footer = false;
+    let mut footer_val: Option<serde_json::Value> = None;
+
     let mut line = String::new();
-    while reader
-        .read_line(&mut line)
-        .map_err(|e| ForgeError::Internal(format!("Failed to read line from snapshot: {}", e)))?
-        > 0
-    {
+    while read_bounded_line(&mut reader, &mut line)? > 0 {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             line.clear();
@@ -474,6 +544,8 @@ pub async fn restore_database_from_reader<R: BufRead>(
                 current_table = None;
             }
             "footer" => {
+                found_footer = true;
+                footer_val = Some(record_val);
                 break;
             }
             _ => {}
@@ -482,7 +554,66 @@ pub async fn restore_database_from_reader<R: BufRead>(
         line.clear();
     }
 
-    // 5. Sequence Resynchronization:
+    let footer = match footer_val {
+        Some(f) if found_footer => f,
+        _ => {
+            return Err(ForgeError::Internal(
+                "Corrupted snapshot: unexpected EOF before footer record".to_string(),
+            ));
+        }
+    };
+
+    let expected_tables = footer
+        .get("total_tables")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| ForgeError::Internal("Missing total_tables in footer".to_string()))?
+        as usize;
+    let expected_rows = footer
+        .get("total_rows")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| ForgeError::Internal("Missing total_rows in footer".to_string()))?
+        as usize;
+
+    if expected_tables != tables_restored {
+        return Err(ForgeError::Internal(format!(
+            "Snapshot table count mismatch: footer declared {} tables, but {} were restored",
+            expected_tables, tables_restored
+        )));
+    }
+    if expected_rows != rows_restored {
+        return Err(ForgeError::Internal(format!(
+            "Snapshot row count mismatch: footer declared {} rows, but {} were restored",
+            expected_rows, rows_restored
+        )));
+    }
+
+    // Check for trailing bytes after footer record
+    let mut trailing_buf = [0u8; 1];
+    let trailing_read = reader
+        .read(&mut trailing_buf)
+        .map_err(|e| ForgeError::Internal(format!("Failed to check trailing bytes: {}", e)))?;
+    if trailing_read > 0 {
+        return Err(ForgeError::Internal(
+            "Corrupted snapshot: unexpected trailing data after footer record".to_string(),
+        ));
+    }
+
+    // 5. Sequence Resynchronization with Collision Prevention:
+    let mut recorded_map = std::collections::HashMap::new();
+    if let Some(recorded_seqs) = header_val.get("sequences").and_then(|s| s.as_array()) {
+        for s in recorded_seqs {
+            if let (Some(name), Some(last_val), Some(is_called)) = (
+                s.get("name").and_then(|n| n.as_str()),
+                s.get("last_value").and_then(|v| v.as_i64()),
+                s.get("is_called").and_then(|c| c.as_bool()),
+            ) {
+                recorded_map.insert(name.to_string(), (last_val, is_called));
+            }
+        }
+    }
+
+    let mut restored_sequences = std::collections::HashSet::new();
+
     // First, restore sequences linked to table columns via system catalog
     let seq_rows = sqlx::query(
         r#"
@@ -506,11 +637,38 @@ pub async fn restore_database_from_reader<R: BufRead>(
         let table: String = row.get("table_name");
         let col: String = row.get("column_name");
 
-        let reset_sql = format!(
-            "SELECT setval('\"{}\"', coalesce((SELECT max(\"{}\") FROM \"{}\"), 1), true)",
-            seq_name, col, table
-        );
-        sqlx::query(&reset_sql)
+        let max_val_row = sqlx::query(&format!(
+            "SELECT max(\"{}\")::bigint AS max_val FROM \"{}\"",
+            col, table
+        ))
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| {
+            ForgeError::Internal(format!(
+                "Failed to query max column value for '{}.{}': {}",
+                table, col, e
+            ))
+        })?;
+
+        let max_val: Option<i64> = max_val_row.try_get("max_val").ok();
+        let recorded = recorded_map.get(&seq_name);
+
+        let (target_val, is_called) = match (max_val, recorded) {
+            (Some(mv), Some(&(rec_val, rec_called))) => {
+                if mv >= rec_val {
+                    (mv, true)
+                } else {
+                    (rec_val, rec_called)
+                }
+            }
+            (Some(mv), None) => (mv, true),
+            (None, Some(&(rec_val, rec_called))) => (rec_val, rec_called),
+            (None, None) => (1, false),
+        };
+
+        sqlx::query(&format!("SELECT setval('\"{}\"', $1, $2)", seq_name))
+            .bind(target_val)
+            .bind(is_called)
             .execute(&mut *tx)
             .await
             .map_err(|e| {
@@ -519,22 +677,24 @@ pub async fn restore_database_from_reader<R: BufRead>(
                     seq_name, table, col, e
                 ))
             })?;
+
+        restored_sequences.insert(seq_name);
     }
 
     // Second, restore recorded sequence states from header for any standalone sequences
-    if let Some(recorded_seqs) = header_val.get("sequences").and_then(|s| s.as_array()) {
-        for s in recorded_seqs {
-            if let (Some(name), Some(last_val), Some(is_called)) = (
-                s.get("name").and_then(|n| n.as_str()),
-                s.get("last_value").and_then(|v| v.as_i64()),
-                s.get("is_called").and_then(|c| c.as_bool()),
-            ) {
-                let _ = sqlx::query(&format!("SELECT setval('\"{}\"', $1, $2)", name))
-                    .bind(last_val)
-                    .bind(is_called)
-                    .execute(&mut *tx)
-                    .await;
-            }
+    for (name, &(last_val, is_called)) in &recorded_map {
+        if !restored_sequences.contains(name) {
+            sqlx::query(&format!("SELECT setval('\"{}\"', $1, $2)", name))
+                .bind(last_val)
+                .bind(is_called)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    ForgeError::Internal(format!(
+                        "Failed to restore standalone sequence '{}': {}",
+                        name, e
+                    ))
+                })?;
         }
     }
 

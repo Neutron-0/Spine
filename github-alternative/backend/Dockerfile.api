@@ -1,5 +1,5 @@
 # Multi-stage build for Spine Forge API & SSH Service
-FROM rust:1.80-bullseye AS builder
+FROM rust:1.85-bookworm AS builder
 
 WORKDIR /usr/src/spine
 
@@ -11,7 +11,7 @@ COPY github-alternative/backend ./github-alternative/backend
 RUN cargo build --release --manifest-path github-alternative/backend/Cargo.toml -p spine-api
 
 # Minimal unprivileged runtime image
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
