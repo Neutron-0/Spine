@@ -22,7 +22,10 @@ pub mod workflow;
 pub use api::{build_router, AppState};
 pub use artifact::ArtifactService;
 pub use auth::DevMailCatcher;
-pub use backup::{BackupManager, BackupManifest, RestoreReport};
+pub use backup::{
+    BackupManager, BackupManifest, RestoreJournal, RestorePhase, RestoreReport,
+    StagedRestoreSession,
+};
 pub use coordinator::CoordinatorClient;
 pub use core::profile::DeploymentProfile;
 pub use core::types::*;
@@ -37,7 +40,7 @@ pub use packages::{CargoRegistryAdapter, PackageService};
 pub use permissions::PermissionService;
 pub use releases::ReleaseService;
 pub use repository::{ProvisioningWorker, RepositoryService};
-pub use runner::{IsolatedRunnerExecutor, RunnerService};
+pub use runner::{AuthoritativeTrustToken, IsolatedRunnerExecutor, RunnerService};
 pub use search::SearchService;
 pub use security::SecurityService;
 pub use ssh::start_ssh_server;

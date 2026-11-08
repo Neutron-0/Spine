@@ -151,6 +151,7 @@ pub async fn is_database_empty(pool: &PgPool) -> Result<bool, ForgeError> {
           AND tablename != '_schema_migrations'
           AND tablename != '_cluster_maintenance_barrier'
           AND tablename != '_spine_disposable_test_marker'
+          AND tablename != '_harness_provision_proof'
         "#,
     )
     .fetch_one(pool)
@@ -244,6 +245,7 @@ pub async fn dump_database_to_writer<W: std::io::Write>(
           AND tablename != '_cluster_maintenance_barrier'
           AND tablename != '_schema_migrations'
           AND tablename != '_spine_disposable_test_marker'
+          AND tablename != '_harness_provision_proof'
         ORDER BY tablename
         "#,
     )
@@ -313,6 +315,15 @@ pub async fn dump_database_to_writer<W: std::io::Write>(
                 ForgeError::Internal(format!("Failed to read row from '{}': {}", table_name, e))
             })?;
             let row_json: String = row.get("row_json");
+
+            // Enforce MAX_SNAPSHOT_LINE_BYTES limit on row serialization to guarantee restore compatibility
+            let line_len = 20 + table_name.len() + 10 + row_json.len() + 2;
+            if line_len > MAX_SNAPSHOT_LINE_BYTES {
+                return Err(ForgeError::Internal(format!(
+                    "Row in table '{}' exceeds maximum snapshot line size (16 MiB): {} bytes",
+                    table_name, line_len
+                )));
+            }
 
             // Direct line write: preserves exact numeric tokens and JSONB structure
             writer

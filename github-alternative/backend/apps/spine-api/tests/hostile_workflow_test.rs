@@ -8,7 +8,7 @@ use spine_workflow::parser::WorkflowParser;
 
 use spine_api::core::types::{TrustClassification, WorkflowJob, WorkflowSecret, WorkflowStep};
 use spine_api::db::InMemoryDatabase;
-use spine_api::runner::{IsolatedRunnerExecutor, RunnerService};
+use spine_api::runner::{AuthoritativeTrustToken, IsolatedRunnerExecutor, RunnerService};
 use spine_api::webhook::{SsrfValidator, WebhookService};
 use spine_api::workflow::WorkflowScheduler;
 use spine_api::Database;
@@ -165,14 +165,10 @@ async fn test_step_timeout_and_process_tree_termination() {
     // To keep the test suite rapid, execute an intentional fast script and verify execution and secret masking
     let mut fast_scripts = HashMap::new();
     fast_scripts.insert(0, "echo Normal execution finished".to_string());
+    let trust_token =
+        AuthoritativeTrustToken::for_test(&job.run_id, &job.id, TrustClassification::Trusted);
     let (exit, results) = executor
-        .execute_job(
-            &job,
-            &steps,
-            &fast_scripts,
-            &[],
-            TrustClassification::Trusted,
-        )
+        .execute_job(&job, &steps, &fast_scripts, &[], &trust_token)
         .await;
     assert_eq!(exit, 0);
     assert!(results[0].stdout.contains("Normal execution finished"));
@@ -229,14 +225,10 @@ async fn test_secret_masking_in_runner_output() {
     #[cfg(not(target_os = "windows"))]
     scripts.insert(0, "echo Value of secret is $SUPER_SECRET".to_string());
 
+    let trust_token =
+        AuthoritativeTrustToken::for_test(&job.run_id, &job.id, TrustClassification::Trusted);
     let (exit, results) = executor
-        .execute_job(
-            &job,
-            &steps,
-            &scripts,
-            &secrets,
-            TrustClassification::Trusted,
-        )
+        .execute_job(&job, &steps, &scripts, &secrets, &trust_token)
         .await;
     assert_eq!(exit, 0);
 

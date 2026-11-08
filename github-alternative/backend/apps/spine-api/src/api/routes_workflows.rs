@@ -52,6 +52,7 @@ pub async fn sync_workflows(
     Path((owner, repo_name)): Path<(String, String)>,
     Json(payload): Json<SyncWorkflowsRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo = state
         .repositories
@@ -81,6 +82,7 @@ pub async fn dispatch_workflow(
     Path((owner, repo_name, _workflow_id)): Path<(String, String, String)>,
     Json(payload): Json<DispatchWorkflowRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo = state
         .repositories
@@ -155,6 +157,7 @@ pub async fn cancel_run(
     user: Option<Extension<User>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let run = state
         .workflows

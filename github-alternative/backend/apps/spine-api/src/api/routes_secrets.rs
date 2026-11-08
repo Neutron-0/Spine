@@ -33,6 +33,7 @@ pub async fn upsert_repo_secret(
     Path((owner, repo_name, secret_name)): Path<(String, String, String)>,
     Json(payload): Json<UpsertSecretRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo = state
         .repositories
@@ -103,6 +104,7 @@ pub async fn delete_repo_secret(
     user: Option<Extension<User>>,
     Path((owner, repo_name, secret_name)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo = state
         .repositories
@@ -127,6 +129,7 @@ pub async fn upsert_org_secret(
     Path((org_name, secret_name)): Path<(String, String)>,
     Json(payload): Json<UpsertSecretRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let org = state
         .db
@@ -195,6 +198,7 @@ pub async fn delete_org_secret(
     user: Option<Extension<User>>,
     Path((org_name, secret_name)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let org = state
         .db

@@ -1,9 +1,9 @@
 use crate::core::error::ForgeError;
-use sqlx::PgPool;
+use sqlx::postgres::PgConnectOptions;
+use sqlx::{Connection, PgConnection, PgPool};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::oneshot;
 use tokio::time::sleep;
 
 /// 64-bit advisory lock key identifying the cluster-wide live backup maintenance barrier.
@@ -18,6 +18,7 @@ pub struct ConsistencyBarrier {
     in_maintenance: Arc<AtomicBool>,
     in_flight_writes: Arc<AtomicUsize>,
     pool: Option<PgPool>,
+    connect_options: Option<Arc<PgConnectOptions>>,
 }
 
 impl ConsistencyBarrier {
@@ -26,14 +27,26 @@ impl ConsistencyBarrier {
             in_maintenance: Arc::new(AtomicBool::new(false)),
             in_flight_writes: Arc::new(AtomicUsize::new(0)),
             pool: None,
+            connect_options: None,
         }
     }
 
     pub fn with_pool(pool: PgPool) -> Self {
+        let connect_options = pool.connect_options().clone();
         Self {
             in_maintenance: Arc::new(AtomicBool::new(false)),
             in_flight_writes: Arc::new(AtomicUsize::new(0)),
             pool: Some(pool),
+            connect_options: Some(connect_options),
+        }
+    }
+
+    pub fn with_pool_and_options(pool: PgPool, options: PgConnectOptions) -> Self {
+        Self {
+            in_maintenance: Arc::new(AtomicBool::new(false)),
+            in_flight_writes: Arc::new(AtomicUsize::new(0)),
+            pool: Some(pool),
+            connect_options: Some(Arc::new(options)),
         }
     }
 
@@ -78,7 +91,8 @@ impl ConsistencyBarrier {
     }
 
     /// Acquire an in-flight write permit asynchronously.
-    /// Checks local atomic flag AND queries the database-backed barrier and acquires a shared advisory lock.
+    /// Checks local atomic flag AND queries the database-backed barrier and acquires a shared advisory lock
+    /// on a dedicated non-pooled connection.
     /// Fails with ServiceUnavailable if the cluster is in maintenance mode.
     pub async fn acquire_write_permit(&self) -> Result<WritePermit, ForgeError> {
         if self.is_maintenance_active() {
@@ -88,37 +102,42 @@ impl ConsistencyBarrier {
             ));
         }
 
-        if let Some(pool) = &self.pool {
+        if let Some(opts) = &self.connect_options {
             // 1. Check if cluster maintenance table has marked maintenance active
-            let active_row: Result<Option<(bool,)>, _> =
-                sqlx::query_as("SELECT is_active FROM _cluster_maintenance_barrier WHERE id = 1")
-                    .fetch_optional(pool)
-                    .await;
+            if let Some(pool) = &self.pool {
+                let active_row: Result<Option<(bool,)>, _> = sqlx::query_as(
+                    "SELECT is_active FROM _cluster_maintenance_barrier WHERE id = 1",
+                )
+                .fetch_optional(pool)
+                .await;
 
-            if let Ok(Some((true,))) = active_row {
-                self.in_maintenance.store(true, Ordering::SeqCst);
-                return Err(ForgeError::ServiceUnavailable(
-                    "Cluster write pipeline is currently paused for coordinated maintenance"
-                        .to_string(),
-                ));
-            } else if let Ok(Some((false,))) = active_row {
-                if self.in_maintenance.load(Ordering::SeqCst) {
-                    self.in_maintenance.store(false, Ordering::SeqCst);
+                if let Ok(Some((true,))) = active_row {
+                    self.in_maintenance.store(true, Ordering::SeqCst);
+                    return Err(ForgeError::ServiceUnavailable(
+                        "Cluster write pipeline is currently paused for coordinated maintenance"
+                            .to_string(),
+                    ));
+                } else if let Ok(Some((false,))) = active_row {
+                    if self.in_maintenance.load(Ordering::SeqCst) {
+                        self.in_maintenance.store(false, Ordering::SeqCst);
+                    }
                 }
             }
 
-            // 2. Acquire a dedicated connection from pool to hold the shared advisory lock
-            let mut conn = pool.acquire().await.map_err(|e| {
-                ForgeError::ServiceUnavailable(format!(
-                    "Failed to acquire database connection for writer permit: {}",
-                    e
-                ))
-            })?;
+            // 2. Establish a dedicated non-pooled PgConnection for session advisory locking.
+            let mut conn = PgConnection::connect_with(opts.as_ref())
+                .await
+                .map_err(|e| {
+                    ForgeError::ServiceUnavailable(format!(
+                        "Failed to establish dedicated database connection for writer permit: {}",
+                        e
+                    ))
+                })?;
 
             // 3. Try acquiring shared session advisory lock across all cluster processes
             let lock_res: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock_shared($1)")
                 .bind(SPINE_CLUSTER_MAINTENANCE_LOCK_ID)
-                .fetch_one(&mut *conn)
+                .fetch_one(&mut conn)
                 .await
                 .map_err(|e| {
                     ForgeError::ServiceUnavailable(format!(
@@ -129,6 +148,7 @@ impl ConsistencyBarrier {
 
             if !lock_res.0 {
                 self.in_maintenance.store(true, Ordering::SeqCst);
+                let _ = conn.close().await;
                 return Err(ForgeError::ServiceUnavailable(
                     "Cluster write pipeline is currently paused for coordinated maintenance"
                         .to_string(),
@@ -137,32 +157,18 @@ impl ConsistencyBarrier {
 
             self.in_flight_writes.fetch_add(1, Ordering::SeqCst);
 
-            // Channel for releasing the shared lock cleanly when permit is dropped
-            let (drop_tx, drop_rx) = oneshot::channel::<()>();
-
-            tokio::spawn(async move {
-                let _ = drop_rx.await;
-                let unlock_res = sqlx::query("SELECT pg_advisory_unlock_shared($1)")
-                    .bind(SPINE_CLUSTER_MAINTENANCE_LOCK_ID)
-                    .execute(&mut *conn)
-                    .await;
-
-                if unlock_res.is_err() {
-                    // If unlock fails, close connection so it NEVER returns to pool while locked
-                    let _ = conn.close().await;
-                }
-            });
-
             Ok(WritePermit {
-                _drop_guard: Some(drop_tx),
+                conn: Some(conn),
                 counter: self.in_flight_writes.clone(),
+                released: false,
             })
         } else {
             // In-memory fallback
             self.in_flight_writes.fetch_add(1, Ordering::SeqCst);
             Ok(WritePermit {
-                _drop_guard: None,
+                conn: None,
                 counter: self.in_flight_writes.clone(),
+                released: false,
             })
         }
     }
@@ -177,8 +183,9 @@ impl ConsistencyBarrier {
         }
         self.in_flight_writes.fetch_add(1, Ordering::SeqCst);
         Ok(WritePermit {
-            _drop_guard: None,
+            conn: None,
             counter: self.in_flight_writes.clone(),
+            released: false,
         })
     }
 
@@ -192,56 +199,79 @@ impl ConsistencyBarrier {
 
         let mut guard_conn = None;
 
-        if let Some(pool) = &self.pool {
-            // 1. Initialize maintenance table and mark barrier active so all processes reject new writers
-            sqlx::query(
-                r#"
-                CREATE TABLE IF NOT EXISTS _cluster_maintenance_barrier (
-                    id INT PRIMARY KEY DEFAULT 1,
-                    is_active BOOLEAN NOT NULL DEFAULT FALSE,
-                    activated_at_nanos BIGINT NOT NULL DEFAULT 0,
-                    activated_by VARCHAR(255) NOT NULL DEFAULT '',
-                    reason VARCHAR(255) NOT NULL DEFAULT ''
+        if let Some(opts) = &self.connect_options {
+            if let Some(pool) = &self.pool {
+                // 1. Mark barrier active so all processes reject new writers
+                let barrier_res = sqlx::query(
+                    r#"
+                    INSERT INTO _cluster_maintenance_barrier (id, is_active, activated_at_nanos, activated_by, reason)
+                    VALUES (1, TRUE, $1, 'spine-backup', 'Coordinated live cluster backup')
+                    ON CONFLICT (id) DO UPDATE SET 
+                        is_active = TRUE,
+                        activated_at_nanos = $1,
+                        activated_by = 'spine-backup',
+                        reason = 'Coordinated live cluster backup'
+                    "#,
                 )
-                "#,
-            )
-            .execute(pool)
-            .await
-            .map_err(|e| {
-                ForgeError::Internal(format!(
-                    "Failed to create cluster maintenance barrier table in database: {}",
-                    e
-                ))
-            })?;
+                .bind(now_nanos)
+                .execute(pool)
+                .await;
 
-            sqlx::query(
-                r#"
-                INSERT INTO _cluster_maintenance_barrier (id, is_active, activated_at_nanos, activated_by, reason)
-                VALUES (1, TRUE, $1, 'spine-backup', 'Coordinated live cluster backup')
-                ON CONFLICT (id) DO UPDATE SET 
-                    is_active = TRUE,
-                    activated_at_nanos = $1,
-                    activated_by = 'spine-backup',
-                    reason = 'Coordinated live cluster backup'
-                "#,
-            )
-            .bind(now_nanos)
-            .execute(pool)
-            .await
-            .map_err(|e| {
-                ForgeError::Internal(format!(
-                    "Failed to activate cluster maintenance barrier in database: {}",
-                    e
-                ))
-            })?;
+                if let Err(e) = barrier_res {
+                    // Fallback: If table does not exist (e.g. unmigrated test), try creating it
+                    let create_res = sqlx::query(
+                        r#"
+                        CREATE TABLE IF NOT EXISTS _cluster_maintenance_barrier (
+                            id INT PRIMARY KEY DEFAULT 1,
+                            is_active BOOLEAN NOT NULL DEFAULT FALSE,
+                            activated_at_nanos BIGINT NOT NULL DEFAULT 0,
+                            activated_by VARCHAR(255) NOT NULL DEFAULT '',
+                            reason VARCHAR(255) NOT NULL DEFAULT ''
+                        )
+                        "#,
+                    )
+                    .execute(pool)
+                    .await;
 
-            // 2. Check out dedicated connection to acquire exclusive advisory lock
-            let mut conn = pool.acquire().await.map_err(|e| {
-                ForgeError::Internal(format!(
-                    "Failed to acquire connection for maintenance lock: {}",
-                    e
-                ))
-            })?;
+                    if create_res.is_ok() {
+                        sqlx::query(
+                            r#"
+                            INSERT INTO _cluster_maintenance_barrier (id, is_active, activated_at_nanos, activated_by, reason)
+                            VALUES (1, TRUE, $1, 'spine-backup', 'Coordinated live cluster backup')
+                            ON CONFLICT (id) DO UPDATE SET 
+                                is_active = TRUE,
+                                activated_at_nanos = $1,
+                                activated_by = 'spine-backup',
+                                reason = 'Coordinated live cluster backup'
+                            "#,
+                        )
+                        .bind(now_nanos)
+                        .execute(pool)
+                        .await
+                        .map_err(|e| {
+                            ForgeError::Internal(format!(
+                                "Failed to activate cluster maintenance barrier in database: {}",
+                                e
+                            ))
+                        })?;
+                    } else {
+                        return Err(ForgeError::Internal(format!(
+                            "Failed to update cluster maintenance barrier: {}",
+                            e
+                        )));
+                    }
+                }
+            }
+
+            // 2. Dedicated non-pooled connection to acquire exclusive advisory lock
+            let mut conn = PgConnection::connect_with(opts.as_ref())
+                .await
+                .map_err(|e| {
+                    ForgeError::Internal(format!(
+                        "Failed to establish dedicated connection for maintenance lock: {}",
+                        e
+                    ))
+                })?;
 
             // 3. Acquire exclusive advisory lock, waiting for existing in-flight shared locks to drain
             let start = std::time::Instant::now();
@@ -249,7 +279,7 @@ impl ConsistencyBarrier {
             while start.elapsed() < drain_timeout {
                 let lock_res: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
                     .bind(SPINE_CLUSTER_MAINTENANCE_LOCK_ID)
-                    .fetch_one(&mut *conn)
+                    .fetch_one(&mut conn)
                     .await
                     .map_err(|e| {
                         ForgeError::Internal(format!(
@@ -266,11 +296,14 @@ impl ConsistencyBarrier {
             }
 
             if !acquired {
-                let _ = sqlx::query(
-                    "UPDATE _cluster_maintenance_barrier SET is_active = FALSE WHERE id = 1",
-                )
-                .execute(pool)
-                .await;
+                let _ = conn.close().await;
+                if let Some(pool) = &self.pool {
+                    let _ = sqlx::query(
+                        "UPDATE _cluster_maintenance_barrier SET is_active = FALSE WHERE id = 1",
+                    )
+                    .execute(pool)
+                    .await;
+                }
                 self.in_maintenance.store(false, Ordering::SeqCst);
                 return Err(ForgeError::Internal(format!(
                     "Timed out after {:?} waiting for in-flight writers to drain across cluster",
@@ -293,50 +326,104 @@ impl ConsistencyBarrier {
 
         Ok(MaintenanceGuard {
             barrier: self.clone(),
-            _conn: guard_conn,
+            conn: guard_conn,
+            released: false,
         })
     }
 }
 
 pub struct WritePermit {
-    _drop_guard: Option<oneshot::Sender<()>>,
+    conn: Option<PgConnection>,
     counter: Arc<AtomicUsize>,
+    released: bool,
+}
+
+impl WritePermit {
+    /// Explicitly release the write permit and shared advisory lock.
+    pub async fn release(mut self) -> Result<(), ForgeError> {
+        if !self.released {
+            self.counter.fetch_sub(1, Ordering::SeqCst);
+            self.released = true;
+        }
+        if let Some(mut conn) = self.conn.take() {
+            let _ = sqlx::query("SELECT pg_advisory_unlock_shared($1)")
+                .bind(SPINE_CLUSTER_MAINTENANCE_LOCK_ID)
+                .execute(&mut conn)
+                .await;
+            let _ = conn.close().await;
+        }
+        Ok(())
+    }
+
+    /// Verify that the dedicated database connection and advisory lock remain active.
+    pub async fn verify_active(&mut self) -> Result<(), ForgeError> {
+        if let Some(conn) = &mut self.conn {
+            sqlx::query("SELECT 1").execute(conn).await.map_err(|e| {
+                ForgeError::ServiceUnavailable(format!("Writer permit connection lost: {}", e))
+            })?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for WritePermit {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::SeqCst);
+        if !self.released {
+            self.counter.fetch_sub(1, Ordering::SeqCst);
+            self.released = true;
+        }
+        // When self.conn is dropped synchronously, the underlying TCP stream is closed,
+        // causing PostgreSQL to automatically and immediately release all session advisory locks.
     }
 }
 
 pub struct MaintenanceGuard {
     barrier: ConsistencyBarrier,
-    _conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
+    conn: Option<PgConnection>,
+    released: bool,
+}
+
+impl MaintenanceGuard {
+    /// Explicitly release the maintenance guard, deactivating the barrier and unlocking the advisory lock.
+    pub async fn release(mut self) -> Result<(), ForgeError> {
+        self.released = true;
+        self.barrier.in_maintenance.store(false, Ordering::SeqCst);
+        if let Some(pool) = &self.barrier.pool {
+            let _ = sqlx::query(
+                "UPDATE _cluster_maintenance_barrier SET is_active = FALSE WHERE id = 1",
+            )
+            .execute(pool)
+            .await;
+        }
+        if let Some(mut conn) = self.conn.take() {
+            let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+                .bind(SPINE_CLUSTER_MAINTENANCE_LOCK_ID)
+                .execute(&mut conn)
+                .await;
+            let _ = conn.close().await;
+        }
+        tracing::info!("Maintenance consistency barrier explicitly released.");
+        Ok(())
+    }
 }
 
 impl Drop for MaintenanceGuard {
     fn drop(&mut self) {
-        self.barrier.in_maintenance.store(false, Ordering::SeqCst);
-        let conn_opt = self._conn.take();
-        if let Some(pool) = self.barrier.pool.clone() {
-            tokio::spawn(async move {
-                let _ = sqlx::query(
-                    "UPDATE _cluster_maintenance_barrier SET is_active = FALSE WHERE id = 1",
-                )
-                .execute(&pool)
-                .await;
-
-                if let Some(mut conn) = conn_opt {
-                    let unlock_res = sqlx::query("SELECT pg_advisory_unlock($1)")
-                        .bind(SPINE_CLUSTER_MAINTENANCE_LOCK_ID)
-                        .execute(&mut *conn)
-                        .await;
-                    if unlock_res.is_err() {
-                        let _ = conn.close().await;
-                    }
-                }
-            });
+        if !self.released {
+            self.barrier.in_maintenance.store(false, Ordering::SeqCst);
+            if let Some(pool) = self.barrier.pool.clone() {
+                // Best-effort asynchronous update for barrier state table if explicit release was skipped
+                tokio::spawn(async move {
+                    let _ = sqlx::query(
+                        "UPDATE _cluster_maintenance_barrier SET is_active = FALSE WHERE id = 1",
+                    )
+                    .execute(&pool)
+                    .await;
+                });
+            }
+            // When self.conn is dropped synchronously, the underlying TCP stream is closed,
+            // causing PostgreSQL to automatically and immediately release all session advisory locks.
+            tracing::info!("Maintenance consistency barrier guard dropped.");
         }
-        tracing::info!("Maintenance consistency barrier deactivated.");
     }
 }

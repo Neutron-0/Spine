@@ -17,10 +17,17 @@ use std::time::Instant;
 use uuid::Uuid;
 
 pub mod consistency;
+pub mod journal;
 pub mod v2;
 
 pub use consistency::{ConsistencyBarrier, MaintenanceGuard, SPINE_CLUSTER_MAINTENANCE_LOCK_ID};
+pub use journal::{RestoreJournal, RestorePhase};
 pub use v2::{BackupHeaderV2, StreamSummary};
+
+pub const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+pub const MAX_ARCHIVE_FILE_COUNT: usize = 1_000_000;
+pub const MAX_ARCHIVE_PATH_LEN: usize = 4096;
+pub const MAX_LEGACY_V1_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 
 const BACKUP_MAGIC: &[u8; 8] = b"SPNEBAK\x01";
 #[allow(dead_code)]
@@ -59,6 +66,62 @@ pub struct RestoreReport {
     pub bytes_restored: u64,
     pub duration_ms: u64,
     pub integrity_verified: bool,
+}
+
+/// Represents an active, staged restore session prior to storage publication.
+/// Keeps live storage unmodified until the caller explicitly confirms and commits.
+pub struct StagedRestoreSession {
+    pub manifest: BackupManifest,
+    pub report: RestoreReport,
+    pub journal: RestoreJournal,
+    pub db_snapshot_path: Option<PathBuf>,
+    pub staging_dir: tempfile::TempDir,
+    pub verified_files: Vec<(String, PathBuf, u64)>,
+    pub target_storage_root: PathBuf,
+}
+
+impl StagedRestoreSession {
+    /// Commits the staged files to live storage root.
+    /// This MUST only be called after target database restore is successful.
+    pub fn publish_storage(mut self) -> Result<RestoreReport, ForgeError> {
+        self.journal.persist(RestorePhase::DatabaseRestored)?;
+
+        let mut files_restored = 0usize;
+        let mut bytes_restored = 0u64;
+
+        fs::create_dir_all(&self.target_storage_root)
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        for (rel_path, staged_path, file_len) in self.verified_files {
+            if rel_path != "database/snapshot.jsonl" && rel_path != "database/snapshot.json" {
+                let dest =
+                    BackupManager::sanitize_restore_path(&self.target_storage_root, &rel_path)?;
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
+                }
+                fs::rename(&staged_path, &dest).map_err(|e| ForgeError::Internal(e.to_string()))?;
+                files_restored += 1;
+                bytes_restored += file_len;
+            }
+        }
+
+        self.journal.persist(RestorePhase::StoragePublished)?;
+        self.journal.persist(RestorePhase::Completed)?;
+        let _ = RestoreJournal::remove(&self.target_storage_root);
+
+        self.report.files_restored = files_restored;
+        self.report.bytes_restored = bytes_restored;
+        Ok(self.report)
+    }
+
+    /// Abort and discard staging artifacts leaving live storage completely untouched.
+    pub fn abort(mut self, reason: &str) -> Result<(), ForgeError> {
+        let _ = self
+            .journal
+            .persist(RestorePhase::Failed(reason.to_string()));
+        let _ = RestoreJournal::remove(&self.target_storage_root);
+        Ok(())
+    }
 }
 
 pub struct BackupManager;
@@ -244,10 +307,11 @@ impl BackupManager {
         backup_tar_gz: &Path,
         target_storage_root: &Path,
     ) -> Result<(BackupManifest, RestoreReport, Option<PathBuf>), ForgeError> {
-        let file = File::open(backup_tar_gz)
-            .map_err(|e| ForgeError::Internal(format!("Failed to open backup archive: {}", e)))?;
-        let dec = GzDecoder::new(file);
-        Self::unpack_archive_staged(dec, target_storage_root)
+        let session = Self::prepare_restore_session(backup_tar_gz, target_storage_root, None)?;
+        let manifest = session.manifest.clone();
+        let db_path = session.db_snapshot_path.clone();
+        let report = session.publish_storage()?;
+        Ok((manifest, report, db_path))
     }
 
     /// Restores an authenticated, AEAD-encrypted backup archive, verifying passphrases, chunks, and tags.
@@ -257,14 +321,16 @@ impl BackupManager {
         target_storage_root: &Path,
         passphrase: &str,
     ) -> Result<(BackupManifest, RestoreReport, Option<String>), ForgeError> {
-        let (manifest, report, db_path) =
-            Self::restore_encrypted_backup_staged(encrypted_path, target_storage_root, passphrase)?;
-        let db_str = match db_path {
-            Some(ref p) => {
+        let session =
+            Self::prepare_restore_session(encrypted_path, target_storage_root, Some(passphrase))?;
+        let manifest = session.manifest.clone();
+        let db_str = match session.db_snapshot_path.as_deref() {
+            Some(p) if p.exists() => {
                 Some(fs::read_to_string(p).map_err(|e| ForgeError::Internal(e.to_string()))?)
             }
-            None => None,
+            _ => None,
         };
+        let report = session.publish_storage()?;
         Ok((manifest, report, db_str))
     }
 
@@ -274,8 +340,23 @@ impl BackupManager {
         target_storage_root: &Path,
         passphrase: &str,
     ) -> Result<(BackupManifest, RestoreReport, Option<PathBuf>), ForgeError> {
-        let mut file = File::open(encrypted_path)
-            .map_err(|e| ForgeError::Internal(format!("Failed to open encrypted backup: {}", e)))?;
+        let session =
+            Self::prepare_restore_session(encrypted_path, target_storage_root, Some(passphrase))?;
+        let manifest = session.manifest.clone();
+        let db_path = session.db_snapshot_path.clone();
+        let report = session.publish_storage()?;
+        Ok((manifest, report, db_path))
+    }
+
+    /// Prepares a staged restoration session with full checksum verification and durable journaling.
+    /// Live storage is NOT touched until StagedRestoreSession::publish_storage() is explicitly called.
+    pub fn prepare_restore_session(
+        input_path: &Path,
+        target_storage_root: &Path,
+        passphrase: Option<&str>,
+    ) -> Result<StagedRestoreSession, ForgeError> {
+        let mut file = File::open(input_path)
+            .map_err(|e| ForgeError::Internal(format!("Failed to open backup archive: {}", e)))?;
 
         let mut magic = [0u8; 8];
         file.read_exact(&mut magic)
@@ -283,38 +364,79 @@ impl BackupManager {
         drop(file);
 
         if &magic == v2::MAGIC_V2 {
-            let reader = File::open(encrypted_path).map_err(|e| {
+            let pass = passphrase.ok_or_else(|| {
+                ForgeError::Internal(
+                    "Passphrase required for encrypted SPNEBAK v2 archive".to_string(),
+                )
+            })?;
+            let reader = File::open(input_path).map_err(|e| {
                 ForgeError::Internal(format!("Failed to open encrypted archive: {}", e))
             })?;
 
-            let temp_dir = tempfile::tempdir().map_err(|e| {
-                ForgeError::Internal(format!("Failed to create temp staging directory: {}", e))
-            })?;
-            let staging_dec_tar_gz = temp_dir.path().join("staging_decrypted.tar.gz");
+            let staging_dir = tempfile::tempdir_in(target_storage_root)
+                .or_else(|_| tempfile::tempdir())
+                .map_err(|e| {
+                    ForgeError::Internal(format!("Failed to create temp staging directory: {}", e))
+                })?;
+            let staging_dec_tar_gz = staging_dir.path().join("staging_decrypted.tar.gz");
             let writer = File::create(&staging_dec_tar_gz).map_err(|e| {
                 ForgeError::Internal(format!("Failed to create staging decrypted file: {}", e))
             })?;
 
-            v2::decrypt_stream(reader, writer, passphrase)?;
+            v2::decrypt_stream(reader, writer, pass)?;
 
             let dec_file = File::open(&staging_dec_tar_gz).map_err(|e| {
                 ForgeError::Internal(format!("Failed to open staging decrypted file: {}", e))
             })?;
             let dec = GzDecoder::new(dec_file);
-            Self::unpack_archive_staged(dec, target_storage_root)
+            Self::unpack_archive_to_session(dec, input_path, target_storage_root, staging_dir)
         } else if &magic == BACKUP_MAGIC {
-            // Legacy v1 single-invocation fallback
-            let encrypted_bytes = fs::read(encrypted_path).map_err(|e| {
-                ForgeError::Internal(format!("Failed to read encrypted backup: {}", e))
+            let pass = passphrase.ok_or_else(|| {
+                ForgeError::Internal(
+                    "Passphrase required for encrypted SPNEBAK v1 archive".to_string(),
+                )
             })?;
-            let decrypted_tar_gz = Self::decrypt_backup_payload(&encrypted_bytes, passphrase)?;
+            // Bounded read for legacy v1
+            let meta = fs::metadata(input_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
+            if meta.len() > MAX_LEGACY_V1_ARCHIVE_BYTES {
+                return Err(ForgeError::Internal(format!(
+                    "Legacy SPNEBAK v1 archive exceeds maximum supported size ({} > {} bytes)",
+                    meta.len(),
+                    MAX_LEGACY_V1_ARCHIVE_BYTES
+                )));
+            }
+            let file = File::open(input_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
+            let mut encrypted_bytes = Vec::new();
+            file.take(MAX_LEGACY_V1_ARCHIVE_BYTES + 1)
+                .read_to_end(&mut encrypted_bytes)
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+            if encrypted_bytes.len() as u64 > MAX_LEGACY_V1_ARCHIVE_BYTES {
+                return Err(ForgeError::Internal(
+                    "Archive exceeded maximum v1 byte limit".to_string(),
+                ));
+            }
+
+            let decrypted_tar_gz = Self::decrypt_backup_payload(&encrypted_bytes, pass)?;
+            let staging_dir = tempfile::tempdir_in(target_storage_root)
+                .or_else(|_| tempfile::tempdir())
+                .map_err(|e| {
+                    ForgeError::Internal(format!("Failed to create temp staging directory: {}", e))
+                })?;
             let cursor = Cursor::new(decrypted_tar_gz);
             let dec = GzDecoder::new(cursor);
-            Self::unpack_archive_staged(dec, target_storage_root)
+            Self::unpack_archive_to_session(dec, input_path, target_storage_root, staging_dir)
         } else {
-            Err(ForgeError::Internal(
-                "Unrecognized backup archive format or invalid magic bytes".to_string(),
-            ))
+            // Unencrypted tar.gz
+            let file = File::open(input_path).map_err(|e| {
+                ForgeError::Internal(format!("Failed to open backup archive: {}", e))
+            })?;
+            let dec = GzDecoder::new(file);
+            let staging_dir = tempfile::tempdir_in(target_storage_root)
+                .or_else(|_| tempfile::tempdir())
+                .map_err(|e| {
+                    ForgeError::Internal(format!("Failed to create temp staging directory: {}", e))
+                })?;
+            Self::unpack_archive_to_session(dec, input_path, target_storage_root, staging_dir)
         }
     }
 
@@ -384,10 +506,28 @@ impl BackupManager {
                     new_key_version,
                 )?;
             } else if &magic == BACKUP_MAGIC {
-                // Upgrade legacy v1 archive to streaming v2 format on rotation
-                let encrypted_bytes = fs::read(encrypted_path).map_err(|e| {
-                    ForgeError::Internal(format!("Failed to read source encrypted backup: {}", e))
-                })?;
+                // Upgrade legacy v1 archive to streaming v2 format on rotation with bounded memory
+                let meta = fs::metadata(encrypted_path)
+                    .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                if meta.len() > MAX_LEGACY_V1_ARCHIVE_BYTES {
+                    return Err(ForgeError::Internal(format!(
+                        "Legacy SPNEBAK v1 archive exceeds maximum supported size ({} > {} bytes)",
+                        meta.len(),
+                        MAX_LEGACY_V1_ARCHIVE_BYTES
+                    )));
+                }
+                let v1_file =
+                    File::open(encrypted_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
+                let mut encrypted_bytes = Vec::new();
+                v1_file
+                    .take(MAX_LEGACY_V1_ARCHIVE_BYTES + 1)
+                    .read_to_end(&mut encrypted_bytes)
+                    .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                if encrypted_bytes.len() as u64 > MAX_LEGACY_V1_ARCHIVE_BYTES {
+                    return Err(ForgeError::Internal(
+                        "Archive exceeded maximum v1 byte limit".to_string(),
+                    ));
+                }
                 let plaintext_tar_gz =
                     Self::decrypt_backup_payload(&encrypted_bytes, old_passphrase)?;
 
@@ -712,27 +852,37 @@ impl BackupManager {
         Ok((manifest, writer))
     }
 
-    /// Internal shared logic to unpack tar archive, validating traversal limits and hashes.
-    /// Streams extracted files to temporary staging on disk, returning Option<PathBuf> for database snapshot.
-    fn unpack_archive_staged<R: Read>(
+    /// Internal shared logic to unpack tar archive into a StagedRestoreSession, validating bounds, traversal limits and hashes.
+    /// Live target storage remains completely untouched until session.publish_storage() is executed.
+    fn unpack_archive_to_session<R: Read>(
         reader: R,
+        input_archive: &Path,
         target_storage_root: &Path,
-    ) -> Result<(BackupManifest, RestoreReport, Option<PathBuf>), ForgeError> {
+        staging_dir: tempfile::TempDir,
+    ) -> Result<StagedRestoreSession, ForgeError> {
         let start = Instant::now();
+        let mut journal =
+            RestoreJournal::new(input_archive, target_storage_root, staging_dir.path());
+        journal.persist(RestorePhase::Initialized)?;
+
         let mut archive = tar::Archive::new(reader);
-
-        fs::create_dir_all(target_storage_root).map_err(|e| ForgeError::Internal(e.to_string()))?;
-
         let mut manifest: Option<BackupManifest> = None;
         let mut extracted_db_staged_path: Option<PathBuf> = None;
-        let staging_dir = tempfile::tempdir_in(target_storage_root)
-            .map_err(|e| ForgeError::Internal(format!("Failed to create staging dir: {}", e)))?;
         let mut files_to_verify: Vec<(String, PathBuf)> = Vec::new();
+        let mut entry_count = 0usize;
 
         for entry in archive
             .entries()
             .map_err(|e| ForgeError::Internal(e.to_string()))?
         {
+            entry_count += 1;
+            if entry_count > MAX_ARCHIVE_FILE_COUNT {
+                return Err(ForgeError::Internal(format!(
+                    "Archive file count exceeds maximum permitted limit ({})",
+                    MAX_ARCHIVE_FILE_COUNT
+                )));
+            }
+
             let mut entry = entry.map_err(|e| ForgeError::Internal(e.to_string()))?;
             let path = entry
                 .path()
@@ -740,11 +890,25 @@ impl BackupManager {
                 .to_path_buf();
             let path_str = path.to_string_lossy().replace('\\', "/");
 
+            if path_str.len() > MAX_ARCHIVE_PATH_LEN {
+                return Err(ForgeError::Internal(format!(
+                    "Archive path exceeds maximum length of {} bytes: {}",
+                    MAX_ARCHIVE_PATH_LEN, path_str
+                )));
+            }
+
             if path_str == "manifest.json" {
                 let mut content = Vec::new();
-                entry
+                let mut limited = entry.take(MAX_MANIFEST_BYTES as u64 + 1);
+                limited
                     .read_to_end(&mut content)
                     .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                if content.len() > MAX_MANIFEST_BYTES {
+                    return Err(ForgeError::Internal(format!(
+                        "manifest.json size exceeds {} bytes maximum",
+                        MAX_MANIFEST_BYTES
+                    )));
+                }
                 let parsed: BackupManifest = serde_json::from_slice(&content)
                     .map_err(|e| ForgeError::Internal(format!("Corrupt manifest: {}", e)))?;
                 manifest = Some(parsed);
@@ -844,41 +1008,31 @@ impl BackupManager {
             }
         }
 
-        // Phase 2: Failure-atomic publication of verified files to target storage root
-        let mut files_restored = 0usize;
-        let mut bytes_restored = 0u64;
-
+        let mut verified_files_list = Vec::new();
         for (rel_path, staged_path) in files_to_verify {
-            let file_len = verified_sizes.get(&rel_path).copied().unwrap_or(0);
-            if rel_path != "database/snapshot.jsonl" && rel_path != "database/snapshot.json" {
-                let dest = Self::sanitize_restore_path(target_storage_root, &rel_path)?;
-                if let Some(parent) = dest.parent() {
-                    fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
-                }
-                fs::rename(&staged_path, &dest).map_err(|e| ForgeError::Internal(e.to_string()))?;
-            }
-
-            files_restored += 1;
-            bytes_restored += file_len;
+            let size = verified_sizes.get(&rel_path).copied().unwrap_or(0);
+            verified_files_list.push((rel_path, staged_path, size));
         }
 
-        let final_db_path = if let Some(staged_db) = extracted_db_staged_path {
-            let final_path = target_storage_root.join(".spine_extracted_db.jsonl");
-            fs::rename(&staged_db, &final_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
-            Some(final_path)
-        } else {
-            None
-        };
+        journal.persist(RestorePhase::StagedStorage)?;
 
-        let duration_ms = start.elapsed().as_millis() as u64;
         let report = RestoreReport {
             backup_id: manifest.backup_id.clone(),
-            files_restored,
-            bytes_restored,
-            duration_ms,
+            files_restored: 0,
+            bytes_restored: 0,
+            duration_ms: start.elapsed().as_millis() as u64,
             integrity_verified: true,
         };
-        Ok((manifest, report, final_db_path))
+
+        Ok(StagedRestoreSession {
+            manifest,
+            report,
+            journal,
+            db_snapshot_path: extracted_db_staged_path,
+            staging_dir,
+            verified_files: verified_files_list,
+            target_storage_root: target_storage_root.to_path_buf(),
+        })
     }
 
     /// Internal shared logic to unpack tar archive, validating traversal limits and hashes
@@ -886,13 +1040,25 @@ impl BackupManager {
         reader: R,
         target_storage_root: &Path,
     ) -> Result<(BackupManifest, RestoreReport, Option<String>), ForgeError> {
-        let (manifest, report, db_path) = Self::unpack_archive_staged(reader, target_storage_root)?;
-        let db_str = match db_path {
-            Some(ref p) => {
+        let staging_dir = tempfile::tempdir_in(target_storage_root)
+            .or_else(|_| tempfile::tempdir())
+            .map_err(|e| {
+                ForgeError::Internal(format!("Failed to create temp staging directory: {}", e))
+            })?;
+        let session = Self::unpack_archive_to_session(
+            reader,
+            Path::new("archive.tar.gz"),
+            target_storage_root,
+            staging_dir,
+        )?;
+        let manifest = session.manifest.clone();
+        let db_str = match &session.db_snapshot_path {
+            Some(p) if p.exists() => {
                 Some(fs::read_to_string(p).map_err(|e| ForgeError::Internal(e.to_string()))?)
             }
-            None => None,
+            _ => None,
         };
+        let report = session.publish_storage()?;
         Ok((manifest, report, db_str))
     }
 

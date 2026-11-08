@@ -56,9 +56,20 @@ async fn test_runner_isolation_fail_closed_on_unsandboxed_untrusted_workflow() {
     let mut scripts = HashMap::new();
     scripts.insert(1, "echo trying to access host".to_string());
 
+    use spine_api::runner::AuthoritativeTrustToken;
+    use spine_api::TrustClassification;
+
     // 1. Untrusted execution with Unsandboxed mode MUST FAIL CLOSED
+    let untrusted_token =
+        AuthoritativeTrustToken::for_test(&job.run_id, &job.id, TrustClassification::Untrusted);
     let (exit_code, results) = executor
-        .execute_job_with_trust(&job, std::slice::from_ref(&step), &scripts, &[], true)
+        .execute_job(
+            &job,
+            std::slice::from_ref(&step),
+            &scripts,
+            &[],
+            &untrusted_token,
+        )
         .await;
 
     assert_eq!(
@@ -77,8 +88,10 @@ async fn test_runner_isolation_fail_closed_on_unsandboxed_untrusted_workflow() {
     let trusted_executor = IsolatedRunnerExecutor::new(tmp.path().to_path_buf())
         .with_sandbox_mode(RunnerSandboxMode::TrustedLocalDevelopment);
 
+    let trusted_token =
+        AuthoritativeTrustToken::for_test(&job.run_id, &job.id, TrustClassification::Trusted);
     let (trusted_exit, trusted_res) = trusted_executor
-        .execute_job_with_trust(&job, &[step], &scripts, &[], false)
+        .execute_job(&job, &[step], &scripts, &[], &trusted_token)
         .await;
 
     assert_eq!(trusted_exit, 0, "Trusted local execution should succeed");

@@ -64,6 +64,7 @@ pub async fn register(
     State(state): State<AppState>,
     Json(payload): Json<RegisterRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let username = payload.username.trim();
     if username.len() < 3 || username.len() > 32 {
         return Err(ForgeError::BadRequest(
@@ -287,6 +288,7 @@ pub async fn change_password(
     Extension(user): Extension<User>,
     Json(payload): Json<ChangePasswordRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let valid = verify_password(&payload.current_password, &user.password_hash)?;
     if !valid {
         return Err(ForgeError::Unauthorized(
@@ -314,6 +316,7 @@ pub async fn request_password_reset(
     State(state): State<AppState>,
     Json(payload): Json<ResetPasswordRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let email = payload.email.trim();
     if !state
         .rate_limiter
@@ -352,6 +355,7 @@ pub async fn complete_password_reset(
     State(state): State<AppState>,
     Json(payload): Json<ResetPasswordCompleteRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     validate_password_strength(&payload.new_password)?;
 
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);

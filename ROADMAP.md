@@ -274,7 +274,7 @@
 
 ---
 
-## Milestone 21: Independent Codex Audit Remediation (Batches 21, 21A, 21B - Completed)
+## Milestone 21: Independent Codex Audit Remediation (Batches 21, 21A, 21B, 21C - Completed)
 - [x] **F-01**: Streaming JSON Lines database dump and restore (Version 3.0), exact JSONB arbitrary numeric precision without floating point loss, database-backed cluster maintenance barrier wired to all mutation routes.
 - [x] **F-02**: SPNEBAK v2 streaming encryption and failure-atomic key rotation with canonical same-path collision check, temporary staging, pre-publish header validation, and zero residual disk residue.
 - [x] **F-03**: Persisted authenticated workflow provenance in PostgreSQL, enforced across trigger, scheduler, and runner assignment layers.
@@ -282,3 +282,17 @@
 - [x] **F-05**: Production Compose port segregation, HTTPS public origin enforcement, and credential userinfo rejection.
 - [x] **F-06**: Password masking across all logs, strict secret file validation, and fail-fast empty target database checks.
 - [x] **F-07**: Verified real PostgreSQL transaction-level advisory lock mutual exclusion, task cancellation, and recovery.
+
+---
+
+## Milestone 21D: System-Wide Writer Coordination, Recoverable Restore, Production Database Security and Release Candidate Verification (Batch 21D - Completed)
+- [x] **F-01 (System-Wide Writer Coordination)**: Extended global maintenance barrier across all API mutating routes, background workers (`ProvisioningWorker`, `WorkflowScheduler`, `WebhookOutboxWorker`), and Git transports. Dedicated non-pooled session connections for PostgreSQL advisory locks (`0x5350494E_4542414B`), eliminating detached unlock in `Drop`. Enforced 16 MiB row limits on snapshot serialization.
+- [x] **F-02 & F-06 (Durable Cross-Resource Restore)**: Two-phase staged restore state machine with durable journal (`.spine_restore_journal.json`). Isolated temporary staging (`.tmp_restore_<uuid>`), pre-cutover database verification, atomic storage publication only after target database restore succeeds, and automatic startup crash recovery.
+- [x] **F-02 (Bounded Archive Processing)**: Removed unbounded memory allocation in legacy SPNEBAK v1 processing; enforced strict bounds on manifest size (16 MiB), total archive files (1,000,000), path lengths (4096 bytes), and archive sizes.
+- [x] **F-03 (Authoritative Workflow Provenance at Executor Boundary)**: `IsolatedRunnerExecutor::execute_job` mandates non-forgeable `AuthoritativeTrustToken` derived from database lookup. Removed caller-asserted trust parameters.
+- [x] **F-04 (Production PostgreSQL Role Separation & Privileges)**: Established distinct identities (`spine_admin`, `spine_migrator`, `spine_app`). Revoked `CREATE ON SCHEMA public` from runtime `spine_app`. Configured `docker/postgres/init-roles.sql`, `scripts/upgrade_postgres_roles.sql`, and `scripts/upgrade_postgres_roles.sh`.
+- [x] **F-05 (Container Toolchain Alignment & Hardening)**: Aligned all Dockerfiles to MSRV `rust:1.88-bookworm`.
+- [x] **F-06 (Elimination of Credential-Bearing CLI Arguments)**: Removed `--database-url`, `--target-database-url`, `--migration-database-url` from public CLI flags in favor of `--*-file` flags and environment variables.
+- [x] **Disposable Database Safety Contract**: Implemented `HarnessDisposableDb` provisioning isolated ephemeral test databases with strict safety proofs and explicit rejection of pre-existing databases.
+- [x] **F-07 (Migration Cancellation & Advisory Locking)**: Verified transaction-level advisory locks in parallel test runs.
+- [x] **Release Evidence**: Built release binaries (`spine-api.exe`, `spine.exe`, `spine-coordinator.exe`, `spine-storage-node.exe`) under `target/release-candidate/` with SHA-256 checksums in `SHA256SUMS`.

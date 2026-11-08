@@ -1,7 +1,7 @@
 # Production Container Image for Spine Forge Control Plane & Storage Node
 # Multi-stage build with zero build tools in final unprivileged runtime
 
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.88-bookworm AS builder
 
 WORKDIR /usr/src/spine
 

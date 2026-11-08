@@ -54,12 +54,13 @@ services:
       - spine-internal
     environment:
       POSTGRES_DB: "${POSTGRES_DB:-spine_forge}"
-      POSTGRES_USER: "${POSTGRES_USER:-spine_app}"
+      POSTGRES_USER: "${POSTGRES_ADMIN_USER:-spine_admin}"
       POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD_required}"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init-roles.sql:/docker-entrypoint-initdb.d/01-init-roles.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-spine_app} -d ${POSTGRES_DB:-spine_forge}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_ADMIN_USER:-spine_admin} -d ${POSTGRES_DB:-spine_forge}"]
       interval: 5s
       timeout: 5s
       retries: 5

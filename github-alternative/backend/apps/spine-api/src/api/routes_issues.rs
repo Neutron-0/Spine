@@ -151,6 +151,7 @@ pub async fn create_issue(
     Path((owner, repo_name)): Path<(String, String)>,
     Json(payload): Json<CreateIssueRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| {
         ForgeError::Unauthorized("Authentication required to create issue".into())
     })?;
@@ -297,6 +298,7 @@ pub async fn update_issue(
     Path((owner, repo_name, number)): Path<(String, String, i64)>,
     Json(payload): Json<UpdateIssueRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo = state
         .repositories
@@ -395,6 +397,7 @@ pub async fn create_issue_comment(
     Path((owner, repo_name, number)): Path<(String, String, i64)>,
     Json(payload): Json<CreateCommentRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo = state
         .repositories
@@ -468,6 +471,7 @@ pub async fn create_label(
     Path((owner, repo_name)): Path<(String, String)>,
     Json(payload): Json<CreateLabelRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo = state
         .repositories
@@ -497,6 +501,7 @@ pub async fn delete_label(
     user: Option<Extension<User>>,
     Path((owner, repo_name, label_id)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo = state
         .repositories
@@ -534,6 +539,7 @@ pub async fn create_milestone(
     Path((owner, repo_name)): Path<(String, String)>,
     Json(payload): Json<CreateMilestoneRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo = state
         .repositories
@@ -567,6 +573,7 @@ pub async fn update_milestone(
     Path((owner, repo_name, milestone_id)): Path<(String, String, String)>,
     Json(payload): Json<UpdateMilestoneRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo = state
         .repositories
@@ -614,6 +621,7 @@ pub async fn delete_milestone(
     user: Option<Extension<User>>,
     Path((owner, repo_name, milestone_id)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo = state
         .repositories

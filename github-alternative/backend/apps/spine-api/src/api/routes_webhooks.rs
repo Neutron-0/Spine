@@ -29,6 +29,7 @@ pub async fn create_repo_webhook(
     Path((owner, repo_name)): Path<(String, String)>,
     Json(payload): Json<CreateWebhookPayload>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo = state
         .repositories
@@ -162,6 +163,7 @@ pub async fn delete_webhook(
     user: Option<Extension<User>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let _caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     state
         .webhooks
@@ -193,6 +195,7 @@ pub async fn create_org_webhook(
     Path(org_name): Path<String>,
     Json(payload): Json<CreateWebhookPayload>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let org = state
         .db

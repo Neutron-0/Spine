@@ -1,67 +1,118 @@
 mod common;
 
-use common::{
-    ensure_disposable_marker, require_safe_test_db_url, verify_disposable_database,
-    DISPOSABLE_MARKER_TABLE,
-};
+use common::{require_safe_test_db_url, HarnessDisposableDb};
 use sqlx::PgPool;
 
 #[tokio::test]
 async fn test_disposable_database_safety_contract() {
-    let url = require_safe_test_db_url();
-    let pool = PgPool::connect(&url).await.expect("connect to db");
-
-    // 1. Test: Without environment opt-in flag, verification MUST fail
+    // 1. Without SPINE_ALLOW_DESTRUCTIVE_TESTS=1, provisioning MUST fail closed
     std::env::remove_var("SPINE_ALLOW_DESTRUCTIVE_TESTS");
-    let verify_no_env = verify_disposable_database(&pool).await;
+    let prov_no_env = HarnessDisposableDb::provision().await;
     assert!(
-        verify_no_env.is_err(),
-        "Verification must fail when SPINE_ALLOW_DESTRUCTIVE_TESTS is unset"
+        prov_no_env.is_err(),
+        "Provisioning must fail when SPINE_ALLOW_DESTRUCTIVE_TESTS is unset"
     );
-    let err_no_env = verify_no_env.unwrap_err();
+    let err_msg = prov_no_env.err().unwrap();
     assert!(
-        err_no_env.contains("SPINE_ALLOW_DESTRUCTIVE_TESTS=1"),
-        "Error message must mention missing env flag: {}",
-        err_no_env
+        err_msg.contains("SPINE_ALLOW_DESTRUCTIVE_TESTS=1"),
+        "Error message must specify missing opt-in flag: {}",
+        err_msg
     );
 
-    // 2. Enable opt-in flag, but drop marker table: verification MUST fail
+    // 2. Enable opt-in flag for testing
     std::env::set_var("SPINE_ALLOW_DESTRUCTIVE_TESTS", "1");
-    let drop_marker_sql = format!(
-        "DROP TABLE IF EXISTS \"{}\" CASCADE",
-        DISPOSABLE_MARKER_TABLE
+
+    // 3. Prove: A pre-existing database called `spine_forge_test` is REJECTED
+    let preexisting_url = require_safe_test_db_url();
+    let preexisting_res = HarnessDisposableDb::verify_preexisting_rejected(&preexisting_url).await;
+    assert!(
+        preexisting_res.is_err(),
+        "Pre-existing database must be rejected: {:?}",
+        preexisting_res
     );
-    sqlx::query(&drop_marker_sql)
-        .execute(&pool)
+    let pre_err = preexisting_res.unwrap_err();
+    assert!(
+        pre_err.contains("SAFETY ABORT:") && pre_err.contains("Missing harness creation proof"),
+        "Error must specify missing proof: {}",
+        pre_err
+    );
+
+    // 4. Prove: Failed provisioning operation never proceeds to destructive SQL
+    std::env::set_var(
+        "SPINE_TEST_DATABASE_URL",
+        "postgres://invalid_user:invalid_pass@127.0.0.1:1/invalid_db",
+    );
+    let failed_prov = HarnessDisposableDb::provision().await;
+    assert!(failed_prov.is_err(), "Failed provisioning must fail closed");
+
+    // Restore valid URL
+    std::env::set_var("SPINE_TEST_DATABASE_URL", &preexisting_url);
+
+    // 5. Prove: Successful unique provisioning by current harness
+    let disposable = HarnessDisposableDb::provision()
         .await
-        .expect("drop marker table");
+        .expect("provision disposable database");
+    assert!(disposable.db_name.starts_with("spine_disp_"));
 
-    let verify_no_marker = verify_disposable_database(&pool).await;
+    // 6. Prove: Verification succeeds for this harness-created database
+    let verify_self = disposable
+        .verify_can_destructively_modify(&disposable.pool)
+        .await;
     assert!(
-        verify_no_marker.is_err(),
-        "Verification must fail when marker table is absent, even if database name contains test"
-    );
-    let err_no_marker = verify_no_marker.unwrap_err();
-    assert!(
-        err_no_marker.contains("SAFETY ABORT:"),
-        "Error must specify SAFETY ABORT: {}",
-        err_no_marker
-    );
-    assert!(
-        err_no_marker.contains(DISPOSABLE_MARKER_TABLE),
-        "Error must mention marker table name: {}",
-        err_no_marker
+        verify_self.is_ok(),
+        "Verification must succeed on its own created database: {:?}",
+        verify_self.err()
     );
 
-    // 3. Now provision explicit disposable marker: verification MUST succeed
-    ensure_disposable_marker(&pool)
+    // 7. Prove: Existing public tables cannot be dropped in an unverified database
+    let unverified_pool = PgPool::connect(&preexisting_url)
         .await
-        .expect("ensure disposable marker");
-
-    let verify_success = verify_disposable_database(&pool).await;
+        .expect("connect preexisting");
+    let verify_foreign = disposable
+        .verify_can_destructively_modify(&unverified_pool)
+        .await;
     assert!(
-        verify_success.is_ok(),
-        "Verification must succeed when marker table and confirmation record are present: {:?}",
-        verify_success.err()
+        verify_foreign.is_err(),
+        "Verification MUST fail on an unverified or preexisting database"
+    );
+
+    // 8. Prove: Cleanup only drops the uniquely created database, leaving preexisting intact
+    let created_db_name = disposable.db_name.clone();
+    disposable.cleanup().await.expect("cleanup disposable db");
+
+    // Verify created DB is dropped
+    let mut admin_url = url::Url::parse(&preexisting_url).unwrap();
+    admin_url.set_path("postgres");
+    let admin_pool = PgPool::connect(admin_url.as_str())
+        .await
+        .expect("connect admin");
+    let db_exists: (bool,) =
+        sqlx::query_as("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)")
+            .bind(&created_db_name)
+            .fetch_one(&admin_pool)
+            .await
+            .expect("check db dropped");
+    assert!(
+        !db_exists.0,
+        "Disposable database must be dropped on cleanup"
+    );
+
+    // Verify preexisting DB still exists!
+    let preexisting_name = url::Url::parse(&preexisting_url)
+        .unwrap()
+        .path_segments()
+        .unwrap()
+        .next()
+        .unwrap()
+        .to_string();
+    let pre_exists: (bool,) =
+        sqlx::query_as("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)")
+            .bind(&preexisting_name)
+            .fetch_one(&admin_pool)
+            .await
+            .expect("check preexisting exists");
+    assert!(
+        pre_exists.0,
+        "Pre-existing database must remain completely untouched"
     );
 }

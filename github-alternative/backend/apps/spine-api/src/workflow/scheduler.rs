@@ -14,6 +14,7 @@ pub struct WorkflowScheduler {
     db: Arc<dyn Database>,
     webhook_service: Option<WebhookService>,
     pub profile: DeploymentProfile,
+    consistency_barrier: Option<Arc<crate::backup::ConsistencyBarrier>>,
 }
 
 impl WorkflowScheduler {
@@ -22,6 +23,7 @@ impl WorkflowScheduler {
             db,
             webhook_service,
             profile: DeploymentProfile::CoreForge,
+            consistency_barrier: None,
         }
     }
 
@@ -30,9 +32,26 @@ impl WorkflowScheduler {
         self
     }
 
+    pub fn with_barrier(mut self, barrier: Arc<crate::backup::ConsistencyBarrier>) -> Self {
+        self.consistency_barrier = Some(barrier);
+        self
+    }
+
     /// Advance active workflow runs, resolve job dependencies, detect timed out leases,
     /// and finalize completed runs.
     pub async fn tick(&self, repo_id: &str) -> Result<(), ForgeError> {
+        let _permit = if let Some(barrier) = &self.consistency_barrier {
+            match barrier.acquire_write_permit().await {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::warn!("WorkflowScheduler paused during cluster maintenance: {}", e);
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
+
         let now_nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let runs = self.db.list_workflow_runs(repo_id, 100).await?;
 

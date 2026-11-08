@@ -12,6 +12,7 @@ pub struct ProvisioningWorker {
     coordinator: Option<CoordinatorClient>,
     storage_root: PathBuf,
     running: Arc<AtomicBool>,
+    consistency_barrier: Option<Arc<crate::backup::ConsistencyBarrier>>,
 }
 
 impl ProvisioningWorker {
@@ -25,7 +26,13 @@ impl ProvisioningWorker {
             coordinator,
             storage_root: storage_root.as_ref().to_path_buf(),
             running: Arc::new(AtomicBool::new(true)),
+            consistency_barrier: None,
         }
+    }
+
+    pub fn with_barrier(mut self, barrier: Arc<crate::backup::ConsistencyBarrier>) -> Self {
+        self.consistency_barrier = Some(barrier);
+        self
     }
 
     pub fn shutdown(&self) {
@@ -34,6 +41,21 @@ impl ProvisioningWorker {
 
     /// Process a single pending provisioning job (useful for deterministic tests).
     pub async fn process_next_job(&self) -> anyhow::Result<bool> {
+        let _permit = if let Some(barrier) = &self.consistency_barrier {
+            match barrier.acquire_write_permit().await {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::warn!(
+                        "ProvisioningWorker write permit unavailable during maintenance: {}",
+                        e
+                    );
+                    return Ok(false);
+                }
+            }
+        } else {
+            None
+        };
+
         let job = match self.db.get_next_pending_job().await? {
             Some(j) => j,
             None => return Ok(false),

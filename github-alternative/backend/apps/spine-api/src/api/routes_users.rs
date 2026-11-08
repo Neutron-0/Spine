@@ -51,6 +51,7 @@ pub async fn revoke_session(
     Extension(user): Extension<User>,
     Path(session_id): Path<String>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let sessions = state.db.list_user_sessions(&user.id).await?;
     if !sessions.iter().any(|s| s.id == session_id) {
         return Err(ForgeError::NotFound("Session not found".into()));
@@ -85,6 +86,7 @@ pub async fn create_pat(
     Extension(user): Extension<User>,
     Json(payload): Json<CreatePatRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let name = payload.name.trim();
     if name.is_empty() || name.len() > 100 {
         return Err(ForgeError::BadRequest(
@@ -138,6 +140,7 @@ pub async fn revoke_pat(
     Extension(user): Extension<User>,
     Path(pat_id): Path<String>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     state.db.revoke_pat(&pat_id, &user.id).await?;
     Ok((StatusCode::NO_CONTENT, ()))
 }
@@ -160,6 +163,7 @@ pub async fn create_ssh_key(
     Extension(user): Extension<User>,
     Json(payload): Json<CreateSshKeyRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let title = payload.title.trim();
     if title.is_empty() || title.len() > 100 {
         return Err(ForgeError::BadRequest(
@@ -200,6 +204,7 @@ pub async fn delete_ssh_key(
     Extension(user): Extension<User>,
     Path(key_id): Path<String>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     state.db.revoke_user_ssh_key(&key_id, &user.id).await?;
     Ok((StatusCode::NO_CONTENT, ()))
 }

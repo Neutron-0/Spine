@@ -213,6 +213,16 @@ pub async fn issue_capability_ticket(
         .unwrap_or_else(|| "read".to_string());
     let op_lower = op.to_lowercase();
 
+    let _permit = if op_lower == "write"
+        || op_lower == "push"
+        || op_lower == "admin"
+        || op_lower == "owner"
+    {
+        Some(state.consistency_barrier.acquire_write_permit().await?)
+    } else {
+        None
+    };
+
     let role = if op_lower == "write" || op_lower == "push" {
         let perm_role = state
             .permissions

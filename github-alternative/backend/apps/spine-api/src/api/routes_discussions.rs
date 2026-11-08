@@ -80,6 +80,7 @@ pub async fn create_category(
     Path((owner, repo_name)): Path<(String, String)>,
     Json(payload): Json<CreateCategoryRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let Extension(user) =
         user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
@@ -119,6 +120,7 @@ pub async fn create_discussion(
     Path((owner, repo_name)): Path<(String, String)>,
     Json(payload): Json<CreateDiscussionRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let Extension(user) =
         user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
@@ -155,6 +157,7 @@ pub async fn update_discussion(
     Path((owner, repo_name, number)): Path<(String, String, i32)>,
     Json(payload): Json<UpdateDiscussionRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let Extension(user) =
         user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
@@ -194,6 +197,7 @@ pub async fn create_comment(
     Path((owner, repo_name, number)): Path<(String, String, i32)>,
     Json(payload): Json<CreateCommentRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let Extension(user) =
         user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
@@ -215,6 +219,7 @@ pub async fn mark_answer(
     user: Option<Extension<User>>,
     Path((owner, repo_name, number, comment_id)): Path<(String, String, i32, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let Extension(user) =
         user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
@@ -231,6 +236,7 @@ pub async fn toggle_comment_reaction(
     Path((_owner, _repo_name, _number, comment_id)): Path<(String, String, i32, String)>,
     Json(payload): Json<ReactionRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let Extension(user) =
         user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let added = state

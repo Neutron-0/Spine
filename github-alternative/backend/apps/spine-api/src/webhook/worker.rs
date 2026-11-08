@@ -16,6 +16,7 @@ pub struct WebhookOutboxWorker {
     db: Arc<dyn Database>,
     ssrf: SsrfValidator,
     timeout_duration: std::time::Duration,
+    consistency_barrier: Option<Arc<crate::backup::ConsistencyBarrier>>,
 }
 
 impl WebhookOutboxWorker {
@@ -24,11 +25,32 @@ impl WebhookOutboxWorker {
             db,
             ssrf,
             timeout_duration: std::time::Duration::from_secs(10),
+            consistency_barrier: None,
         }
+    }
+
+    pub fn with_barrier(mut self, barrier: Arc<crate::backup::ConsistencyBarrier>) -> Self {
+        self.consistency_barrier = Some(barrier);
+        self
     }
 
     /// Process a batch of scheduled outbox webhook events.
     pub async fn process_batch(&self, limit: i64) -> Result<usize, ForgeError> {
+        let _permit = if let Some(barrier) = &self.consistency_barrier {
+            match barrier.acquire_write_permit().await {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::warn!(
+                        "WebhookOutboxWorker paused during cluster maintenance: {}",
+                        e
+                    );
+                    return Ok(0);
+                }
+            }
+        } else {
+            None
+        };
+
         let now_nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let pending = self
             .db

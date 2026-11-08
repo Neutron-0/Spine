@@ -1,9 +1,6 @@
 mod common;
 
-use common::{
-    ensure_disposable_marker, require_safe_test_db_url, verify_disposable_database,
-    DISPOSABLE_MARKER_TABLE,
-};
+use common::HarnessDisposableDb;
 use spine_api::{
     backup::BackupManager,
     db::{dump_database, is_database_empty, restore_database},
@@ -11,15 +8,17 @@ use spine_api::{
 
 #[tokio::test]
 async fn test_postgres_dump_and_empty_check() {
-    let url = require_safe_test_db_url();
-    let pool = sqlx::PgPool::connect(&url)
+    let disp_db = match HarnessDisposableDb::provision_migrated().await {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("Skipping test_postgres_dump_and_empty_check: {}", e);
+            return;
+        }
+    };
+    let pool = disp_db
+        .migrator_pool()
         .await
-        .expect("connect to test database");
-
-    // Ensure baseline schema is present in test database
-    spine_api::db::migrations::run_migrations(&pool)
-        .await
-        .expect("run_migrations on test database failed");
+        .expect("connect migrator pool");
 
     // 1. Dump database snapshot
     let snapshot_json = dump_database(&pool).await.expect("dump_database failed");
@@ -56,10 +55,20 @@ async fn test_postgres_dump_and_empty_check() {
 
 #[tokio::test]
 async fn test_full_archive_backup_restore_roundtrip_with_db_snapshot() {
-    let url = require_safe_test_db_url();
-    let pool = sqlx::PgPool::connect(&url)
+    let disp_db = match HarnessDisposableDb::provision_migrated().await {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!(
+                "Skipping test_full_archive_backup_restore_roundtrip_with_db_snapshot: {}",
+                e
+            );
+            return;
+        }
+    };
+    let pool = disp_db
+        .migrator_pool()
         .await
-        .expect("connect to test database");
+        .expect("connect migrator pool");
 
     let temp_dir = tempfile::tempdir().unwrap();
     let storage_root = temp_dir.path().join("storage_node");
@@ -131,15 +140,20 @@ async fn test_full_archive_backup_restore_roundtrip_with_db_snapshot() {
 
 #[tokio::test]
 async fn test_postgres_jsonb_numeric_precision_roundtrip() {
-    let url = require_safe_test_db_url();
-    let pool = sqlx::PgPool::connect(&url)
+    let src_disp_db = match HarnessDisposableDb::provision_migrated().await {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!(
+                "Skipping test_postgres_jsonb_numeric_precision_roundtrip: {}",
+                e
+            );
+            return;
+        }
+    };
+    let pool = src_disp_db
+        .migrator_pool()
         .await
-        .expect("connect to test database");
-
-    // Run migrations
-    spine_api::db::migrations::run_migrations(&pool)
-        .await
-        .expect("run_migrations on test database failed");
+        .expect("connect source pool");
 
     // Insert user and profile with huge arbitrary numeric precision inside JSONB
     let uid = format!("usr_prec_{}", uuid::Uuid::new_v4().simple());
@@ -191,36 +205,22 @@ async fn test_postgres_jsonb_numeric_precision_roundtrip() {
         exact_token
     );
 
-    // Now clean the database to simulate empty target, verifying explicit disposable marker first
-    ensure_disposable_marker(&pool)
+    // Target empty disposable database for restore
+    let target_disp_db = HarnessDisposableDb::provision_empty()
         .await
-        .expect("ensure disposable marker");
-    verify_disposable_database(&pool)
+        .expect("provision empty target db");
+    let target_pool = target_disp_db
+        .migrator_pool()
         .await
-        .expect("verify disposable database before destructive table drop");
+        .expect("connect target pool");
 
-    let tables: Vec<(String,)> = sqlx::query_as(
-        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name != $1"
-    )
-    .bind(DISPOSABLE_MARKER_TABLE)
-    .fetch_all(&pool)
-    .await
-    .expect("fetch tables");
-
-    for (tbl,) in tables {
-        sqlx::query(&format!("DROP TABLE IF EXISTS \"{}\" CASCADE", tbl))
-            .execute(&pool)
-            .await
-            .expect("drop table");
-    }
-
-    // Verify empty
-    let empty = is_database_empty(&pool).await.expect("check empty");
+    // Verify empty prior to restore
+    let empty = is_database_empty(&target_pool).await.expect("check empty");
     assert!(empty, "Database must be empty prior to restore");
 
     // Restore from streaming reader
     let mut reader = std::io::BufReader::new(std::io::Cursor::new(dump_buf));
-    let restore_report = spine_api::restore_database_from_reader(&pool, &mut reader)
+    let restore_report = spine_api::restore_database_from_reader(&target_pool, &mut reader)
         .await
         .expect("restore_database_from_reader failed");
 
@@ -231,7 +231,7 @@ async fn test_postgres_jsonb_numeric_precision_roundtrip() {
     let row: (String,) =
         sqlx::query_as("SELECT (pinned_repo_ids->>0)::text FROM user_profiles WHERE user_id = $1")
             .bind(&uid)
-            .fetch_one(&pool)
+            .fetch_one(&target_pool)
             .await
             .expect("query restored profile");
 
@@ -243,8 +243,18 @@ async fn test_postgres_jsonb_numeric_precision_roundtrip() {
 
 #[tokio::test]
 async fn test_spine_app_least_privilege_schema_create_rejected() {
-    let app_url = common::get_app_role_test_db_url();
-    let pool = sqlx::PgPool::connect(&app_url)
+    let disp_db = match HarnessDisposableDb::provision_migrated().await {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!(
+                "Skipping test_spine_app_least_privilege_schema_create_rejected: {}",
+                e
+            );
+            return;
+        }
+    };
+    let pool = disp_db
+        .app_pool()
         .await
         .expect("connect to test database as spine_app");
 

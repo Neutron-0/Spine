@@ -38,10 +38,6 @@ struct Cli {
     #[arg(long, default_value_t = 2222)]
     ssh_port: u16,
 
-    /// PostgreSQL Database URL (e.g. postgres://spine:spine@127.0.0.1:5432/spine_forge)
-    #[arg(long)]
-    database_url: Option<String>,
-
     /// Path to file containing PostgreSQL Database URL
     #[arg(long)]
     database_url_file: Option<PathBuf>,
@@ -74,10 +70,6 @@ enum Commands {
 
     /// Run pending database migrations against PostgreSQL
     Migrate {
-        /// PostgreSQL Database URL
-        #[arg(long)]
-        database_url: Option<String>,
-
         /// Path to file containing PostgreSQL Database URL
         #[arg(long)]
         database_url_file: Option<PathBuf>,
@@ -97,9 +89,9 @@ enum Commands {
         #[arg(short, long)]
         email: String,
 
-        /// PostgreSQL Database URL
+        /// Path to file containing PostgreSQL Database URL
         #[arg(long)]
-        database_url: Option<String>,
+        database_url_file: Option<PathBuf>,
 
         /// Deployment profile
         #[arg(long)]
@@ -129,10 +121,6 @@ enum BackupCommands {
         #[arg(long, default_value = "./.spine-dev-cluster/node-1")]
         storage_root: PathBuf,
 
-        /// Optional PostgreSQL Database URL
-        #[arg(long)]
-        database_url: Option<String>,
-
         /// Path to file containing PostgreSQL Database URL
         #[arg(long)]
         database_url_file: Option<PathBuf>,
@@ -159,10 +147,6 @@ enum BackupCommands {
         /// Target storage root directory to restore into
         #[arg(long, default_value = "./.spine-dev-cluster/node-1")]
         target_storage: PathBuf,
-
-        /// Target PostgreSQL Database URL for database restoration
-        #[arg(long)]
-        target_database_url: Option<String>,
 
         /// Path to file containing target PostgreSQL Database URL
         #[arg(long)]
@@ -294,12 +278,11 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Commands::Migrate {
-            database_url,
             database_url_file,
             migration_database_url_file,
         }) => {
             let db_url = read_secret(
-                database_url,
+                None,
                 migration_database_url_file
                     .as_deref()
                     .or(database_url_file.as_deref()),
@@ -332,7 +315,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::BootstrapAdmin {
             username,
             email,
-            database_url,
+            database_url_file,
             profile,
             in_memory_db,
         }) => {
@@ -342,7 +325,11 @@ async fn main() -> anyhow::Result<()> {
             let prof = spine_api::DeploymentProfile::from_str_relaxed(&raw_prof)
                 .map_err(|e| anyhow::anyhow!(e))?;
 
-            let db_url = database_url.or_else(|| std::env::var("DATABASE_URL").ok());
+            let db_url = read_secret(
+                None,
+                database_url_file.as_deref(),
+                &["DATABASE_URL", "SPINE_DATABASE_URL"],
+            )?;
             let db: Arc<dyn Database> = if prof.requires_persistent_database() {
                 if in_memory_db {
                     anyhow::bail!(
@@ -454,7 +441,6 @@ async fn main() -> anyhow::Result<()> {
             BackupCommands::Create {
                 output,
                 storage_root,
-                database_url,
                 database_url_file,
                 passphrase_file,
                 key_version,
@@ -462,7 +448,7 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 let prof = parse_cli_profile(profile.as_deref())?;
                 let db_url = read_secret(
-                    database_url,
+                    None,
                     database_url_file.as_deref(),
                     &["DATABASE_URL", "SPINE_DATABASE_URL"],
                 )?;
@@ -547,12 +533,15 @@ async fn main() -> anyhow::Result<()> {
                 println!("  Total files:   {}", manifest.total_files);
                 println!("  Total bytes:   {}", manifest.total_bytes);
                 println!("  Status:        {}", manifest.integrity_status);
+
+                if let Some(guard) = _maintenance_guard {
+                    let _ = guard.release().await;
+                }
                 Ok(())
             }
             BackupCommands::Restore {
                 input,
                 target_storage,
-                target_database_url,
                 target_database_url_file,
                 passphrase_file,
                 profile,
@@ -569,7 +558,7 @@ async fn main() -> anyhow::Result<()> {
                     &["SPINE_BACKUP_PASSPHRASE", "BACKUP_PASSPHRASE"],
                 )?;
                 let target_db = read_secret(
-                    target_database_url,
+                    None,
                     target_database_url_file.as_deref(),
                     &["TARGET_DATABASE_URL", "DATABASE_URL"],
                 )?;
@@ -621,58 +610,63 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 println!(
-                    "Restoring backup archive from {} into {}",
+                    "Staging backup archive from {} into isolated staging directory for {}...",
                     input.display(),
                     target_storage.display()
                 );
-                let (manifest, report, db_snapshot_path) = if let Some(pass_str) = pass {
-                    println!(
-                        "Decrypting with AEAD passphrase and verifying chunk integrity tags..."
-                    );
-                    spine_api::backup::BackupManager::restore_encrypted_backup_staged(
-                        &input,
-                        &target_storage,
-                        &pass_str,
-                    )?
-                } else {
-                    spine_api::backup::BackupManager::restore_backup_staged(
-                        &input,
-                        &target_storage,
-                    )?
-                };
-                println!("Storage restoration completed:");
-                println!("  Backup ID:     {}", manifest.backup_id);
-                println!("  Files restored:{}", report.files_restored);
-                println!("  Bytes restored:{}", report.bytes_restored);
+                let session = spine_api::backup::BackupManager::prepare_restore_session(
+                    &input,
+                    &target_storage,
+                    pass.as_deref(),
+                )?;
 
-                if let Some(ref snap_path) = db_snapshot_path {
-                    if let Some(pool) = target_db_pool {
+                println!("Archive staged and all checksums verified against manifest.");
+
+                // If backup contains a database snapshot, restore database BEFORE publishing storage
+                if let Some(ref snap_path) = session.db_snapshot_path {
+                    if let Some(ref pool) = target_db_pool {
                         println!("Restoring streaming database snapshot into target database...");
                         let file = std::fs::File::open(snap_path).map_err(|e| {
                             anyhow::anyhow!("Failed to open extracted database snapshot: {}", e)
                         })?;
                         let mut reader = std::io::BufReader::new(file);
-                        let db_report = spine_api::restore_database_from_reader(&pool, &mut reader)
-                            .await
-                            .map_err(|e| {
-                                anyhow::anyhow!("Failed to restore database snapshot: {}", e)
-                            })?;
+                        let db_report = match spine_api::restore_database_from_reader(
+                            pool,
+                            &mut reader,
+                        )
+                        .await
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
+                                let _ = session.abort(&format!("Database restore failed: {}", e));
+                                anyhow::bail!("Failed to restore database snapshot: {}. Target repository storage was left untouched.", e);
+                            }
+                        };
                         println!("Database restore completed successfully:");
                         println!("  Tables restored: {}", db_report.tables_restored);
                         println!("  Rows restored:   {}", db_report.rows_restored);
                         println!("  Duration:        {} ms", db_report.duration_ms);
-                        let _ = std::fs::remove_file(snap_path);
                     } else if prof.requires_persistent_database() {
-                        let _ = std::fs::remove_file(snap_path);
+                        let _ = session.abort("Target database required under current profile");
                         anyhow::bail!(
-                            "Under deployment profile '{}', a target PostgreSQL database URL is required for restoring backups containing database snapshots (--target-database-url, --target-database-url-file, or TARGET_DATABASE_URL).",
+                            "Under deployment profile '{}', a target PostgreSQL database URL is required for restoring backups containing database snapshots (--target-database-url-file, or TARGET_DATABASE_URL).",
                             prof
                         );
                     } else {
-                        let _ = std::fs::remove_file(snap_path);
-                        println!("WARNING: Backup archive contains a database snapshot, but no --target-database-url was specified. Database was not restored.");
+                        println!("WARNING: Backup archive contains a database snapshot, but no target database URL was specified. Database was not restored.");
                     }
                 }
+
+                println!("Atomically publishing verified repository storage to live root...");
+                let manifest = session.manifest.clone();
+                let report = session.publish_storage().map_err(|e| {
+                    anyhow::anyhow!("Failed to publish verified storage to live root: {}", e)
+                })?;
+
+                println!("Restoration sequence completed successfully:");
+                println!("  Backup ID:     {}", manifest.backup_id);
+                println!("  Files restored:{}", report.files_restored);
+                println!("  Bytes restored:{}", report.bytes_restored);
                 println!(
                     "  Integrity:     {}",
                     if report.integrity_verified {
@@ -742,7 +736,7 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
         .init();
 
     let database_url = read_secret(
-        args.database_url,
+        None,
         args.database_url_file.as_deref(),
         &["DATABASE_URL", "SPINE_DATABASE_URL"],
     )?;
@@ -883,6 +877,14 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
     let storage_root_canonical = std::fs::canonicalize(&args.storage_root)?;
     tracing::info!("Storage root: {}", storage_root_canonical.display());
 
+    // 3.1 Restore state machine crash recovery
+    if let Some(msg) =
+        spine_api::backup::RestoreJournal::handle_startup_recovery(&storage_root_canonical)
+            .map_err(|e| anyhow::anyhow!("Failed restore crash recovery check: {}", e))?
+    {
+        tracing::warn!("Restore state machine recovery: {}", msg);
+    }
+
     let permissions = Arc::new(PermissionService::new(Arc::clone(&db)));
     let repositories = Arc::new(RepositoryService::new(
         Arc::clone(&db),
@@ -902,10 +904,20 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
     let cargo = Arc::new(CargoRegistryAdapter::new(Arc::clone(&packages)));
 
     let ssrf = SsrfValidator::new(false);
+    let consistency_barrier = Arc::new(match pg_pool {
+        Some(pool) => spine_api::backup::ConsistencyBarrier::with_pool(pool),
+        None => spine_api::backup::ConsistencyBarrier::new(),
+    });
+
     let webhooks = Arc::new(WebhookService::new(Arc::clone(&db), ssrf.clone()));
-    let webhook_worker = Arc::new(WebhookOutboxWorker::new(Arc::clone(&db), ssrf));
+    let webhook_worker = Arc::new(
+        WebhookOutboxWorker::new(Arc::clone(&db), ssrf)
+            .with_barrier(Arc::clone(&consistency_barrier)),
+    );
     let scheduler = Arc::new(
-        WorkflowScheduler::new(Arc::clone(&db), Some((*webhooks).clone())).with_profile(profile),
+        WorkflowScheduler::new(Arc::clone(&db), Some((*webhooks).clone()))
+            .with_profile(profile)
+            .with_barrier(Arc::clone(&consistency_barrier)),
     );
     let workflows = Arc::new(
         WorkflowService::new(Arc::clone(&db), Some((*webhooks).clone())).with_profile(profile),
@@ -948,11 +960,6 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
 
     validate_public_origin(&public_origin, profile)?;
 
-    let consistency_barrier = Arc::new(match pg_pool {
-        Some(pool) => spine_api::backup::ConsistencyBarrier::with_pool(pool),
-        None => spine_api::backup::ConsistencyBarrier::new(),
-    });
-
     let state = AppState {
         profile,
         db: Arc::clone(&db),
@@ -977,15 +984,14 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
         discovery,
         security,
         public_origin,
-        consistency_barrier,
+        consistency_barrier: Arc::clone(&consistency_barrier),
     };
 
     // 4. Spawn background provisioning worker
-    let worker = Arc::new(ProvisioningWorker::new(
-        Arc::clone(&db),
-        coordinator,
-        &storage_root_canonical,
-    ));
+    let worker = Arc::new(
+        ProvisioningWorker::new(Arc::clone(&db), coordinator, &storage_root_canonical)
+            .with_barrier(Arc::clone(&consistency_barrier)),
+    );
     let worker_clone = Arc::clone(&worker);
     let worker_handle = tokio::spawn(async move {
         tracing::info!("Starting background repository provisioning worker");

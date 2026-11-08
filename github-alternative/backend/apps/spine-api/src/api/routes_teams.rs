@@ -53,6 +53,7 @@ pub async fn create_team(
     Path(org_name): Path<String>,
     Json(payload): Json<CreateTeamRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let org = state
         .db
@@ -126,6 +127,7 @@ pub async fn delete_team(
     user: Option<Extension<User>>,
     Path((org_name, team_slug)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let org = state
         .db
@@ -188,6 +190,7 @@ pub async fn add_team_member(
     Path((org_name, team_slug)): Path<(String, String)>,
     Json(payload): Json<AddTeamMemberRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let org = state
         .db
@@ -227,6 +230,7 @@ pub async fn remove_team_member(
     user: Option<Extension<User>>,
     Path((org_name, team_slug, user_id)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let org = state
         .db
@@ -252,6 +256,7 @@ pub async fn set_team_repository_permission(
     Path((org_name, team_slug, repo_name)): Path<(String, String, String)>,
     Json(payload): Json<SetTeamRepoPermissionRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let org = state
         .db

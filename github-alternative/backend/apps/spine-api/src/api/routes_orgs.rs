@@ -62,6 +62,7 @@ pub async fn create_organization(
     user: Option<Extension<User>>,
     Json(payload): Json<CreateOrgRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let creator = user.ok_or_else(|| {
         ForgeError::Unauthorized("Authentication required to create organization".into())
     })?;
@@ -128,6 +129,7 @@ pub async fn update_organization(
     Path(org_name): Path<String>,
     Json(payload): Json<UpdateOrgRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let mut org = state
         .db
@@ -160,6 +162,7 @@ pub async fn delete_organization(
     user: Option<Extension<User>>,
     Path(org_name): Path<String>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let org = state
         .db
@@ -214,6 +217,7 @@ pub async fn add_or_update_member(
     Path(org_name): Path<String>,
     Json(payload): Json<AddMemberRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let org = state
         .db
@@ -267,6 +271,7 @@ pub async fn remove_member(
     user: Option<Extension<User>>,
     Path((org_name, user_id)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let org = state
         .db
@@ -314,6 +319,7 @@ pub async fn create_invitation(
     Path(org_name): Path<String>,
     Json(payload): Json<CreateInvitationRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let org = state
         .db
@@ -366,6 +372,7 @@ pub async fn accept_invitation(
     user: Option<Extension<User>>,
     Path(token): Path<String>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| {
         ForgeError::Unauthorized("Authentication required to accept invitation".into())
     })?;
@@ -442,6 +449,7 @@ pub async fn create_org_repository(
     Path(org_name): Path<String>,
     Json(payload): Json<CreateOrgRepoRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let org = state
         .db

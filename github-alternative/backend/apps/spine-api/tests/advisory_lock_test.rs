@@ -1,9 +1,6 @@
 mod common;
 
-use common::{
-    ensure_disposable_marker, require_safe_test_db_url, verify_disposable_database,
-    DISPOSABLE_MARKER_TABLE,
-};
+use common::HarnessDisposableDb;
 use spine_api::db::migrations::{
     run_migrations, run_migrations_with_pause, run_migrations_with_pause_after_step,
     SPINE_MIGRATION_ADVISORY_LOCK_ID,
@@ -14,24 +11,23 @@ use tokio::sync::Notify;
 
 #[tokio::test]
 async fn test_actual_run_migrations_cancellation_and_recovery() {
-    let url = require_safe_test_db_url();
+    if std::env::var("SPINE_TEST_DATABASE_URL").is_err() {
+        eprintln!("Skipping advisory lock test: SPINE_TEST_DATABASE_URL not set");
+        return;
+    }
+
+    let disp_db = HarnessDisposableDb::provision()
+        .await
+        .expect("provision disposable database");
+    let url = disp_db.migrator_url.clone();
 
     let pool = sqlx::PgPool::connect(&url)
         .await
         .expect("connect to test database");
 
-    ensure_disposable_marker(&pool)
-        .await
-        .expect("ensure disposable marker");
-    verify_disposable_database(&pool)
-        .await
-        .expect("verify disposable database before cleaning");
-
-    // Clean existing tables in the disposable test database (preserving disposable marker)
     let tables: Vec<(String,)> = sqlx::query_as(
-        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name != $1"
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name != '_harness_provision_proof'"
     )
-    .bind(DISPOSABLE_MARKER_TABLE)
     .fetch_all(&pool)
     .await
     .expect("fetch tables");
@@ -78,6 +74,7 @@ async fn test_actual_run_migrations_cancellation_and_recovery() {
         WHERE locktype = 'advisory' 
           AND classid = (($1::bigint >> 32) & 4294967295)::integer
           AND objid = ($1::bigint & 4294967295)::integer
+          AND (database = 0 OR database = (SELECT oid FROM pg_database WHERE datname = current_database()))
         "#,
     )
     .bind(SPINE_MIGRATION_ADVISORY_LOCK_ID)
@@ -127,6 +124,7 @@ async fn test_actual_run_migrations_cancellation_and_recovery() {
         WHERE locktype = 'advisory' 
           AND classid = (($1::bigint >> 32) & 4294967295)::integer
           AND objid = ($1::bigint & 4294967295)::integer
+          AND (database = 0 OR database = (SELECT oid FROM pg_database WHERE datname = current_database()))
         "#,
     )
     .bind(SPINE_MIGRATION_ADVISORY_LOCK_ID)
@@ -160,21 +158,29 @@ async fn test_actual_run_migrations_cancellation_and_recovery() {
     run_migrations(&pool_b)
         .await
         .expect("Subsequent migration run must be idempotent");
+
+    pool.close().await;
+    pool_b.close().await;
+    disp_db
+        .cleanup()
+        .await
+        .expect("cleanup disposable database");
 }
 
 #[tokio::test]
 async fn test_repeated_migration_cancellation_during_real_ddl_and_inserts() {
-    let url = require_safe_test_db_url();
+    if std::env::var("SPINE_TEST_DATABASE_URL").is_err() {
+        eprintln!("Skipping repeated advisory lock test: SPINE_TEST_DATABASE_URL not set");
+        return;
+    }
+
+    let disp_db = HarnessDisposableDb::provision()
+        .await
+        .expect("provision disposable database");
+    let url = disp_db.migrator_url.clone();
     let pool = sqlx::PgPool::connect(&url)
         .await
         .expect("connect to test db");
-
-    ensure_disposable_marker(&pool)
-        .await
-        .expect("ensure disposable marker");
-    verify_disposable_database(&pool)
-        .await
-        .expect("verify disposable database");
 
     // Repeat the transactional cancellation and recovery workflow 5 times
     for cycle in 1..=5 {
@@ -183,11 +189,10 @@ async fn test_repeated_migration_cancellation_during_real_ddl_and_inserts() {
             cycle
         );
 
-        // Clean existing tables (preserving disposable marker)
+        // Clean existing tables (preserving proof table)
         let tables: Vec<(String,)> = sqlx::query_as(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name != $1"
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name != '_harness_provision_proof'"
         )
-        .bind(DISPOSABLE_MARKER_TABLE)
         .fetch_all(&pool)
         .await
         .expect("fetch tables");
@@ -282,4 +287,10 @@ async fn test_repeated_migration_cancellation_during_real_ddl_and_inserts() {
             cycle
         );
     }
+
+    pool.close().await;
+    disp_db
+        .cleanup()
+        .await
+        .expect("cleanup disposable database");
 }

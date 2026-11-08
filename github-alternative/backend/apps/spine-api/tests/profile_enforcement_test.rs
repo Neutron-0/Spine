@@ -1,8 +1,8 @@
 use spine_api::{
     core::profile::DeploymentProfile,
-    core::types::WorkflowJob,
+    core::types::{TrustClassification, WorkflowJob},
     db::InMemoryDatabase,
-    runner::{IsolatedRunnerExecutor, RunnerService},
+    runner::{AuthoritativeTrustToken, IsolatedRunnerExecutor, RunnerService},
     workflow::{WorkflowScheduler, WorkflowService},
 };
 use std::sync::Arc;
@@ -132,13 +132,18 @@ async fn test_isolated_executor_fails_closed_on_untrusted_execution() {
         completed_at_nanos: None,
     };
 
+    let trust_token = AuthoritativeTrustToken::for_test(
+        &dummy_job.run_id,
+        &dummy_job.id,
+        TrustClassification::Untrusted,
+    );
     let (exit_code, step_results) = executor
-        .execute_job_with_trust(
+        .execute_job(
             &dummy_job,
             &[],
             &std::collections::HashMap::new(),
             &[],
-            true, // is_untrusted
+            &trust_token,
         )
         .await;
 

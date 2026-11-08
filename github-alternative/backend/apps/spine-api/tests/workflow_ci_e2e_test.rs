@@ -5,11 +5,11 @@ use tempfile::tempdir;
 use uuid::Uuid;
 
 use spine_api::core::types::{
-    BranchProtectionRule, ForgeRepository, PullRequest, TrustClassification, User, WorkflowSecret,
+    BranchProtectionRule, ForgeRepository, PullRequest, User, WorkflowSecret,
 };
 use spine_api::db::InMemoryDatabase;
 use spine_api::permissions::PermissionService;
-use spine_api::runner::{IsolatedRunnerExecutor, RunnerService};
+use spine_api::runner::{AuthoritativeTrustToken, IsolatedRunnerExecutor, RunnerService};
 use spine_api::webhook::{SsrfValidator, WebhookService};
 use spine_api::workflow::{WorkflowScheduler, WorkflowService};
 use spine_api::Database;
@@ -213,14 +213,11 @@ jobs:
     // Execute build job steps
     let mut step_scripts = HashMap::new();
     step_scripts.insert(0, "echo Compiling Spine...".to_string());
+    let trust_token1 = AuthoritativeTrustToken::from_database(db.as_ref(), &job1)
+        .await
+        .unwrap();
     let (exit1, results1) = executor
-        .execute_job(
-            &job1,
-            &steps1,
-            &step_scripts,
-            &secrets1,
-            TrustClassification::Trusted,
-        )
+        .execute_job(&job1, &steps1, &step_scripts, &secrets1, &trust_token1)
         .await;
     assert_eq!(exit1, 0);
 
@@ -267,14 +264,11 @@ jobs:
         0,
         "echo Testing Spine with secret %SPINE_API_SECRET%".to_string(),
     );
+    let trust_token2 = AuthoritativeTrustToken::from_database(db.as_ref(), &job2)
+        .await
+        .unwrap();
     let (exit2, results2) = executor
-        .execute_job(
-            &job2,
-            &steps2,
-            &step_scripts2,
-            &secrets2,
-            TrustClassification::Trusted,
-        )
+        .execute_job(&job2, &steps2, &step_scripts2, &secrets2, &trust_token2)
         .await;
     assert_eq!(exit2, 0);
 

@@ -6,6 +6,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use crate::core::error::ForgeError;
 use crate::core::types::{TrustClassification, WorkflowJob, WorkflowSecret, WorkflowStep};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +29,59 @@ pub struct StepExecutionResult {
 }
 
 use crate::core::profile::DeploymentProfile;
+
+/// Authoritative provenance trust token validating execution authority.
+/// Callers cannot manufacture trust arbitrarily; it must be resolved authoritatively from the database record.
+#[derive(Debug, Clone)]
+pub struct AuthoritativeTrustToken {
+    pub(crate) run_id: String,
+    pub(crate) job_id: String,
+    pub(crate) classification: TrustClassification,
+}
+
+impl AuthoritativeTrustToken {
+    /// Authoritatively load workflow run trust token directly from database.
+    /// Callers cannot spoof or assert trust; it is validated against the recorded workflow_run.
+    pub async fn from_database(
+        db: &dyn crate::db::Database,
+        job: &WorkflowJob,
+    ) -> Result<Self, ForgeError> {
+        let run = db.get_workflow_run(&job.run_id).await?.ok_or_else(|| {
+            ForgeError::NotFound(format!("Workflow run '{}' not found", job.run_id))
+        })?;
+
+        Ok(Self {
+            run_id: run.id,
+            job_id: job.id.clone(),
+            classification: run.trust_classification,
+        })
+    }
+
+    /// Factory method for test harnesses ONLY.
+    pub fn for_test(run_id: &str, job_id: &str, classification: TrustClassification) -> Self {
+        Self {
+            run_id: run_id.to_string(),
+            job_id: job_id.to_string(),
+            classification,
+        }
+    }
+
+    pub fn classification(&self) -> TrustClassification {
+        self.classification
+    }
+
+    pub fn is_untrusted(&self) -> bool {
+        self.classification == TrustClassification::Untrusted
+    }
+
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub fn job_id(&self) -> &str {
+        &self.job_id
+    }
+}
 
 pub struct IsolatedRunnerExecutor {
     workspace_root: PathBuf,
@@ -60,29 +114,31 @@ impl IsolatedRunnerExecutor {
         self.sandbox_mode
     }
 
-    /// Execute all steps in an isolated workspace with sanitized environment and explicit provenance trust level.
+    /// Execute all steps in an isolated workspace with sanitized environment and authoritative provenance verification.
     pub async fn execute_job(
         &self,
         job: &WorkflowJob,
         steps: &[WorkflowStep],
         step_scripts: &HashMap<i32, String>,
         secrets: &[WorkflowSecret],
-        trust: TrustClassification,
+        trust_token: &AuthoritativeTrustToken,
     ) -> (i32, Vec<StepExecutionResult>) {
-        let is_untrusted = trust == TrustClassification::Untrusted;
-        self.execute_job_with_trust(job, steps, step_scripts, secrets, is_untrusted)
-            .await
-    }
+        if trust_token.job_id() != job.id || trust_token.run_id() != job.run_id {
+            return (
+                1,
+                vec![StepExecutionResult {
+                    step_index: 0,
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: "SECURITY ERROR: Trust token does not match job/run identity"
+                        .to_string(),
+                    timed_out: false,
+                }],
+            );
+        }
 
-    /// Execute all steps with explicit trust level check. Untrusted workflows fail closed if unsandboxed.
-    pub async fn execute_job_with_trust(
-        &self,
-        job: &WorkflowJob,
-        steps: &[WorkflowStep],
-        step_scripts: &HashMap<i32, String>,
-        secrets: &[WorkflowSecret],
-        is_untrusted: bool,
-    ) -> (i32, Vec<StepExecutionResult>) {
+        let is_untrusted = trust_token.is_untrusted();
+
         if is_untrusted && !self.profile.allow_untrusted_ci() {
             return (
                 1,
