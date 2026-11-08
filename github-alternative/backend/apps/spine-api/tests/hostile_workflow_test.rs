@@ -6,7 +6,9 @@ use uuid::Uuid;
 use spine_workflow::dag::JobDag;
 use spine_workflow::parser::WorkflowParser;
 
-use spine_api::core::types::{TrustClassification, WorkflowJob, WorkflowSecret, WorkflowStep};
+use spine_api::core::types::{
+    TrustClassification, WorkflowJob, WorkflowRun, WorkflowSecret, WorkflowStep,
+};
 use spine_api::db::InMemoryDatabase;
 use spine_api::runner::{AuthoritativeTrustToken, IsolatedRunnerExecutor, RunnerService};
 use spine_api::webhook::{SsrfValidator, WebhookService};
@@ -69,10 +71,34 @@ async fn test_runner_stale_fencing_token_rejected() {
         .await
         .unwrap();
 
+    let run_id = Uuid::new_v4().to_string();
+    let run = WorkflowRun {
+        id: run_id.clone(),
+        repo_id: "repo_1".to_string(),
+        workflow_id: "wf_1".to_string(),
+        workflow_name: "test".to_string(),
+        commit_oid: "c1".to_string(),
+        ref_name: "refs/heads/main".to_string(),
+        trigger_event: "push".to_string(),
+        actor_id: "user_1".to_string(),
+        status: "RUNNING".to_string(),
+        conclusion: None,
+        definition_yaml: "test".to_string(),
+        definition_digest: "digest".to_string(),
+        source_repo_id: None,
+        is_fork: false,
+        trust_classification: TrustClassification::Trusted,
+        provenance_reason: "direct".to_string(),
+        created_at_nanos: 1,
+        started_at_nanos: Some(1),
+        completed_at_nanos: None,
+    };
+    db.create_workflow_run(run).await.unwrap();
+
     let job_id = Uuid::new_v4().to_string();
     let job = WorkflowJob {
         id: job_id.clone(),
-        run_id: Uuid::new_v4().to_string(),
+        run_id,
         repo_id: "repo_1".to_string(),
         job_key: "lint".to_string(),
         name: "Lint".to_string(),
@@ -165,8 +191,12 @@ async fn test_step_timeout_and_process_tree_termination() {
     // To keep the test suite rapid, execute an intentional fast script and verify execution and secret masking
     let mut fast_scripts = HashMap::new();
     fast_scripts.insert(0, "echo Normal execution finished".to_string());
-    let trust_token =
-        AuthoritativeTrustToken::for_test(&job.run_id, &job.id, TrustClassification::Trusted);
+    let trust_token = AuthoritativeTrustToken::for_test(
+        &job.run_id,
+        &job.id,
+        &job.repo_id,
+        TrustClassification::Trusted,
+    );
     let (exit, results) = executor
         .execute_job(&job, &steps, &fast_scripts, &[], &trust_token)
         .await;
@@ -225,8 +255,12 @@ async fn test_secret_masking_in_runner_output() {
     #[cfg(not(target_os = "windows"))]
     scripts.insert(0, "echo Value of secret is $SUPER_SECRET".to_string());
 
-    let trust_token =
-        AuthoritativeTrustToken::for_test(&job.run_id, &job.id, TrustClassification::Trusted);
+    let trust_token = AuthoritativeTrustToken::for_test(
+        &job.run_id,
+        &job.id,
+        &job.repo_id,
+        TrustClassification::Trusted,
+    );
     let (exit, results) = executor
         .execute_job(&job, &steps, &scripts, &secrets, &trust_token)
         .await;

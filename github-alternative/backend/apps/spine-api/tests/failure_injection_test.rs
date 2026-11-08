@@ -60,8 +60,12 @@ async fn test_runner_isolation_fail_closed_on_unsandboxed_untrusted_workflow() {
     use spine_api::TrustClassification;
 
     // 1. Untrusted execution with Unsandboxed mode MUST FAIL CLOSED
-    let untrusted_token =
-        AuthoritativeTrustToken::for_test(&job.run_id, &job.id, TrustClassification::Untrusted);
+    let untrusted_token = AuthoritativeTrustToken::for_test(
+        &job.run_id,
+        &job.id,
+        &job.repo_id,
+        TrustClassification::Untrusted,
+    );
     let (exit_code, results) = executor
         .execute_job(
             &job,
@@ -88,8 +92,12 @@ async fn test_runner_isolation_fail_closed_on_unsandboxed_untrusted_workflow() {
     let trusted_executor = IsolatedRunnerExecutor::new(tmp.path().to_path_buf())
         .with_sandbox_mode(RunnerSandboxMode::TrustedLocalDevelopment);
 
-    let trusted_token =
-        AuthoritativeTrustToken::for_test(&job.run_id, &job.id, TrustClassification::Trusted);
+    let trusted_token = AuthoritativeTrustToken::for_test(
+        &job.run_id,
+        &job.id,
+        &job.repo_id,
+        TrustClassification::Trusted,
+    );
     let (trusted_exit, trusted_res) = trusted_executor
         .execute_job(&job, &[step], &scripts, &[], &trusted_token)
         .await;

@@ -180,6 +180,11 @@ impl RunnerService {
                 continue;
             }
 
+            // Authoritatively construct and validate trust token from database records
+            let _trust_token =
+                crate::runner::AuthoritativeTrustToken::from_database(self.db.as_ref(), &job)
+                    .await?;
+
             // Assign job with lease and incremented fencing token ONLY after trust verification
             let fencing_token = job.fencing_token + 1;
             // 5 minute initial lease
@@ -273,6 +278,10 @@ impl RunnerService {
                 "Stale fencing token or runner lease expired".to_string(),
             ));
         }
+
+        // Authoritatively validate trust token from persisted records for job completion
+        let _trust_token =
+            crate::runner::AuthoritativeTrustToken::from_database(self.db.as_ref(), &job).await?;
 
         let now_nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let final_status = if exit_code == 0 {

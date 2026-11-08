@@ -94,13 +94,21 @@ impl HarnessDisposableDb {
                 )
             })?;
 
-        // 2. Build connection URLs for the newly created database
+        // 2. Build distinct connection URLs for the newly created database (no identity fallback)
         let mut parsed_migrator =
             Url::parse(&base_url).map_err(|e| format!("Invalid migrator URL: {}", e))?;
         parsed_migrator.set_path(&format!("/{}", db_name));
+        let _ = parsed_migrator.set_username("spine_migrator");
+        if let Ok(mig_pass) = std::env::var("SPINE_MIGRATOR_PASSWORD")
+            .or_else(|_| std::env::var("SPINE_TEST_MIGRATOR_PASSWORD"))
+        {
+            let _ = parsed_migrator.set_password(Some(&mig_pass));
+        }
         let migrator_url = parsed_migrator.to_string();
 
-        let mut parsed_app = parsed_migrator.clone();
+        let mut parsed_app =
+            Url::parse(&base_url).map_err(|e| format!("Invalid app URL: {}", e))?;
+        parsed_app.set_path(&format!("/{}", db_name));
         let _ = parsed_app.set_username("spine_app");
         if let Ok(app_pass) = std::env::var("SPINE_APP_PASSWORD")
             .or_else(|_| std::env::var("SPINE_TEST_APP_PASSWORD"))
@@ -338,6 +346,11 @@ pub fn require_safe_test_db_url() -> String {
 pub fn get_app_role_test_db_url() -> String {
     let mut parsed = Url::parse(&require_safe_test_db_url()).expect("valid test db url");
     let _ = parsed.set_username("spine_app");
+    if let Ok(app_pass) =
+        std::env::var("SPINE_APP_PASSWORD").or_else(|_| std::env::var("SPINE_TEST_APP_PASSWORD"))
+    {
+        let _ = parsed.set_password(Some(&app_pass));
+    }
     parsed.to_string()
 }
 

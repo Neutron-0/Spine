@@ -6,14 +6,17 @@ use crate::gc::TombstoneRecord;
 use crate::heartbeat::NodeHeartbeat;
 use crate::node::{NodeStatus, StorageNodeInfo};
 use crate::placement::PlacementPlan;
+use crate::protocol::VolumeSnapshotManifest;
 use crate::repair::RepairJob;
 use crate::transaction::ReplicationTransaction;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RepositoryMeta {
@@ -89,11 +92,31 @@ pub trait CoordinatorStore: Send + Sync {
 
     fn create_tombstone(&self, tombstone: TombstoneRecord) -> Result<()>;
     fn list_tombstones(&self) -> Result<Vec<TombstoneRecord>>;
+
+    fn enter_maintenance(&self, fencing_generation: u64) -> Result<()>;
+    fn exit_maintenance(&self, fencing_generation: u64) -> Result<()>;
+    fn get_maintenance_status(&self) -> (bool, u64);
+    fn capture_snapshot(
+        &self,
+        snapshot_id: &str,
+        fencing_generation: u64,
+    ) -> Result<(VolumeSnapshotManifest, Vec<u8>)>;
+    fn stage_restore(
+        &self,
+        snapshot_id: &str,
+        fencing_generation: u64,
+        payload: &[u8],
+    ) -> Result<()>;
+    fn commit_restore(&self, snapshot_id: &str, fencing_generation: u64) -> Result<()>;
+    fn rollback_restore(&self, snapshot_id: &str) -> Result<()>;
 }
 
 pub struct FileBackedCoordinatorStore {
     path: Option<PathBuf>,
     state: RwLock<StateSnapshot>,
+    in_maintenance: Arc<AtomicBool>,
+    fencing_generation: Arc<AtomicU64>,
+    staged_restore: RwLock<Option<(String, u64, Vec<u8>)>>,
 }
 
 impl FileBackedCoordinatorStore {
@@ -101,6 +124,9 @@ impl FileBackedCoordinatorStore {
         Self {
             path: None,
             state: RwLock::new(StateSnapshot::default()),
+            in_maintenance: Arc::new(AtomicBool::new(false)),
+            fencing_generation: Arc::new(AtomicU64::new(1)),
+            staged_restore: RwLock::new(None),
         }
     }
 
@@ -119,7 +145,17 @@ impl FileBackedCoordinatorStore {
         Ok(Self {
             path: Some(p),
             state: RwLock::new(state),
+            in_maintenance: Arc::new(AtomicBool::new(false)),
+            fencing_generation: Arc::new(AtomicU64::new(1)),
+            staged_restore: RwLock::new(None),
         })
+    }
+
+    fn check_maintenance(&self) -> Result<()> {
+        if self.in_maintenance.load(Ordering::SeqCst) {
+            bail!("Coordinator mutations rejected: cluster is currently in maintenance mode");
+        }
+        Ok(())
     }
 
     fn persist(&self) -> Result<()> {
@@ -139,6 +175,7 @@ impl FileBackedCoordinatorStore {
 
 impl CoordinatorStore for FileBackedCoordinatorStore {
     fn register_node(&self, node: StorageNodeInfo) -> Result<()> {
+        self.check_maintenance()?;
         {
             let mut snap = self.state.write().unwrap();
             snap.nodes.insert(node.node_id.clone(), node);
@@ -157,6 +194,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn update_node_status(&self, node_id: &str, status: NodeStatus) -> Result<()> {
+        self.check_maintenance()?;
         {
             let mut snap = self.state.write().unwrap();
             if let Some(node) = snap.nodes.get_mut(node_id) {
@@ -168,6 +206,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn record_heartbeat(&self, heartbeat: NodeHeartbeat) -> Result<()> {
+        // Record heartbeat only updates transient health metadata; allowed or rejected during maintenance
         {
             let mut snap = self.state.write().unwrap();
             if let Some(node) = snap.nodes.get_mut(&heartbeat.node_id) {
@@ -184,6 +223,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn create_token(&self, token: EnrollmentToken) -> Result<()> {
+        self.check_maintenance()?;
         {
             let mut snap = self.state.write().unwrap();
             snap.tokens.insert(token.token.clone(), token);
@@ -197,6 +237,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn consume_token(&self, token_str: &str) -> Result<()> {
+        self.check_maintenance()?;
         {
             let mut snap = self.state.write().unwrap();
             if let Some(tok) = snap.tokens.get_mut(token_str) {
@@ -207,6 +248,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn revoke_token(&self, token_str: &str) -> Result<()> {
+        self.check_maintenance()?;
         {
             let mut snap = self.state.write().unwrap();
             if let Some(tok) = snap.tokens.get_mut(token_str) {
@@ -217,6 +259,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn create_repository(&self, repo: RepositoryMeta) -> Result<()> {
+        self.check_maintenance()?;
         {
             let mut snap = self.state.write().unwrap();
             snap.repositories.insert(repo.repo_id.clone(), repo);
@@ -235,6 +278,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn set_placement(&self, placement: PlacementPlan) -> Result<()> {
+        self.check_maintenance()?;
         {
             let mut snap = self.state.write().unwrap();
             let repo_id = placement.repo_id.clone();
@@ -262,6 +306,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
         verified: bool,
         now_nanos: i64,
     ) -> Result<()> {
+        self.check_maintenance()?;
         {
             let mut snap = self.state.write().unwrap();
             let reps = snap.replicas.entry(repo_id.to_string()).or_default();
@@ -297,6 +342,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
         epoch: u64,
         primary_node_id: &str,
     ) -> Result<()> {
+        self.check_maintenance()?;
         {
             let mut snap = self.state.write().unwrap();
             if let Some(repo) = snap.repositories.get_mut(repo_id) {
@@ -310,6 +356,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn advance_committed_generation(&self, repo_id: &str, new_gen: u64) -> Result<()> {
+        self.check_maintenance()?;
         {
             let mut snap = self.state.write().unwrap();
             if let Some(repo) = snap.repositories.get_mut(repo_id) {
@@ -320,6 +367,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn create_transaction(&self, tx: ReplicationTransaction) -> Result<()> {
+        self.check_maintenance()?;
         {
             let mut snap = self.state.write().unwrap();
             snap.transactions.insert(tx.transaction_id.clone(), tx);
@@ -333,6 +381,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn update_transaction(&self, tx: ReplicationTransaction) -> Result<()> {
+        self.check_maintenance()?;
         {
             let mut snap = self.state.write().unwrap();
             snap.transactions.insert(tx.transaction_id.clone(), tx);
@@ -359,6 +408,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn create_repair_job(&self, job: RepairJob) -> Result<()> {
+        self.check_maintenance()?;
         {
             let mut snap = self.state.write().unwrap();
             snap.repair_jobs.insert(job.job_id.clone(), job);
@@ -372,6 +422,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn create_tombstone(&self, tombstone: TombstoneRecord) -> Result<()> {
+        self.check_maintenance()?;
         {
             let mut snap = self.state.write().unwrap();
             snap.tombstones
@@ -383,5 +434,119 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     fn list_tombstones(&self) -> Result<Vec<TombstoneRecord>> {
         let snap = self.state.read().unwrap();
         Ok(snap.tombstones.values().cloned().collect())
+    }
+
+    fn enter_maintenance(&self, fencing_generation: u64) -> Result<()> {
+        self.in_maintenance.store(true, Ordering::SeqCst);
+        let current_gen = self.fencing_generation.load(Ordering::SeqCst);
+        if fencing_generation > current_gen {
+            self.fencing_generation
+                .store(fencing_generation, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    fn exit_maintenance(&self, fencing_generation: u64) -> Result<()> {
+        let current_gen = self.fencing_generation.load(Ordering::SeqCst);
+        if fencing_generation >= current_gen {
+            self.fencing_generation
+                .store(fencing_generation, Ordering::SeqCst);
+        }
+        self.in_maintenance.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn get_maintenance_status(&self) -> (bool, u64) {
+        (
+            self.in_maintenance.load(Ordering::SeqCst),
+            self.fencing_generation.load(Ordering::SeqCst),
+        )
+    }
+
+    fn capture_snapshot(
+        &self,
+        snapshot_id: &str,
+        fencing_generation: u64,
+    ) -> Result<(VolumeSnapshotManifest, Vec<u8>)> {
+        let snap = self.state.read().unwrap();
+        let payload = serde_json::to_vec_pretty(&*snap)?;
+        let sha256_checksum = format!("{:x}", sha2::Sha256::digest(&payload));
+        let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let manifest = VolumeSnapshotManifest {
+            participant_id: "coordinator".to_string(),
+            volume_name: "coordinator_data".to_string(),
+            snapshot_id: snapshot_id.to_string(),
+            fencing_generation,
+            file_count: 1,
+            total_bytes: payload.len() as u64,
+            sha256_checksum,
+            created_at_nanos: now_nanos,
+        };
+        Ok((manifest, payload))
+    }
+
+    fn stage_restore(
+        &self,
+        snapshot_id: &str,
+        fencing_generation: u64,
+        payload: &[u8],
+    ) -> Result<()> {
+        // Validate JSON payload
+        let _test_snap: StateSnapshot = serde_json::from_slice(payload)
+            .with_context(|| "Invalid coordinator state snapshot JSON")?;
+        let mut staged = self.staged_restore.write().unwrap();
+        *staged = Some((
+            snapshot_id.to_string(),
+            fencing_generation,
+            payload.to_vec(),
+        ));
+        Ok(())
+    }
+
+    fn commit_restore(&self, snapshot_id: &str, fencing_generation: u64) -> Result<()> {
+        let payload = {
+            let mut staged = self.staged_restore.write().unwrap();
+            match staged.take() {
+                Some((id, gen, bytes)) => {
+                    if id != snapshot_id {
+                        bail!(
+                            "Staged restore snapshot ID mismatch: expected {}, staged {}",
+                            snapshot_id,
+                            id
+                        );
+                    }
+                    if gen != fencing_generation {
+                        bail!(
+                            "Staged restore fencing generation mismatch: expected {}, staged {}",
+                            fencing_generation,
+                            gen
+                        );
+                    }
+                    bytes
+                }
+                None => bail!("No staged restore found for coordinator"),
+            }
+        };
+
+        let new_snap: StateSnapshot = serde_json::from_slice(&payload)?;
+        {
+            let mut current = self.state.write().unwrap();
+            *current = new_snap;
+        }
+        self.persist()?;
+        self.fencing_generation
+            .store(fencing_generation, Ordering::SeqCst);
+        self.in_maintenance.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn rollback_restore(&self, snapshot_id: &str) -> Result<()> {
+        let mut staged = self.staged_restore.write().unwrap();
+        if let Some((id, _, _)) = staged.as_ref() {
+            if id == snapshot_id {
+                *staged = None;
+            }
+        }
+        Ok(())
     }
 }

@@ -258,6 +258,68 @@ async fn handle_connection(
                 Err(e) => ClusterRpcResponse::Error(e.to_string()),
             }
         }
+        ClusterRpcRequest::EnterMaintenanceBarrier { fencing_generation } => {
+            match backend.enter_maintenance(fencing_generation) {
+                Ok(_) => ClusterRpcResponse::MaintenanceBarrierAck { success: true },
+                Err(e) => ClusterRpcResponse::Error(e.to_string()),
+            }
+        }
+        ClusterRpcRequest::ExitMaintenanceBarrier { fencing_generation } => {
+            match backend.exit_maintenance(fencing_generation) {
+                Ok(_) => ClusterRpcResponse::MaintenanceBarrierAck { success: true },
+                Err(e) => ClusterRpcResponse::Error(e.to_string()),
+            }
+        }
+        ClusterRpcRequest::QueryMaintenanceStatus => {
+            let (in_maintenance, fencing_generation, active_writers) =
+                backend.get_maintenance_status();
+            ClusterRpcResponse::MaintenanceStatus {
+                in_maintenance,
+                fencing_generation,
+                active_writers,
+            }
+        }
+        ClusterRpcRequest::CaptureVolumeSnapshot {
+            snapshot_id,
+            fencing_generation,
+        } => match backend.capture_volume_snapshot(&snapshot_id, fencing_generation) {
+            Ok((manifest, payload_bytes)) => ClusterRpcResponse::VolumeSnapshotCaptured {
+                manifest,
+                payload_bytes,
+            },
+            Err(e) => ClusterRpcResponse::Error(e.to_string()),
+        },
+        ClusterRpcRequest::StageVolumeRestore {
+            snapshot_id,
+            fencing_generation,
+            manifest: _,
+            payload_bytes,
+        } => match backend.stage_volume_restore(&snapshot_id, fencing_generation, &payload_bytes) {
+            Ok(_) => ClusterRpcResponse::VolumeRestoreStaged {
+                snapshot_id,
+                success: true,
+            },
+            Err(e) => ClusterRpcResponse::Error(e.to_string()),
+        },
+        ClusterRpcRequest::CommitVolumeRestore {
+            snapshot_id,
+            fencing_generation,
+        } => match backend.commit_volume_restore(&snapshot_id, fencing_generation) {
+            Ok(_) => ClusterRpcResponse::VolumeRestoreCommitted {
+                snapshot_id,
+                success: true,
+            },
+            Err(e) => ClusterRpcResponse::Error(e.to_string()),
+        },
+        ClusterRpcRequest::RollbackVolumeRestore { snapshot_id } => {
+            match backend.rollback_volume_restore(&snapshot_id) {
+                Ok(_) => ClusterRpcResponse::VolumeRestoreRolledBack {
+                    snapshot_id,
+                    success: true,
+                },
+                Err(e) => ClusterRpcResponse::Error(e.to_string()),
+            }
+        }
         _ => ClusterRpcResponse::Error("Unhandled storage node request".into()),
     };
 

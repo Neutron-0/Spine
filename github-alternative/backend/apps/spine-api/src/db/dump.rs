@@ -390,7 +390,18 @@ pub async fn dump_database_to_writer<W: std::io::Write>(
 /// Strictly bounded in memory O(batch_size) and preserves exact arbitrary numeric precision.
 pub async fn restore_database_from_reader<R: BufRead>(
     pool: &PgPool,
+    reader: R,
+) -> Result<DatabaseRestoreReport, ForgeError> {
+    restore_database_with_generation(pool, reader, None, None).await
+}
+
+/// Restores a database snapshot from a streaming reader with atomic in-transaction generation recording.
+/// The generation token is committed within the exact same database transaction as all restored tables.
+pub async fn restore_database_with_generation<R: BufRead>(
+    pool: &PgPool,
     mut reader: R,
+    generation_token: Option<&str>,
+    backup_id: Option<&str>,
 ) -> Result<DatabaseRestoreReport, ForgeError> {
     let start = std::time::Instant::now();
 
@@ -707,6 +718,11 @@ pub async fn restore_database_from_reader<R: BufRead>(
                     ))
                 })?;
         }
+    }
+
+    // Record generation token inside the active transaction if provided
+    if let (Some(gen), Some(bak)) = (generation_token, backup_id) {
+        crate::backup::RestoreJournal::record_db_generation_in_tx(&mut tx, gen, bak).await?;
     }
 
     tx.commit().await.map_err(|e| {

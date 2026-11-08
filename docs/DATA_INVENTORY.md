@@ -1,96 +1,93 @@
 # Spine Forge — Authoritative Cluster Data Inventory & Persistence Architecture
-**Batch 21E Operational Engineering Specification**
+**Batch 21F Operational Engineering Specification & Canonical Resource Inventory**
 
 ## 1. Overview and Boundary Scope
 
-Spine Forge maintains high-availability, durable source control and collaboration infrastructure. Persistent state is partitioned into five distinct storage domains to guarantee durability, least privilege, zero data loss, and crash-recoverable restoration.
+Spine Forge maintains high-availability, durable source control and collaboration infrastructure. Persistent state is partitioned into distinct authoritative persistent resources to guarantee durability, least privilege, zero data loss, and crash-recoverable restoration.
 
-Every persistent mutation across all domains is governed by:
-1. **The Global Consistency Barrier:** Coordinates across arbitrary operating-system processes via PostgreSQL session advisory locking (`0x5350494E_4542414B`) and `_cluster_maintenance_barrier`.
-2. **Strict Generation Identity:** Atomic cross-resource pairing of `_restore_generation` in the database and `.spine_storage_generation` in the storage root.
-3. **Monotonic Ownership Fencing:** Primary storage node ownership epochs preventing stale brain split.
-
----
-
-## 2. Authoritative Data Domains
-
-### Domain 1: API Relational Database (`postgres_data`)
-- **Volume / Mount:** `postgres_data` mounted at `/var/lib/postgresql/data`
-- **Engine:** PostgreSQL 16 (Alpine)
-- **Role Isolation:**
-  - `spine_admin`: Superuser bootstrap identity, never exposed to application workloads.
-  - `spine_migrator`: DDL schema owner, executes idempotent migration suites.
-  - `spine_app`: Least-privilege runtime identity (DML only: SELECT, INSERT, UPDATE, DELETE). `CREATE ON SCHEMA public` is revoked.
-- **Persistent Tables:**
-  - **Identity & Organization:** `users`, `sessions`, `organizations`, `teams`, `organization_members`, `team_members`
-  - **Repository & Access:** `repositories`, `repository_permissions`, `branch_protections`, `deploy_keys`
-  - **Collaboration:** `issues`, `issue_comments`, `pull_requests`, `pull_request_reviews`, `discussions`, `discussion_comments`
-  - **Releases & Packages:** `releases`, `release_assets`, `packages`, `package_versions`, `cargo_crates`, `cargo_crate_versions`
-  - **CI & Automation:** `workflow_runs`, `workflow_jobs`, `workflow_steps`, `workflow_log_chunks`, `workflow_secrets`, `runner_registrations`
-  - **Webhooks:** `webhooks`, `webhook_deliveries`
-  - **Coordination & Recovery:** `_cluster_maintenance_barrier`, `_restore_generation`
-- **Backup & Snapshot:** Row-by-row JSON Lines streaming (`database/snapshot.jsonl`) under `REPEATABLE READ READ ONLY` snapshot isolation. Sequences synchronized via catalog tables (`pg_class`, `pg_depend`, `pg_attribute`).
+Every persistent mutation across all resources is strictly governed by:
+1. **The Global Consistency Barrier & Monotonic Fencing Authority:** Coordinates across all distributed cluster nodes and operating-system processes via PostgreSQL session advisory locking (`SPINE_CLUSTER_MAINTENANCE_LOCK_ID = 0x5350494E_4542414B`) and the monotonic fencing generation counter in `_cluster_maintenance_barrier`.
+2. **Strict Multi-Volume Generation Identity:** Deployment-wide generation identity stamped across PostgreSQL (`_restore_generation`), API storage (`.spine_storage_generation`), storage nodes (`.spine_storage_generation`), and coordinator (`coordinator.state`).
+3. **Monotonic Primary Ownership Fencing:** Primary storage node ownership epochs and coordinator fencing tokens preventing split-brain writes.
 
 ---
 
-### Domain 2: Application Storage Root (`spine_storage`)
-- **Volume / Mount:** `spine_storage` mounted at `/var/lib/spine/storage`
-- **Component:** `spine-api`
-- **Contents:**
-  - `repositories/<native_repo_id>/`: Bare VCS repositories containing native objects, commits, refs, and packfiles.
-  - `artifacts/`: Build outputs, release binaries, and packaged distribution assets managed by `spine_artifact::LocalArtifactStore`.
-  - `.spine_storage_generation`: Generation token file stamping the cluster restore generation identity.
-  - `.spine_restore_journal.json`: Ephemeral crash-recovery journal tracking restore state machine transitions (`Initialized` -> `StagedStorage` -> `StagedDb` -> `DbPublished` -> `StoragePublished` -> `Committed`).
+## 2. Canonical Persistent Resource Inventory
+
+| Resource Identifier | Service Owner | Docker Volume Name | Container Destination | Physical Storage Root | Every Writer | Backup Participant Implementation | Restore Participant Implementation | Generation Identity | Expected Manifest | Integrity Verification | Authoritative vs Reconstructible |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `postgres_data` | `spine-api` | `postgres_data` | `/var/lib/postgresql/data` | Docker volume `postgres_data` | PostgreSQL 16 engine, `spine-api` (via `spine_migrator` for DDL, `spine_app` for runtime DML) | `spine-api` streaming JSON Lines dumper (`dump_database_to_writer`) | `spine-api` streaming JSON Lines transactional restorer (`restore_database_from_reader`) with transactional `_restore_generation` insertion | `_restore_generation.generation_token` (UUID v4) | `database/snapshot.jsonl` (Header v3.0, table records, footer summary) | Line-by-line JSON validation, row/table count verification against footer, sequence resync validation | **Authoritative** (primary store of metadata, users, permissions, issues, PRs, CI state) |
+| `spine_storage` | `spine-api` | `spine_storage` | `/var/lib/spine/storage` | Docker volume `spine_storage` | `spine-api` backend (Git smart HTTP, LFS transfer, artifact store, package uploads) | `BackupManager::create_archive_internal` | `StagedRestoreSession::publish_storage` (whole-generation directory cutover) | `.spine_storage_generation` | `storage/` directory tree in archive | BLAKE3 / SHA-256 file checksums in `manifest.json`, bounds checking, path traversal rejection | **Authoritative** (Git repositories, LFS blobs, artifacts, releases, cargo crates) |
+| `storage_1_data` | `spine-storage-node-1` | `storage_1_data` | `/var/lib/spine/node-1` | Docker volume `storage_1_data` (Zone A) | `spine-storage-node-1` (`stage_pack`, `commit_pack`, `store_chunk`, `store_manifest`) | Storage Node RPC `CaptureVolumeSnapshot` | Storage Node RPC `StageVolumeRestore` -> `CommitVolumeRestore` (whole-generation cutover) | `.spine_storage_generation` | `storage_node_1/volume_manifest.json` | SPK1 packfile magic & BLAKE3 checksums, SPIDX index verification, chunk SHA-256 | **Authoritative** (distributed Git pack shards, content-addressed chunks, manifests) |
+| `storage_2_data` | `spine-storage-node-2` | `storage_2_data` | `/var/lib/spine/node-2` | Docker volume `storage_2_data` (Zone B) | `spine-storage-node-2` (`stage_pack`, `commit_pack`, `store_chunk`, `store_manifest`) | Storage Node RPC `CaptureVolumeSnapshot` | Storage Node RPC `StageVolumeRestore` -> `CommitVolumeRestore` (whole-generation cutover) | `.spine_storage_generation` | `storage_node_2/volume_manifest.json` | SPK1 packfile magic & BLAKE3 checksums, SPIDX index verification, chunk SHA-256 | **Authoritative** (distributed Git pack shards, content-addressed chunks, manifests) |
+| `storage_3_data` | `spine-storage-node-3` | `storage_3_data` | `/var/lib/spine/node-3` | Docker volume `storage_3_data` (Zone C) | `spine-storage-node-3` (`stage_pack`, `commit_pack`, `store_chunk`, `store_manifest`) | Storage Node RPC `CaptureVolumeSnapshot` | Storage Node RPC `StageVolumeRestore` -> `CommitVolumeRestore` (whole-generation cutover) | `.spine_storage_generation` | `storage_node_3/volume_manifest.json` | SPK1 packfile magic & BLAKE3 checksums, SPIDX index verification, chunk SHA-256 | **Authoritative** (distributed Git pack shards, content-addressed chunks, manifests) |
+| `coordinator_data` | `spine-coordinator` | `coordinator_data` | `/var/lib/spine` | Docker volume `coordinator_data` | `spine-coordinator` (`FileBackedCoordinatorStore`) | Coordinator RPC `CaptureVolumeSnapshot` | Coordinator RPC `StageVolumeRestore` -> `CommitVolumeRestore` | `coordinator.state` metadata snapshot epoch | `coordinator/coordinator_manifest.json`, `coordinator/coordinator.state` | JSON schema validation, checksum verification, node and placement topology sanity | **Authoritative** (cluster topology, node registry, replica mappings, primary ownership epochs, failover state) |
+| `spine_ssh` | `spine-api` | `spine_ssh` | `/var/lib/spine/ssh` | Docker volume `spine_ssh` | `spine-api` SSH key generator (on initial setup) | `BackupManager` SSH identity participant | `StagedRestoreSession` SSH identity participant | Host key fingerprint SHA-256 | `ssh/host_keys.manifest.json`, `ssh/ssh_host_ed25519_key`, `ssh/ssh_host_ed25519_key.pub` | OpenSSH key format validation, public-private keypair match verification | **Authoritative** (prevents host key verification failure and man-in-the-middle warnings on client reconnect) |
+| `runner_workspaces` | `spine-runner` | N/A (local temp or container volume) | `/tmp/spine-runner` / workspace root | Local filesystem / tmpfs | `spine-runner` execution processes | Excluded (ephemeral) | Excluded (ephemeral) | Transient job ID | N/A | Ephemeral step exit status and log verification | **Reconstructible / Ephemeral** (ephemeral execution sandbox; persistent job logs/status stored authoritatively in `postgres_data`) |
 
 ---
 
-### Domain 3: Distributed Storage Node Volumes (`storage_1_data`, `storage_2_data`, `storage_3_data`)
-- **Volumes / Mounts:**
-  - `storage_1_data` -> `/var/lib/spine/node-1` (Zone A)
-  - `storage_2_data` -> `/var/lib/spine/node-2` (Zone B)
-  - `storage_3_data` -> `/var/lib/spine/node-3` (Zone C)
-- **Component:** `spine-storage-node`
-- **Contents:**
-  - `repos/<repo_id>/.spine/`:
-    - `pack/`: BLAKE3-checksummed packfiles (`<pack_id>.spk`) and binary index files (`<pack_id>.spidx`).
-    - `ownership_epoch`: Monotonically increasing u64 primary ownership fencing epoch.
-    - `generation`: Monotonically increasing push generation counter.
-  - `staging/<tx_id>/`: Two-phase commit staged packfiles and metadata before cutover.
-  - `chunks/<prefix>/<chunk_hash>`: Content-addressed BLAKE3 raw blob chunks.
-  - `manifests/<prefix>/<manifest_id>.json`: Chunk composition manifests.
+## 3. Global Coordination & Monotonic Fencing Authority
+
+1. **Single Authoritative Barrier:**
+   All persistent write paths (API HTTP routes, Git smart HTTP, native Git-over-SSH, distributed 2PC pack commits, chunk stores, coordinator state mutations) MUST acquire an active `WritePermit` before mutating authoritative storage.
+2. **Commit-Boundary Fencing Validation:**
+   `WritePermit::verify_active` does NOT rely on a simple TCP connection check. It checks both `is_active == false` AND matches `fencing_generation == permit.fencing_generation`. When maintenance is entered, the global fencing generation increments monotonically:
+   ```sql
+   UPDATE _cluster_maintenance_barrier
+   SET is_active = TRUE,
+       activated_at_nanos = $1,
+       activated_by = 'spine-backup',
+       reason = 'Coordinated deployment-wide multi-volume backup',
+       fencing_generation = _cluster_maintenance_barrier.fencing_generation + 1
+   WHERE id = 1
+   RETURNING fencing_generation;
+   ```
+3. **Rejection at Storage Publication Boundary:**
+   Any writer that acquired a permit before maintenance entered will be fenced out at commit time because its generation is stale. Storage nodes and coordinator explicitly reject any operation presented with a stale fencing generation or during active maintenance.
 
 ---
 
-### Domain 4: Cluster Coordinator State (`coordinator_data`)
-- **Volume / Mount:** `coordinator_data` mounted at `/var/lib/spine`
-- **Component:** `spine-coordinator`
-- **Contents:**
-  - `coordinator.state`: Atomic file-backed persistent state tracking:
-    - Node registrations, endpoints, capacity, and failure domain topology.
-    - Repository placement plans and replica mappings.
-    - Monotonic primary ownership epochs and automated failover records.
-    - Node enrollment tokens.
+## 4. Multi-Volume Backup Participant Protocol Sequence
+
+1. **Phase 1: Enter Maintenance Barrier:**
+   The backup orchestrator enters maintenance mode in PostgreSQL, increments the global fencing generation, and holds the exclusive advisory lock `0x5350494E_4542414B`.
+2. **Phase 2: Notify Participants & Drain Writers:**
+   Orchestrator sends `EnterMaintenanceBarrier { fencing_generation }` RPC to:
+   - Coordinator
+   - Storage Node 1
+   - Storage Node 2
+   - Storage Node 3
+   Every participant stops admitting new writes and drains in-flight operations.
+3. **Phase 3: Snapshot Capture & Manifest Generation:**
+   - PostgreSQL: Database snapshot streamed under repeatable read isolation (`snapshot.jsonl`).
+   - `spine_storage`: Local files staged with checksums into `storage/`.
+   - `spine_ssh`: Host keypair staged into `ssh/`.
+   - `spine-coordinator`: Persistent state snapshot captured into `coordinator/`.
+   - Storage Nodes 1-3: `CaptureVolumeSnapshot` RPC captures packfiles, chunks, and manifests into snapshot payloads.
+4. **Phase 4: Unified Multi-Volume Archive Assembly:**
+   Root archive manifest (`manifest.json`) aggregates individual volume manifests, participant identifiers, and the uniform snapshot fencing generation.
+5. **Phase 5: Release Maintenance Barrier:**
+   Orchestrator sends `ExitMaintenanceBarrier { fencing_generation }` to all participants and releases the PostgreSQL advisory lock.
 
 ---
 
-### Domain 5: SSH Host Identity (`spine_ssh`)
-- **Volume / Mount:** `spine_ssh` mounted at `/var/lib/spine/ssh`
-- **Component:** `spine-api` (Native SSH Server on port 2222)
-- **Contents:**
-  - `ssh_host_ed25519_key`: Ed25519 host private key.
-  - `ssh_host_ed25519_key.pub`: Ed25519 host public key.
-  - Ensures persistent SSH server identity across container recreations and restarts.
+## 5. Crash-Recoverable Restore State Machine & Startup Safety
 
----
-
-## 3. Crash Recovery and Startup Invariant Enforcement
-
-1. **State Machine Verification:**
-   On startup, `handle_startup_recovery` inspects `.spine_restore_journal.json`.
-   - If an interrupted restore is in `Initialized`, `StagedStorage`, or `StagedDb`, the staging directory and journal are safely discarded because no live state was modified.
-   - If in `DbPublished`, `StoragePublished`, or `Failed`, the server **FAILS CLOSED** with a fatal error, preventing startup with half-cutover state.
-
-2. **Cross-Resource Generation Alignment:**
-   On startup, `handle_startup_recovery` queries `_restore_generation` in the database and reads `.spine_storage_generation` in the storage root.
-   - Any generation mismatch or missing generation file **FAILS CLOSED** with an immediate fatal exit.
-   - Server readiness probe (`/health/ready`) will never report ready if data generation is mismatched.
+1. **Durable Journal Phases:**
+   The restore state machine tracks transitions through explicit durable phases:
+   `Initialized` -> `StagedStorage` -> `StagedDb` -> `DbPublished` -> `StoragePublished` -> `Committed`.
+2. **Atomic In-Transaction Database Generation Recording:**
+   `_restore_generation` is recorded *inside the exact same database transaction* that restores the tables. It is impossible for database restore to commit without simultaneously committing the generation token.
+3. **Whole-Generation Storage Replacement:**
+   Storage restoration never overlays files. Instead:
+   - Target files are assembled in `.staged_generation_<restore_id>`.
+   - Live generation directories are moved to `.old_generation_<restore_id>`.
+   - Staged generation is moved into the live root.
+   - `.spine_storage_generation` is written durably.
+   - `.old_generation_<restore_id>` is removed upon commit.
+   Files absent from the backup are guaranteed absent after restore.
+4. **Fail-Closed Startup Invariant:**
+   On process startup (API, coordinator, storage nodes):
+   - Restore state is evaluated before listeners open.
+   - Any uncommitted journal, generation mismatch, missing generation token, missing table, or query error **FAILS CLOSED** with a fatal diagnostic. The deployment remains offline until recovery is reconciled.

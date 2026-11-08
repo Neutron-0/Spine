@@ -47,6 +47,17 @@ impl NonceSequence for OneNonce {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BackupParticipantRecord {
+    pub participant_id: String,
+    pub volume_name: String,
+    pub snapshot_id: String,
+    pub fencing_generation: u64,
+    pub byte_length: u64,
+    pub sha256_checksum: String,
+    pub archive_rel_path: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BackupManifest {
     pub backup_id: String,
     pub timestamp_nanos: i64,
@@ -57,6 +68,10 @@ pub struct BackupManifest {
     pub file_hashes: BTreeMap<String, String>,
     pub ssh_host_key_fingerprint: Option<String>,
     pub integrity_status: String,
+    #[serde(default)]
+    pub fencing_generation: Option<u64>,
+    #[serde(default)]
+    pub participants: Vec<BackupParticipantRecord>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -81,7 +96,16 @@ pub struct StagedRestoreSession {
 }
 
 impl StagedRestoreSession {
-    /// Commits the staged files to live storage root.
+    pub fn get_participant_snapshot_data(&self, rel_path: &str) -> Option<Vec<u8>> {
+        for (p, staged_path, _) in &self.verified_files {
+            if p == rel_path {
+                return fs::read(staged_path).ok();
+            }
+        }
+        None
+    }
+
+    /// Commits the staged files to live storage root using whole-generation replacement.
     /// This MUST only be called after target database restore is successful.
     pub fn publish_storage(mut self) -> Result<RestoreReport, ForgeError> {
         let mut files_restored = 0usize;
@@ -90,14 +114,57 @@ impl StagedRestoreSession {
         fs::create_dir_all(&self.target_storage_root)
             .map_err(|e| ForgeError::Internal(e.to_string()))?;
 
+        let restore_id = &self.journal.restore_id;
+        let old_dir = self
+            .target_storage_root
+            .join(format!(".old_generation_{}", restore_id));
+        if old_dir.exists() {
+            let _ = fs::remove_dir_all(&old_dir);
+        }
+        fs::create_dir_all(&old_dir).map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        // 1. Whole-generation replacement: move existing live entries into old_dir
+        let staging_path = self.staging_dir.path().to_path_buf();
+        if let Ok(entries) = fs::read_dir(&self.target_storage_root) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p == old_dir || p == staging_path {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !name.starts_with(".old_generation_")
+                    && !name.starts_with(".staged_generation_")
+                    && !name.starts_with(".tmp")
+                    && name != RestoreJournal::JOURNAL_FILE_NAME
+                {
+                    let dst = old_dir.join(&name);
+                    let _ = fs::rename(&p, &dst);
+                }
+            }
+        }
+
+        let participant_paths: std::collections::HashSet<_> = self
+            .manifest
+            .participants
+            .iter()
+            .map(|p| p.archive_rel_path.as_str())
+            .collect();
+
+        // 2. Move staged verified files into target live root
         for (rel_path, staged_path, file_len) in self.verified_files {
-            if rel_path != "database/snapshot.jsonl" && rel_path != "database/snapshot.json" {
+            if rel_path != "database/snapshot.jsonl"
+                && rel_path != "database/snapshot.json"
+                && !participant_paths.contains(rel_path.as_str())
+            {
                 let dest =
                     BackupManager::sanitize_restore_path(&self.target_storage_root, &rel_path)?;
                 if let Some(parent) = dest.parent() {
                     fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
                 }
                 fs::rename(&staged_path, &dest).map_err(|e| ForgeError::Internal(e.to_string()))?;
+                files_restored += 1;
+                bytes_restored += file_len;
+            } else {
                 files_restored += 1;
                 bytes_restored += file_len;
             }
@@ -110,6 +177,9 @@ impl StagedRestoreSession {
 
         self.journal.persist(RestorePhase::StoragePublished)?;
         self.journal.persist(RestorePhase::Committed)?;
+
+        // 3. Cutover committed: remove old generation backup and restore journal
+        let _ = fs::remove_dir_all(&old_dir);
         let _ = RestoreJournal::remove(&self.target_storage_root);
 
         self.report.files_restored = files_restored;
@@ -144,8 +214,14 @@ impl BackupManager {
             let file =
                 File::create(&tmp_output).map_err(|e| ForgeError::Internal(e.to_string()))?;
             let enc = GzEncoder::new(file, Compression::default());
-            let (manifest, _) =
-                Self::create_archive_internal(storage_root, db_snapshot_json, None, enc)?;
+            let (manifest, _) = Self::create_archive_internal(
+                storage_root,
+                db_snapshot_json,
+                None,
+                &[],
+                None,
+                enc,
+            )?;
             fs::rename(&tmp_output, output_tar_gz)
                 .map_err(|e| ForgeError::Internal(e.to_string()))?;
             Ok(manifest)
@@ -171,8 +247,14 @@ impl BackupManager {
             let file =
                 File::create(&tmp_output).map_err(|e| ForgeError::Internal(e.to_string()))?;
             let enc = GzEncoder::new(file, Compression::default());
-            let (manifest, _) =
-                Self::create_archive_internal(storage_root, None, db_snapshot_file, enc)?;
+            let (manifest, _) = Self::create_archive_internal(
+                storage_root,
+                None,
+                db_snapshot_file,
+                &[],
+                None,
+                enc,
+            )?;
             fs::rename(&tmp_output, output_tar_gz)
                 .map_err(|e| ForgeError::Internal(e.to_string()))?;
             Ok(manifest)
@@ -182,6 +264,91 @@ impl BackupManager {
             let _ = fs::remove_file(&tmp_output);
         }
         res
+    }
+
+    /// Creates a complete cluster backup archive with database dump and multi-volume participant snapshots.
+    pub fn create_cluster_backup(
+        storage_root: &Path,
+        db_snapshot_file: Option<&Path>,
+        participants: Vec<(BackupParticipantRecord, Vec<u8>)>,
+        fencing_generation: Option<u64>,
+        output_path: &Path,
+        passphrase: Option<&str>,
+        key_version: u16,
+    ) -> Result<BackupManifest, ForgeError> {
+        let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        if let Some(pass) = passphrase {
+            if pass.trim().is_empty() {
+                return Err(ForgeError::Internal(
+                    "Backup encryption passphrase cannot be empty".to_string(),
+                ));
+            }
+            let tmp_output = parent.join(format!(".tmp_bak_{}.spnebak", Uuid::new_v4()));
+            let res = (|| {
+                let temp_dir = tempfile::tempdir().map_err(|e| {
+                    ForgeError::Internal(format!("Failed to create temp staging directory: {}", e))
+                })?;
+                let staging_tar_gz = temp_dir.path().join("staging.tar.gz");
+                let file = File::create(&staging_tar_gz).map_err(|e| {
+                    ForgeError::Internal(format!("Failed to create staging file: {}", e))
+                })?;
+                let enc = GzEncoder::new(file, Compression::default());
+                let (manifest, _) = Self::create_archive_internal(
+                    storage_root,
+                    None,
+                    db_snapshot_file,
+                    &participants,
+                    fencing_generation,
+                    enc,
+                )?;
+                let reader = File::open(&staging_tar_gz).map_err(|e| {
+                    ForgeError::Internal(format!("Failed to open staging file: {}", e))
+                })?;
+                let writer = File::create(&tmp_output).map_err(|e| {
+                    ForgeError::Internal(format!("Failed to create output archive: {}", e))
+                })?;
+                v2::encrypt_stream(reader, writer, pass, key_version, v2::DEFAULT_CHUNK_SIZE)?;
+                let verify_file = File::open(&tmp_output).map_err(|e| {
+                    ForgeError::Internal(format!(
+                        "Failed to reopen archive for verification: {}",
+                        e
+                    ))
+                })?;
+                v2::decrypt_stream(verify_file, std::io::sink(), pass)?;
+                fs::rename(&tmp_output, output_path).map_err(|e| {
+                    ForgeError::Internal(format!("Failed to publish encrypted archive: {}", e))
+                })?;
+                Ok(manifest)
+            })();
+            if res.is_err() && tmp_output.exists() {
+                let _ = fs::remove_file(&tmp_output);
+            }
+            res
+        } else {
+            let tmp_output = parent.join(format!(".tmp_bak_{}.tar.gz", Uuid::new_v4()));
+            let res = (|| {
+                let file =
+                    File::create(&tmp_output).map_err(|e| ForgeError::Internal(e.to_string()))?;
+                let enc = GzEncoder::new(file, Compression::default());
+                let (manifest, _) = Self::create_archive_internal(
+                    storage_root,
+                    None,
+                    db_snapshot_file,
+                    &participants,
+                    fencing_generation,
+                    enc,
+                )?;
+                fs::rename(&tmp_output, output_path)
+                    .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                Ok(manifest)
+            })();
+            if res.is_err() && tmp_output.exists() {
+                let _ = fs::remove_file(&tmp_output);
+            }
+            res
+        }
     }
 
     /// Creates an authenticated, streaming chunked AEAD-encrypted backup archive (SPNEBAK v2)
@@ -256,6 +423,8 @@ impl BackupManager {
                 storage_root,
                 db_snapshot_json,
                 db_snapshot_file,
+                &[],
+                None,
                 enc,
             )?;
 
@@ -714,6 +883,8 @@ impl BackupManager {
         storage_root: &Path,
         db_snapshot_json: Option<&str>,
         db_snapshot_file: Option<&Path>,
+        participants: &[(BackupParticipantRecord, Vec<u8>)],
+        fencing_generation: Option<u64>,
         writer: W,
     ) -> Result<(BackupManifest, W), ForgeError> {
         let backup_id = Uuid::new_v4().to_string();
@@ -721,6 +892,14 @@ impl BackupManager {
 
         let mut file_hashes = BTreeMap::new();
         let mut total_bytes = 0u64;
+
+        for (record, _) in participants {
+            file_hashes.insert(
+                record.archive_rel_path.clone(),
+                record.sha256_checksum.clone(),
+            );
+            total_bytes += record.byte_length;
+        }
 
         let mut file_paths = Vec::new();
         if storage_root.exists() {
@@ -803,6 +982,8 @@ impl BackupManager {
             file_hashes,
             ssh_host_key_fingerprint: ssh_fingerprint,
             integrity_status: "VERIFIED".to_string(),
+            fencing_generation,
+            participants: participants.iter().map(|(r, _)| r.clone()).collect(),
         };
 
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)
@@ -846,6 +1027,15 @@ impl BackupManager {
             f_header.set_mode(0o644);
             f_header.set_cksum();
             tar.append_data(&mut f_header, &rel_path, &mut f)
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        }
+
+        for (record, data) in participants {
+            let mut p_header = tar::Header::new_gnu();
+            p_header.set_size(data.len() as u64);
+            p_header.set_mode(0o644);
+            p_header.set_cksum();
+            tar.append_data(&mut p_header, &record.archive_rel_path, &data[..])
                 .map_err(|e| ForgeError::Internal(e.to_string()))?;
         }
 

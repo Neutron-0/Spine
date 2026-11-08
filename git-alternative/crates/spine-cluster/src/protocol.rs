@@ -89,6 +89,42 @@ pub enum ClusterRpcRequest {
     GetManifest {
         manifest_id: String,
     },
+    EnterMaintenanceBarrier {
+        fencing_generation: u64,
+    },
+    ExitMaintenanceBarrier {
+        fencing_generation: u64,
+    },
+    QueryMaintenanceStatus,
+    CaptureVolumeSnapshot {
+        snapshot_id: String,
+        fencing_generation: u64,
+    },
+    StageVolumeRestore {
+        snapshot_id: String,
+        fencing_generation: u64,
+        manifest: VolumeSnapshotManifest,
+        payload_bytes: Vec<u8>,
+    },
+    CommitVolumeRestore {
+        snapshot_id: String,
+        fencing_generation: u64,
+    },
+    RollbackVolumeRestore {
+        snapshot_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VolumeSnapshotManifest {
+    pub participant_id: String,
+    pub volume_name: String,
+    pub snapshot_id: String,
+    pub fencing_generation: u64,
+    pub file_count: usize,
+    pub total_bytes: u64,
+    pub sha256_checksum: String,
+    pub created_at_nanos: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -150,6 +186,30 @@ pub enum ClusterRpcResponse {
     NodeStatusUpdated {
         node_id: String,
         new_status: NodeStatus,
+    },
+    MaintenanceStatus {
+        in_maintenance: bool,
+        fencing_generation: u64,
+        active_writers: usize,
+    },
+    MaintenanceBarrierAck {
+        success: bool,
+    },
+    VolumeSnapshotCaptured {
+        manifest: VolumeSnapshotManifest,
+        payload_bytes: Vec<u8>,
+    },
+    VolumeRestoreStaged {
+        snapshot_id: String,
+        success: bool,
+    },
+    VolumeRestoreCommitted {
+        snapshot_id: String,
+        success: bool,
+    },
+    VolumeRestoreRolledBack {
+        snapshot_id: String,
+        success: bool,
     },
     Error(String),
 }

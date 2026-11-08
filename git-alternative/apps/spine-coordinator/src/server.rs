@@ -316,6 +316,67 @@ async fn handle_coordinator_connection(
                 Err(e) => ClusterRpcResponse::Error(e.to_string()),
             }
         }
+        ClusterRpcRequest::EnterMaintenanceBarrier { fencing_generation } => {
+            match store.enter_maintenance(fencing_generation) {
+                Ok(_) => ClusterRpcResponse::MaintenanceBarrierAck { success: true },
+                Err(e) => ClusterRpcResponse::Error(e.to_string()),
+            }
+        }
+        ClusterRpcRequest::ExitMaintenanceBarrier { fencing_generation } => {
+            match store.exit_maintenance(fencing_generation) {
+                Ok(_) => ClusterRpcResponse::MaintenanceBarrierAck { success: true },
+                Err(e) => ClusterRpcResponse::Error(e.to_string()),
+            }
+        }
+        ClusterRpcRequest::QueryMaintenanceStatus => {
+            let (in_maintenance, fencing_generation) = store.get_maintenance_status();
+            ClusterRpcResponse::MaintenanceStatus {
+                in_maintenance,
+                fencing_generation,
+                active_writers: 0,
+            }
+        }
+        ClusterRpcRequest::CaptureVolumeSnapshot {
+            snapshot_id,
+            fencing_generation,
+        } => match store.capture_snapshot(&snapshot_id, fencing_generation) {
+            Ok((manifest, payload_bytes)) => ClusterRpcResponse::VolumeSnapshotCaptured {
+                manifest,
+                payload_bytes,
+            },
+            Err(e) => ClusterRpcResponse::Error(e.to_string()),
+        },
+        ClusterRpcRequest::StageVolumeRestore {
+            snapshot_id,
+            fencing_generation,
+            manifest: _,
+            payload_bytes,
+        } => match store.stage_restore(&snapshot_id, fencing_generation, &payload_bytes) {
+            Ok(_) => ClusterRpcResponse::VolumeRestoreStaged {
+                snapshot_id,
+                success: true,
+            },
+            Err(e) => ClusterRpcResponse::Error(e.to_string()),
+        },
+        ClusterRpcRequest::CommitVolumeRestore {
+            snapshot_id,
+            fencing_generation,
+        } => match store.commit_restore(&snapshot_id, fencing_generation) {
+            Ok(_) => ClusterRpcResponse::VolumeRestoreCommitted {
+                snapshot_id,
+                success: true,
+            },
+            Err(e) => ClusterRpcResponse::Error(e.to_string()),
+        },
+        ClusterRpcRequest::RollbackVolumeRestore { snapshot_id } => {
+            match store.rollback_restore(&snapshot_id) {
+                Ok(_) => ClusterRpcResponse::VolumeRestoreRolledBack {
+                    snapshot_id,
+                    success: true,
+                },
+                Err(e) => ClusterRpcResponse::Error(e.to_string()),
+            }
+        }
         _ => ClusterRpcResponse::Error("Unsupported coordinator request".into()),
     };
 

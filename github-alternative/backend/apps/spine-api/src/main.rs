@@ -136,6 +136,14 @@ enum BackupCommands {
         /// Deployment profile (core-forge-v1, development, test)
         #[arg(long)]
         profile: Option<String>,
+
+        /// Spine coordinator RPC address (e.g. 127.0.0.1:9000 or COORDINATOR_ADDR)
+        #[arg(long)]
+        coordinator_addr: Option<String>,
+
+        /// Comma-separated storage node endpoints (e.g. "storage-1=127.0.0.1:9001,storage-2=127.0.0.1:9002")
+        #[arg(long)]
+        storage_node_addrs: Option<String>,
     },
 
     /// Restore and verify a backup archive into target directory
@@ -159,6 +167,14 @@ enum BackupCommands {
         /// Deployment profile (core-forge-v1, development, test)
         #[arg(long)]
         profile: Option<String>,
+
+        /// Spine coordinator RPC address (e.g. 127.0.0.1:9000 or COORDINATOR_ADDR)
+        #[arg(long)]
+        coordinator_addr: Option<String>,
+
+        /// Comma-separated storage node endpoints (e.g. "storage-1=127.0.0.1:9001,storage-2=127.0.0.1:9002")
+        #[arg(long)]
+        storage_node_addrs: Option<String>,
     },
 
     /// Rotate the encryption key/passphrase of an encrypted backup archive without disk writes
@@ -445,6 +461,8 @@ async fn main() -> anyhow::Result<()> {
                 passphrase_file,
                 key_version,
                 profile,
+                coordinator_addr,
+                storage_node_addrs,
             } => {
                 let prof = parse_cli_profile(profile.as_deref())?;
                 let db_url = read_secret(
@@ -457,6 +475,31 @@ async fn main() -> anyhow::Result<()> {
                     passphrase_file.as_deref(),
                     &["SPINE_BACKUP_PASSPHRASE", "BACKUP_PASSPHRASE"],
                 )?;
+
+                let coord_addr_opt = coordinator_addr
+                    .or_else(|| std::env::var("COORDINATOR_ADDR").ok())
+                    .or_else(|| std::env::var("SPINE_COORDINATOR_ADDR").ok());
+                let storage_nodes_str_opt = storage_node_addrs
+                    .or_else(|| std::env::var("STORAGE_NODE_ADDRS").ok())
+                    .or_else(|| std::env::var("SPINE_STORAGE_NODES").ok());
+
+                let mut node_endpoints = Vec::new();
+                if let Some(nodes_str) = storage_nodes_str_opt {
+                    for part in nodes_str.split(',') {
+                        let trimmed = part.trim();
+                        if !trimmed.is_empty() {
+                            if let Some((id, addr)) = trimmed.split_once('=') {
+                                node_endpoints
+                                    .push((id.trim().to_string(), addr.trim().to_string()));
+                            } else {
+                                node_endpoints.push((
+                                    format!("storage-{}", node_endpoints.len() + 1),
+                                    trimmed.to_string(),
+                                ));
+                            }
+                        }
+                    }
+                }
 
                 let tmp_snap_dir = tempfile::Builder::new().prefix("spine_snap_").tempdir()?;
                 let snap_file_path = tmp_snap_dir.path().join("snapshot.jsonl");
@@ -497,6 +540,91 @@ async fn main() -> anyhow::Result<()> {
                     (None, None)
                 };
 
+                let fencing_generation = _maintenance_guard
+                    .as_ref()
+                    .map(|g| g.fencing_generation)
+                    .unwrap_or(1);
+
+                let mut participant_snapshots = Vec::new();
+                let mut coord_client = None;
+                if let Some(ref c_addr) = coord_addr_opt {
+                    println!(
+                        "Coordinating maintenance barrier with Spine Coordinator at {}...",
+                        c_addr
+                    );
+                    let client = spine_api::CoordinatorClient::new(c_addr.clone());
+                    client
+                        .enter_maintenance(fencing_generation)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "Failed to coordinate maintenance barrier with coordinator: {}",
+                                e
+                            )
+                        })?;
+                    let snap_id = uuid::Uuid::new_v4().to_string();
+                    let (manifest, data) = client
+                        .capture_snapshot(&snap_id, fencing_generation)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to capture coordinator snapshot: {}", e)
+                        })?;
+                    participant_snapshots.push((
+                        spine_api::BackupParticipantRecord {
+                            participant_id: manifest.participant_id,
+                            volume_name: manifest.volume_name,
+                            snapshot_id: manifest.snapshot_id,
+                            fencing_generation: manifest.fencing_generation,
+                            byte_length: manifest.total_bytes,
+                            sha256_checksum: manifest.sha256_checksum,
+                            archive_rel_path: "coordinator/coordinator_snapshot.tar.gz".to_string(),
+                        },
+                        data,
+                    ));
+                    println!("Coordinator volume snapshot captured successfully.");
+                    coord_client = Some(client);
+                }
+
+                let mut storage_clients = Vec::new();
+                for (node_id, addr) in &node_endpoints {
+                    println!(
+                        "Coordinating maintenance barrier with storage node '{}' at {}...",
+                        node_id, addr
+                    );
+                    let client = spine_api::ClusterNodeClient::new(addr.clone());
+                    client.enter_maintenance(fencing_generation).await.map_err(|e| {
+                        anyhow::anyhow!("Failed to coordinate maintenance barrier with storage node '{}': {}", node_id, e)
+                    })?;
+                    let snap_id = uuid::Uuid::new_v4().to_string();
+                    let (manifest, data) = client
+                        .capture_snapshot(&snap_id, fencing_generation)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "Failed to capture storage node '{}' snapshot: {}",
+                                node_id,
+                                e
+                            )
+                        })?;
+                    participant_snapshots.push((
+                        spine_api::BackupParticipantRecord {
+                            participant_id: manifest.participant_id,
+                            volume_name: manifest.volume_name,
+                            snapshot_id: manifest.snapshot_id,
+                            fencing_generation: manifest.fencing_generation,
+                            byte_length: manifest.total_bytes,
+                            sha256_checksum: manifest.sha256_checksum,
+                            archive_rel_path: format!("storage_nodes/{}_snapshot.tar.gz", node_id),
+                        },
+                        data,
+                    ));
+                    println!(
+                        "Storage node '{}' volume snapshot captured successfully.",
+                        node_id
+                    );
+                    storage_clients.push((node_id.clone(), client));
+                }
+
                 let has_db_snap = _maintenance_guard.is_some();
 
                 println!(
@@ -509,30 +637,40 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     None
                 };
-                let manifest = if let Some(pass_str) = pass {
-                    println!(
-                        "Applying SPNEBAK v2 AES-256-GCM AEAD streaming encryption (key version {})...",
-                        key_version
-                    );
-                    spine_api::backup::BackupManager::create_encrypted_backup_from_file(
-                        &storage_root,
-                        snap_path_opt,
-                        &output,
-                        &pass_str,
-                        key_version,
-                    )?
-                } else {
-                    spine_api::backup::BackupManager::create_backup_from_file(
-                        &storage_root,
-                        snap_path_opt,
-                        &output,
-                    )?
-                };
+                let manifest = spine_api::backup::BackupManager::create_cluster_backup(
+                    &storage_root,
+                    snap_path_opt,
+                    participant_snapshots,
+                    Some(fencing_generation),
+                    &output,
+                    pass.as_deref(),
+                    key_version,
+                )?;
                 println!("Backup archive created successfully:");
                 println!("  Backup ID:     {}", manifest.backup_id);
                 println!("  Total files:   {}", manifest.total_files);
                 println!("  Total bytes:   {}", manifest.total_bytes);
                 println!("  Status:        {}", manifest.integrity_status);
+                if !manifest.participants.is_empty() {
+                    println!(
+                        "  Participants:  {} cluster volumes captured",
+                        manifest.participants.len()
+                    );
+                }
+
+                for (id, client) in storage_clients {
+                    if let Err(e) = client.exit_maintenance(fencing_generation).await {
+                        eprintln!(
+                            "Warning: Failed to exit maintenance on storage node '{}': {}",
+                            id, e
+                        );
+                    }
+                }
+                if let Some(client) = coord_client {
+                    if let Err(e) = client.exit_maintenance(fencing_generation).await {
+                        eprintln!("Warning: Failed to exit maintenance on coordinator: {}", e);
+                    }
+                }
 
                 if let Some(guard) = _maintenance_guard {
                     let _ = guard.release().await;
@@ -545,6 +683,8 @@ async fn main() -> anyhow::Result<()> {
                 target_database_url_file,
                 passphrase_file,
                 profile,
+                coordinator_addr,
+                storage_node_addrs,
             } => {
                 let prof = parse_cli_profile(profile.as_deref())?;
 
@@ -622,6 +762,106 @@ async fn main() -> anyhow::Result<()> {
 
                 println!("Archive staged and all checksums verified against manifest.");
 
+                let coord_addr_opt = coordinator_addr
+                    .or_else(|| std::env::var("COORDINATOR_ADDR").ok())
+                    .or_else(|| std::env::var("SPINE_COORDINATOR_ADDR").ok());
+                let storage_nodes_str_opt = storage_node_addrs
+                    .or_else(|| std::env::var("STORAGE_NODE_ADDRS").ok())
+                    .or_else(|| std::env::var("SPINE_STORAGE_NODES").ok());
+
+                let mut node_endpoints = std::collections::HashMap::new();
+                if let Some(nodes_str) = storage_nodes_str_opt {
+                    for part in nodes_str.split(',') {
+                        let trimmed = part.trim();
+                        if !trimmed.is_empty() {
+                            if let Some((id, addr)) = trimmed.split_once('=') {
+                                node_endpoints
+                                    .insert(id.trim().to_string(), addr.trim().to_string());
+                            }
+                        }
+                    }
+                }
+
+                // Stage restore on coordinator and storage nodes if participant archives exist
+                let mut staged_cluster_restores = Vec::new();
+                for participant in &session.manifest.participants {
+                    if participant.participant_id == "coordinator"
+                        || participant.archive_rel_path.starts_with("coordinator/")
+                    {
+                        if let Some(ref c_addr) = coord_addr_opt {
+                            if let Some(data) =
+                                session.get_participant_snapshot_data(&participant.archive_rel_path)
+                            {
+                                println!(
+                                    "Staging volume restore on Spine Coordinator at {}...",
+                                    c_addr
+                                );
+                                let client = spine_api::CoordinatorClient::new(c_addr.clone());
+                                let vol_manifest =
+                                    spine_cluster::protocol::VolumeSnapshotManifest {
+                                        participant_id: participant.participant_id.clone(),
+                                        volume_name: participant.volume_name.clone(),
+                                        snapshot_id: participant.snapshot_id.clone(),
+                                        fencing_generation: participant.fencing_generation,
+                                        file_count: 0,
+                                        total_bytes: participant.byte_length,
+                                        sha256_checksum: participant.sha256_checksum.clone(),
+                                        created_at_nanos: 0,
+                                    };
+                                client
+                                    .stage_restore(vol_manifest, data)
+                                    .await
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "Failed to stage volume restore on coordinator: {}",
+                                            e
+                                        )
+                                    })?;
+                                staged_cluster_restores.push((
+                                    participant.snapshot_id.clone(),
+                                    participant.fencing_generation,
+                                    client,
+                                ));
+                            }
+                        }
+                    } else if let Some(addr) = node_endpoints.get(&participant.participant_id) {
+                        if let Some(data) =
+                            session.get_participant_snapshot_data(&participant.archive_rel_path)
+                        {
+                            println!(
+                                "Staging volume restore on storage node '{}' at {}...",
+                                participant.participant_id, addr
+                            );
+                            let client = spine_api::CoordinatorClient::new(addr.clone());
+                            let vol_manifest = spine_cluster::protocol::VolumeSnapshotManifest {
+                                participant_id: participant.participant_id.clone(),
+                                volume_name: participant.volume_name.clone(),
+                                snapshot_id: participant.snapshot_id.clone(),
+                                fencing_generation: participant.fencing_generation,
+                                file_count: 0,
+                                total_bytes: participant.byte_length,
+                                sha256_checksum: participant.sha256_checksum.clone(),
+                                created_at_nanos: 0,
+                            };
+                            client
+                                .stage_restore(vol_manifest, data)
+                                .await
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "Failed to stage volume restore on storage node '{}': {}",
+                                        participant.participant_id,
+                                        e
+                                    )
+                                })?;
+                            staged_cluster_restores.push((
+                                participant.snapshot_id.clone(),
+                                participant.fencing_generation,
+                                client,
+                            ));
+                        }
+                    }
+                }
+
                 // If backup contains a database snapshot, restore database BEFORE publishing storage
                 if let Some(ref snap_path) = session.db_snapshot_path {
                     if let Some(ref pool) = target_db_pool {
@@ -630,22 +870,15 @@ async fn main() -> anyhow::Result<()> {
                             anyhow::anyhow!("Failed to open extracted database snapshot: {}", e)
                         })?;
                         let mut reader = std::io::BufReader::new(file);
-                        let db_report = match spine_api::restore_database_from_reader(
+                        let db_report = match spine_api::restore_database_with_generation(
                             pool,
                             &mut reader,
+                            Some(&session.journal.target_generation),
+                            Some(&session.manifest.backup_id),
                         )
                         .await
                         {
                             Ok(r) => {
-                                spine_api::backup::RestoreJournal::record_db_generation(
-                                    pool,
-                                    &session.journal.target_generation,
-                                    &session.manifest.backup_id,
-                                )
-                                .await
-                                .map_err(|e| {
-                                    anyhow::anyhow!("Failed to record database generation: {}", e)
-                                })?;
                                 session
                                     .journal
                                     .persist(spine_api::backup::RestorePhase::DbPublished)
@@ -655,6 +888,9 @@ async fn main() -> anyhow::Result<()> {
                                 r
                             }
                             Err(e) => {
+                                for (snap_id, _, client) in &staged_cluster_restores {
+                                    let _ = client.rollback_restore(snap_id).await;
+                                }
                                 let _ = session.abort(&format!("Database restore failed: {}", e));
                                 anyhow::bail!("Failed to restore database snapshot: {}. Target repository storage was left untouched.", e);
                             }
@@ -671,6 +907,18 @@ async fn main() -> anyhow::Result<()> {
                         );
                     } else {
                         println!("WARNING: Backup archive contains a database snapshot, but no target database URL was specified. Database was not restored.");
+                    }
+                }
+
+                for (snap_id, fencing_gen, client) in &staged_cluster_restores {
+                    println!("Committing volume restore for snapshot {}...", snap_id);
+                    if let Err(e) = client.commit_restore(snap_id, *fencing_gen).await {
+                        for (r_snap, _, r_client) in &staged_cluster_restores {
+                            let _ = r_client.rollback_restore(r_snap).await;
+                        }
+                        let _ = session
+                            .abort(&format!("Failed to commit cluster volume restore: {}", e));
+                        anyhow::bail!("Failed to commit cluster volume restore: {}. Target repository storage was left untouched.", e);
                     }
                 }
 

@@ -44,21 +44,54 @@ pub struct AuthoritativeTrustToken {
 
 impl AuthoritativeTrustToken {
     /// Authoritatively load workflow run trust token directly from database.
-    /// Callers cannot spoof or assert trust; it is validated against the recorded workflow_run.
+    /// Callers cannot spoof or assert trust; it is validated against the recorded workflow_job and workflow_run.
     pub async fn from_database(
         db: &dyn crate::db::Database,
         job: &WorkflowJob,
     ) -> Result<Self, ForgeError> {
-        let run = db.get_workflow_run(&job.run_id).await?.ok_or_else(|| {
-            ForgeError::NotFound(format!("Workflow run '{}' not found", job.run_id))
+        let persisted_job = db.get_workflow_job(&job.id).await?.ok_or_else(|| {
+            ForgeError::NotFound(format!("Workflow job '{}' not found in database", job.id))
         })?;
 
-        if run.id != job.run_id {
+        if persisted_job.id != job.id {
+            return Err(ForgeError::Unauthorized(
+                "Job ID mismatch with persisted database record".to_string(),
+            ));
+        }
+        if persisted_job.run_id != job.run_id {
+            return Err(ForgeError::Unauthorized(
+                "Job run_id mismatch with persisted database record".to_string(),
+            ));
+        }
+        if persisted_job.repo_id.trim().is_empty() {
+            return Err(ForgeError::Unauthorized(
+                "Persisted workflow job has empty repository ID".to_string(),
+            ));
+        }
+        if persisted_job.repo_id != job.repo_id {
+            return Err(ForgeError::Unauthorized(
+                "Job repo_id mismatch with persisted database record".to_string(),
+            ));
+        }
+
+        let run = db.get_workflow_run(&job.run_id).await?.ok_or_else(|| {
+            ForgeError::NotFound(format!(
+                "Workflow run '{}' not found in database",
+                job.run_id
+            ))
+        })?;
+
+        if run.id != job.run_id || run.id != persisted_job.run_id {
             return Err(ForgeError::Unauthorized(
                 "Job run_id mismatch with workflow run".to_string(),
             ));
         }
-        if run.repo_id != job.repo_id {
+        if run.repo_id.trim().is_empty() {
+            return Err(ForgeError::Unauthorized(
+                "Persisted workflow run has empty repository ID".to_string(),
+            ));
+        }
+        if run.repo_id != job.repo_id || run.repo_id != persisted_job.repo_id {
             return Err(ForgeError::Unauthorized(
                 "Job repo_id mismatch with workflow run".to_string(),
             ));
@@ -71,7 +104,7 @@ impl AuthoritativeTrustToken {
 
         Ok(Self {
             run_id: run.id,
-            job_id: job.id.clone(),
+            job_id: persisted_job.id,
             repository_id: run.repo_id,
             classification: run.trust_classification,
             is_fork: run.is_fork,
@@ -81,11 +114,16 @@ impl AuthoritativeTrustToken {
 
     /// Factory method for test harnesses ONLY.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn for_test(run_id: &str, job_id: &str, classification: TrustClassification) -> Self {
+    pub fn for_test(
+        run_id: &str,
+        job_id: &str,
+        repository_id: &str,
+        classification: TrustClassification,
+    ) -> Self {
         Self {
             run_id: run_id.to_string(),
             job_id: job_id.to_string(),
-            repository_id: String::new(),
+            repository_id: repository_id.to_string(),
             classification,
             is_fork: classification == TrustClassification::Untrusted,
             source_repo_id: None,
@@ -182,8 +220,8 @@ impl IsolatedRunnerExecutor {
     ) -> (i32, Vec<StepExecutionResult>) {
         if trust_token.job_id() != job.id
             || trust_token.run_id() != job.run_id
-            || (!trust_token.repository_id().is_empty()
-                && trust_token.repository_id() != job.repo_id)
+            || trust_token.repository_id().trim().is_empty()
+            || trust_token.repository_id() != job.repo_id
         {
             return (
                 1,
@@ -192,7 +230,7 @@ impl IsolatedRunnerExecutor {
                     exit_code: 1,
                     stdout: String::new(),
                     stderr:
-                        "SECURITY ERROR: Trust token does not match job/run/repository identity"
+                        "SECURITY ERROR: Trust token does not match job/run/repository identity or repository ID is empty"
                             .to_string(),
                     timed_out: false,
                 }],

@@ -33,6 +33,9 @@ hex.workspace = true
 ed25519-dalek.workspace = true
 rand.workspace = true
 blake3.workspace = true
+flate2.workspace = true
+tar.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

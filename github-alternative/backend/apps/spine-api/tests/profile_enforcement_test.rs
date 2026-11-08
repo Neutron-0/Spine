@@ -135,6 +135,7 @@ async fn test_isolated_executor_fails_closed_on_untrusted_execution() {
     let trust_token = AuthoritativeTrustToken::for_test(
         &dummy_job.run_id,
         &dummy_job.id,
+        &dummy_job.repo_id,
         TrustClassification::Untrusted,
     );
     let (exit_code, step_results) = executor

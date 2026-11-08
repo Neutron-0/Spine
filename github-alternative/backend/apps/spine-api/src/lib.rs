@@ -23,16 +23,16 @@ pub use api::{build_router, AppState};
 pub use artifact::ArtifactService;
 pub use auth::DevMailCatcher;
 pub use backup::{
-    BackupManager, BackupManifest, RestoreJournal, RestorePhase, RestoreReport,
-    StagedRestoreSession,
+    BackupManager, BackupManifest, BackupParticipantRecord, RestoreJournal, RestorePhase,
+    RestoreReport, StagedRestoreSession,
 };
-pub use coordinator::CoordinatorClient;
+pub use coordinator::{ClusterNodeClient, CoordinatorClient};
 pub use core::profile::DeploymentProfile;
 pub use core::types::*;
 pub use db::{
     dump_database, dump_database_to_writer, is_database_empty, restore_database,
-    restore_database_from_reader, Database, DatabaseRestoreReport, DatabaseSnapshot,
-    InMemoryDatabase, PgDatabase,
+    restore_database_from_reader, restore_database_with_generation, Database,
+    DatabaseRestoreReport, DatabaseSnapshot, InMemoryDatabase, PgDatabase,
 };
 pub use discovery::DiscoveryService;
 pub use discussions::DiscussionService;

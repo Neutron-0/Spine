@@ -1,7 +1,7 @@
 use crate::core::error::ForgeError;
 use sqlx::postgres::PgConnectOptions;
 use sqlx::{Connection, PgConnection, PgPool};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -13,12 +13,19 @@ pub const SPINE_CLUSTER_MAINTENANCE_LOCK_ID: i64 = 0x5350_494E_4542_414B;
 /// Consistency barrier for coordinating live backups and draining in-flight writes.
 /// Coordinates across independent operating-system processes via PostgreSQL advisory locking
 /// and a cluster maintenance state table.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ConsistencyBarrier {
     in_maintenance: Arc<AtomicBool>,
     in_flight_writes: Arc<AtomicUsize>,
+    fencing_generation: Arc<AtomicU64>,
     pool: Option<PgPool>,
     connect_options: Option<Arc<PgConnectOptions>>,
+}
+
+impl Default for ConsistencyBarrier {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ConsistencyBarrier {
@@ -26,6 +33,7 @@ impl ConsistencyBarrier {
         Self {
             in_maintenance: Arc::new(AtomicBool::new(false)),
             in_flight_writes: Arc::new(AtomicUsize::new(0)),
+            fencing_generation: Arc::new(AtomicU64::new(1)),
             pool: None,
             connect_options: None,
         }
@@ -36,6 +44,7 @@ impl ConsistencyBarrier {
         Self {
             in_maintenance: Arc::new(AtomicBool::new(false)),
             in_flight_writes: Arc::new(AtomicUsize::new(0)),
+            fencing_generation: Arc::new(AtomicU64::new(1)),
             pool: Some(pool),
             connect_options: Some(connect_options),
         }
@@ -45,6 +54,7 @@ impl ConsistencyBarrier {
         Self {
             in_maintenance: Arc::new(AtomicBool::new(false)),
             in_flight_writes: Arc::new(AtomicUsize::new(0)),
+            fencing_generation: Arc::new(AtomicU64::new(1)),
             pool: Some(pool),
             connect_options: Some(Arc::new(options)),
         }
@@ -52,6 +62,10 @@ impl ConsistencyBarrier {
 
     pub fn pool(&self) -> Option<&PgPool> {
         self.pool.as_ref()
+    }
+
+    pub fn current_fencing_generation(&self) -> u64 {
+        self.fencing_generation.load(Ordering::SeqCst)
     }
 
     /// Check whether the cluster or node is currently in a maintenance barrier window.
@@ -102,22 +116,26 @@ impl ConsistencyBarrier {
             ));
         }
 
+        let mut permit_gen = self.fencing_generation.load(Ordering::SeqCst);
+
         if let Some(opts) = &self.connect_options {
-            // 1. Check if cluster maintenance table has marked maintenance active
+            // 1. Check if cluster maintenance table has marked maintenance active and read fencing generation
             if let Some(pool) = &self.pool {
-                let active_row: Result<Option<(bool,)>, _> = sqlx::query_as(
-                    "SELECT is_active FROM _cluster_maintenance_barrier WHERE id = 1",
+                let barrier_row: Result<Option<(bool, i64)>, _> = sqlx::query_as(
+                    "SELECT is_active, fencing_generation FROM _cluster_maintenance_barrier WHERE id = 1",
                 )
                 .fetch_optional(pool)
                 .await;
 
-                if let Ok(Some((true,))) = active_row {
+                if let Ok(Some((true, _))) = barrier_row {
                     self.in_maintenance.store(true, Ordering::SeqCst);
                     return Err(ForgeError::ServiceUnavailable(
                         "Cluster write pipeline is currently paused for coordinated maintenance"
                             .to_string(),
                     ));
-                } else if let Ok(Some((false,))) = active_row {
+                } else if let Ok(Some((false, gen))) = barrier_row {
+                    permit_gen = gen as u64;
+                    self.fencing_generation.store(permit_gen, Ordering::SeqCst);
                     if self.in_maintenance.load(Ordering::SeqCst) {
                         self.in_maintenance.store(false, Ordering::SeqCst);
                     }
@@ -160,6 +178,7 @@ impl ConsistencyBarrier {
             Ok(WritePermit {
                 conn: Some(conn),
                 counter: self.in_flight_writes.clone(),
+                permit_generation: permit_gen,
                 released: false,
             })
         } else {
@@ -168,6 +187,7 @@ impl ConsistencyBarrier {
             Ok(WritePermit {
                 conn: None,
                 counter: self.in_flight_writes.clone(),
+                permit_generation: permit_gen,
                 released: false,
             })
         }
@@ -181,10 +201,12 @@ impl ConsistencyBarrier {
                     .to_string(),
             ));
         }
+        let permit_gen = self.fencing_generation.load(Ordering::SeqCst);
         self.in_flight_writes.fetch_add(1, Ordering::SeqCst);
         Ok(WritePermit {
             conn: None,
             counter: self.in_flight_writes.clone(),
+            permit_generation: permit_gen,
             released: false,
         })
     }
@@ -195,70 +217,84 @@ impl ConsistencyBarrier {
         drain_timeout: Duration,
     ) -> Result<MaintenanceGuard, ForgeError> {
         self.in_maintenance.store(true, Ordering::SeqCst);
+        let in_memory_gen = self.fencing_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
         let mut guard_conn = None;
+        let mut final_fencing_gen = in_memory_gen;
 
         if let Some(opts) = &self.connect_options {
             if let Some(pool) = &self.pool {
-                // 1. Mark barrier active so all processes reject new writers
-                let barrier_res = sqlx::query(
+                // 1. Mark barrier active and increment monotonic fencing generation
+                let barrier_res: Result<(i64,), _> = sqlx::query_as(
                     r#"
-                    INSERT INTO _cluster_maintenance_barrier (id, is_active, activated_at_nanos, activated_by, reason)
-                    VALUES (1, TRUE, $1, 'spine-backup', 'Coordinated live cluster backup')
+                    INSERT INTO _cluster_maintenance_barrier (id, is_active, activated_at_nanos, activated_by, reason, fencing_generation)
+                    VALUES (1, TRUE, $1, 'spine-backup', 'Coordinated deployment-wide multi-volume backup', 2)
                     ON CONFLICT (id) DO UPDATE SET 
                         is_active = TRUE,
                         activated_at_nanos = $1,
                         activated_by = 'spine-backup',
-                        reason = 'Coordinated live cluster backup'
+                        reason = 'Coordinated deployment-wide multi-volume backup',
+                        fencing_generation = _cluster_maintenance_barrier.fencing_generation + 1
+                    RETURNING fencing_generation
                     "#,
                 )
                 .bind(now_nanos)
-                .execute(pool)
+                .fetch_one(pool)
                 .await;
 
-                if let Err(e) = barrier_res {
-                    // Fallback: If table does not exist (e.g. unmigrated test), try creating it
-                    let create_res = sqlx::query(
-                        r#"
-                        CREATE TABLE IF NOT EXISTS _cluster_maintenance_barrier (
-                            id INT PRIMARY KEY DEFAULT 1,
-                            is_active BOOLEAN NOT NULL DEFAULT FALSE,
-                            activated_at_nanos BIGINT NOT NULL DEFAULT 0,
-                            activated_by VARCHAR(255) NOT NULL DEFAULT '',
-                            reason VARCHAR(255) NOT NULL DEFAULT ''
-                        )
-                        "#,
-                    )
-                    .execute(pool)
-                    .await;
-
-                    if create_res.is_ok() {
-                        sqlx::query(
+                match barrier_res {
+                    Ok((gen,)) => {
+                        final_fencing_gen = gen as u64;
+                        self.fencing_generation
+                            .store(final_fencing_gen, Ordering::SeqCst);
+                    }
+                    Err(e) => {
+                        // Fallback: If table does not exist, create it with fencing_generation
+                        let create_res = sqlx::query(
                             r#"
-                            INSERT INTO _cluster_maintenance_barrier (id, is_active, activated_at_nanos, activated_by, reason)
-                            VALUES (1, TRUE, $1, 'spine-backup', 'Coordinated live cluster backup')
-                            ON CONFLICT (id) DO UPDATE SET 
-                                is_active = TRUE,
-                                activated_at_nanos = $1,
-                                activated_by = 'spine-backup',
-                                reason = 'Coordinated live cluster backup'
+                            CREATE TABLE IF NOT EXISTS _cluster_maintenance_barrier (
+                                id INT PRIMARY KEY DEFAULT 1,
+                                is_active BOOLEAN NOT NULL DEFAULT FALSE,
+                                activated_at_nanos BIGINT NOT NULL DEFAULT 0,
+                                activated_by VARCHAR(255) NOT NULL DEFAULT '',
+                                reason VARCHAR(255) NOT NULL DEFAULT '',
+                                fencing_generation BIGINT NOT NULL DEFAULT 1
+                            )
                             "#,
                         )
-                        .bind(now_nanos)
                         .execute(pool)
-                        .await
-                        .map_err(|e| {
-                            ForgeError::Internal(format!(
-                                "Failed to activate cluster maintenance barrier in database: {}",
+                        .await;
+
+                        if create_res.is_ok() {
+                            let gen_res: Result<(i64,), _> = sqlx::query_as(
+                                r#"
+                                INSERT INTO _cluster_maintenance_barrier (id, is_active, activated_at_nanos, activated_by, reason, fencing_generation)
+                                VALUES (1, TRUE, $1, 'spine-backup', 'Coordinated deployment-wide multi-volume backup', 2)
+                                ON CONFLICT (id) DO UPDATE SET 
+                                    is_active = TRUE,
+                                    activated_at_nanos = $1,
+                                    activated_by = 'spine-backup',
+                                    reason = 'Coordinated deployment-wide multi-volume backup',
+                                    fencing_generation = _cluster_maintenance_barrier.fencing_generation + 1
+                                RETURNING fencing_generation
+                                "#,
+                            )
+                            .bind(now_nanos)
+                            .fetch_one(pool)
+                            .await;
+
+                            if let Ok((gen,)) = gen_res {
+                                final_fencing_gen = gen as u64;
+                                self.fencing_generation
+                                    .store(final_fencing_gen, Ordering::SeqCst);
+                            }
+                        } else {
+                            return Err(ForgeError::Internal(format!(
+                                "Failed to update cluster maintenance barrier: {}",
                                 e
-                            ))
-                        })?;
-                    } else {
-                        return Err(ForgeError::Internal(format!(
-                            "Failed to update cluster maintenance barrier: {}",
-                            e
-                        )));
+                            )));
+                        }
                     }
                 }
             }
@@ -315,7 +351,8 @@ impl ConsistencyBarrier {
         }
 
         tracing::info!(
-            "Maintenance consistency barrier activated. Draining in-flight writes for {:?}...",
+            "Maintenance consistency barrier activated at generation {}. Draining in-flight writes for {:?}...",
+            final_fencing_gen,
             drain_timeout
         );
 
@@ -327,6 +364,7 @@ impl ConsistencyBarrier {
         Ok(MaintenanceGuard {
             barrier: self.clone(),
             conn: guard_conn,
+            fencing_generation: final_fencing_gen,
             released: false,
         })
     }
@@ -335,6 +373,7 @@ impl ConsistencyBarrier {
 pub struct WritePermit {
     conn: Option<PgConnection>,
     counter: Arc<AtomicUsize>,
+    pub permit_generation: u64,
     released: bool,
 }
 
@@ -355,12 +394,33 @@ impl WritePermit {
         Ok(())
     }
 
-    /// Verify that the dedicated database connection and advisory lock remain active.
+    /// Verify that the dedicated database connection and advisory lock remain active,
+    /// and that the cluster has not entered maintenance or advanced the fencing generation.
     pub async fn verify_active(&mut self) -> Result<(), ForgeError> {
         if let Some(conn) = &mut self.conn {
-            sqlx::query("SELECT 1").execute(conn).await.map_err(|e| {
-                ForgeError::ServiceUnavailable(format!("Writer permit connection lost: {}", e))
-            })?;
+            let barrier_row: Result<Option<(bool, i64)>, _> = sqlx::query_as(
+                "SELECT is_active, fencing_generation FROM _cluster_maintenance_barrier WHERE id = 1",
+            )
+            .fetch_optional(conn)
+            .await;
+
+            match barrier_row {
+                Ok(Some((is_active, active_gen))) => {
+                    if is_active || active_gen as u64 != self.permit_generation {
+                        return Err(ForgeError::ServiceUnavailable(format!(
+                            "Write permit fencing violation: cluster is in maintenance or fencing generation advanced (permit generation {}, active generation {})",
+                            self.permit_generation, active_gen
+                        )));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(ForgeError::ServiceUnavailable(format!(
+                        "Writer permit connection or barrier verification failed: {}",
+                        e
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -372,18 +432,21 @@ impl Drop for WritePermit {
             self.counter.fetch_sub(1, Ordering::SeqCst);
             self.released = true;
         }
-        // When self.conn is dropped synchronously, the underlying TCP stream is closed,
-        // causing PostgreSQL to automatically and immediately release all session advisory locks.
     }
 }
 
 pub struct MaintenanceGuard {
     barrier: ConsistencyBarrier,
     conn: Option<PgConnection>,
+    pub fencing_generation: u64,
     released: bool,
 }
 
 impl MaintenanceGuard {
+    pub fn fencing_generation(&self) -> u64 {
+        self.fencing_generation
+    }
+
     /// Explicitly release the maintenance guard, deactivating the barrier and unlocking the advisory lock.
     pub async fn release(mut self) -> Result<(), ForgeError> {
         self.released = true;

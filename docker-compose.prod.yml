@@ -55,15 +55,21 @@ services:
     environment:
       POSTGRES_DB: "${POSTGRES_DB:-spine_forge}"
       POSTGRES_USER: "${POSTGRES_ADMIN_USER:-spine_admin}"
-      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD_required}"
+      POSTGRES_PASSWORD: "${POSTGRES_ADMIN_PASSWORD:-${POSTGRES_PASSWORD:?POSTGRES_ADMIN_PASSWORD_required}}"
+      POSTGRES_MIGRATOR_USER: "${POSTGRES_MIGRATOR_USER:-spine_migrator}"
+      POSTGRES_MIGRATOR_PASSWORD: "${POSTGRES_MIGRATOR_PASSWORD:?POSTGRES_MIGRATOR_PASSWORD_required}"
+      POSTGRES_APP_USER: "${POSTGRES_APP_USER:-spine_app}"
+      POSTGRES_APP_PASSWORD: "${POSTGRES_APP_PASSWORD:?POSTGRES_APP_PASSWORD_required}"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./docker/postgres/01-init-roles.sh:/docker-entrypoint-initdb.d/01-init-roles.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_ADMIN_USER:-spine_admin} -d ${POSTGRES_DB:-spine_forge}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_APP_USER:-spine_app} -d ${POSTGRES_DB:-spine_forge}"]
       interval: 5s
       timeout: 5s
       retries: 5
+    security_opt:
+      - no-new-privileges:true
 
   # ----------------------------------------------------------------------------
   # 3. State Coordinator - Raft Consensus (No Host Port Exposure)
@@ -81,6 +87,8 @@ services:
       SPINE_STORE_PATH: "/var/lib/spine/coordinator.state"
     volumes:
       - coordinator_data:/var/lib/spine
+    security_opt:
+      - no-new-privileges:true
 
   # ----------------------------------------------------------------------------
   # 4. Storage Nodes (No Host Port Exposure)
@@ -103,6 +111,8 @@ services:
       - storage_1_data:/var/lib/spine/node-1
     depends_on:
       - coordinator
+    security_opt:
+      - no-new-privileges:true
 
   storage-node-2:
     build:
@@ -122,6 +132,8 @@ services:
       - storage_2_data:/var/lib/spine/node-2
     depends_on:
       - coordinator
+    security_opt:
+      - no-new-privileges:true
 
   storage-node-3:
     build:
@@ -141,6 +153,8 @@ services:
       - storage_3_data:/var/lib/spine/node-3
     depends_on:
       - coordinator
+    security_opt:
+      - no-new-privileges:true
 
   # ----------------------------------------------------------------------------
   # 5. Core Application Server - Spine Forge API & Native SSH Daemon
@@ -163,8 +177,8 @@ services:
       PORT: "3000"
       SSH_PORT: "2222"
       SPINE_DEPLOYMENT_PROFILE: "core-forge-v1"
-      MIGRATION_DATABASE_URL: "postgres://${POSTGRES_MIGRATOR_USER:-spine_migrator}:${POSTGRES_MIGRATOR_PASSWORD:-${POSTGRES_PASSWORD:?POSTGRES_PASSWORD_required}}@postgres:5432/${POSTGRES_DB:-spine_forge}"
-      DATABASE_URL: "postgres://${POSTGRES_USER:-spine_app}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD_required}@postgres:5432/${POSTGRES_DB:-spine_forge}"
+      MIGRATION_DATABASE_URL: "postgres://${POSTGRES_MIGRATOR_USER:-spine_migrator}:${POSTGRES_MIGRATOR_PASSWORD:?POSTGRES_MIGRATOR_PASSWORD_required}@postgres:5432/${POSTGRES_DB:-spine_forge}"
+      DATABASE_URL: "postgres://${POSTGRES_APP_USER:-spine_app}:${POSTGRES_APP_PASSWORD:?POSTGRES_APP_PASSWORD_required}@postgres:5432/${POSTGRES_DB:-spine_forge}"
       COORDINATOR_ADDR: "coordinator:8400"
       STORAGE_ROOT: "/var/lib/spine/storage"
       FORGE_PUBLIC_ORIGIN: "${FORGE_PUBLIC_ORIGIN:?FORGE_PUBLIC_ORIGIN_required_must_be_https_URL}"
@@ -182,6 +196,8 @@ services:
         condition: service_healthy
       coordinator:
         condition: service_started
+    security_opt:
+      - no-new-privileges:true
 
   # ----------------------------------------------------------------------------
   # 6. Web User Interface - Internal Static Asset Server
@@ -194,6 +210,8 @@ services:
     restart: unless-stopped
     networks:
       - spine-ingress-proxy
+    security_opt:
+      - no-new-privileges:true
     # No host port exposed; routed strictly via ingress on port 443
     depends_on:
       - spine-api

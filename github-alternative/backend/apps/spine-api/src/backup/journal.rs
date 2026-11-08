@@ -97,6 +97,56 @@ impl RestoreJournal {
             .map_err(|e| ForgeError::Internal(format!("Failed to write storage generation: {}", e)))
     }
 
+    /// Record generation token inside an active database transaction before committing.
+    pub async fn record_db_generation_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        generation: &str,
+        backup_id: &str,
+    ) -> Result<(), ForgeError> {
+        let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let create_sql = r#"
+            CREATE TABLE IF NOT EXISTS _restore_generation (
+                id INT PRIMARY KEY DEFAULT 1,
+                generation_token VARCHAR(128) NOT NULL,
+                backup_id VARCHAR(128) NOT NULL,
+                restored_at_nanos BIGINT NOT NULL,
+                status VARCHAR(32) NOT NULL DEFAULT 'COMMITTED'
+            )
+        "#;
+        sqlx::query(create_sql)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| {
+                ForgeError::Internal(format!(
+                    "Failed to create _restore_generation table in transaction: {}",
+                    e
+                ))
+            })?;
+
+        let insert_sql = r#"
+            INSERT INTO _restore_generation (id, generation_token, backup_id, restored_at_nanos, status)
+            VALUES (1, $1, $2, $3, 'COMMITTED')
+            ON CONFLICT (id) DO UPDATE SET
+                generation_token = EXCLUDED.generation_token,
+                backup_id = EXCLUDED.backup_id,
+                restored_at_nanos = EXCLUDED.restored_at_nanos,
+                status = EXCLUDED.status
+        "#;
+        sqlx::query(insert_sql)
+            .bind(generation)
+            .bind(backup_id)
+            .bind(now_nanos)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| {
+                ForgeError::Internal(format!(
+                    "Failed to record database restore generation in transaction: {}",
+                    e
+                ))
+            })?;
+        Ok(())
+    }
+
     /// Record generation token in target database.
     pub async fn record_db_generation(
         pool: &sqlx::PgPool,
@@ -248,30 +298,58 @@ impl RestoreJournal {
         let sync_msg = Self::handle_startup_recovery_sync(storage_root)?;
 
         if let Some(pool) = pool {
-            let row: Result<Option<(String,)>, _> =
-                sqlx::query_as("SELECT generation_token FROM _restore_generation WHERE id = 1")
-                    .fetch_optional(pool)
-                    .await;
+            // Check if database is empty or initialized
+            let table_count: (i64,) = sqlx::query_as(
+                "SELECT count(*)::bigint FROM information_schema.tables WHERE table_schema = 'public' AND table_name NOT LIKE 'pg_%'",
+            )
+            .fetch_one(pool)
+            .await
+            .map_err(|e| {
+                ForgeError::Internal(format!(
+                    "FATAL STARTUP BLOCKED: Failed to inspect database schema catalog during recovery check: {}",
+                    e
+                ))
+            })?;
 
-            if let Ok(Some((db_gen,))) = row {
-                let storage_gen = Self::read_storage_generation(storage_root);
-                match storage_gen {
-                    Some(s_gen) if s_gen == db_gen => {
-                        tracing::info!(
-                            "Verified consistent generation token '{}' across database and storage root.",
-                            db_gen
-                        );
+            if table_count.0 > 0 {
+                let row: Result<Option<(String,)>, _> =
+                    sqlx::query_as("SELECT generation_token FROM _restore_generation WHERE id = 1")
+                        .fetch_optional(pool)
+                        .await;
+
+                match row {
+                    Ok(Some((db_gen,))) => {
+                        let storage_gen = Self::read_storage_generation(storage_root);
+                        match storage_gen {
+                            Some(s_gen) if s_gen == db_gen => {
+                                tracing::info!(
+                                    "Verified consistent generation token '{}' across database and storage root.",
+                                    db_gen
+                                );
+                            }
+                            Some(s_gen) => {
+                                return Err(ForgeError::Internal(format!(
+                                    "FATAL STARTUP BLOCKED: Generation mismatch! Database generation is '{}' but storage generation is '{}'. Startup aborted to prevent split-brain data corruption.",
+                                    db_gen, s_gen
+                                )));
+                            }
+                            None => {
+                                return Err(ForgeError::Internal(format!(
+                                    "FATAL STARTUP BLOCKED: Database has generation '{}' but storage generation file is missing! Startup aborted to prevent split-brain data corruption.",
+                                    db_gen
+                                )));
+                            }
+                        }
                     }
-                    Some(s_gen) => {
-                        return Err(ForgeError::Internal(format!(
-                            "FATAL STARTUP BLOCKED: Generation mismatch! Database generation is '{}' but storage generation is '{}'. Startup aborted to prevent split-brain data corruption.",
-                            db_gen, s_gen
-                        )));
+                    Ok(None) => {
+                        return Err(ForgeError::Internal(
+                            "FATAL STARTUP BLOCKED: Non-empty database missing generation record in _restore_generation table. Startup aborted to prevent unaligned state.".to_string(),
+                        ));
                     }
-                    None => {
+                    Err(e) => {
                         return Err(ForgeError::Internal(format!(
-                            "FATAL STARTUP BLOCKED: Database has generation '{}' but storage generation file is missing! Startup aborted to prevent split-brain data corruption.",
-                            db_gen
+                            "FATAL STARTUP BLOCKED: Failed to query _restore_generation table: {}. Missing generation tables and query errors cannot be ignored.",
+                            e
                         )));
                     }
                 }

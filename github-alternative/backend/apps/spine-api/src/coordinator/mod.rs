@@ -1,3 +1,3 @@
 pub mod client;
 
-pub use client::CoordinatorClient;
+pub use client::{ClusterNodeClient, CoordinatorClient};

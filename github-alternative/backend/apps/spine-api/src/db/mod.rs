@@ -6,7 +6,8 @@ pub mod traits;
 
 pub use dump::{
     dump_database, dump_database_to_writer, is_database_empty, restore_database,
-    restore_database_from_reader, DatabaseRestoreReport, DatabaseSnapshot,
+    restore_database_from_reader, restore_database_with_generation, DatabaseRestoreReport,
+    DatabaseSnapshot,
 };
 pub use in_memory::InMemoryDatabase;
 pub use migrations::run_migrations;
