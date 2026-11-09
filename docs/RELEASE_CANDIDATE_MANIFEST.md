@@ -64,3 +64,14 @@ All findings from the Codex deployment audit (F-01 through F-07) have been remed
 - **F-05**: Dockerfile modern Rust alignment, ingress network isolation.
 - **F-06**: Preflight archive format, keys, and database empty checks before touching disk.
 - **F-07**: Migration cancellation safety verified during active DDL and inserts across 5 cycles.
+
+---
+
+## 5. Batch 21I Tenth Audit Remediation Status
+
+All findings from the Tenth Independent Codex Audit (SPINE-21H-01 through SPINE-21H-05) have been addressed and verified:
+- **SPINE-21H-01 (P0)**: Complete participant payload contract. All 7 participants (database, coordinator, storage_1_data, storage_2_data, storage_3_data, spine_storage, ssh_identity) stream non-empty payload archives (`.tar.gz`). Bypasses eliminated; strict byte length and SHA-256 verification byte-for-byte upon extraction.
+- **SPINE-21H-02 (P0)**: Durable, actionable restore recovery. Restore journal stored in dedicated control directory (`.spine_restore_control/restore_journal.json`), protected with `sync_all()` and atomic replace. Forward recovery on restart advances from `StoragePublished` to `Committed`, purging old generations and staging folders. Incomplete restore states fail closed with actionable diagnostics. Coordinator staged and previous committed states persisted across restarts. SSH identity staged publication after DB and storage cutovers, with rollback backup preserved in `.old_ssh_<id>`.
+- **SPINE-21H-03 (P1)**: Coordinator `record_heartbeat` acquires writer guard; rejected during maintenance. Generation monotonicity enforced. Existing participants with missing fencing markers fail closed immediately (`bail!`). Safe atomic replace with `sync_all()`.
+- **SPINE-21H-04 (P1)**: Production readiness endpoint `/api/v1/health/ready` checking DB, storage root, coordinator, and all storage nodes with 2s bounded timeouts. Requires >=3 storage nodes under `CoreForge`. Healthchecks configured in `docker-compose.prod.yml` with service dependency wiring.
+- **SPINE-21H-05 (P1)**: Fixed SQL identifier vs literal quoting in `01-init-roles.sh`. Canonical database name contract detecting conflicts between `POSTGRES_DB` and `SPINE_POSTGRES_DB`. Immediate fail-fast termination on unreadable or empty password files.

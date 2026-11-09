@@ -59,6 +59,43 @@ pub struct BackupParticipantRecord {
     pub archive_rel_path: String,
 }
 
+/// Source of raw payload bytes for a backup participant.
+/// Supports both in-memory buffers (for small metadata/keys) and streamed disk files (for large volumes).
+#[derive(Clone, Debug)]
+pub enum ParticipantPayloadSource {
+    Memory(Vec<u8>),
+    File(PathBuf),
+}
+
+/// Safely moves a file across filesystems or drive letters with copy+delete fallback.
+pub fn safe_move_file(from: &Path, to: &Path) -> Result<(), ForgeError> {
+    if fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    fs::copy(from, to).map_err(|e| {
+        ForgeError::Internal(format!(
+            "Failed to copy file from {:?} to {:?}: {}",
+            from, to, e
+        ))
+    })?;
+    let _ = fs::remove_file(from);
+    Ok(())
+}
+
+/// Safely replaces a destination file atomically, accommodating Windows rename semantics.
+pub fn safe_atomic_replace(from: &Path, to: &Path) -> Result<(), ForgeError> {
+    if fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    let _ = fs::remove_file(to);
+    if fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    fs::copy(from, to).map_err(|e| ForgeError::Internal(format!("Failed to copy file: {}", e)))?;
+    let _ = fs::remove_file(from);
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BackupManifest {
     pub backup_id: String,
@@ -109,8 +146,15 @@ impl StagedRestoreSession {
         None
     }
 
-    /// Commits the staged files to live storage root using whole-generation replacement.
-    /// This MUST only be called after target database restore is successful.
+    pub fn get_participant_snapshot_path(&self, rel_path: &str) -> Option<PathBuf> {
+        for (p, staged_path, _) in &self.verified_files {
+            if p == rel_path {
+                return Some(staged_path.clone());
+            }
+        }
+        None
+    }
+
     /// Commits the staged files to live storage root using whole-generation replacement.
     /// This MUST only be called after target database restore is successful.
     /// Retains old generation in `.old_generation_<restore_id>` until finalize() is called.
@@ -142,10 +186,12 @@ impl StagedRestoreSession {
                 if !name.starts_with(".old_generation_")
                     && !name.starts_with(".staged_generation_")
                     && !name.starts_with(".tmp")
+                    && !name.starts_with(".old_ssh_")
+                    && !name.starts_with(".spine_restore_control")
                     && name != RestoreJournal::JOURNAL_FILE_NAME
                 {
                     let dst = old_dir.join(&name);
-                    let _ = fs::rename(&p, &dst);
+                    let _ = safe_move_file(&p, &dst);
                 }
             }
         }
@@ -157,23 +203,77 @@ impl StagedRestoreSession {
             .map(|p| p.archive_rel_path.as_str())
             .collect();
 
-        // 2. Move staged verified files into target live root
-        for (rel_path, staged_path, file_len) in &self.verified_files {
-            if rel_path != "database/snapshot.jsonl"
-                && rel_path != "database/snapshot.json"
-                && !participant_paths.contains(rel_path.as_str())
+        // Check if spine_storage participant snapshot is present
+        let storage_participant = self
+            .manifest
+            .participants
+            .iter()
+            .find(|p| p.participant_id == "spine_storage");
+
+        if let Some(sp) = storage_participant {
+            // Find staged snapshot file
+            let staged_snap = self
+                .verified_files
+                .iter()
+                .find(|(rel, _, _)| rel == &sp.archive_rel_path)
+                .map(|(_, path, _)| path.clone())
+                .ok_or_else(|| {
+                    ForgeError::Internal(format!(
+                        "spine_storage payload '{}' missing from staged files",
+                        sp.archive_rel_path
+                    ))
+                })?;
+
+            let snap_file = File::open(&staged_snap).map_err(|e| {
+                ForgeError::Internal(format!("Failed to open spine_storage payload: {}", e))
+            })?;
+            let dec = GzDecoder::new(snap_file);
+            let mut snap_tar = tar::Archive::new(dec);
+
+            for entry in snap_tar
+                .entries()
+                .map_err(|e| ForgeError::Internal(e.to_string()))?
             {
-                let dest =
-                    BackupManager::sanitize_restore_path(&self.target_storage_root, rel_path)?;
+                let mut entry = entry.map_err(|e| ForgeError::Internal(e.to_string()))?;
+                let path = entry
+                    .path()
+                    .map_err(|e| ForgeError::Internal(e.to_string()))?
+                    .to_path_buf();
+                let dest = BackupManager::sanitize_restore_path(
+                    &self.target_storage_root,
+                    &path.to_string_lossy(),
+                )?;
                 if let Some(parent) = dest.parent() {
                     fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
                 }
-                fs::rename(staged_path, &dest).map_err(|e| ForgeError::Internal(e.to_string()))?;
+                entry
+                    .unpack(&dest)
+                    .map_err(|e| ForgeError::Internal(e.to_string()))?;
                 files_restored += 1;
-                bytes_restored += *file_len;
-            } else {
-                files_restored += 1;
-                bytes_restored += *file_len;
+                if let Ok(m) = fs::metadata(&dest) {
+                    bytes_restored += m.len();
+                }
+            }
+        } else {
+            // 2. Move staged verified files into target live root (standalone legacy format)
+            for (rel_path, staged_path, file_len) in &self.verified_files {
+                if rel_path != "database/snapshot.jsonl"
+                    && rel_path != "database/snapshot.json"
+                    && !participant_paths.contains(rel_path.as_str())
+                {
+                    let dest =
+                        BackupManager::sanitize_restore_path(&self.target_storage_root, rel_path)?;
+                    if let Some(parent) = dest.parent() {
+                        fs::create_dir_all(parent)
+                            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                    }
+                    safe_move_file(staged_path, &dest)?;
+                    files_restored += 1;
+                    bytes_restored += *file_len;
+                } else {
+                    files_restored += 1;
+                    bytes_restored += *file_len;
+                }
             }
         }
 
@@ -287,8 +387,7 @@ impl BackupManager {
                 None,
                 enc,
             )?;
-            fs::rename(&tmp_output, output_tar_gz)
-                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+            safe_atomic_replace(&tmp_output, output_tar_gz)?;
             Ok(manifest)
         })();
 
@@ -320,8 +419,7 @@ impl BackupManager {
                 None,
                 enc,
             )?;
-            fs::rename(&tmp_output, output_tar_gz)
-                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+            safe_atomic_replace(&tmp_output, output_tar_gz)?;
             Ok(manifest)
         })();
 
@@ -331,11 +429,105 @@ impl BackupManager {
         res
     }
 
+    /// Captures the complete storage directory into a streaming .tar.gz archive payload on disk.
+    /// Memory consumption is strictly O(1) (~64 KiB buffer), returning exact byte length and SHA-256 digest.
+    pub fn capture_storage_snapshot(
+        storage_root: &Path,
+        dest_path: &Path,
+    ) -> Result<(u64, String), ForgeError> {
+        let parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let file = File::create(dest_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let enc = GzEncoder::new(file, Compression::default());
+        let mut tar = tar::Builder::new(enc);
+
+        let mut file_paths = Vec::new();
+        if storage_root.exists() {
+            Self::collect_files_recursive(storage_root, storage_root, &mut file_paths)?;
+        }
+        file_paths.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (rel_path, abs_path) in file_paths {
+            if rel_path.starts_with(".old_generation_")
+                || rel_path.starts_with(".old_ssh_")
+                || rel_path.starts_with(".staged_generation_")
+                || rel_path.starts_with(".tmp")
+                || rel_path.starts_with(".spine_restore_control")
+                || rel_path == RestoreJournal::JOURNAL_FILE_NAME
+            {
+                continue;
+            }
+
+            let meta = fs::metadata(&abs_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
+            let mut f =
+                fs::File::open(&abs_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
+            let mut header = tar::Header::new_gnu();
+            header.set_size(meta.len());
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, &rel_path, &mut f)
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        }
+
+        let enc = tar
+            .into_inner()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut file = enc
+            .finish()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        file.flush()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        file.sync_all()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let meta = fs::metadata(dest_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut f = File::open(dest_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = f
+                .read(&mut buf)
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        let hash = hex::encode(hasher.finalize());
+        Ok((meta.len(), hash))
+    }
+
     /// Creates a complete cluster backup archive with database dump and multi-volume participant snapshots.
     pub fn create_cluster_backup(
         storage_root: &Path,
         db_snapshot_file: Option<&Path>,
         participants: Vec<(BackupParticipantRecord, Vec<u8>)>,
+        fencing_generation: Option<u64>,
+        output_path: &Path,
+        passphrase: Option<&str>,
+        key_version: u16,
+    ) -> Result<BackupManifest, ForgeError> {
+        let stream_participants: Vec<_> = participants
+            .into_iter()
+            .map(|(r, d)| (r, ParticipantPayloadSource::Memory(d)))
+            .collect();
+        Self::create_cluster_backup_streaming(
+            storage_root,
+            db_snapshot_file,
+            stream_participants,
+            fencing_generation,
+            output_path,
+            passphrase,
+            key_version,
+        )
+    }
+
+    /// Creates a complete cluster backup archive with bounded-memory streaming participant payloads.
+    pub fn create_cluster_backup_streaming(
+        storage_root: &Path,
+        db_snapshot_file: Option<&Path>,
+        participants: Vec<(BackupParticipantRecord, ParticipantPayloadSource)>,
         fencing_generation: Option<u64>,
         output_path: &Path,
         passphrase: Option<&str>,
@@ -382,9 +574,7 @@ impl BackupManager {
                     ))
                 })?;
                 v2::decrypt_stream(verify_file, std::io::sink(), pass)?;
-                fs::rename(&tmp_output, output_path).map_err(|e| {
-                    ForgeError::Internal(format!("Failed to publish encrypted archive: {}", e))
-                })?;
+                safe_atomic_replace(&tmp_output, output_path)?;
                 Ok(manifest)
             })();
             if res.is_err() && tmp_output.exists() {
@@ -405,8 +595,7 @@ impl BackupManager {
                     fencing_generation,
                     enc,
                 )?;
-                fs::rename(&tmp_output, output_path)
-                    .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                safe_atomic_replace(&tmp_output, output_path)?;
                 Ok(manifest)
             })();
             if res.is_err() && tmp_output.exists() {
@@ -1073,7 +1262,7 @@ impl BackupManager {
         storage_root: &Path,
         db_snapshot_json: Option<&str>,
         db_snapshot_file: Option<&Path>,
-        participants: &[(BackupParticipantRecord, Vec<u8>)],
+        participants: &[(BackupParticipantRecord, ParticipantPayloadSource)],
         fencing_generation: Option<u64>,
         writer: W,
     ) -> Result<(BackupManifest, W), ForgeError> {
@@ -1082,8 +1271,10 @@ impl BackupManager {
 
         let mut file_hashes = BTreeMap::new();
         let mut total_bytes = 0u64;
+        let mut participant_paths = std::collections::HashSet::new();
 
         for (record, _) in participants {
+            participant_paths.insert(record.archive_rel_path.clone());
             file_hashes.insert(
                 record.archive_rel_path.clone(),
                 record.sha256_checksum.clone(),
@@ -1092,7 +1283,11 @@ impl BackupManager {
         }
 
         let mut file_paths = Vec::new();
-        if storage_root.exists() {
+        // If spine_storage is explicitly included as a participant snapshot, do NOT duplicate loose files!
+        let has_spine_storage_participant = participants
+            .iter()
+            .any(|(p, _)| p.participant_id == "spine_storage");
+        if !has_spine_storage_participant && storage_root.exists() {
             Self::collect_files_recursive(storage_root, storage_root, &mut file_paths)?;
         }
 
@@ -1118,23 +1313,26 @@ impl BackupManager {
         }
 
         if let Some(db_file) = db_snapshot_file {
-            let mut f = fs::File::open(db_file).map_err(|e| ForgeError::Internal(e.to_string()))?;
-            let mut hasher = Sha256::new();
-            let mut buf = [0u8; 64 * 1024];
-            let mut f_len = 0u64;
-            loop {
-                let n = f
-                    .read(&mut buf)
-                    .map_err(|e| ForgeError::Internal(e.to_string()))?;
-                if n == 0 {
-                    break;
+            if !participant_paths.contains("database/snapshot.jsonl") {
+                let mut f =
+                    fs::File::open(db_file).map_err(|e| ForgeError::Internal(e.to_string()))?;
+                let mut hasher = Sha256::new();
+                let mut buf = [0u8; 64 * 1024];
+                let mut f_len = 0u64;
+                loop {
+                    let n = f
+                        .read(&mut buf)
+                        .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buf[..n]);
+                    f_len += n as u64;
                 }
-                hasher.update(&buf[..n]);
-                f_len += n as u64;
+                total_bytes += f_len;
+                let digest = hex::encode(hasher.finalize());
+                file_hashes.insert("database/snapshot.jsonl".to_string(), digest);
             }
-            total_bytes += f_len;
-            let digest = hex::encode(hasher.finalize());
-            file_hashes.insert("database/snapshot.jsonl".to_string(), digest);
         } else if let Some(db_json) = db_snapshot_json {
             let mut hasher = Sha256::new();
             hasher.update(db_json.as_bytes());
@@ -1206,15 +1404,18 @@ impl BackupManager {
             .map_err(|e| ForgeError::Internal(e.to_string()))?;
 
         if let Some(db_file) = db_snapshot_file {
-            let metadata =
-                fs::metadata(db_file).map_err(|e| ForgeError::Internal(e.to_string()))?;
-            let mut f = fs::File::open(db_file).map_err(|e| ForgeError::Internal(e.to_string()))?;
-            let mut db_header = tar::Header::new_gnu();
-            db_header.set_size(metadata.len());
-            db_header.set_mode(0o600);
-            db_header.set_cksum();
-            tar.append_data(&mut db_header, "database/snapshot.jsonl", &mut f)
-                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+            if !participant_paths.contains("database/snapshot.jsonl") {
+                let metadata =
+                    fs::metadata(db_file).map_err(|e| ForgeError::Internal(e.to_string()))?;
+                let mut f =
+                    fs::File::open(db_file).map_err(|e| ForgeError::Internal(e.to_string()))?;
+                let mut db_header = tar::Header::new_gnu();
+                db_header.set_size(metadata.len());
+                db_header.set_mode(0o600);
+                db_header.set_cksum();
+                tar.append_data(&mut db_header, "database/snapshot.jsonl", &mut f)
+                    .map_err(|e| ForgeError::Internal(e.to_string()))?;
+            }
         } else if let Some(db_json) = db_snapshot_json {
             let mut db_header = tar::Header::new_gnu();
             db_header.set_size(db_json.len() as u64);
@@ -1237,13 +1438,29 @@ impl BackupManager {
                 .map_err(|e| ForgeError::Internal(e.to_string()))?;
         }
 
-        for (record, data) in participants {
-            let mut p_header = tar::Header::new_gnu();
-            p_header.set_size(data.len() as u64);
-            p_header.set_mode(0o644);
-            p_header.set_cksum();
-            tar.append_data(&mut p_header, &record.archive_rel_path, &data[..])
-                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        for (record, source) in participants {
+            match source {
+                ParticipantPayloadSource::Memory(data) => {
+                    let mut p_header = tar::Header::new_gnu();
+                    p_header.set_size(data.len() as u64);
+                    p_header.set_mode(0o644);
+                    p_header.set_cksum();
+                    tar.append_data(&mut p_header, &record.archive_rel_path, &data[..])
+                        .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                }
+                ParticipantPayloadSource::File(path) => {
+                    let mut f =
+                        fs::File::open(path).map_err(|e| ForgeError::Internal(e.to_string()))?;
+                    let meta =
+                        fs::metadata(path).map_err(|e| ForgeError::Internal(e.to_string()))?;
+                    let mut p_header = tar::Header::new_gnu();
+                    p_header.set_size(meta.len());
+                    p_header.set_mode(0o644);
+                    p_header.set_cksum();
+                    tar.append_data(&mut p_header, &record.archive_rel_path, &mut f)
+                        .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                }
+            }
         }
 
         let writer = tar
@@ -1293,6 +1510,10 @@ impl BackupManager {
                 .map_err(|e| ForgeError::Internal(e.to_string()))?
                 .to_path_buf();
             let path_str = path.to_string_lossy().replace('\\', "/");
+
+            if entry.header().entry_type().is_dir() {
+                continue;
+            }
 
             if path_str.len() > MAX_ARCHIVE_PATH_LEN {
                 return Err(ForgeError::Internal(format!(
@@ -1414,9 +1635,6 @@ impl BackupManager {
 
         // Verify that every participant declared in manifest has matching archive payload
         for participant in &manifest.participants {
-            if participant.participant_id == "spine_storage" {
-                continue;
-            }
             let (rel, _staged_p) = files_to_verify
                 .iter()
                 .find(|(p_rel, _)| p_rel == &participant.archive_rel_path)

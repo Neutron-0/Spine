@@ -112,6 +112,11 @@ services:
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8400 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -141,8 +146,14 @@ services:
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8401 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
     depends_on:
-      - coordinator
+      coordinator:
+        condition: service_healthy
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -169,8 +180,14 @@ services:
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8401 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
     depends_on:
-      - coordinator
+      coordinator:
+        condition: service_healthy
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -197,8 +214,14 @@ services:
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8401 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
     depends_on:
-      - coordinator
+      coordinator:
+        condition: service_healthy
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -259,7 +282,13 @@ services:
       postgres:
         condition: service_healthy
       coordinator:
-        condition: service_started
+        condition: service_healthy
+      storage-node-1:
+        condition: service_healthy
+      storage-node-2:
+        condition: service_healthy
+      storage-node-3:
+        condition: service_healthy
     security_opt:
       - no-new-privileges:true
     cap_drop:

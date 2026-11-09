@@ -15,6 +15,9 @@ pub struct ReadinessResponse {
     pub database: bool,
     pub storage: bool,
     pub coordinator: bool,
+    pub storage_nodes: bool,
+    pub storage_nodes_healthy: usize,
+    pub storage_nodes_required: usize,
 }
 
 pub async fn health_liveness() -> impl IntoResponse {
@@ -26,14 +29,55 @@ pub async fn health_liveness() -> impl IntoResponse {
 }
 
 pub async fn health_readiness(State(state): State<AppState>) -> impl IntoResponse {
-    let db_ok = state.db.ping().await.is_ok();
+    let db_ok = tokio::time::timeout(std::time::Duration::from_secs(2), state.db.ping())
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false);
+
     let storage_ok = state.vcs.storage_root().exists();
+
     let coord_ok = match &state.coordinator {
-        Some(c) => c.check_health().await,
+        Some(c) => {
+            let health_fut = c.check_health();
+            tokio::time::timeout(std::time::Duration::from_secs(2), health_fut)
+                .await
+                .unwrap_or(false)
+        }
         None => true, // Standalone mode without external coordinator
     };
 
-    let overall = db_ok && storage_ok && coord_ok;
+    let mut healthy_nodes = 0usize;
+    for (_id, addr) in &state.storage_nodes {
+        let client = crate::ClusterNodeClient::new(addr.clone());
+        let node_check = async {
+            match client.query_maintenance_status().await {
+                Ok((in_maint, _)) => !in_maint,
+                Err(_) => false,
+            }
+        };
+        if tokio::time::timeout(std::time::Duration::from_secs(2), node_check)
+            .await
+            .unwrap_or(false)
+        {
+            healthy_nodes += 1;
+        }
+    }
+
+    let min_nodes = if state.profile == crate::core::profile::DeploymentProfile::CoreForge {
+        3
+    } else {
+        0
+    };
+
+    let storage_nodes_ok = if state.profile == crate::core::profile::DeploymentProfile::CoreForge {
+        healthy_nodes >= min_nodes && healthy_nodes == state.storage_nodes.len()
+    } else if !state.storage_nodes.is_empty() {
+        healthy_nodes == state.storage_nodes.len()
+    } else {
+        true
+    };
+
+    let overall = db_ok && storage_ok && coord_ok && storage_nodes_ok;
     let status_code = if overall {
         StatusCode::OK
     } else {
@@ -45,6 +89,9 @@ pub async fn health_readiness(State(state): State<AppState>) -> impl IntoRespons
         database: db_ok,
         storage: storage_ok,
         coordinator: coord_ok,
+        storage_nodes: storage_nodes_ok,
+        storage_nodes_healthy: healthy_nodes,
+        storage_nodes_required: min_nodes,
     };
 
     (status_code, Json(resp))

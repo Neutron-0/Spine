@@ -132,6 +132,23 @@ pub struct FileSystemStorageBackend {
 impl FileSystemStorageBackend {
     pub fn new<P: AsRef<Path>>(storage_root: P, total_capacity: u64) -> Result<Self> {
         let root = storage_root.as_ref().to_path_buf();
+        let repos_exist = root.join("repos").exists()
+            && fs::read_dir(root.join("repos"))
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false);
+        let chunks_exist = root.join("chunks").exists()
+            && fs::read_dir(root.join("chunks"))
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false);
+        let manifests_exist = root.join("manifests").exists()
+            && fs::read_dir(root.join("manifests"))
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false);
+        let has_existing_data = root.join(".spine_storage_generation").exists()
+            || repos_exist
+            || chunks_exist
+            || manifests_exist;
+
         fs::create_dir_all(root.join("repos"))?;
         fs::create_dir_all(root.join("staging"))?;
         fs::create_dir_all(root.join("chunks"))?;
@@ -157,6 +174,12 @@ impl FileSystemStorageBackend {
                 bail!("Invalid fencing generation 0 in {}", fencing_path.display());
             }
             gen
+        } else if has_existing_data {
+            bail!(
+                "FATAL: Storage node root '{}' contains existing data, but fencing generation record '{}' is missing! Existing participants with missing fencing markers must fail closed.",
+                root.display(),
+                fencing_path.display()
+            );
         } else {
             let _ = fs::write(&fencing_path, "1\n");
             1
@@ -175,13 +198,26 @@ impl FileSystemStorageBackend {
 
     pub fn persist_fencing_generation(&self, gen: u64) -> Result<()> {
         let cur = self.fencing_generation.load(Ordering::SeqCst);
+        if gen < cur {
+            bail!(
+                "Monotonicity violation: cannot decrement storage node fencing generation from {} to {}",
+                cur,
+                gen
+            );
+        }
         let target = std::cmp::max(cur, gen);
         let fencing_path = self.storage_root.join(".fencing_generation");
         let tmp = fencing_path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
-        fs::write(&tmp, format!("{}\n", target))?;
+        {
+            let mut f = fs::File::create(&tmp)?;
+            use std::io::Write;
+            f.write_all(format!("{}\n", target).as_bytes())?;
+            f.flush()?;
+            f.sync_all()?;
+        }
         if fs::rename(&tmp, &fencing_path).is_err() {
-            let _ = fs::remove_file(&fencing_path);
-            fs::rename(&tmp, &fencing_path)?;
+            let _ = fs::copy(&tmp, &fencing_path);
+            let _ = fs::remove_file(&tmp);
         }
         self.fencing_generation.store(target, Ordering::SeqCst);
         Ok(())

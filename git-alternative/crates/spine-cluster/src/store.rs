@@ -149,14 +149,18 @@ impl FileBackedCoordinatorStore {
 
     pub fn new_file_backed<P: AsRef<Path>>(path: P) -> Result<Self> {
         let p = path.as_ref().to_path_buf();
-        let state = if p.exists() {
+        let existed_before = p.exists();
+        let state = if existed_before {
             let bytes = fs::read(&p).with_context(|| format!("Reading {}", p.display()))?;
             serde_json::from_slice(&bytes).unwrap_or_default()
         } else {
             if let Some(parent) = p.parent() {
                 fs::create_dir_all(parent)?;
             }
-            StateSnapshot::default()
+            let initial = StateSnapshot::default();
+            let bytes = serde_json::to_vec_pretty(&initial)?;
+            let _ = fs::write(&p, bytes);
+            initial
         };
 
         let parent_dir = p.parent().unwrap_or_else(|| Path::new("."));
@@ -182,10 +186,42 @@ impl FileBackedCoordinatorStore {
                 );
             }
             gen
+        } else if existed_before {
+            bail!(
+                "FATAL: Coordinator state file '{}' exists, but fencing generation record '{}' is missing! Existing participants with missing fencing markers must fail closed.",
+                p.display(),
+                fencing_path.display()
+            );
         } else {
             let _ = fs::write(&fencing_path, "1\n");
             1
         };
+
+        let mut initial_staged = None;
+        let mut initial_prev = None;
+        if let Ok(entries) = fs::read_dir(parent_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(".staged_coordinator_restore_") && name.ends_with(".json") {
+                    if let Ok(bytes) = fs::read(entry.path()) {
+                        if let Ok(record) = serde_json::from_slice::<(String, u64, Vec<u8>)>(&bytes)
+                        {
+                            initial_staged = Some(record);
+                        }
+                    }
+                } else if name.starts_with(".previous_coordinator_state_")
+                    && name.ends_with(".json")
+                {
+                    if let Ok(bytes) = fs::read(entry.path()) {
+                        if let Ok(record) =
+                            serde_json::from_slice::<(String, StateSnapshot, u64)>(&bytes)
+                        {
+                            initial_prev = Some(record);
+                        }
+                    }
+                }
+            }
+        }
 
         Ok(Self {
             path: Some(p),
@@ -194,22 +230,35 @@ impl FileBackedCoordinatorStore {
             fencing_generation: Arc::new(AtomicU64::new(initial_gen)),
             active_writers: Arc::new(AtomicUsize::new(0)),
             mutation_barrier: Arc::new(RwLock::new(())),
-            staged_restore: RwLock::new(None),
-            previous_committed_state: RwLock::new(None),
+            staged_restore: RwLock::new(initial_staged),
+            previous_committed_state: RwLock::new(initial_prev),
         })
     }
 
     pub fn persist_fencing_generation(&self, gen: u64) -> Result<()> {
         let cur = self.fencing_generation.load(Ordering::SeqCst);
+        if gen < cur {
+            bail!(
+                "Monotonicity violation: cannot decrement fencing generation from {} to {}",
+                cur,
+                gen
+            );
+        }
         let target = std::cmp::max(cur, gen);
         if let Some(ref p) = self.path {
             let parent_dir = p.parent().unwrap_or_else(|| Path::new("."));
             let fencing_path = parent_dir.join(".coordinator_fencing_generation");
             let tmp = fencing_path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
-            fs::write(&tmp, format!("{}\n", target))?;
+            {
+                let mut f = fs::File::create(&tmp)?;
+                use std::io::Write;
+                f.write_all(format!("{}\n", target).as_bytes())?;
+                f.flush()?;
+                f.sync_all()?;
+            }
             if fs::rename(&tmp, &fencing_path).is_err() {
-                let _ = fs::remove_file(&fencing_path);
-                fs::rename(&tmp, &fencing_path)?;
+                let _ = fs::copy(&tmp, &fencing_path);
+                let _ = fs::remove_file(&tmp);
             }
         }
         self.fencing_generation.store(target, Ordering::SeqCst);
@@ -278,7 +327,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn record_heartbeat(&self, heartbeat: NodeHeartbeat) -> Result<()> {
-        // Record heartbeat only updates transient health metadata; allowed or rejected during maintenance
+        let _guard = self.acquire_writer()?;
         {
             let mut snap = self.state.write().unwrap();
             if let Some(node) = snap.nodes.get_mut(&heartbeat.node_id) {
@@ -579,12 +628,33 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
         // Validate JSON payload
         let _test_snap: StateSnapshot = serde_json::from_slice(payload)
             .with_context(|| "Invalid coordinator state snapshot JSON")?;
-        let mut staged = self.staged_restore.write().unwrap();
-        *staged = Some((
+        let staged_record = (
             snapshot_id.to_string(),
             fencing_generation,
             payload.to_vec(),
-        ));
+        );
+
+        if let Some(ref p) = self.path {
+            let parent_dir = p.parent().unwrap_or_else(|| Path::new("."));
+            let staged_path =
+                parent_dir.join(format!(".staged_coordinator_restore_{}.json", snapshot_id));
+            let tmp = staged_path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
+            let json = serde_json::to_vec_pretty(&staged_record)?;
+            {
+                let mut f = fs::File::create(&tmp)?;
+                use std::io::Write;
+                f.write_all(&json)?;
+                f.flush()?;
+                f.sync_all()?;
+            }
+            if fs::rename(&tmp, &staged_path).is_err() {
+                let _ = fs::copy(&tmp, &staged_path);
+                let _ = fs::remove_file(&tmp);
+            }
+        }
+
+        let mut staged = self.staged_restore.write().unwrap();
+        *staged = Some(staged_record);
         Ok(())
     }
 
@@ -615,10 +685,39 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
 
         let new_snap: StateSnapshot = serde_json::from_slice(&payload)?;
         let cur_gen = self.fencing_generation.load(Ordering::SeqCst);
+        let prev_record = (
+            snapshot_id.to_string(),
+            self.state.read().unwrap().clone(),
+            cur_gen,
+        );
+
+        if let Some(ref p) = self.path {
+            let parent_dir = p.parent().unwrap_or_else(|| Path::new("."));
+            let prev_path =
+                parent_dir.join(format!(".previous_coordinator_state_{}.json", snapshot_id));
+            let tmp = prev_path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
+            let json = serde_json::to_vec_pretty(&prev_record)?;
+            {
+                let mut f = fs::File::create(&tmp)?;
+                use std::io::Write;
+                f.write_all(&json)?;
+                f.flush()?;
+                f.sync_all()?;
+            }
+            if fs::rename(&tmp, &prev_path).is_err() {
+                let _ = fs::copy(&tmp, &prev_path);
+                let _ = fs::remove_file(&tmp);
+            }
+
+            let staged_path =
+                parent_dir.join(format!(".staged_coordinator_restore_{}.json", snapshot_id));
+            let _ = fs::remove_file(&staged_path);
+        }
+
         {
             let mut current = self.state.write().unwrap();
             let mut prev = self.previous_committed_state.write().unwrap();
-            *prev = Some((snapshot_id.to_string(), current.clone(), cur_gen));
+            *prev = Some(prev_record);
             *current = new_snap;
         }
         self.persist()?;
@@ -645,6 +744,16 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
                 *staged = None;
             }
         }
+
+        if let Some(ref p) = self.path {
+            let parent_dir = p.parent().unwrap_or_else(|| Path::new("."));
+            let prev_path =
+                parent_dir.join(format!(".previous_coordinator_state_{}.json", snapshot_id));
+            let _ = fs::remove_file(&prev_path);
+            let staged_path =
+                parent_dir.join(format!(".staged_coordinator_restore_{}.json", snapshot_id));
+            let _ = fs::remove_file(&staged_path);
+        }
         Ok(())
     }
 
@@ -660,6 +769,16 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
             if id == snapshot_id {
                 *staged = None;
             }
+        }
+
+        if let Some(ref p) = self.path {
+            let parent_dir = p.parent().unwrap_or_else(|| Path::new("."));
+            let prev_path =
+                parent_dir.join(format!(".previous_coordinator_state_{}.json", snapshot_id));
+            let _ = fs::remove_file(&prev_path);
+            let staged_path =
+                parent_dir.join(format!(".staged_coordinator_restore_{}.json", snapshot_id));
+            let _ = fs::remove_file(&staged_path);
         }
         Ok(())
     }

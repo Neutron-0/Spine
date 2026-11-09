@@ -63,7 +63,9 @@ pub struct RestoreJournal {
 }
 
 impl RestoreJournal {
-    pub const JOURNAL_FILE_NAME: &'static str = ".spine_restore_journal.json";
+    pub const CONTROL_DIR_NAME: &'static str = ".spine_restore_control";
+    pub const JOURNAL_FILE_NAME: &'static str = "restore_journal.json";
+    pub const LEGACY_JOURNAL_FILE_NAME: &'static str = ".spine_restore_journal.json";
     pub const GENERATION_FILE_NAME: &'static str = ".spine_storage_generation";
     pub const DB_GENERATION_TABLE: &'static str = "_restore_generation";
 
@@ -208,26 +210,41 @@ impl RestoreJournal {
         Ok(())
     }
 
-    /// Return the canonical path to the journal file in target storage root.
+    /// Return the canonical path to the journal file in dedicated control directory.
     pub fn journal_path(target_storage_root: &Path) -> PathBuf {
-        target_storage_root.join(Self::JOURNAL_FILE_NAME)
+        target_storage_root
+            .join(Self::CONTROL_DIR_NAME)
+            .join(Self::JOURNAL_FILE_NAME)
     }
 
-    /// Load an existing restore journal if present in target storage root.
+    /// Return legacy journal file path for backwards compatibility.
+    pub fn legacy_journal_path(target_storage_root: &Path) -> PathBuf {
+        target_storage_root.join(Self::LEGACY_JOURNAL_FILE_NAME)
+    }
+
+    /// Load an existing restore journal if present in target storage control directory or root.
     pub fn load(target_storage_root: &Path) -> Result<Option<Self>, ForgeError> {
         let path = Self::journal_path(target_storage_root);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let content = std::fs::read_to_string(&path)
+        let active_path = if path.exists() {
+            path
+        } else {
+            let legacy = Self::legacy_journal_path(target_storage_root);
+            if legacy.exists() {
+                legacy
+            } else {
+                return Ok(None);
+            }
+        };
+        let content = std::fs::read_to_string(&active_path)
             .map_err(|e| ForgeError::Internal(format!("Failed to read restore journal: {}", e)))?;
         let journal: Self = serde_json::from_str(&content)
             .map_err(|e| ForgeError::Internal(format!("Corrupt restore journal: {}", e)))?;
         Ok(Some(journal))
     }
 
-    /// Persist the updated state machine phase to disk with atomic write-and-rename.
+    /// Persist the updated state machine phase to disk with sync_all and atomic replacement.
     pub fn persist(&mut self, phase: RestorePhase) -> Result<(), ForgeError> {
+        use std::io::Write;
         self.phase = phase;
         self.updated_at_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let path = Self::journal_path(&self.target_storage_root);
@@ -237,12 +254,18 @@ impl RestoreJournal {
         let tmp_path = parent.join(format!(".tmp_jnl_{}.json", uuid::Uuid::new_v4().simple()));
         let json_data = serde_json::to_string_pretty(self)
             .map_err(|e| ForgeError::Internal(format!("Failed to serialize journal: {}", e)))?;
-        std::fs::write(&tmp_path, json_data).map_err(|e| {
-            ForgeError::Internal(format!("Failed to write temporary journal: {}", e))
-        })?;
-        std::fs::rename(&tmp_path, &path).map_err(|e| {
-            ForgeError::Internal(format!("Failed to atomically publish journal: {}", e))
-        })?;
+        {
+            let mut f = std::fs::File::create(&tmp_path).map_err(|e| {
+                ForgeError::Internal(format!("Failed to create temporary journal: {}", e))
+            })?;
+            f.write_all(json_data.as_bytes()).map_err(|e| {
+                ForgeError::Internal(format!("Failed to write temporary journal: {}", e))
+            })?;
+            f.flush().map_err(|e| ForgeError::Internal(e.to_string()))?;
+            f.sync_all()
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        }
+        super::safe_atomic_replace(&tmp_path, &path)?;
         Ok(())
     }
 
@@ -252,14 +275,22 @@ impl RestoreJournal {
         if path.exists() {
             let _ = std::fs::remove_file(&path);
         }
+        let legacy = Self::legacy_journal_path(target_storage_root);
+        if legacy.exists() {
+            let _ = std::fs::remove_file(&legacy);
+        }
+        let control_dir = target_storage_root.join(Self::CONTROL_DIR_NAME);
+        if control_dir.exists() {
+            let _ = std::fs::remove_dir_all(&control_dir);
+        }
         Ok(())
     }
 
     /// Synchronous journal recovery.
     /// Cleans up uncommitted staging artifacts if interrupted before database cutover.
-    /// FAILS CLOSED with error if interrupted during or after publication.
+    /// Safely forward-recovers completed cutovers; fails closed with actionable diagnostics if cutover is incomplete.
     pub fn handle_startup_recovery_sync(storage_root: &Path) -> Result<Option<String>, ForgeError> {
-        if let Some(journal) = Self::load(storage_root)? {
+        if let Some(mut journal) = Self::load(storage_root)? {
             match journal.phase {
                 RestorePhase::Committed | RestorePhase::Completed => {
                     let _ = Self::remove(storage_root);
@@ -285,20 +316,61 @@ impl RestoreJournal {
                         journal.restore_id
                     )))
                 }
-                RestorePhase::CommitDecision(_)
-                | RestorePhase::DbPublished
-                | RestorePhase::DatabaseRestored
-                | RestorePhase::StoragePublished
-                | RestorePhase::Failed(_) => {
-                    tracing::error!(
+                RestorePhase::StoragePublished => {
+                    // Storage and database cutover already completed!
+                    // Forward recovery: clean up old generation and finalize state to Committed.
+                    tracing::info!(
+                        "Forward recovering interrupted restore '{}' in phase 'StoragePublished' to 'Committed'.",
+                        journal.restore_id
+                    );
+                    let old_dir =
+                        storage_root.join(format!(".old_generation_{}", journal.restore_id));
+                    if old_dir.exists() {
+                        let _ = std::fs::remove_dir_all(&old_dir);
+                    }
+                    journal.persist(RestorePhase::Committed)?;
+                    let _ = Self::remove(storage_root);
+                    Ok(Some(format!(
+                        "Interrupted restore '{}' at StoragePublished was forward-recovered to Committed.",
+                        journal.restore_id
+                    )))
+                }
+                RestorePhase::DbPublished | RestorePhase::DatabaseRestored => {
+                    tracing::warn!(
                         "FATAL: Incomplete restore session '{}' detected in phase '{:?}'. Aborting startup.",
                         journal.restore_id,
                         journal.phase
                     );
                     Err(ForgeError::Internal(format!(
-                        "FATAL STARTUP BLOCKED: Incomplete restore session '{}' detected in phase '{:?}'. Database and storage cutover was incomplete. Startup failed closed to prevent split-brain data corruption.",
+                        "FATAL STARTUP BLOCKED: Incomplete restore session '{}' detected in phase '{:?}'. Database was restored but storage cutover was incomplete. Target generation is '{}'. Resume restore or rollback before starting service.",
                         journal.restore_id,
-                        journal.phase
+                        journal.phase,
+                        journal.target_generation
+                    )))
+                }
+                RestorePhase::CommitDecision(ref decision) => {
+                    tracing::warn!(
+                        "FATAL: Incomplete restore session '{}' detected at CommitDecision for backup '{}'. Aborting startup.",
+                        journal.restore_id,
+                        decision.backup_id
+                    );
+                    Err(ForgeError::Internal(format!(
+                        "FATAL STARTUP BLOCKED: Incomplete restore session '{}' detected at CommitDecision for backup '{}'. Target generation is '{}'. Resume restore or rollback before starting service.",
+                        journal.restore_id,
+                        decision.backup_id,
+                        decision.new_generation
+                    )))
+                }
+                RestorePhase::Failed(ref reason) => {
+                    tracing::error!(
+                        "FATAL: Incomplete restore session '{}' detected in phase 'Failed({})'. Aborting startup.",
+                        journal.restore_id,
+                        reason
+                    );
+                    Err(ForgeError::Internal(format!(
+                        "FATAL STARTUP BLOCKED: Restore session '{}' previously failed with: {}. Manual intervention required.",
+                        journal.restore_id,
+                        reason
                     )))
                 }
             }

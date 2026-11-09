@@ -46,6 +46,7 @@ pub struct AppState {
     pub security: Arc<crate::security::SecurityService>,
     pub public_origin: String,
     pub consistency_barrier: Arc<crate::backup::ConsistencyBarrier>,
+    pub storage_nodes: Vec<(String, String)>,
 }
 
 impl AppState {
@@ -167,6 +168,7 @@ impl AppState {
             security,
             public_origin,
             consistency_barrier,
+            storage_nodes: Vec::new(),
         })
     }
 }
