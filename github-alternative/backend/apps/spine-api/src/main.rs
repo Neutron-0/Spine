@@ -530,12 +530,28 @@ async fn main() -> anyhow::Result<()> {
                     &["SPINE_BACKUP_PASSPHRASE", "BACKUP_PASSPHRASE"],
                 )?;
 
+                let storage_root = if storage_root == std::path::Path::new("./.spine-dev-cluster/node-1") {
+                    if let Ok(r) = std::env::var("SPINE_STORAGE_ROOT").or_else(|_| std::env::var("STORAGE_ROOT")) {
+                        std::path::PathBuf::from(r.trim())
+                    } else if prof.requires_persistent_database() {
+                        anyhow::bail!(
+                            "Under deployment profile '{}', the default development storage root ('./.spine-dev-cluster/node-1') is strictly forbidden. Configure STORAGE_ROOT or --storage-root.",
+                            prof
+                        );
+                    } else {
+                        storage_root
+                    }
+                } else {
+                    storage_root
+                };
+
                 let coord_addr_opt = coordinator_addr
-                    .or_else(|| std::env::var("COORDINATOR_ADDR").ok())
-                    .or_else(|| std::env::var("SPINE_COORDINATOR_ADDR").ok());
+                    .or_else(|| std::env::var("SPINE_COORDINATOR_ADDR").ok())
+                    .or_else(|| std::env::var("COORDINATOR_ADDR").ok());
                 let storage_nodes_str_opt = storage_node_addrs
+                    .or_else(|| std::env::var("SPINE_STORAGE_NODES").ok())
                     .or_else(|| std::env::var("STORAGE_NODE_ADDRS").ok())
-                    .or_else(|| std::env::var("SPINE_STORAGE_NODES").ok());
+                    .or_else(|| std::env::var("STORAGE_NODES").ok());
 
                 let mut node_endpoints = Vec::new();
                 if let Some(nodes_str) = storage_nodes_str_opt {
@@ -791,6 +807,21 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 let prof = parse_cli_profile(profile.as_deref())?;
 
+                let target_storage = if target_storage == std::path::Path::new("./.spine-dev-cluster/node-1") {
+                    if let Ok(r) = std::env::var("SPINE_STORAGE_ROOT").or_else(|_| std::env::var("STORAGE_ROOT")) {
+                        std::path::PathBuf::from(r.trim())
+                    } else if prof.requires_persistent_database() {
+                        anyhow::bail!(
+                            "Under deployment profile '{}', the default development target storage root ('./.spine-dev-cluster/node-1') is strictly forbidden. Configure STORAGE_ROOT or --target-storage.",
+                            prof
+                        );
+                    } else {
+                        target_storage
+                    }
+                } else {
+                    target_storage
+                };
+
                 if !input.exists() {
                     anyhow::bail!("Input backup archive '{}' does not exist", input.display());
                 }
@@ -882,11 +913,12 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 let coord_addr_opt = coordinator_addr
-                    .or_else(|| std::env::var("COORDINATOR_ADDR").ok())
-                    .or_else(|| std::env::var("SPINE_COORDINATOR_ADDR").ok());
+                    .or_else(|| std::env::var("SPINE_COORDINATOR_ADDR").ok())
+                    .or_else(|| std::env::var("COORDINATOR_ADDR").ok());
                 let storage_nodes_str_opt = storage_node_addrs
+                    .or_else(|| std::env::var("SPINE_STORAGE_NODES").ok())
                     .or_else(|| std::env::var("STORAGE_NODE_ADDRS").ok())
-                    .or_else(|| std::env::var("SPINE_STORAGE_NODES").ok());
+                    .or_else(|| std::env::var("STORAGE_NODES").ok());
 
                 let mut node_endpoints = std::collections::HashMap::new();
                 if let Some(nodes_str) = storage_nodes_str_opt {
@@ -1306,6 +1338,7 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
 
     let coordinator_addr = args
         .coordinator_addr
+        .or_else(|| std::env::var("SPINE_COORDINATOR_ADDR").ok())
         .or_else(|| std::env::var("COORDINATOR_ADDR").ok());
 
     let raw_profile = args
@@ -1314,6 +1347,36 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
         .unwrap_or_else(|| "core-forge-v1".to_string());
     let profile = spine_api::DeploymentProfile::from_str_relaxed(&raw_profile)
         .map_err(|e| anyhow::anyhow!(e))?;
+
+    if profile.requires_persistent_database() && coordinator_addr.is_none() {
+        anyhow::bail!(
+            "CRITICAL CONFIGURATION ERROR: Under deployment profile '{}', a coordinator address is required. Set COORDINATOR_ADDR or --coordinator-addr.",
+            profile
+        );
+    }
+
+    let storage_nodes_str_opt = std::env::var("SPINE_STORAGE_NODES")
+        .or_else(|_| std::env::var("STORAGE_NODE_ADDRS"))
+        .or_else(|_| std::env::var("STORAGE_NODES"))
+        .ok();
+
+    if profile.requires_persistent_database() {
+        let mut count = 0;
+        if let Some(ref s) = storage_nodes_str_opt {
+            for part in s.split(',') {
+                if !part.trim().is_empty() {
+                    count += 1;
+                }
+            }
+        }
+        if count < 3 {
+            anyhow::bail!(
+                "CRITICAL CONFIGURATION ERROR: Under deployment profile '{}', all 3 storage nodes (node-1, node-2, node-3) must be configured in SPINE_STORAGE_NODES or STORAGE_NODE_ADDRS. Found {} nodes.",
+                profile,
+                count
+            );
+        }
+    }
 
     tracing::info!(
         "Active deployment profile: {} (Requires PostgreSQL: {}, Untrusted CI: {})",
@@ -1429,9 +1492,20 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
         CoordinatorClient::new(addr)
     });
 
-    // 3. Ensure Storage Root exists
-    std::fs::create_dir_all(&args.storage_root)?;
-    let storage_root_canonical = std::fs::canonicalize(&args.storage_root)?;
+    // 3. Resolve and ensure Storage Root exists
+    let storage_root_path = if let Ok(root_str) = std::env::var("SPINE_STORAGE_ROOT").or_else(|_| std::env::var("STORAGE_ROOT")) {
+        std::path::PathBuf::from(root_str.trim())
+    } else {
+        args.storage_root
+    };
+    if profile.requires_persistent_database() && storage_root_path == std::path::Path::new("./.spine-dev-cluster/node-1") {
+        anyhow::bail!(
+            "CRITICAL CONFIGURATION ERROR: Production profile '{}' disallows default development storage root './.spine-dev-cluster/node-1'. Configure SPINE_STORAGE_ROOT, STORAGE_ROOT, or --storage-root.",
+            profile
+        );
+    }
+    std::fs::create_dir_all(&storage_root_path)?;
+    let storage_root_canonical = std::fs::canonicalize(&storage_root_path)?;
     tracing::info!("Storage root: {}", storage_root_canonical.display());
 
     // 3.1 Restore state machine crash recovery & generation validation
