@@ -109,12 +109,23 @@ pub trait StorageBackend: Send + Sync {
     fn finalize_volume_restore(&self, snapshot_id: &str) -> Result<()>;
 }
 
+pub struct StorageWriterGuard {
+    active_writers: Arc<AtomicUsize>,
+}
+
+impl Drop for StorageWriterGuard {
+    fn drop(&mut self) {
+        self.active_writers.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 pub struct FileSystemStorageBackend {
     storage_root: PathBuf,
     total_capacity: u64,
     in_maintenance: Arc<AtomicBool>,
     fencing_generation: Arc<AtomicU64>,
     active_writers: Arc<AtomicUsize>,
+    mutation_barrier: Arc<std::sync::RwLock<()>>,
     node_id: String,
 }
 
@@ -157,6 +168,7 @@ impl FileSystemStorageBackend {
             in_maintenance: Arc::new(AtomicBool::new(false)),
             fencing_generation: Arc::new(AtomicU64::new(initial_gen)),
             active_writers: Arc::new(AtomicUsize::new(0)),
+            mutation_barrier: Arc::new(std::sync::RwLock::new(())),
             node_id: "storage-node".to_string(),
         })
     }
@@ -180,11 +192,28 @@ impl FileSystemStorageBackend {
         self
     }
 
-    fn check_mutation_allowed(&self) -> Result<()> {
+    pub fn acquire_writer(&self, required_generation: Option<u64>) -> Result<StorageWriterGuard> {
+        let _barrier = self
+            .mutation_barrier
+            .read()
+            .map_err(|_| anyhow::anyhow!("Storage mutation barrier poisoned"))?;
         if self.in_maintenance.load(Ordering::SeqCst) {
             bail!("Storage node mutation rejected: node is currently in maintenance mode");
         }
-        Ok(())
+        let cur_gen = self.fencing_generation.load(Ordering::SeqCst);
+        if let Some(req_gen) = required_generation {
+            if req_gen < cur_gen {
+                bail!(
+                    "Storage node mutation rejected: stale fencing generation {} (current {})",
+                    req_gen,
+                    cur_gen
+                );
+            }
+        }
+        self.active_writers.fetch_add(1, Ordering::SeqCst);
+        Ok(StorageWriterGuard {
+            active_writers: Arc::clone(&self.active_writers),
+        })
     }
 
     fn staging_dir(&self, tx_id: &str) -> PathBuf {
@@ -261,7 +290,7 @@ impl StorageBackend for FileSystemStorageBackend {
         pack_bytes: &[u8],
         index_bytes: &[u8],
     ) -> Result<()> {
-        self.check_mutation_allowed()?;
+        let _guard = self.acquire_writer(None)?;
         let current_epoch = self.get_epoch(repo_id)?;
         OwnershipEpoch(current_epoch).validate(epoch)?;
 
@@ -294,15 +323,7 @@ impl StorageBackend for FileSystemStorageBackend {
         epoch: u64,
         new_generation: u64,
     ) -> Result<()> {
-        self.check_mutation_allowed()?;
-        let current_gen = self.fencing_generation.load(Ordering::SeqCst);
-        if new_generation < current_gen {
-            bail!(
-                "Storage node commit rejected: stale fencing generation {} (current {})",
-                new_generation,
-                current_gen
-            );
-        }
+        let _guard = self.acquire_writer(Some(new_generation))?;
         let current_epoch = self.get_epoch(repo_id)?;
         OwnershipEpoch(current_epoch).validate(epoch)?;
 
@@ -346,6 +367,7 @@ impl StorageBackend for FileSystemStorageBackend {
     }
 
     fn abort_pack(&self, tx_id: &str) -> Result<()> {
+        let _guard = self.acquire_writer(None)?;
         let stage = self.staging_dir(tx_id);
         if stage.exists() {
             fs::remove_dir_all(&stage)?;
@@ -361,7 +383,7 @@ impl StorageBackend for FileSystemStorageBackend {
         pack_bytes: &[u8],
         index_bytes: &[u8],
     ) -> Result<()> {
-        self.check_mutation_allowed()?;
+        let _guard = self.acquire_writer(None)?;
         let actual_hash = blake3::hash(pack_bytes).to_hex().to_string();
         if actual_hash != pack_checksum {
             bail!(
@@ -426,7 +448,7 @@ impl StorageBackend for FileSystemStorageBackend {
     }
 
     fn store_chunk(&self, chunk_hash: &str, bytes: &[u8]) -> Result<()> {
-        self.check_mutation_allowed()?;
+        let _guard = self.acquire_writer(None)?;
         let prefix = if chunk_hash.len() >= 2 {
             &chunk_hash[0..2]
         } else {
@@ -462,7 +484,7 @@ impl StorageBackend for FileSystemStorageBackend {
     }
 
     fn store_manifest(&self, manifest_id: &str, bytes: &[u8]) -> Result<()> {
-        self.check_mutation_allowed()?;
+        let _guard = self.acquire_writer(None)?;
         let prefix = if manifest_id.len() >= 2 {
             &manifest_id[0..2]
         } else {
@@ -498,12 +520,32 @@ impl StorageBackend for FileSystemStorageBackend {
     }
 
     fn enter_maintenance(&self, fencing_generation: u64) -> Result<()> {
+        let _barrier = self
+            .mutation_barrier
+            .write()
+            .map_err(|_| anyhow::anyhow!("Storage mutation barrier poisoned"))?;
         self.in_maintenance.store(true, Ordering::SeqCst);
         self.persist_fencing_generation(fencing_generation)?;
+
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(5);
+        while self.active_writers.load(Ordering::SeqCst) > 0 {
+            if start.elapsed() > timeout {
+                bail!(
+                    "Timed out waiting for {} active storage writers to drain during enter_maintenance",
+                    self.active_writers.load(Ordering::SeqCst)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         Ok(())
     }
 
     fn exit_maintenance(&self, fencing_generation: u64) -> Result<()> {
+        let _barrier = self
+            .mutation_barrier
+            .write()
+            .map_err(|_| anyhow::anyhow!("Storage mutation barrier poisoned"))?;
         self.persist_fencing_generation(fencing_generation)?;
         self.in_maintenance.store(false, Ordering::SeqCst);
         Ok(())
@@ -686,5 +728,55 @@ impl StorageBackend for FileSystemStorageBackend {
             let _ = fs::remove_dir_all(&staged_root);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_storage_node_writer_guard_and_fencing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FileSystemStorageBackend::new(tmp.path(), 100_000_000).unwrap();
+        assert_eq!(backend.get_maintenance_status(), (false, 1, 0));
+
+        // Acquire writer without generation requirement
+        {
+            let _guard = backend.acquire_writer(None).expect("Acquire writer without generation");
+            assert_eq!(backend.get_maintenance_status(), (false, 1, 1));
+        }
+        assert_eq!(backend.get_maintenance_status(), (false, 1, 0));
+
+        // Acquire writer with matching/higher generation requirement
+        {
+            let _guard = backend.acquire_writer(Some(2)).expect("Acquire writer with gen 2 >= 1");
+            assert_eq!(backend.get_maintenance_status(), (false, 1, 1));
+        }
+        assert_eq!(backend.get_maintenance_status(), (false, 1, 0));
+
+        // Advance fencing generation
+        backend.persist_fencing_generation(10).unwrap();
+        assert_eq!(backend.get_maintenance_status(), (false, 10, 0));
+
+        // Stale generation must be rejected
+        let stale_res = backend.acquire_writer(Some(9));
+        assert!(stale_res.is_err(), "Writer with stale generation 9 < 10 must fail");
+
+        // Enter maintenance
+        backend.enter_maintenance(15).unwrap();
+        assert_eq!(backend.get_maintenance_status(), (true, 15, 0));
+
+        // In maintenance, any writer must be rejected
+        let mut_res = backend.acquire_writer(None);
+        assert!(mut_res.is_err(), "Writer must be rejected during maintenance");
+
+        // Exit maintenance
+        backend.exit_maintenance(15).unwrap();
+        assert_eq!(backend.get_maintenance_status(), (false, 15, 0));
+
+        // After exiting maintenance, writer succeeds
+        let _guard = backend.acquire_writer(Some(15)).unwrap();
+        assert_eq!(backend.get_maintenance_status(), (false, 15, 1));
     }
 }

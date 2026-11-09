@@ -329,11 +329,11 @@ async fn handle_coordinator_connection(
             }
         }
         ClusterRpcRequest::QueryMaintenanceStatus => {
-            let (in_maintenance, fencing_generation) = store.get_maintenance_status();
+            let (in_maintenance, fencing_generation, active_writers) = store.get_maintenance_status();
             ClusterRpcResponse::MaintenanceStatus {
                 in_maintenance,
                 fencing_generation,
-                active_writers: 0,
+                active_writers,
             }
         }
         ClusterRpcRequest::CaptureVolumeSnapshot {

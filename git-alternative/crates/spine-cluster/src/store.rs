@@ -15,8 +15,18 @@ use sha2::Digest;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
+
+pub struct CoordinatorWriterGuard {
+    active_writers: Arc<AtomicUsize>,
+}
+
+impl Drop for CoordinatorWriterGuard {
+    fn drop(&mut self) {
+        self.active_writers.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RepositoryMeta {
@@ -95,7 +105,7 @@ pub trait CoordinatorStore: Send + Sync {
 
     fn enter_maintenance(&self, fencing_generation: u64) -> Result<()>;
     fn exit_maintenance(&self, fencing_generation: u64) -> Result<()>;
-    fn get_maintenance_status(&self) -> (bool, u64);
+    fn get_maintenance_status(&self) -> (bool, u64, usize);
     fn capture_snapshot(
         &self,
         snapshot_id: &str,
@@ -117,6 +127,8 @@ pub struct FileBackedCoordinatorStore {
     state: RwLock<StateSnapshot>,
     in_maintenance: Arc<AtomicBool>,
     fencing_generation: Arc<AtomicU64>,
+    active_writers: Arc<AtomicUsize>,
+    mutation_barrier: Arc<RwLock<()>>,
     staged_restore: RwLock<Option<(String, u64, Vec<u8>)>>,
     previous_committed_state: RwLock<Option<(String, StateSnapshot, u64)>>,
 }
@@ -128,6 +140,8 @@ impl FileBackedCoordinatorStore {
             state: RwLock::new(StateSnapshot::default()),
             in_maintenance: Arc::new(AtomicBool::new(false)),
             fencing_generation: Arc::new(AtomicU64::new(1)),
+            active_writers: Arc::new(AtomicUsize::new(0)),
+            mutation_barrier: Arc::new(RwLock::new(())),
             staged_restore: RwLock::new(None),
             previous_committed_state: RwLock::new(None),
         }
@@ -178,6 +192,8 @@ impl FileBackedCoordinatorStore {
             state: RwLock::new(state),
             in_maintenance: Arc::new(AtomicBool::new(false)),
             fencing_generation: Arc::new(AtomicU64::new(initial_gen)),
+            active_writers: Arc::new(AtomicUsize::new(0)),
+            mutation_barrier: Arc::new(RwLock::new(())),
             staged_restore: RwLock::new(None),
             previous_committed_state: RwLock::new(None),
         })
@@ -200,11 +216,18 @@ impl FileBackedCoordinatorStore {
         Ok(())
     }
 
-    fn check_maintenance(&self) -> Result<()> {
+    pub fn acquire_writer(&self) -> Result<CoordinatorWriterGuard> {
+        let _barrier = self
+            .mutation_barrier
+            .read()
+            .map_err(|_| anyhow::anyhow!("Coordinator mutation barrier poisoned"))?;
         if self.in_maintenance.load(Ordering::SeqCst) {
             bail!("Coordinator mutations rejected: cluster is currently in maintenance mode");
         }
-        Ok(())
+        self.active_writers.fetch_add(1, Ordering::SeqCst);
+        Ok(CoordinatorWriterGuard {
+            active_writers: Arc::clone(&self.active_writers),
+        })
     }
 
     fn persist(&self) -> Result<()> {
@@ -224,7 +247,7 @@ impl FileBackedCoordinatorStore {
 
 impl CoordinatorStore for FileBackedCoordinatorStore {
     fn register_node(&self, node: StorageNodeInfo) -> Result<()> {
-        self.check_maintenance()?;
+        let _guard = self.acquire_writer()?;
         {
             let mut snap = self.state.write().unwrap();
             snap.nodes.insert(node.node_id.clone(), node);
@@ -243,7 +266,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn update_node_status(&self, node_id: &str, status: NodeStatus) -> Result<()> {
-        self.check_maintenance()?;
+        let _guard = self.acquire_writer()?;
         {
             let mut snap = self.state.write().unwrap();
             if let Some(node) = snap.nodes.get_mut(node_id) {
@@ -272,7 +295,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn create_token(&self, token: EnrollmentToken) -> Result<()> {
-        self.check_maintenance()?;
+        let _guard = self.acquire_writer()?;
         {
             let mut snap = self.state.write().unwrap();
             snap.tokens.insert(token.token.clone(), token);
@@ -286,7 +309,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn consume_token(&self, token_str: &str) -> Result<()> {
-        self.check_maintenance()?;
+        let _guard = self.acquire_writer()?;
         {
             let mut snap = self.state.write().unwrap();
             if let Some(tok) = snap.tokens.get_mut(token_str) {
@@ -297,7 +320,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn revoke_token(&self, token_str: &str) -> Result<()> {
-        self.check_maintenance()?;
+        let _guard = self.acquire_writer()?;
         {
             let mut snap = self.state.write().unwrap();
             if let Some(tok) = snap.tokens.get_mut(token_str) {
@@ -308,7 +331,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn create_repository(&self, repo: RepositoryMeta) -> Result<()> {
-        self.check_maintenance()?;
+        let _guard = self.acquire_writer()?;
         {
             let mut snap = self.state.write().unwrap();
             snap.repositories.insert(repo.repo_id.clone(), repo);
@@ -327,7 +350,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn set_placement(&self, placement: PlacementPlan) -> Result<()> {
-        self.check_maintenance()?;
+        let _guard = self.acquire_writer()?;
         {
             let mut snap = self.state.write().unwrap();
             let repo_id = placement.repo_id.clone();
@@ -355,7 +378,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
         verified: bool,
         now_nanos: i64,
     ) -> Result<()> {
-        self.check_maintenance()?;
+        let _guard = self.acquire_writer()?;
         {
             let mut snap = self.state.write().unwrap();
             let reps = snap.replicas.entry(repo_id.to_string()).or_default();
@@ -391,7 +414,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
         epoch: u64,
         primary_node_id: &str,
     ) -> Result<()> {
-        self.check_maintenance()?;
+        let _guard = self.acquire_writer()?;
         {
             let mut snap = self.state.write().unwrap();
             if let Some(repo) = snap.repositories.get_mut(repo_id) {
@@ -405,7 +428,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn advance_committed_generation(&self, repo_id: &str, new_gen: u64) -> Result<()> {
-        self.check_maintenance()?;
+        let _guard = self.acquire_writer()?;
         {
             let mut snap = self.state.write().unwrap();
             if let Some(repo) = snap.repositories.get_mut(repo_id) {
@@ -416,7 +439,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn create_transaction(&self, tx: ReplicationTransaction) -> Result<()> {
-        self.check_maintenance()?;
+        let _guard = self.acquire_writer()?;
         {
             let mut snap = self.state.write().unwrap();
             snap.transactions.insert(tx.transaction_id.clone(), tx);
@@ -430,7 +453,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn update_transaction(&self, tx: ReplicationTransaction) -> Result<()> {
-        self.check_maintenance()?;
+        let _guard = self.acquire_writer()?;
         {
             let mut snap = self.state.write().unwrap();
             snap.transactions.insert(tx.transaction_id.clone(), tx);
@@ -457,7 +480,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn create_repair_job(&self, job: RepairJob) -> Result<()> {
-        self.check_maintenance()?;
+        let _guard = self.acquire_writer()?;
         {
             let mut snap = self.state.write().unwrap();
             snap.repair_jobs.insert(job.job_id.clone(), job);
@@ -471,7 +494,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn create_tombstone(&self, tombstone: TombstoneRecord) -> Result<()> {
-        self.check_maintenance()?;
+        let _guard = self.acquire_writer()?;
         {
             let mut snap = self.state.write().unwrap();
             snap.tombstones
@@ -486,21 +509,42 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn enter_maintenance(&self, fencing_generation: u64) -> Result<()> {
+        let _barrier = self
+            .mutation_barrier
+            .write()
+            .map_err(|_| anyhow::anyhow!("Coordinator mutation barrier poisoned"))?;
         self.in_maintenance.store(true, Ordering::SeqCst);
         self.persist_fencing_generation(fencing_generation)?;
+
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(5);
+        while self.active_writers.load(Ordering::SeqCst) > 0 {
+            if start.elapsed() > timeout {
+                bail!(
+                    "Timed out waiting for {} active coordinator writers to drain during enter_maintenance",
+                    self.active_writers.load(Ordering::SeqCst)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         Ok(())
     }
 
     fn exit_maintenance(&self, fencing_generation: u64) -> Result<()> {
+        let _barrier = self
+            .mutation_barrier
+            .write()
+            .map_err(|_| anyhow::anyhow!("Coordinator mutation barrier poisoned"))?;
         self.persist_fencing_generation(fencing_generation)?;
         self.in_maintenance.store(false, Ordering::SeqCst);
         Ok(())
     }
 
-    fn get_maintenance_status(&self) -> (bool, u64) {
+    fn get_maintenance_status(&self) -> (bool, u64, usize) {
         (
             self.in_maintenance.load(Ordering::SeqCst),
             self.fencing_generation.load(Ordering::SeqCst),
+            self.active_writers.load(Ordering::SeqCst),
         )
     }
 
@@ -618,5 +662,38 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_coordinator_writer_guard_and_maintenance_barrier() {
+        let store = FileBackedCoordinatorStore::new_in_memory();
+        assert_eq!(store.get_maintenance_status(), (false, 1, 0));
+
+        {
+            let _guard = store.acquire_writer().expect("Acquire writer should succeed");
+            assert_eq!(store.get_maintenance_status(), (false, 1, 1));
+        }
+        assert_eq!(store.get_maintenance_status(), (false, 1, 0));
+
+        // Enter maintenance barrier
+        store.enter_maintenance(5).expect("Enter maintenance should succeed");
+        assert_eq!(store.get_maintenance_status(), (true, 5, 0));
+
+        // Attempt mutation while in maintenance must fail
+        let mut_res = store.acquire_writer();
+        assert!(mut_res.is_err(), "Writer must be rejected during maintenance");
+
+        // Exit maintenance
+        store.exit_maintenance(5).expect("Exit maintenance should succeed");
+        assert_eq!(store.get_maintenance_status(), (false, 5, 0));
+
+        // Now writer succeeds again
+        let _guard = store.acquire_writer().expect("Writer should succeed after exit maintenance");
+        assert_eq!(store.get_maintenance_status(), (false, 5, 1));
     }
 }
