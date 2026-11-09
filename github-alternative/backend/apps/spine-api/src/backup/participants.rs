@@ -174,6 +174,62 @@ impl ParticipantRegistry {
         ]
     }
 
+    /// Returns canonical volume name for a given participant ID.
+    pub fn canonical_volume_for_participant(participant_id: &str) -> Option<&'static str> {
+        match participant_id {
+            "postgres_data" => Some("postgres_data"),
+            "spine_storage" => Some("spine_storage"),
+            "node-1" | "storage_1_data" => Some("storage_1_data"),
+            "node-2" | "storage_2_data" => Some("storage_2_data"),
+            "node-3" | "storage_3_data" => Some("storage_3_data"),
+            "coordinator" | "coordinator_data" => Some("coordinator_data"),
+            "spine_ssh" => Some("spine_ssh"),
+            _ => None,
+        }
+    }
+
+    /// Validates whether an archive relative path matches the expected path pattern for a participant.
+    pub fn is_valid_archive_path_for_participant(participant_id: &str, path: &str) -> bool {
+        match participant_id {
+            "postgres_data" => {
+                path == "database/postgres_data.jsonl"
+                    || path == "database/snapshot.jsonl"
+                    || path == "database/snapshot.json"
+                    || path == "database/catalog_dump.jsonl"
+                    || path.starts_with("database/")
+            }
+            "spine_storage" => {
+                path == "storage/spine_storage_snapshot.tar.gz" || path.starts_with("storage/")
+            }
+            "node-1" | "storage_1_data" => {
+                path == "storage_nodes/storage_1_data.tar.gz"
+                    || path == "storage_nodes/node-1.tar.gz"
+                    || path == "storage_nodes/node-1_snapshot.tar.gz"
+            }
+            "node-2" | "storage_2_data" => {
+                path == "storage_nodes/storage_2_data.tar.gz"
+                    || path == "storage_nodes/node-2.tar.gz"
+                    || path == "storage_nodes/node-2_snapshot.tar.gz"
+            }
+            "node-3" | "storage_3_data" => {
+                path == "storage_nodes/storage_3_data.tar.gz"
+                    || path == "storage_nodes/node-3.tar.gz"
+                    || path == "storage_nodes/node-3_snapshot.tar.gz"
+            }
+            "coordinator" | "coordinator_data" => {
+                path == "coordinator/coordinator_data.tar.gz"
+                    || path == "coordinator/coordinator_snapshot.tar.gz"
+                    || path.starts_with("coordinator/")
+            }
+            "spine_ssh" => {
+                path == "ssh/spine_ssh.tar.gz"
+                    || path == "ssh/ssh_identity_snapshot.tar.gz"
+                    || path.starts_with("ssh/")
+            }
+            _ => false,
+        }
+    }
+
     /// Verifies that all expected participants for the given deployment profile are present,
     /// complete, uncorrupted, and consistently fenced.
     pub fn validate_participants(
@@ -182,11 +238,38 @@ impl ParticipantRegistry {
         fencing_generation: u64,
     ) -> Result<(), ForgeError> {
         let mut seen_ids = HashSet::new();
+        let mut seen_paths = HashSet::new();
         for p in participants {
             if !seen_ids.insert(p.participant_id.as_str()) {
                 return Err(ForgeError::Internal(format!(
                     "Duplicate participant ID '{}' rejected in backup participant list",
                     p.participant_id
+                )));
+            }
+            if !seen_paths.insert(p.archive_rel_path.as_str()) {
+                return Err(ForgeError::Internal(format!(
+                    "Duplicate participant archive path '{}' rejected in backup participant list",
+                    p.archive_rel_path
+                )));
+            }
+            let expected_vol = Self::canonical_volume_for_participant(&p.participant_id)
+                .ok_or_else(|| {
+                    ForgeError::Internal(format!(
+                        "Unrecognized participant ID '{}' in backup manifest",
+                        p.participant_id
+                    ))
+                })?;
+            if p.volume_name != expected_vol {
+                return Err(ForgeError::Internal(format!(
+                    "Participant-to-volume substitution rejected: participant '{}' declared volume '{}', expected '{}'",
+                    p.participant_id, p.volume_name, expected_vol
+                )));
+            }
+            if !Self::is_valid_archive_path_for_participant(&p.participant_id, &p.archive_rel_path)
+            {
+                return Err(ForgeError::Internal(format!(
+                    "Unexpected archive path '{}' for participant '{}'",
+                    p.archive_rel_path, p.participant_id
                 )));
             }
             if p.byte_length == 0 {
@@ -212,7 +295,13 @@ impl ParticipantRegistry {
         if profile.requires_persistent_database() {
             let required = Self::production_registry();
             for req in &required {
-                if !seen_ids.contains(req.participant_id.as_str()) {
+                let matches_req = seen_ids.contains(req.participant_id.as_str())
+                    || (req.participant_id == "node-1" && seen_ids.contains("storage_1_data"))
+                    || (req.participant_id == "node-2" && seen_ids.contains("storage_2_data"))
+                    || (req.participant_id == "node-3" && seen_ids.contains("storage_3_data"))
+                    || (req.participant_id == "coordinator"
+                        && seen_ids.contains("coordinator_data"));
+                if !matches_req {
                     return Err(ForgeError::Internal(format!(
                         "FATAL BACKUP INCOMPLETE: Under deployment profile '{}', required participant '{}' ({}) is missing from archive! Incomplete cluster backups are strictly forbidden.",
                         profile, req.participant_id, req.resource_identity

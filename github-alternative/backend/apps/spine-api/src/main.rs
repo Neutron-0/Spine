@@ -176,6 +176,10 @@ enum BackupCommands {
         /// Comma-separated storage node endpoints (e.g. "storage-1=127.0.0.1:9001,storage-2=127.0.0.1:9002")
         #[arg(long)]
         storage_node_addrs: Option<String>,
+
+        /// Explicitly permit restoring unencrypted plaintext archives during legacy migration
+        #[arg(long, default_value_t = false)]
+        allow_unencrypted_legacy_restore: bool,
     },
 
     /// Rotate the encryption key/passphrase of an encrypted backup archive without disk writes
@@ -632,6 +636,12 @@ async fn main() -> anyhow::Result<()> {
                             prof
                         );
                     }
+                    if pass.is_none() {
+                        anyhow::bail!(
+                            "Under deployment profile '{}', authenticated AEAD encryption is MANDATORY for backups. Passphrase must be provided (--passphrase-file, or SPINE_BACKUP_PASSPHRASE). Plaintext production backups containing SSH identity keys are strictly forbidden.",
+                            prof
+                        );
+                    }
                 }
 
                 let tmp_snap_dir = tempfile::Builder::new().prefix("spine_snap_").tempdir()?;
@@ -903,6 +913,7 @@ async fn main() -> anyhow::Result<()> {
                 profile,
                 coordinator_addr,
                 storage_node_addrs,
+                allow_unencrypted_legacy_restore,
             } => {
                 let prof = parse_cli_profile(profile.as_deref())?;
 
@@ -954,6 +965,18 @@ async fn main() -> anyhow::Result<()> {
                 if is_encrypted && pass.is_none() {
                     anyhow::bail!(
                         "Input archive is encrypted (SPNEBAK format), but no passphrase was provided (--passphrase-file, or SPINE_BACKUP_PASSPHRASE)."
+                    );
+                }
+
+                let allow_legacy = allow_unencrypted_legacy_restore
+                    || std::env::var("SPINE_ALLOW_LEGACY_PLAINTEXT_RESTORE")
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+
+                if prof.requires_persistent_database() && !is_encrypted && !allow_legacy {
+                    anyhow::bail!(
+                        "Under deployment profile '{}', restoring unencrypted plaintext archives is strictly forbidden. Pass an AEAD-encrypted backup archive (.spinebak) or explicitly pass --allow-unencrypted-legacy-restore / set SPINE_ALLOW_LEGACY_PLAINTEXT_RESTORE=1 for migration.",
+                        prof
                     );
                 }
 
@@ -1202,6 +1225,11 @@ async fn main() -> anyhow::Result<()> {
                 // Phase 3: COMMIT DECISION (Durable Pre-Cutover Transaction Record)
                 // ------------------------------------------------------------------------
                 println!("=== Phase 3: COMMIT DECISION (Durable Pre-Cutover Ledger Invariant) ===");
+                let decision_token = format!(
+                    "commit_{}_{}",
+                    session.manifest.backup_id,
+                    uuid::Uuid::new_v4().simple()
+                );
                 let decision_record = spine_api::backup::CommitDecisionRecord {
                     restore_id: session.journal.restore_id.clone(),
                     backup_id: session.manifest.backup_id.clone(),
@@ -1216,6 +1244,7 @@ async fn main() -> anyhow::Result<()> {
                     staged_manifest_digests: session.manifest.file_hashes.clone(),
                     decision_timestamp_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
                     schema_identity: session.manifest.schema_version.clone(),
+                    decision_token,
                 };
                 session
                     .journal
@@ -1255,7 +1284,7 @@ async fn main() -> anyhow::Result<()> {
                             Ok(r) => {
                                 session
                                     .journal
-                                    .persist(spine_api::backup::RestorePhase::DbPublished)
+                                    .record_participant_published("postgres_data")
                                     .map_err(|e| {
                                         anyhow::anyhow!("Failed to update restore journal: {}", e)
                                     })?;
@@ -1288,7 +1317,12 @@ async fn main() -> anyhow::Result<()> {
                 println!("Atomically publishing verified repository storage to live root (retaining rollback generation)...");
                 let manifest = session.manifest.clone();
                 let report = match session.publish_storage() {
-                    Ok(r) => r,
+                    Ok(r) => {
+                        let _ = session
+                            .journal
+                            .record_participant_published("spine_storage");
+                        r
+                    }
                     Err(e) => {
                         println!(
                             "Storage publication failed, rolling back cluster participants..."
@@ -1323,6 +1357,7 @@ async fn main() -> anyhow::Result<()> {
                             .abort(&format!("Failed to commit cluster volume restore: {}", e));
                         anyhow::bail!("Failed to commit cluster volume restore: {}. Repository storage rolled back.", e);
                     }
+                    let _ = session.journal.record_participant_published(snap_id);
                     committed_cluster_restores.push((
                         snap_id.clone(),
                         *fencing_gen,
@@ -1373,8 +1408,14 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
+                    let _ = session.journal.record_participant_published("spine_ssh");
                     println!("SSH host identity published successfully.");
                 }
+
+                session
+                    .journal
+                    .persist(spine_api::backup::RestorePhase::Published)
+                    .map_err(|e| anyhow::anyhow!("Failed to record Published phase: {}", e))?;
 
                 // ------------------------------------------------------------------------
                 // Phase 5: VERIFY
@@ -1426,6 +1467,12 @@ async fn main() -> anyhow::Result<()> {
                     let _ = session.rollback();
                     anyhow::bail!("Restore failed post-cutover verification: {}. All participants rolled back to previous generation.", verify_err_msg);
                 }
+
+                session
+                    .journal
+                    .persist(spine_api::backup::RestorePhase::Verified)
+                    .map_err(|e| anyhow::anyhow!("Failed to record Verified phase: {}", e))?;
+                println!("All participants verified against committed target generation.");
 
                 // ------------------------------------------------------------------------
                 // Phase 6: FINALIZE

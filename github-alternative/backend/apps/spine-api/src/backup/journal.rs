@@ -1,6 +1,22 @@
 use crate::core::error::ForgeError;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+/// Durable preparation acknowledgement for an authoritative restore participant.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParticipantAcknowledgement {
+    pub restore_id: String,
+    pub backup_id: String,
+    pub participant_id: String,
+    pub volume_name: String,
+    pub previous_generation: Option<String>,
+    pub target_generation: String,
+    pub staged_digest: String,
+    pub staged_byte_length: u64,
+    pub prepared_at_nanos: i64,
+    pub prepared: bool,
+}
 
 /// Durable commit decision record persisted before any irreversible participant mutations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -10,9 +26,20 @@ pub struct CommitDecisionRecord {
     pub old_generation: Option<String>,
     pub new_generation: String,
     pub required_participants: Vec<String>,
-    pub staged_manifest_digests: std::collections::BTreeMap<String, String>,
+    pub staged_manifest_digests: BTreeMap<String, String>,
     pub decision_timestamp_nanos: i64,
     pub schema_identity: String,
+    #[serde(default)]
+    pub decision_token: String,
+}
+
+/// Durable publication record tracking cutover completion for an individual participant.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParticipantPublicationRecord {
+    pub participant_id: String,
+    pub target_generation: String,
+    pub published_at_nanos: i64,
+    pub published: bool,
 }
 
 /// Discrete phases of the cross-resource restore state machine.
@@ -26,8 +53,10 @@ pub enum RestorePhase {
     StagedDb,
     /// All participant snapshots staged and verified in isolated temporary areas.
     Prepared,
-    /// Durable commit decision logged to disk before irreversible cutover begins.
+    /// Durable global commit decision logged to disk before irreversible cutover begins.
     CommitDecision(CommitDecisionRecord),
+    /// Participants currently publishing (tracks list of published participant IDs).
+    Publishing { published_participants: Vec<String> },
     /// Database snapshot verified and restored to target database before storage publication.
     DbPublished,
     /// Backward-compatible alias for DbPublished
@@ -35,18 +64,24 @@ pub enum RestorePhase {
     DatabaseRestored,
     /// Staged storage atomically published to live repository storage root.
     StoragePublished,
-    /// Entire restore sequence completed and committed successfully.
+    /// All required participants published.
+    Published,
+    /// Post-cutover verification in progress or verified across all participants.
+    Verified,
+    /// Entire restore sequence completed, old generations purged, and committed successfully.
     Committed,
     /// Backward-compatible alias for Committed
     #[serde(alias = "Completed")]
     Completed,
-    /// Restore cleanly rolled back.
+    /// Restore cleanly aborted / rolled back before global commit decision.
     RolledBack(String),
+    #[serde(alias = "Aborted")]
+    Aborted(String),
     /// Restore failed with specific diagnostic error.
     Failed(String),
 }
 
-/// Durable cross-resource restoration journal persisted as `.spine_restore_journal.json`.
+/// Durable cross-resource restoration journal persisted as `.spine_restore_control/restore_journal.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestoreJournal {
     pub restore_id: String,
@@ -60,6 +95,12 @@ pub struct RestoreJournal {
     pub target_generation: String,
     pub started_at_nanos: i64,
     pub updated_at_nanos: i64,
+    #[serde(default)]
+    pub published_participants: Vec<String>,
+    #[serde(default)]
+    pub acknowledgements: BTreeMap<String, ParticipantAcknowledgement>,
+    #[serde(default)]
+    pub commit_decision: Option<CommitDecisionRecord>,
 }
 
 impl RestoreJournal {
@@ -91,6 +132,9 @@ impl RestoreJournal {
             target_generation,
             started_at_nanos: now,
             updated_at_nanos: now,
+            published_participants: Vec::new(),
+            acknowledgements: BTreeMap::new(),
+            commit_decision: None,
         }
     }
 
@@ -217,39 +261,117 @@ impl RestoreJournal {
             .join(Self::JOURNAL_FILE_NAME)
     }
 
+    /// Return fallback last-valid journal path.
+    pub fn last_valid_journal_path(target_storage_root: &Path) -> PathBuf {
+        target_storage_root
+            .join(Self::CONTROL_DIR_NAME)
+            .join(format!("{}.last_valid", Self::JOURNAL_FILE_NAME))
+    }
+
     /// Return legacy journal file path for backwards compatibility.
     pub fn legacy_journal_path(target_storage_root: &Path) -> PathBuf {
         target_storage_root.join(Self::LEGACY_JOURNAL_FILE_NAME)
     }
 
+    /// Record participant preparation acknowledgement.
+    pub fn record_participant_ack(
+        &mut self,
+        ack: ParticipantAcknowledgement,
+    ) -> Result<(), ForgeError> {
+        self.acknowledgements
+            .insert(ack.participant_id.clone(), ack);
+        self.persist(self.phase.clone())
+    }
+
+    /// Record participant publication progress.
+    pub fn record_participant_published(&mut self, participant_id: &str) -> Result<(), ForgeError> {
+        if !self
+            .published_participants
+            .iter()
+            .any(|p| p == participant_id)
+        {
+            self.published_participants.push(participant_id.to_string());
+        }
+        self.persist(RestorePhase::Publishing {
+            published_participants: self.published_participants.clone(),
+        })
+    }
+
     /// Load an existing restore journal if present in target storage control directory or root.
+    /// Resiliently falls back to last_valid journal backup if primary journal is corrupt or unreadable.
     pub fn load(target_storage_root: &Path) -> Result<Option<Self>, ForgeError> {
         let path = Self::journal_path(target_storage_root);
+        let last_valid = Self::last_valid_journal_path(target_storage_root);
+        let legacy = Self::legacy_journal_path(target_storage_root);
+
         let active_path = if path.exists() {
             path
+        } else if last_valid.exists() {
+            last_valid.clone()
+        } else if legacy.exists() {
+            legacy
         } else {
-            let legacy = Self::legacy_journal_path(target_storage_root);
-            if legacy.exists() {
-                legacy
-            } else {
-                return Ok(None);
+            return Ok(None);
+        };
+
+        let content = match std::fs::read_to_string(&active_path) {
+            Ok(c) => c,
+            Err(_) if last_valid.exists() && active_path != last_valid => {
+                std::fs::read_to_string(&last_valid).map_err(|e| {
+                    ForgeError::Internal(format!("Failed to read fallback restore journal: {}", e))
+                })?
+            }
+            Err(e) => {
+                return Err(ForgeError::Internal(format!(
+                    "Failed to read restore journal: {}",
+                    e
+                )));
             }
         };
-        let content = std::fs::read_to_string(&active_path)
-            .map_err(|e| ForgeError::Internal(format!("Failed to read restore journal: {}", e)))?;
-        let journal: Self = serde_json::from_str(&content)
-            .map_err(|e| ForgeError::Internal(format!("Corrupt restore journal: {}", e)))?;
+
+        let journal: Self = match serde_json::from_str(&content) {
+            Ok(j) => j,
+            Err(e) if last_valid.exists() && active_path != last_valid => {
+                if let Ok(c) = std::fs::read_to_string(&last_valid) {
+                    serde_json::from_str(&c).map_err(|_| {
+                        ForgeError::Internal(format!("Corrupt restore journal: {}", e))
+                    })?
+                } else {
+                    return Err(ForgeError::Internal(format!(
+                        "Corrupt restore journal: {}",
+                        e
+                    )));
+                }
+            }
+            Err(e) => {
+                return Err(ForgeError::Internal(format!(
+                    "Corrupt restore journal: {}",
+                    e
+                )))
+            }
+        };
+
         Ok(Some(journal))
     }
 
     /// Persist the updated state machine phase to disk with sync_all and atomic replacement.
+    /// Preserves last_valid backup to ensure power-loss safety and non-destructive roll forward.
     pub fn persist(&mut self, phase: RestorePhase) -> Result<(), ForgeError> {
         use std::io::Write;
-        self.phase = phase;
+        self.phase = phase.clone();
+        if let RestorePhase::CommitDecision(ref cdr) = phase {
+            self.commit_decision = Some(cdr.clone());
+        }
         self.updated_at_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let path = Self::journal_path(&self.target_storage_root);
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let _ = std::fs::create_dir_all(parent);
+
+        // Preserve previous valid journal as last_valid backup
+        let last_valid = Self::last_valid_journal_path(&self.target_storage_root);
+        if path.exists() {
+            let _ = std::fs::copy(&path, &last_valid);
+        }
 
         let tmp_path = parent.join(format!(".tmp_jnl_{}.json", uuid::Uuid::new_v4().simple()));
         let json_data = serde_json::to_string_pretty(self)
@@ -275,6 +397,10 @@ impl RestoreJournal {
         if path.exists() {
             let _ = std::fs::remove_file(&path);
         }
+        let last_valid = Self::last_valid_journal_path(target_storage_root);
+        if last_valid.exists() {
+            let _ = std::fs::remove_file(&last_valid);
+        }
         let legacy = Self::legacy_journal_path(target_storage_root);
         if legacy.exists() {
             let _ = std::fs::remove_file(&legacy);
@@ -287,12 +413,17 @@ impl RestoreJournal {
     }
 
     /// Synchronous journal recovery.
-    /// Cleans up uncommitted staging artifacts if interrupted before database cutover.
-    /// Safely forward-recovers completed cutovers; fails closed with actionable diagnostics if cutover is incomplete.
+    /// Cleans up uncommitted staging artifacts if interrupted before global commit decision.
+    /// Safely forward-recovers committed restores across all local storage participants; fails closed if unrecoverable.
     pub fn handle_startup_recovery_sync(storage_root: &Path) -> Result<Option<String>, ForgeError> {
         if let Some(mut journal) = Self::load(storage_root)? {
             match journal.phase {
                 RestorePhase::Committed | RestorePhase::Completed => {
+                    let old_dir =
+                        storage_root.join(format!(".old_generation_{}", journal.restore_id));
+                    if old_dir.exists() {
+                        let _ = std::fs::remove_dir_all(&old_dir);
+                    }
                     let _ = Self::remove(storage_root);
                     Ok(None)
                 }
@@ -300,9 +431,10 @@ impl RestoreJournal {
                 | RestorePhase::StagedStorage
                 | RestorePhase::StagedDb
                 | RestorePhase::Prepared
-                | RestorePhase::RolledBack(_) => {
+                | RestorePhase::RolledBack(_)
+                | RestorePhase::Aborted(_) => {
                     tracing::warn!(
-                        "Detected interrupted restore session '{}' in phase '{:?}'. Cleaning up staging directory {:?}...",
+                        "Detected interrupted restore session '{}' before global commit decision in phase '{:?}'. Cleaning up staging directory {:?}...",
                         journal.restore_id,
                         journal.phase,
                         journal.staging_storage_root
@@ -312,66 +444,130 @@ impl RestoreJournal {
                     }
                     let _ = Self::remove(storage_root);
                     Ok(Some(format!(
-                        "Interrupted restore '{}' before publication was cleanly rolled back.",
+                        "Interrupted restore '{}' before global commit decision was cleanly rolled back.",
                         journal.restore_id
                     )))
                 }
-                RestorePhase::StoragePublished => {
-                    // Storage and database cutover already completed!
-                    // Forward recovery: clean up old generation and finalize state to Committed.
+                RestorePhase::CommitDecision(_)
+                | RestorePhase::Publishing { .. }
+                | RestorePhase::DbPublished
+                | RestorePhase::DatabaseRestored
+                | RestorePhase::StoragePublished
+                | RestorePhase::Published
+                | RestorePhase::Verified => {
+                    // Global Commit Decision was reached! Irreversible forward recovery.
                     tracing::info!(
-                        "Forward recovering interrupted restore '{}' in phase 'StoragePublished' to 'Committed'.",
-                        journal.restore_id
-                    );
-                    let old_dir =
-                        storage_root.join(format!(".old_generation_{}", journal.restore_id));
-                    if old_dir.exists() {
-                        let _ = std::fs::remove_dir_all(&old_dir);
-                    }
-                    journal.persist(RestorePhase::Committed)?;
-                    let _ = Self::remove(storage_root);
-                    Ok(Some(format!(
-                        "Interrupted restore '{}' at StoragePublished was forward-recovered to Committed.",
-                        journal.restore_id
-                    )))
-                }
-                RestorePhase::DbPublished | RestorePhase::DatabaseRestored => {
-                    tracing::warn!(
-                        "FATAL: Incomplete restore session '{}' detected in phase '{:?}'. Aborting startup.",
-                        journal.restore_id,
-                        journal.phase
-                    );
-                    Err(ForgeError::Internal(format!(
-                        "FATAL STARTUP BLOCKED: Incomplete restore session '{}' detected in phase '{:?}'. Database was restored but storage cutover was incomplete. Target generation is '{}'. Resume restore or rollback before starting service.",
+                        "Forward recovering committed restore '{}' in phase '{:?}' to target generation '{}'.",
                         journal.restore_id,
                         journal.phase,
                         journal.target_generation
-                    )))
-                }
-                RestorePhase::CommitDecision(ref decision) => {
-                    tracing::warn!(
-                        "FATAL: Incomplete restore session '{}' detected at CommitDecision for backup '{}'. Aborting startup.",
-                        journal.restore_id,
-                        decision.backup_id
                     );
-                    Err(ForgeError::Internal(format!(
-                        "FATAL STARTUP BLOCKED: Incomplete restore session '{}' detected at CommitDecision for backup '{}'. Target generation is '{}'. Resume restore or rollback before starting service.",
-                        journal.restore_id,
-                        decision.backup_id,
-                        decision.new_generation
-                    )))
+
+                    // 1. Resume / Complete live storage publication if staging exists
+                    let storage_gen = Self::read_storage_generation(storage_root);
+                    let storage_needs_cutover =
+                        storage_gen.as_deref() != Some(&journal.target_generation);
+
+                    if storage_needs_cutover && journal.staging_storage_root.exists() {
+                        let old_dir =
+                            storage_root.join(format!(".old_generation_{}", journal.restore_id));
+                        let _ = std::fs::create_dir_all(&old_dir);
+
+                        // Move existing entries to old_generation
+                        if let Ok(entries) = std::fs::read_dir(storage_root) {
+                            for entry in entries.flatten() {
+                                let p = entry.path();
+                                if p == old_dir || p == journal.staging_storage_root {
+                                    continue;
+                                }
+                                let name = entry.file_name().to_string_lossy().to_string();
+                                if !name.starts_with(".old_generation_")
+                                    && !name.starts_with(".staged_generation_")
+                                    && !name.starts_with(".tmp")
+                                    && !name.starts_with(".spine_restore_control")
+                                    && name != Self::JOURNAL_FILE_NAME
+                                {
+                                    let dst = old_dir.join(&name);
+                                    let _ = super::safe_move_file(&p, &dst);
+                                }
+                            }
+                        }
+
+                        // Move staging entries to storage root
+                        if let Ok(entries) = std::fs::read_dir(&journal.staging_storage_root) {
+                            for entry in entries.flatten() {
+                                let p = entry.path();
+                                let name = entry.file_name().to_string_lossy().to_string();
+                                if name != "database"
+                                    && name != "staged_ssh"
+                                    && !name.starts_with(".tmp")
+                                {
+                                    let dst = storage_root.join(&name);
+                                    let _ = super::safe_move_file(&p, &dst);
+                                }
+                            }
+                        }
+
+                        Self::write_storage_generation(storage_root, &journal.target_generation)?;
+                    }
+
+                    // 2. Resume / Complete SSH identity cutover if staged
+                    let staged_ssh = journal.staging_storage_root.join("staged_ssh");
+                    let ssh_dir = storage_root.join(".ssh");
+                    if staged_ssh.exists() && ssh_dir.exists() {
+                        if let Ok(entries) = std::fs::read_dir(&staged_ssh) {
+                            for entry in entries.flatten() {
+                                let dst = ssh_dir.join(entry.file_name());
+                                let _ = std::fs::copy(entry.path(), &dst);
+                            }
+                        }
+                    }
+
+                    // 3. Verify storage generation now matches
+                    let updated_storage_gen = Self::read_storage_generation(storage_root);
+                    if updated_storage_gen.as_deref() == Some(&journal.target_generation) {
+                        let old_dir =
+                            storage_root.join(format!(".old_generation_{}", journal.restore_id));
+                        if old_dir.exists() {
+                            let _ = std::fs::remove_dir_all(&old_dir);
+                        }
+                        if journal.staging_storage_root.exists() {
+                            let _ = std::fs::remove_dir_all(&journal.staging_storage_root);
+                        }
+                        journal.persist(RestorePhase::Committed)?;
+                        let _ = Self::remove(storage_root);
+                        Ok(Some(format!(
+                            "Interrupted restore '{}' at '{:?}' was forward-recovered to Committed and rolled forward to target generation '{}'.",
+                            journal.restore_id,
+                            journal.phase,
+                            journal.target_generation
+                        )))
+                    } else {
+                        Err(ForgeError::Internal(format!(
+                            "FATAL STARTUP BLOCKED: Committed restore '{}' in phase '{:?}' could not complete storage cutover. Staging directory may be missing.",
+                            journal.restore_id,
+                            journal.phase
+                        )))
+                    }
                 }
                 RestorePhase::Failed(ref reason) => {
-                    tracing::error!(
-                        "FATAL: Incomplete restore session '{}' detected in phase 'Failed({})'. Aborting startup.",
-                        journal.restore_id,
-                        reason
-                    );
-                    Err(ForgeError::Internal(format!(
-                        "FATAL STARTUP BLOCKED: Restore session '{}' previously failed with: {}. Manual intervention required.",
-                        journal.restore_id,
-                        reason
-                    )))
+                    if journal.commit_decision.is_none() {
+                        // Failed before commit decision -> clean up staging and abort
+                        if journal.staging_storage_root.exists() {
+                            let _ = std::fs::remove_dir_all(&journal.staging_storage_root);
+                        }
+                        let _ = Self::remove(storage_root);
+                        Ok(Some(format!(
+                            "Interrupted restore '{}' previously failed before decision and was cleaned up: {}",
+                            journal.restore_id, reason
+                        )))
+                    } else {
+                        Err(ForgeError::Internal(format!(
+                            "FATAL STARTUP BLOCKED: Restore session '{}' with committed decision failed with: {}. Manual intervention required.",
+                            journal.restore_id,
+                            reason
+                        )))
+                    }
                 }
             }
         } else {

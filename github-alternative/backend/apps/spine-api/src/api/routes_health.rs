@@ -1,6 +1,10 @@
 use super::middleware::AppState;
+use crate::backup::journal::RestoreJournal;
+use crate::backup::RestorePhase;
+use crate::core::profile::DeploymentProfile;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::Serialize;
+use std::collections::HashSet;
 
 #[derive(Serialize)]
 pub struct HealthStatusResponse {
@@ -18,6 +22,8 @@ pub struct ReadinessResponse {
     pub storage_nodes: bool,
     pub storage_nodes_healthy: usize,
     pub storage_nodes_required: usize,
+    pub cluster_consistent: bool,
+    pub restore_in_progress: bool,
 }
 
 pub async fn health_liveness() -> impl IntoResponse {
@@ -34,11 +40,34 @@ pub async fn health_readiness(State(state): State<AppState>) -> impl IntoRespons
         .map(|r| r.is_ok())
         .unwrap_or(false);
 
-    let storage_ok = state.vcs.storage_root().exists();
+    let storage_root = state.vcs.storage_root();
+    let storage_ok = storage_root.exists();
 
+    // Check for active or incomplete restore journals
+    let restore_in_progress = match RestoreJournal::load(storage_root) {
+        Ok(Some(journal)) => !matches!(
+            journal.phase,
+            RestorePhase::Committed | RestorePhase::Completed
+        ),
+        _ => false,
+    };
+
+    let mut coord_gen: Option<u64> = None;
     let coord_ok = match &state.coordinator {
         Some(c) => {
-            let health_fut = c.check_health();
+            let health_fut = async {
+                match c.query_maintenance_status().await {
+                    Ok((in_maint, gen)) => {
+                        if in_maint {
+                            false
+                        } else {
+                            coord_gen = Some(gen);
+                            true
+                        }
+                    }
+                    Err(_) => false,
+                }
+            };
             tokio::time::timeout(std::time::Duration::from_secs(2), health_fut)
                 .await
                 .unwrap_or(false)
@@ -46,38 +75,96 @@ pub async fn health_readiness(State(state): State<AppState>) -> impl IntoRespons
         None => true, // Standalone mode without external coordinator
     };
 
-    let mut healthy_nodes = 0usize;
-    for (_id, addr) in &state.storage_nodes {
-        let client = crate::ClusterNodeClient::new(addr.clone());
-        let node_check = async {
-            match client.query_maintenance_status().await {
-                Ok((in_maint, _)) => !in_maint,
-                Err(_) => false,
-            }
-        };
-        if tokio::time::timeout(std::time::Duration::from_secs(2), node_check)
-            .await
-            .unwrap_or(false)
-        {
-            healthy_nodes += 1;
+    // Canonical node configuration checks
+    let mut seen_ids = HashSet::new();
+    let mut seen_addrs = HashSet::new();
+    let mut duplicate_found = false;
+    for (id, addr) in &state.storage_nodes {
+        if !seen_ids.insert(id.clone()) || !seen_addrs.insert(addr.clone()) {
+            duplicate_found = true;
+            break;
         }
     }
 
-    let min_nodes = if state.profile == crate::core::profile::DeploymentProfile::CoreForge {
+    let min_nodes = if state.profile == DeploymentProfile::CoreForge {
         3
     } else {
         0
     };
 
-    let storage_nodes_ok = if state.profile == crate::core::profile::DeploymentProfile::CoreForge {
-        healthy_nodes >= min_nodes && healthy_nodes == state.storage_nodes.len()
-    } else if !state.storage_nodes.is_empty() {
-        healthy_nodes == state.storage_nodes.len()
+    let required_ids_present = if state.profile == DeploymentProfile::CoreForge {
+        seen_ids.contains("node-1") && seen_ids.contains("node-2") && seen_ids.contains("node-3")
     } else {
         true
     };
 
-    let overall = db_ok && storage_ok && coord_ok && storage_nodes_ok;
+    let mut healthy_nodes = 0usize;
+    let mut node_generations = Vec::new();
+    if !duplicate_found && required_ids_present {
+        for (expected_id, addr) in &state.storage_nodes {
+            let client = crate::ClusterNodeClient::new(addr.clone());
+            let node_check = async {
+                match client.query_node_details().await {
+                    Ok((in_maint, gen, _, responding_id)) => {
+                        if in_maint {
+                            return None;
+                        }
+                        if let Some(ref r_id) = responding_id {
+                            if r_id != expected_id {
+                                return None;
+                            }
+                        }
+                        Some(gen)
+                    }
+                    Err(_) => None,
+                }
+            };
+            if let Ok(Some(gen)) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), node_check).await
+            {
+                healthy_nodes += 1;
+                node_generations.push(gen);
+            }
+        }
+    }
+
+    let storage_nodes_ok = if state.profile == DeploymentProfile::CoreForge {
+        !duplicate_found
+            && required_ids_present
+            && healthy_nodes >= min_nodes
+            && healthy_nodes == state.storage_nodes.len()
+    } else if !state.storage_nodes.is_empty() {
+        !duplicate_found && healthy_nodes == state.storage_nodes.len()
+    } else {
+        true
+    };
+
+    // Check generation consistency across all responsive cluster participants
+    let mut cluster_consistent = true;
+    if let Some(c_gen) = coord_gen {
+        for n_gen in &node_generations {
+            if *n_gen != c_gen {
+                cluster_consistent = false;
+                break;
+            }
+        }
+    } else if !node_generations.is_empty() {
+        let first_gen = node_generations[0];
+        for n_gen in &node_generations {
+            if *n_gen != first_gen {
+                cluster_consistent = false;
+                break;
+            }
+        }
+    }
+
+    let overall = db_ok
+        && storage_ok
+        && coord_ok
+        && storage_nodes_ok
+        && cluster_consistent
+        && !restore_in_progress;
+
     let status_code = if overall {
         StatusCode::OK
     } else {
@@ -92,6 +179,8 @@ pub async fn health_readiness(State(state): State<AppState>) -> impl IntoRespons
         storage_nodes: storage_nodes_ok,
         storage_nodes_healthy: healthy_nodes,
         storage_nodes_required: min_nodes,
+        cluster_consistent,
+        restore_in_progress,
     };
 
     (status_code, Json(resp))

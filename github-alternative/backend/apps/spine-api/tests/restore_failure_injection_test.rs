@@ -196,35 +196,44 @@ async fn test_startup_crash_recovery_cleans_interrupted_staging() {
 }
 
 #[tokio::test]
-async fn test_startup_recovery_fails_closed_on_interrupted_db_cutover() {
+async fn test_startup_recovery_rolls_forward_on_interrupted_db_cutover() {
     let temp = tempdir().unwrap();
     let storage_root = temp.path().join("storage_root");
     fs::create_dir_all(&storage_root).unwrap();
 
-    let orphan_staging = storage_root.join(".tmp_restore_orphaned_456");
-    fs::create_dir_all(&orphan_staging).unwrap();
+    let staging = storage_root.join(".tmp_restore_staged_456");
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(staging.join("repo_data.txt"), b"committed data").unwrap();
 
-    // Journal at DbPublished phase: target DB was updated but storage not yet published!
+    // Journal at DbPublished phase: target DB was updated and commit decision reached.
+    // Under Batch 21J, startup recovery must roll forward across storage to converge!
     let mut journal = RestoreJournal::new(
         &temp.path().join("archive.spnebak"),
         &storage_root,
-        &orphan_staging,
+        &staging,
         "test_backup_456",
     );
+    let target_gen = journal.target_generation.clone();
     journal.persist(RestorePhase::DbPublished).unwrap();
 
-    // Startup recovery MUST FAIL CLOSED
     let recovery_result = RestoreJournal::handle_startup_recovery(&storage_root, None).await;
     assert!(
-        recovery_result.is_err(),
-        "Startup recovery must return an error when interrupted during cutover"
+        recovery_result.is_ok(),
+        "Startup recovery must roll forward committed cutover: {:?}",
+        recovery_result.err()
     );
-    let err_msg = recovery_result.err().unwrap().to_string();
+    let msg = recovery_result.unwrap().expect("Recovery message");
     assert!(
-        err_msg.contains("FATAL STARTUP BLOCKED") || err_msg.contains("split-brain"),
-        "Error message should clearly report fatal block: {}",
-        err_msg
+        msg.contains("rolled forward") || msg.contains("committed"),
+        "{}",
+        msg
     );
+    assert_eq!(
+        RestoreJournal::read_storage_generation(&storage_root).as_deref(),
+        Some(target_gen.as_str()),
+        "Storage generation must be updated to target generation"
+    );
+    assert!(storage_root.join("repo_data.txt").exists());
 }
 
 #[tokio::test]
