@@ -47,7 +47,7 @@ async fn test_restore_database_failure_leaves_live_storage_untouched() {
     .expect("create backup");
 
     // 1. Prepare restore session (Phase 1: unpacks into staging and verifies checksums)
-    let session =
+    let mut session =
         BackupManager::prepare_restore_session(&archive_path, &live_storage, Some(passphrase))
             .expect("prepare restore session");
 
@@ -121,12 +121,13 @@ async fn test_restore_database_success_publishes_storage_atomically() {
     BackupManager::create_encrypted_backup(&backup_source, None, &archive_path, passphrase, 2)
         .expect("create backup");
 
-    let session =
+    let mut session =
         BackupManager::prepare_restore_session(&archive_path, &live_storage, Some(passphrase))
             .expect("prepare restore session");
 
     // Publish storage
-    let report = session.publish_storage().expect("publish storage");
+    let _ = session.publish_storage().expect("publish storage");
+    let report = session.finalize().expect("finalize restore");
     assert!(report.integrity_verified);
     assert_eq!(report.files_restored, 1);
 
@@ -250,12 +251,13 @@ async fn test_whole_generation_cutover_absent_files_do_not_survive() {
     let archive_path = temp.path().join("clean_cutover.tar.gz");
     BackupManager::create_backup(&backup_source, None, &archive_path).expect("create backup");
 
-    let session = BackupManager::prepare_restore_session(&archive_path, &live_storage, None)
+    let mut session = BackupManager::prepare_restore_session(&archive_path, &live_storage, None)
         .expect("prepare session");
     let target_gen = session.journal.target_generation.clone();
 
     // Commit publication
-    let report = session.publish_storage().expect("publish storage");
+    let _ = session.publish_storage().expect("publish storage");
+    let report = session.finalize().expect("finalize restore");
     assert!(report.integrity_verified);
 
     // Verified: active.txt has restored content
@@ -357,7 +359,7 @@ async fn test_multi_volume_cluster_backup_manifest_and_cutover_isolation() {
     let target_root = temp.path().join("target_live_root");
     fs::create_dir_all(&target_root).unwrap();
 
-    let session = BackupManager::prepare_restore_session(&archive_path, &target_root, None)
+    let mut session = BackupManager::prepare_restore_session(&archive_path, &target_root, None)
         .expect("prepare session");
 
     // Verify participant payloads are accessible in staging
@@ -372,7 +374,8 @@ async fn test_multi_volume_cluster_backup_manifest_and_cutover_isolation() {
     assert_eq!(fetched_node1, node1_data);
 
     // Publish storage to live root
-    let report = session.publish_storage().expect("publish storage");
+    let _ = session.publish_storage().expect("publish storage");
+    let report = session.finalize().expect("finalize restore");
     assert!(report.integrity_verified);
 
     // CRITICAL: Live storage root should only receive storage files, NOT participant archives

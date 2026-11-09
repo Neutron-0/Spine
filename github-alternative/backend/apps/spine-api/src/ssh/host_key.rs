@@ -5,8 +5,18 @@ use russh::keys::ssh_key::{LineEnding, PrivateKey};
 use std::fs;
 use std::path::Path;
 
+pub fn resolve_ssh_dir(storage_root: &Path) -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("SSH_DIR") {
+        let p = std::path::PathBuf::from(dir.trim());
+        if !p.as_os_str().is_empty() {
+            return p;
+        }
+    }
+    storage_root.join("ssh")
+}
+
 pub fn load_or_generate_host_key(storage_root: &Path) -> Result<PrivateKey> {
-    let ssh_dir = storage_root.join("ssh");
+    let ssh_dir = resolve_ssh_dir(storage_root);
     if !ssh_dir.exists() {
         fs::create_dir_all(&ssh_dir)
             .with_context(|| format!("Failed to create SSH host key dir: {:?}", ssh_dir))?;

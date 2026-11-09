@@ -320,6 +320,15 @@ async fn handle_connection(
                 Err(e) => ClusterRpcResponse::Error(e.to_string()),
             }
         }
+        ClusterRpcRequest::FinalizeVolumeRestore { snapshot_id } => {
+            match backend.finalize_volume_restore(&snapshot_id) {
+                Ok(_) => ClusterRpcResponse::VolumeRestoreFinalized {
+                    snapshot_id,
+                    success: true,
+                },
+                Err(e) => ClusterRpcResponse::Error(e.to_string()),
+            }
+        }
         _ => ClusterRpcResponse::Error("Unhandled storage node request".into()),
     };
 

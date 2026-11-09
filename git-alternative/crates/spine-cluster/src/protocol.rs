@@ -113,6 +113,9 @@ pub enum ClusterRpcRequest {
     RollbackVolumeRestore {
         snapshot_id: String,
     },
+    FinalizeVolumeRestore {
+        snapshot_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -208,6 +211,10 @@ pub enum ClusterRpcResponse {
         success: bool,
     },
     VolumeRestoreRolledBack {
+        snapshot_id: String,
+        success: bool,
+    },
+    VolumeRestoreFinalized {
         snapshot_id: String,
         success: bool,
     },

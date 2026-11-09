@@ -37,6 +37,19 @@ services:
       - ./deploy/nginx/ingress.conf:/etc/nginx/conf.d/default.conf:ro
       - ${SPINE_TLS_CERT_FILE:?SPINE_TLS_CERT_FILE_required_path}:/etc/spine/certs/tls.crt:ro
       - ${SPINE_TLS_KEY_FILE:?SPINE_TLS_KEY_FILE_required_path}:/etc/spine/certs/tls.key:ro
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:rw,noexec,nosuid,size=64m
+      - /var/run:rw,noexec,nosuid,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+      - CHOWN
+      - SETUID
+      - SETGID
     depends_on:
       spine-api:
         condition: service_healthy
@@ -55,7 +68,7 @@ services:
     environment:
       POSTGRES_DB: "${POSTGRES_DB:-spine_forge}"
       POSTGRES_USER: "${POSTGRES_ADMIN_USER:-spine_admin}"
-      POSTGRES_PASSWORD: "${POSTGRES_ADMIN_PASSWORD:-${POSTGRES_PASSWORD:?POSTGRES_ADMIN_PASSWORD_required}}"
+      POSTGRES_PASSWORD: "${POSTGRES_ADMIN_PASSWORD:?POSTGRES_ADMIN_PASSWORD_required}"
       POSTGRES_MIGRATOR_USER: "${POSTGRES_MIGRATOR_USER:-spine_migrator}"
       POSTGRES_MIGRATOR_PASSWORD: "${POSTGRES_MIGRATOR_PASSWORD:?POSTGRES_MIGRATOR_PASSWORD_required}"
       POSTGRES_APP_USER: "${POSTGRES_APP_USER:-spine_app}"
@@ -70,6 +83,14 @@ services:
       retries: 5
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+      - FOWNER
 
   # ----------------------------------------------------------------------------
   # 3. State Coordinator - Raft Consensus (No Host Port Exposure)
@@ -87,8 +108,13 @@ services:
       SPINE_STORE_PATH: "/var/lib/spine/coordinator.state"
     volumes:
       - coordinator_data:/var/lib/spine
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
 
   # ----------------------------------------------------------------------------
   # 4. Storage Nodes (No Host Port Exposure)
@@ -109,10 +135,15 @@ services:
       SPINE_DATA_DIR: "/var/lib/spine/node-1"
     volumes:
       - storage_1_data:/var/lib/spine/node-1
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
     depends_on:
       - coordinator
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
 
   storage-node-2:
     build:
@@ -130,10 +161,15 @@ services:
       SPINE_DATA_DIR: "/var/lib/spine/node-2"
     volumes:
       - storage_2_data:/var/lib/spine/node-2
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
     depends_on:
       - coordinator
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
 
   storage-node-3:
     build:
@@ -151,10 +187,15 @@ services:
       SPINE_DATA_DIR: "/var/lib/spine/node-3"
     volumes:
       - storage_3_data:/var/lib/spine/node-3
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
     depends_on:
       - coordinator
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
 
   # ----------------------------------------------------------------------------
   # 5. Core Application Server - Spine Forge API & Native SSH Daemon
@@ -177,15 +218,27 @@ services:
       PORT: "3000"
       SSH_PORT: "2222"
       SPINE_DEPLOYMENT_PROFILE: "core-forge-v1"
+      POSTGRES_HOST: "postgres"
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: "${POSTGRES_DB:-spine_forge}"
+      POSTGRES_MIGRATOR_USER: "${POSTGRES_MIGRATOR_USER:-spine_migrator}"
+      POSTGRES_MIGRATOR_PASSWORD: "${POSTGRES_MIGRATOR_PASSWORD:?POSTGRES_MIGRATOR_PASSWORD_required}"
+      POSTGRES_APP_USER: "${POSTGRES_APP_USER:-spine_app}"
+      POSTGRES_APP_PASSWORD: "${POSTGRES_APP_PASSWORD:?POSTGRES_APP_PASSWORD_required}"
       MIGRATION_DATABASE_URL: "postgres://${POSTGRES_MIGRATOR_USER:-spine_migrator}:${POSTGRES_MIGRATOR_PASSWORD:?POSTGRES_MIGRATOR_PASSWORD_required}@postgres:5432/${POSTGRES_DB:-spine_forge}"
       DATABASE_URL: "postgres://${POSTGRES_APP_USER:-spine_app}:${POSTGRES_APP_PASSWORD:?POSTGRES_APP_PASSWORD_required}@postgres:5432/${POSTGRES_DB:-spine_forge}"
       COORDINATOR_ADDR: "coordinator:8400"
+      STORAGE_NODES: "node-1=storage-node-1:8401,node-2=storage-node-2:8401,node-3=storage-node-3:8401"
       STORAGE_ROOT: "/var/lib/spine/storage"
+      SSH_DIR: "/var/lib/spine/ssh"
       FORGE_PUBLIC_ORIGIN: "${FORGE_PUBLIC_ORIGIN:?FORGE_PUBLIC_ORIGIN_required_must_be_https_URL}"
       RUST_LOG: "info,spine_api=info"
     volumes:
       - spine_storage:/var/lib/spine/storage
       - spine_ssh:/var/lib/spine/ssh
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://127.0.0.1:3000/health/ready || exit 1"]
       interval: 10s
@@ -198,6 +251,8 @@ services:
         condition: service_started
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
 
   # ----------------------------------------------------------------------------
   # 6. Web User Interface - Internal Static Asset Server
@@ -210,8 +265,19 @@ services:
     restart: unless-stopped
     networks:
       - spine-ingress-proxy
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:rw,noexec,nosuid,size=64m
+      - /var/run:rw,noexec,nosuid,size=16m
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+      - CHOWN
+      - SETUID
+      - SETGID
     # No host port exposed; routed strictly via ingress on port 443
     depends_on:
       - spine-api

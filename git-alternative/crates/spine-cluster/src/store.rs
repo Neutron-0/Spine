@@ -32,7 +32,7 @@ pub struct RepositoryMeta {
     pub updated_at_nanos: i64,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct StateSnapshot {
     nodes: HashMap<String, StorageNodeInfo>,
     tokens: HashMap<String, EnrollmentToken>,
@@ -109,6 +109,7 @@ pub trait CoordinatorStore: Send + Sync {
     ) -> Result<()>;
     fn commit_restore(&self, snapshot_id: &str, fencing_generation: u64) -> Result<()>;
     fn rollback_restore(&self, snapshot_id: &str) -> Result<()>;
+    fn finalize_restore(&self, snapshot_id: &str) -> Result<()>;
 }
 
 pub struct FileBackedCoordinatorStore {
@@ -117,6 +118,7 @@ pub struct FileBackedCoordinatorStore {
     in_maintenance: Arc<AtomicBool>,
     fencing_generation: Arc<AtomicU64>,
     staged_restore: RwLock<Option<(String, u64, Vec<u8>)>>,
+    previous_committed_state: RwLock<Option<(String, StateSnapshot, u64)>>,
 }
 
 impl FileBackedCoordinatorStore {
@@ -127,6 +129,7 @@ impl FileBackedCoordinatorStore {
             in_maintenance: Arc::new(AtomicBool::new(false)),
             fencing_generation: Arc::new(AtomicU64::new(1)),
             staged_restore: RwLock::new(None),
+            previous_committed_state: RwLock::new(None),
         }
     }
 
@@ -142,13 +145,59 @@ impl FileBackedCoordinatorStore {
             StateSnapshot::default()
         };
 
+        let parent_dir = p.parent().unwrap_or_else(|| Path::new("."));
+        let fencing_path = parent_dir.join(".coordinator_fencing_generation");
+        let initial_gen = if fencing_path.exists() {
+            let s = fs::read_to_string(&fencing_path).with_context(|| {
+                format!(
+                    "Failed to read coordinator fencing generation from {}",
+                    fencing_path.display()
+                )
+            })?;
+            let gen = s.trim().parse::<u64>().map_err(|e| {
+                anyhow::anyhow!(
+                    "Corrupt coordinator fencing generation record in {}: {}",
+                    fencing_path.display(),
+                    e
+                )
+            })?;
+            if gen == 0 {
+                bail!(
+                    "Invalid coordinator fencing generation 0 in {}",
+                    fencing_path.display()
+                );
+            }
+            gen
+        } else {
+            let _ = fs::write(&fencing_path, "1\n");
+            1
+        };
+
         Ok(Self {
             path: Some(p),
             state: RwLock::new(state),
             in_maintenance: Arc::new(AtomicBool::new(false)),
-            fencing_generation: Arc::new(AtomicU64::new(1)),
+            fencing_generation: Arc::new(AtomicU64::new(initial_gen)),
             staged_restore: RwLock::new(None),
+            previous_committed_state: RwLock::new(None),
         })
+    }
+
+    pub fn persist_fencing_generation(&self, gen: u64) -> Result<()> {
+        let cur = self.fencing_generation.load(Ordering::SeqCst);
+        let target = std::cmp::max(cur, gen);
+        if let Some(ref p) = self.path {
+            let parent_dir = p.parent().unwrap_or_else(|| Path::new("."));
+            let fencing_path = parent_dir.join(".coordinator_fencing_generation");
+            let tmp = fencing_path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
+            fs::write(&tmp, format!("{}\n", target))?;
+            if fs::rename(&tmp, &fencing_path).is_err() {
+                let _ = fs::remove_file(&fencing_path);
+                fs::rename(&tmp, &fencing_path)?;
+            }
+        }
+        self.fencing_generation.store(target, Ordering::SeqCst);
+        Ok(())
     }
 
     fn check_maintenance(&self) -> Result<()> {
@@ -438,20 +487,12 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
 
     fn enter_maintenance(&self, fencing_generation: u64) -> Result<()> {
         self.in_maintenance.store(true, Ordering::SeqCst);
-        let current_gen = self.fencing_generation.load(Ordering::SeqCst);
-        if fencing_generation > current_gen {
-            self.fencing_generation
-                .store(fencing_generation, Ordering::SeqCst);
-        }
+        self.persist_fencing_generation(fencing_generation)?;
         Ok(())
     }
 
     fn exit_maintenance(&self, fencing_generation: u64) -> Result<()> {
-        let current_gen = self.fencing_generation.load(Ordering::SeqCst);
-        if fencing_generation >= current_gen {
-            self.fencing_generation
-                .store(fencing_generation, Ordering::SeqCst);
-        }
+        self.persist_fencing_generation(fencing_generation)?;
         self.in_maintenance.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -529,18 +570,47 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
         };
 
         let new_snap: StateSnapshot = serde_json::from_slice(&payload)?;
+        let cur_gen = self.fencing_generation.load(Ordering::SeqCst);
         {
             let mut current = self.state.write().unwrap();
+            let mut prev = self.previous_committed_state.write().unwrap();
+            *prev = Some((snapshot_id.to_string(), current.clone(), cur_gen));
             *current = new_snap;
         }
         self.persist()?;
-        self.fencing_generation
-            .store(fencing_generation, Ordering::SeqCst);
+        self.persist_fencing_generation(fencing_generation)?;
         self.in_maintenance.store(false, Ordering::SeqCst);
         Ok(())
     }
 
     fn rollback_restore(&self, snapshot_id: &str) -> Result<()> {
+        let mut prev = self.previous_committed_state.write().unwrap();
+        if let Some((id, old_snap, old_gen)) = prev.take() {
+            if id == snapshot_id {
+                {
+                    let mut current = self.state.write().unwrap();
+                    *current = old_snap;
+                }
+                self.persist()?;
+                self.persist_fencing_generation(old_gen)?;
+            }
+        }
+        let mut staged = self.staged_restore.write().unwrap();
+        if let Some((id, _, _)) = staged.as_ref() {
+            if id == snapshot_id {
+                *staged = None;
+            }
+        }
+        Ok(())
+    }
+
+    fn finalize_restore(&self, snapshot_id: &str) -> Result<()> {
+        let mut prev = self.previous_committed_state.write().unwrap();
+        if let Some((id, _, _)) = prev.as_ref() {
+            if id == snapshot_id {
+                *prev = None;
+            }
+        }
         let mut staged = self.staged_restore.write().unwrap();
         if let Some((id, _, _)) = staged.as_ref() {
             if id == snapshot_id {

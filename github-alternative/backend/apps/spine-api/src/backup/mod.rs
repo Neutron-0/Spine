@@ -18,10 +18,12 @@ use uuid::Uuid;
 
 pub mod consistency;
 pub mod journal;
+pub mod participants;
 pub mod v2;
 
 pub use consistency::{ConsistencyBarrier, MaintenanceGuard, SPINE_CLUSTER_MAINTENANCE_LOCK_ID};
 pub use journal::{RestoreJournal, RestorePhase};
+pub use participants::{DeploymentResource, ParticipantClassification, ParticipantRegistry};
 pub use v2::{BackupHeaderV2, StreamSummary};
 
 pub const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
@@ -72,6 +74,8 @@ pub struct BackupManifest {
     pub fencing_generation: Option<u64>,
     #[serde(default)]
     pub participants: Vec<BackupParticipantRecord>,
+    #[serde(default)]
+    pub required_participant_count: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -107,7 +111,10 @@ impl StagedRestoreSession {
 
     /// Commits the staged files to live storage root using whole-generation replacement.
     /// This MUST only be called after target database restore is successful.
-    pub fn publish_storage(mut self) -> Result<RestoreReport, ForgeError> {
+    /// Commits the staged files to live storage root using whole-generation replacement.
+    /// This MUST only be called after target database restore is successful.
+    /// Retains old generation in `.old_generation_<restore_id>` until finalize() is called.
+    pub fn publish_storage(&mut self) -> Result<RestoreReport, ForgeError> {
         let mut files_restored = 0usize;
         let mut bytes_restored = 0u64;
 
@@ -151,22 +158,22 @@ impl StagedRestoreSession {
             .collect();
 
         // 2. Move staged verified files into target live root
-        for (rel_path, staged_path, file_len) in self.verified_files {
+        for (rel_path, staged_path, file_len) in &self.verified_files {
             if rel_path != "database/snapshot.jsonl"
                 && rel_path != "database/snapshot.json"
                 && !participant_paths.contains(rel_path.as_str())
             {
                 let dest =
-                    BackupManager::sanitize_restore_path(&self.target_storage_root, &rel_path)?;
+                    BackupManager::sanitize_restore_path(&self.target_storage_root, rel_path)?;
                 if let Some(parent) = dest.parent() {
                     fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
                 }
-                fs::rename(&staged_path, &dest).map_err(|e| ForgeError::Internal(e.to_string()))?;
+                fs::rename(staged_path, &dest).map_err(|e| ForgeError::Internal(e.to_string()))?;
                 files_restored += 1;
-                bytes_restored += file_len;
+                bytes_restored += *file_len;
             } else {
                 files_restored += 1;
-                bytes_restored += file_len;
+                bytes_restored += *file_len;
             }
         }
 
@@ -176,19 +183,77 @@ impl StagedRestoreSession {
         )?;
 
         self.journal.persist(RestorePhase::StoragePublished)?;
-        self.journal.persist(RestorePhase::Committed)?;
 
-        // 3. Cutover committed: remove old generation backup and restore journal
-        let _ = fs::remove_dir_all(&old_dir);
-        let _ = RestoreJournal::remove(&self.target_storage_root);
-
+        // NOTE: .old_generation_<id> is retained until finalize() to guarantee rollback is possible
         self.report.files_restored = files_restored;
         self.report.bytes_restored = bytes_restored;
+        Ok(self.report.clone())
+    }
+
+    /// Finalizes the restore session after all participants have been verified.
+    /// Deletes the retained old generation directory and removes the restore journal.
+    pub fn finalize(mut self) -> Result<RestoreReport, ForgeError> {
+        self.journal.persist(RestorePhase::Committed)?;
+        let old_dir = self
+            .target_storage_root
+            .join(format!(".old_generation_{}", self.journal.restore_id));
+        if old_dir.exists() {
+            let _ = fs::remove_dir_all(&old_dir);
+        }
+        let _ = RestoreJournal::remove(&self.target_storage_root);
         Ok(self.report)
     }
 
+    /// Reverts the live storage root back to the retained old generation.
+    pub fn rollback(&mut self) -> Result<(), ForgeError> {
+        let old_dir = self
+            .target_storage_root
+            .join(format!(".old_generation_{}", self.journal.restore_id));
+        if old_dir.exists() {
+            // Remove current live files
+            if let Ok(entries) = fs::read_dir(&self.target_storage_root) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p != old_dir && p != self.staging_dir.path() {
+                        if p.is_dir() {
+                            let _ = fs::remove_dir_all(&p);
+                        } else {
+                            let _ = fs::remove_file(&p);
+                        }
+                    }
+                }
+            }
+            // Move old generation files back
+            if let Ok(entries) = fs::read_dir(&old_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    let name = entry.file_name();
+                    let dst = self.target_storage_root.join(name);
+                    let _ = fs::rename(&p, &dst);
+                }
+            }
+            let _ = fs::remove_dir_all(&old_dir);
+        }
+
+        if let Some(ref prev_gen) = self.journal.previous_storage_generation {
+            let _ = RestoreJournal::write_storage_generation(&self.target_storage_root, prev_gen);
+        } else {
+            let gen_file = self
+                .target_storage_root
+                .join(RestoreJournal::GENERATION_FILE_NAME);
+            let _ = fs::remove_file(&gen_file);
+        }
+
+        let _ = self.journal.persist(RestorePhase::RolledBack(
+            "Restored from old generation".to_string(),
+        ));
+        let _ = RestoreJournal::remove(&self.target_storage_root);
+        Ok(())
+    }
+
     /// Abort and discard staging artifacts leaving live storage completely untouched.
-    pub fn abort(mut self, reason: &str) -> Result<(), ForgeError> {
+    pub fn abort(&mut self, reason: &str) -> Result<(), ForgeError> {
+        let _ = self.rollback();
         let _ = self
             .journal
             .persist(RestorePhase::Failed(reason.to_string()));
@@ -479,10 +544,11 @@ impl BackupManager {
         backup_tar_gz: &Path,
         target_storage_root: &Path,
     ) -> Result<(BackupManifest, RestoreReport, Option<PathBuf>), ForgeError> {
-        let session = Self::prepare_restore_session(backup_tar_gz, target_storage_root, None)?;
+        let mut session = Self::prepare_restore_session(backup_tar_gz, target_storage_root, None)?;
         let manifest = session.manifest.clone();
         let db_path = session.db_snapshot_path.clone();
-        let report = session.publish_storage()?;
+        session.publish_storage()?;
+        let report = session.finalize()?;
         Ok((manifest, report, db_path))
     }
 
@@ -493,7 +559,7 @@ impl BackupManager {
         target_storage_root: &Path,
         passphrase: &str,
     ) -> Result<(BackupManifest, RestoreReport, Option<String>), ForgeError> {
-        let session =
+        let mut session =
             Self::prepare_restore_session(encrypted_path, target_storage_root, Some(passphrase))?;
         let manifest = session.manifest.clone();
         let db_str = match session.db_snapshot_path.as_deref() {
@@ -502,7 +568,8 @@ impl BackupManager {
             }
             _ => None,
         };
-        let report = session.publish_storage()?;
+        session.publish_storage()?;
+        let report = session.finalize()?;
         Ok((manifest, report, db_str))
     }
 
@@ -512,11 +579,12 @@ impl BackupManager {
         target_storage_root: &Path,
         passphrase: &str,
     ) -> Result<(BackupManifest, RestoreReport, Option<PathBuf>), ForgeError> {
-        let session =
+        let mut session =
             Self::prepare_restore_session(encrypted_path, target_storage_root, Some(passphrase))?;
         let manifest = session.manifest.clone();
         let db_path = session.db_snapshot_path.clone();
-        let report = session.publish_storage()?;
+        session.publish_storage()?;
+        let report = session.finalize()?;
         Ok((manifest, report, db_path))
     }
 
@@ -878,6 +946,128 @@ impl BackupManager {
         Ok(dest_root.join(path))
     }
 
+    /// Captures the authoritative private and public SSH host identity into a memory snapshot archive.
+    pub fn capture_ssh_identity_snapshot(
+        ssh_dir: &Path,
+        fencing_generation: u64,
+    ) -> Result<Option<(BackupParticipantRecord, Vec<u8>, String)>, ForgeError> {
+        let key_path = ssh_dir.join("host_key_ed25519");
+        if !key_path.exists() {
+            return Ok(None);
+        }
+        let pem_str = fs::read_to_string(&key_path)
+            .map_err(|e| ForgeError::Internal(format!("Failed to read SSH host key: {}", e)))?;
+        let key = russh::keys::ssh_key::PrivateKey::from_openssh(&pem_str)
+            .map_err(|e| ForgeError::Internal(format!("Invalid OpenSSH host key: {}", e)))?;
+        let fingerprint = key
+            .public_key()
+            .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
+            .to_string();
+
+        let mut buffer = Vec::new();
+        {
+            let enc = GzEncoder::new(&mut buffer, Compression::default());
+            let mut tar = tar::Builder::new(enc);
+
+            let priv_data = pem_str.as_bytes();
+            let mut header = tar::Header::new_gnu();
+            header
+                .set_path("host_key_ed25519")
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+            header.set_size(priv_data.len() as u64);
+            header.set_mode(0o600);
+            header.set_cksum();
+            tar.append(&header, priv_data)
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+            let pub_path = ssh_dir.join("host_key_ed25519.pub");
+            if pub_path.exists() {
+                if let Ok(pub_data) = fs::read(&pub_path) {
+                    let mut pub_header = tar::Header::new_gnu();
+                    pub_header
+                        .set_path("host_key_ed25519.pub")
+                        .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                    pub_header.set_size(pub_data.len() as u64);
+                    pub_header.set_mode(0o644);
+                    pub_header.set_cksum();
+                    tar.append(&pub_header, &pub_data[..])
+                        .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                }
+            }
+            tar.finish()
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        }
+
+        let sha256_checksum = format!("{:x}", sha2::Sha256::digest(&buffer));
+        let byte_length = buffer.len() as u64;
+
+        let record = BackupParticipantRecord {
+            participant_id: "spine_ssh".to_string(),
+            volume_name: "spine_ssh".to_string(),
+            snapshot_id: format!("ssh_snap_{}", Uuid::new_v4().simple()),
+            fencing_generation,
+            byte_length,
+            sha256_checksum,
+            archive_rel_path: "ssh/ssh_identity_snapshot.tar.gz".to_string(),
+        };
+
+        Ok(Some((record, buffer, fingerprint)))
+    }
+
+    /// Restores the SSH host identity into the target SSH directory and verifies key consistency.
+    pub fn restore_ssh_identity_snapshot(
+        ssh_dir: &Path,
+        payload_bytes: &[u8],
+        expected_fingerprint: Option<&str>,
+    ) -> Result<String, ForgeError> {
+        fs::create_dir_all(ssh_dir).map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let gz = GzDecoder::new(payload_bytes);
+        let mut archive = tar::Archive::new(gz);
+
+        for entry in archive
+            .entries()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?
+        {
+            let mut entry = entry.map_err(|e| ForgeError::Internal(e.to_string()))?;
+            let path = entry
+                .path()
+                .map_err(|e| ForgeError::Internal(e.to_string()))?
+                .to_path_buf();
+            let dest = ssh_dir.join(path);
+            entry
+                .unpack(&dest)
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        }
+
+        let key_path = ssh_dir.join("host_key_ed25519");
+        if !key_path.exists() {
+            return Err(ForgeError::Internal(
+                "Restored SSH identity missing host_key_ed25519".to_string(),
+            ));
+        }
+        let pem_str = fs::read_to_string(&key_path).map_err(|e| {
+            ForgeError::Internal(format!("Failed to read restored SSH host key: {}", e))
+        })?;
+        let key = russh::keys::ssh_key::PrivateKey::from_openssh(&pem_str).map_err(|e| {
+            ForgeError::Internal(format!("Restored SSH key is invalid OpenSSH key: {}", e))
+        })?;
+        let actual_fingerprint = key
+            .public_key()
+            .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
+            .to_string();
+
+        if let Some(expected) = expected_fingerprint {
+            if actual_fingerprint != expected {
+                return Err(ForgeError::Internal(format!(
+                    "Restored SSH host key fingerprint mismatch: expected {}, got {}",
+                    expected, actual_fingerprint
+                )));
+            }
+        }
+
+        Ok(actual_fingerprint)
+    }
+
     /// Internal shared logic to package files into a tar builder
     fn create_archive_internal<W: std::io::Write>(
         storage_root: &Path,
@@ -953,8 +1143,24 @@ impl BackupManager {
             file_hashes.insert("database/snapshot.json".to_string(), digest);
         }
 
-        let host_pub_path = storage_root.join("ssh/host_key_ed25519.pub");
-        let ssh_fingerprint = if host_pub_path.exists() {
+        let ssh_dir = crate::ssh::host_key::resolve_ssh_dir(storage_root);
+        let host_priv_path = ssh_dir.join("host_key_ed25519");
+        let host_pub_path = ssh_dir.join("host_key_ed25519.pub");
+        let ssh_fingerprint = if host_priv_path.exists() {
+            if let Ok(pem_str) = fs::read_to_string(&host_priv_path) {
+                if let Ok(key) = russh::keys::ssh_key::PrivateKey::from_openssh(&pem_str) {
+                    Some(
+                        key.public_key()
+                            .fingerprint(russh::keys::ssh_key::HashAlg::Sha256)
+                            .to_string(),
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else if host_pub_path.exists() {
             if let Ok(pub_str) = fs::read_to_string(&host_pub_path) {
                 if let Ok(parsed) = russh::keys::ssh_key::PublicKey::from_openssh(&pub_str) {
                     Some(
@@ -984,6 +1190,7 @@ impl BackupManager {
             integrity_status: "VERIFIED".to_string(),
             fencing_generation,
             participants: participants.iter().map(|(r, _)| r.clone()).collect(),
+            required_participant_count: participants.len(),
         };
 
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)
@@ -1253,7 +1460,7 @@ impl BackupManager {
             .map_err(|e| {
                 ForgeError::Internal(format!("Failed to create temp staging directory: {}", e))
             })?;
-        let session = Self::unpack_archive_to_session(
+        let mut session = Self::unpack_archive_to_session(
             reader,
             Path::new("archive.tar.gz"),
             target_storage_root,
@@ -1266,7 +1473,8 @@ impl BackupManager {
             }
             _ => None,
         };
-        let report = session.publish_storage()?;
+        session.publish_storage()?;
+        let report = session.finalize()?;
         Ok((manifest, report, db_str))
     }
 

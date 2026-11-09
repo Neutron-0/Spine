@@ -277,6 +277,54 @@ fn read_secret(
     Ok(None)
 }
 
+fn resolve_postgres_url(
+    direct_arg: Option<String>,
+    file_path: Option<&std::path::Path>,
+    env_vars: &[&str],
+    user_var: Option<&str>,
+    pass_var: Option<&str>,
+    pass_file_var: Option<&str>,
+) -> Result<Option<String>, anyhow::Error> {
+    if let Some(url) = read_secret(direct_arg, file_path, env_vars)? {
+        return Ok(Some(url));
+    }
+
+    let host = std::env::var("POSTGRES_HOST").ok();
+    let port = std::env::var("POSTGRES_PORT")
+        .ok()
+        .unwrap_or_else(|| "5432".to_string());
+    let db = std::env::var("POSTGRES_DB")
+        .ok()
+        .unwrap_or_else(|| "spine_forge".to_string());
+
+    if let Some(host) = host {
+        let user = user_var
+            .and_then(|v| std::env::var(v).ok())
+            .unwrap_or_else(|| "spine_app".to_string());
+        let pass = if let Some(pf) = pass_file_var.and_then(|v| std::env::var(v).ok()) {
+            std::fs::read_to_string(&pf)
+                .ok()
+                .map(|s| s.trim().to_string())
+        } else {
+            None
+        }
+        .or_else(|| pass_var.and_then(|v| std::env::var(v).ok()));
+
+        if let Some(pass) = pass {
+            let mut parsed_url = url::Url::parse(&format!("postgres://{}:{}/{}", host, port, db))?;
+            parsed_url
+                .set_username(&user)
+                .map_err(|_| anyhow::anyhow!("Invalid database username"))?;
+            parsed_url
+                .set_password(Some(&pass))
+                .map_err(|_| anyhow::anyhow!("Invalid database password"))?;
+            return Ok(Some(parsed_url.to_string()));
+        }
+    }
+
+    Ok(None)
+}
+
 fn parse_cli_profile(
     profile_arg: Option<&str>,
 ) -> Result<spine_api::DeploymentProfile, anyhow::Error> {
@@ -297,7 +345,7 @@ async fn main() -> anyhow::Result<()> {
             database_url_file,
             migration_database_url_file,
         }) => {
-            let db_url = read_secret(
+            let db_url = resolve_postgres_url(
                 None,
                 migration_database_url_file
                     .as_deref()
@@ -308,6 +356,9 @@ async fn main() -> anyhow::Result<()> {
                     "DATABASE_URL",
                     "SPINE_DATABASE_URL",
                 ],
+                Some("POSTGRES_MIGRATOR_USER"),
+                Some("POSTGRES_MIGRATOR_PASSWORD"),
+                Some("POSTGRES_MIGRATOR_PASSWORD_FILE"),
             )?
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -341,10 +392,13 @@ async fn main() -> anyhow::Result<()> {
             let prof = spine_api::DeploymentProfile::from_str_relaxed(&raw_prof)
                 .map_err(|e| anyhow::anyhow!(e))?;
 
-            let db_url = read_secret(
+            let db_url = resolve_postgres_url(
                 None,
                 database_url_file.as_deref(),
                 &["DATABASE_URL", "SPINE_DATABASE_URL"],
+                Some("POSTGRES_APP_USER"),
+                Some("POSTGRES_APP_PASSWORD"),
+                Some("POSTGRES_APP_PASSWORD_FILE"),
             )?;
             let db: Arc<dyn Database> = if prof.requires_persistent_database() {
                 if in_memory_db {
@@ -493,11 +547,33 @@ async fn main() -> anyhow::Result<()> {
                                     .push((id.trim().to_string(), addr.trim().to_string()));
                             } else {
                                 node_endpoints.push((
-                                    format!("storage-{}", node_endpoints.len() + 1),
+                                    format!("node-{}", node_endpoints.len() + 1),
                                     trimmed.to_string(),
                                 ));
                             }
                         }
+                    }
+                }
+
+                if prof.requires_persistent_database() {
+                    if coord_addr_opt.is_none() {
+                        anyhow::bail!(
+                            "Under deployment profile '{}', a coordinator address is required for complete cluster backups (--coordinator-addr, or COORDINATOR_ADDR).",
+                            prof
+                        );
+                    }
+                    if node_endpoints.len() < 3 {
+                        anyhow::bail!(
+                            "Under deployment profile '{}', all 3 storage nodes (node-1, node-2, node-3) are required for complete cluster backups (--storage-node-addrs, or STORAGE_NODE_ADDRS). Found {} nodes.",
+                            prof,
+                            node_endpoints.len()
+                        );
+                    }
+                    if db_url.is_none() {
+                        anyhow::bail!(
+                            "Under deployment profile '{}', a PostgreSQL database URL is required for complete backups (--database-url, --database-url-file, or DATABASE_URL).",
+                            prof
+                        );
                     }
                 }
 
@@ -531,12 +607,6 @@ async fn main() -> anyhow::Result<()> {
                     println!("PostgreSQL streaming snapshot captured successfully.");
                     (Some(barrier), Some(guard))
                 } else {
-                    if prof.requires_persistent_database() {
-                        anyhow::bail!(
-                            "Under deployment profile '{}', a PostgreSQL database URL is required for complete backups (--database-url, --database-url-file, or DATABASE_URL).",
-                            prof
-                        );
-                    }
                     (None, None)
                 };
 
@@ -624,6 +694,39 @@ async fn main() -> anyhow::Result<()> {
                     );
                     storage_clients.push((node_id.clone(), client));
                 }
+
+                // Capture authoritative SSH host identity snapshot
+                let ssh_dir = spine_api::ssh::host_key::resolve_ssh_dir(&storage_root);
+                let ssh_identity_opt =
+                    spine_api::backup::BackupManager::capture_ssh_identity_snapshot(
+                        &ssh_dir,
+                        fencing_generation,
+                    )?;
+                if let Some((ssh_record, ssh_bytes, fingerprint)) = ssh_identity_opt {
+                    println!(
+                        "Authoritative SSH host identity snapshot captured (fingerprint: {}).",
+                        fingerprint
+                    );
+                    participant_snapshots.push((ssh_record, ssh_bytes));
+                } else if prof.requires_persistent_database() {
+                    anyhow::bail!(
+                        "Under deployment profile '{}', SSH host identity ('spine_ssh') is required. No host key found in '{}'.",
+                        prof,
+                        ssh_dir.display()
+                    );
+                }
+
+                // Enforce participant registry validation before archive assembly
+                let participant_records: Vec<_> = participant_snapshots
+                    .iter()
+                    .map(|(r, _)| r.clone())
+                    .collect();
+                spine_api::backup::participants::ParticipantRegistry::validate_participants(
+                    &prof,
+                    &participant_records,
+                    fencing_generation,
+                )
+                .map_err(|e| anyhow::anyhow!("Participant validation failed: {}", e))?;
 
                 let has_db_snap = _maintenance_guard.is_some();
 
@@ -727,28 +830,7 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
 
-                // FAIL-SAFE: Validate target database BEFORE modifying repository storage on disk
-                let mut target_db_pool = None;
-                if let Some(ref db_url) = target_db {
-                    println!(
-                        "Connecting and verifying target database: {}...",
-                        sanitize_db_url(db_url)
-                    );
-                    let pool = sqlx::PgPool::connect(db_url).await.map_err(|e| {
-                        anyhow::anyhow!("Failed to connect to target PostgreSQL for restore: {}", e)
-                    })?;
-
-                    let empty = spine_api::is_database_empty(&pool).await.map_err(|e| {
-                        anyhow::anyhow!("Failed to inspect target database state: {}", e)
-                    })?;
-                    if !empty {
-                        anyhow::bail!(
-                            "Target database is not empty. Full database restoration requires a clean, empty target database to prevent data corruption."
-                        );
-                    }
-                    target_db_pool = Some(pool);
-                }
-
+                // Staging restore session and verifying checksums
                 println!(
                     "Staging backup archive from {} into isolated staging directory for {}...",
                     input.display(),
@@ -759,8 +841,45 @@ async fn main() -> anyhow::Result<()> {
                     &target_storage,
                     pass.as_deref(),
                 )?;
-
                 println!("Archive staged and all checksums verified against manifest.");
+
+                let fencing_generation = session.manifest.fencing_generation.unwrap_or(1);
+
+                // Enforce participant completeness according to deployment profile
+                spine_api::backup::participants::ParticipantRegistry::validate_participants(
+                    &prof,
+                    &session.manifest.participants,
+                    fencing_generation,
+                )
+                .map_err(|e| {
+                    let _ = session.abort(&format!("Participant validation failed: {}", e));
+                    anyhow::anyhow!("Participant validation failed: {}", e)
+                })?;
+
+                // FAIL-SAFE: Validate target database BEFORE modifying repository storage on disk
+                let mut target_db_pool = None;
+                if let Some(ref db_url) = target_db {
+                    println!(
+                        "Connecting and verifying target database: {}...",
+                        sanitize_db_url(db_url)
+                    );
+                    let pool = sqlx::PgPool::connect(db_url).await.map_err(|e| {
+                        let _ = session.abort(&format!("Target DB connect failed: {}", e));
+                        anyhow::anyhow!("Failed to connect to target PostgreSQL for restore: {}", e)
+                    })?;
+
+                    let empty = spine_api::is_database_empty(&pool).await.map_err(|e| {
+                        let _ = session.abort(&format!("Failed to inspect target DB state: {}", e));
+                        anyhow::anyhow!("Failed to inspect target database state: {}", e)
+                    })?;
+                    if !empty {
+                        let _ = session.abort("Target database is not empty");
+                        anyhow::bail!(
+                            "Target database is not empty. Full database restoration requires a clean, empty target database to prevent data corruption."
+                        );
+                    }
+                    target_db_pool = Some(pool);
+                }
 
                 let coord_addr_opt = coordinator_addr
                     .or_else(|| std::env::var("COORDINATOR_ADDR").ok())
@@ -777,14 +896,48 @@ async fn main() -> anyhow::Result<()> {
                             if let Some((id, addr)) = trimmed.split_once('=') {
                                 node_endpoints
                                     .insert(id.trim().to_string(), addr.trim().to_string());
+                            } else {
+                                node_endpoints.insert(
+                                    format!("node-{}", node_endpoints.len() + 1),
+                                    trimmed.to_string(),
+                                );
                             }
                         }
                     }
                 }
 
-                // Stage restore on coordinator and storage nodes if participant archives exist
-                let mut staged_cluster_restores = Vec::new();
-                for participant in &session.manifest.participants {
+                // If production profile, coordinator and 3 storage nodes must have endpoints supplied
+                if prof.requires_persistent_database() {
+                    if coord_addr_opt.is_none() {
+                        let _ = session.abort("Missing coordinator address for production restore");
+                        anyhow::bail!(
+                            "Under deployment profile '{}', a coordinator address is required for restore (--coordinator-addr, or COORDINATOR_ADDR).",
+                            prof
+                        );
+                    }
+                    for needed_node in ["node-1", "node-2", "node-3"] {
+                        if !node_endpoints.contains_key(needed_node) {
+                            let _ = session.abort(&format!(
+                                "Missing storage node endpoint for {}",
+                                needed_node
+                            ));
+                            anyhow::bail!(
+                                "Under deployment profile '{}', storage node endpoint for '{}' is required (--storage-node-addrs, or STORAGE_NODE_ADDRS).",
+                                prof, needed_node
+                            );
+                        }
+                    }
+                }
+
+                // ------------------------------------------------------------------------
+                // DISTRIBUTED CUTOVER PROTOCOL
+                // Phase 1: PREPARE (Stage restore on coordinator and storage nodes)
+                // ------------------------------------------------------------------------
+                println!("=== Phase 1: PREPARE (Staging Cluster Volume Restores) ===");
+                let mut staged_cluster_restores: Vec<(String, u64, spine_api::CoordinatorClient)> =
+                    Vec::new();
+                let manifest_participants = session.manifest.participants.clone();
+                for participant in &manifest_participants {
                     if participant.participant_id == "coordinator"
                         || participant.archive_rel_path.starts_with("coordinator/")
                     {
@@ -808,15 +961,19 @@ async fn main() -> anyhow::Result<()> {
                                         sha256_checksum: participant.sha256_checksum.clone(),
                                         created_at_nanos: 0,
                                     };
-                                client
-                                    .stage_restore(vol_manifest, data)
-                                    .await
-                                    .map_err(|e| {
-                                        anyhow::anyhow!(
-                                            "Failed to stage volume restore on coordinator: {}",
-                                            e
-                                        )
-                                    })?;
+                                if let Err(e) = client.stage_restore(vol_manifest, data).await {
+                                    for (r_snap, _, r_client) in &staged_cluster_restores {
+                                        let _ = r_client.rollback_restore(r_snap).await;
+                                    }
+                                    let _ = session.abort(&format!(
+                                        "Failed to stage volume restore on coordinator: {}",
+                                        e
+                                    ));
+                                    anyhow::bail!(
+                                        "Failed to stage volume restore on coordinator: {}",
+                                        e
+                                    );
+                                }
                                 staged_cluster_restores.push((
                                     participant.snapshot_id.clone(),
                                     participant.fencing_generation,
@@ -843,21 +1000,67 @@ async fn main() -> anyhow::Result<()> {
                                 sha256_checksum: participant.sha256_checksum.clone(),
                                 created_at_nanos: 0,
                             };
-                            client
-                                .stage_restore(vol_manifest, data)
-                                .await
-                                .map_err(|e| {
-                                    anyhow::anyhow!(
-                                        "Failed to stage volume restore on storage node '{}': {}",
-                                        participant.participant_id,
-                                        e
-                                    )
-                                })?;
+                            if let Err(e) = client.stage_restore(vol_manifest, data).await {
+                                for (r_snap, _, r_client) in &staged_cluster_restores {
+                                    let _ = r_client.rollback_restore(r_snap).await;
+                                }
+                                let _ = session.abort(&format!(
+                                    "Failed to stage volume restore on storage node '{}': {}",
+                                    participant.participant_id, e
+                                ));
+                                anyhow::bail!(
+                                    "Failed to stage volume restore on storage node '{}': {}",
+                                    participant.participant_id,
+                                    e
+                                );
+                            }
                             staged_cluster_restores.push((
                                 participant.snapshot_id.clone(),
                                 participant.fencing_generation,
                                 client,
                             ));
+                        }
+                    }
+                }
+
+                // ------------------------------------------------------------------------
+                // Phase 2: PREPARED (SSH Host Identity & Target Database Restore)
+                // ------------------------------------------------------------------------
+                println!("=== Phase 2: PREPARED (Restoring SSH Identity & Database) ===");
+                // Restore SSH host identity snapshot if present
+                let has_ssh = session
+                    .manifest
+                    .participants
+                    .iter()
+                    .any(|p| p.participant_id == "spine_ssh");
+                if has_ssh {
+                    let ssh_dir = spine_api::ssh::host_key::resolve_ssh_dir(&target_storage);
+                    if let Some(data) =
+                        session.get_participant_snapshot_data("ssh/ssh_identity_snapshot.tar.gz")
+                    {
+                        println!(
+                            "Restoring and validating SSH host identity in {}...",
+                            ssh_dir.display()
+                        );
+                        match spine_api::backup::BackupManager::restore_ssh_identity_snapshot(
+                            &ssh_dir,
+                            &data,
+                            session.manifest.ssh_host_key_fingerprint.as_deref(),
+                        ) {
+                            Ok(fp) => {
+                                println!(
+                                    "SSH host key restored and verified (fingerprint: {}).",
+                                    fp
+                                );
+                            }
+                            Err(e) => {
+                                for (snap_id, _, client) in &staged_cluster_restores {
+                                    let _ = client.rollback_restore(snap_id).await;
+                                }
+                                let _ =
+                                    session.abort(&format!("SSH identity restore failed: {}", e));
+                                anyhow::bail!("Failed to restore SSH host identity: {}. Target repository storage was left untouched.", e);
+                            }
                         }
                     }
                 }
@@ -910,9 +1113,23 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
 
+                // ------------------------------------------------------------------------
+                // Phase 3: COMMIT DECISION & Phase 4: PUBLISH
+                // Commit cluster nodes (retaining .old_restore) and publish storage (retaining .old_generation)
+                // ------------------------------------------------------------------------
+                println!("=== Phase 3 & 4: COMMIT DECISION & PUBLISH ===");
+                let mut committed_cluster_restores: Vec<(
+                    String,
+                    u64,
+                    spine_api::CoordinatorClient,
+                )> = Vec::new();
                 for (snap_id, fencing_gen, client) in &staged_cluster_restores {
                     println!("Committing volume restore for snapshot {}...", snap_id);
                     if let Err(e) = client.commit_restore(snap_id, *fencing_gen).await {
+                        // Rollback already-committed cluster participants
+                        for (r_snap, _, r_client) in &committed_cluster_restores {
+                            let _ = r_client.rollback_restore(r_snap).await;
+                        }
                         for (r_snap, _, r_client) in &staged_cluster_restores {
                             let _ = r_client.rollback_restore(r_snap).await;
                         }
@@ -920,13 +1137,82 @@ async fn main() -> anyhow::Result<()> {
                             .abort(&format!("Failed to commit cluster volume restore: {}", e));
                         anyhow::bail!("Failed to commit cluster volume restore: {}. Target repository storage was left untouched.", e);
                     }
+                    committed_cluster_restores.push((
+                        snap_id.clone(),
+                        *fencing_gen,
+                        client.clone(),
+                    ));
                 }
 
-                println!("Atomically publishing verified repository storage to live root...");
+                println!("Atomically publishing verified repository storage to live root (retaining rollback generation)...");
                 let manifest = session.manifest.clone();
-                let report = session.publish_storage().map_err(|e| {
-                    anyhow::anyhow!("Failed to publish verified storage to live root: {}", e)
-                })?;
+                let report = match session.publish_storage() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        println!(
+                            "Storage publication failed, rolling back cluster participants..."
+                        );
+                        for (r_snap, _, r_client) in &committed_cluster_restores {
+                            let _ = r_client.rollback_restore(r_snap).await;
+                        }
+                        let _ = session.rollback();
+                        anyhow::bail!("Failed to publish verified storage to live root: {}", e);
+                    }
+                };
+
+                // ------------------------------------------------------------------------
+                // Phase 5: VERIFY
+                // Confirm health, fencing generation, and integrity across all participants
+                // ------------------------------------------------------------------------
+                println!("=== Phase 5: VERIFY (Post-Cutover Distributed Integrity Validation) ===");
+                let mut verification_failed = false;
+                let mut verify_err_msg = String::new();
+
+                for (snap_id, expected_gen, client) in &committed_cluster_restores {
+                    match client.query_maintenance_status().await {
+                        Ok((_, current_gen)) => {
+                            if current_gen < *expected_gen {
+                                verification_failed = true;
+                                verify_err_msg = format!("Participant for snapshot {} reported generation {} < expected {}", snap_id, current_gen, expected_gen);
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            verification_failed = true;
+                            verify_err_msg = format!(
+                                "Failed to verify participant for snapshot {}: {}",
+                                snap_id, e
+                            );
+                            break;
+                        }
+                    }
+                }
+
+                if verification_failed {
+                    println!(
+                        "Post-cutover verification failed: {}. Executing distributed rollback...",
+                        verify_err_msg
+                    );
+                    for (r_snap, _, r_client) in &committed_cluster_restores {
+                        let _ = r_client.rollback_restore(r_snap).await;
+                    }
+                    let _ = session.rollback();
+                    anyhow::bail!("Restore failed post-cutover verification: {}. All participants rolled back to previous generation.", verify_err_msg);
+                }
+
+                // ------------------------------------------------------------------------
+                // Phase 6: FINALIZE
+                // Purge .old_restore and .old_generation across all participants
+                // ------------------------------------------------------------------------
+                println!("=== Phase 6: FINALIZE (Purging Retained Old Generations) ===");
+                for (snap_id, _, client) in &committed_cluster_restores {
+                    if let Err(e) = client.finalize_restore(snap_id).await {
+                        eprintln!("Warning: Failed to finalize restore on cluster participant for snapshot {}: {}", snap_id, e);
+                    }
+                }
+                let finalize_report = session
+                    .finalize()
+                    .map_err(|e| anyhow::anyhow!("Failed to finalize storage session: {}", e))?;
 
                 println!("Restoration sequence completed successfully:");
                 println!("  Backup ID:     {}", manifest.backup_id);
@@ -934,7 +1220,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("  Bytes restored:{}", report.bytes_restored);
                 println!(
                     "  Integrity:     {}",
-                    if report.integrity_verified {
+                    if finalize_report.integrity_verified {
                         "VERIFIED (SHA-256 matched)"
                     } else {
                         "FAILED"
@@ -1000,16 +1286,22 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let database_url = read_secret(
+    let database_url = resolve_postgres_url(
         None,
         args.database_url_file.as_deref(),
         &["DATABASE_URL", "SPINE_DATABASE_URL"],
+        Some("POSTGRES_APP_USER"),
+        Some("POSTGRES_APP_PASSWORD"),
+        Some("POSTGRES_APP_PASSWORD_FILE"),
     )?;
 
-    let migration_database_url = read_secret(
+    let migration_database_url = resolve_postgres_url(
         None,
         args.migration_database_url_file.as_deref(),
         &["MIGRATION_DATABASE_URL", "SPINE_MIGRATION_DATABASE_URL"],
+        Some("POSTGRES_MIGRATOR_USER"),
+        Some("POSTGRES_MIGRATOR_PASSWORD"),
+        Some("POSTGRES_MIGRATOR_PASSWORD_FILE"),
     )?;
 
     let coordinator_addr = args

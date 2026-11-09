@@ -377,6 +377,15 @@ async fn handle_coordinator_connection(
                 Err(e) => ClusterRpcResponse::Error(e.to_string()),
             }
         }
+        ClusterRpcRequest::FinalizeVolumeRestore { snapshot_id } => {
+            match store.finalize_restore(&snapshot_id) {
+                Ok(_) => ClusterRpcResponse::VolumeRestoreFinalized {
+                    snapshot_id,
+                    success: true,
+                },
+                Err(e) => ClusterRpcResponse::Error(e.to_string()),
+            }
+        }
         _ => ClusterRpcResponse::Error("Unsupported coordinator request".into()),
     };
 

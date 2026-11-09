@@ -205,6 +205,20 @@ impl ClusterNodeClient {
             _ => Err(ForgeError::Internal("Unexpected RPC response".into())),
         }
     }
+
+    pub async fn finalize_restore(&self, snapshot_id: &str) -> Result<(), ForgeError> {
+        let req = ClusterRpcRequest::FinalizeVolumeRestore {
+            snapshot_id: snapshot_id.to_string(),
+        };
+        match self.send_rpc(&req).await? {
+            ClusterRpcResponse::VolumeRestoreFinalized { .. } => Ok(()),
+            ClusterRpcResponse::Error(msg) => Err(ForgeError::Internal(format!(
+                "Finalize restore failed: {}",
+                msg
+            ))),
+            _ => Err(ForgeError::Internal("Unexpected RPC response".into())),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -341,5 +355,9 @@ impl CoordinatorClient {
 
     pub async fn rollback_restore(&self, snapshot_id: &str) -> Result<(), ForgeError> {
         self.node_client.rollback_restore(snapshot_id).await
+    }
+
+    pub async fn finalize_restore(&self, snapshot_id: &str) -> Result<(), ForgeError> {
+        self.node_client.finalize_restore(snapshot_id).await
     }
 }

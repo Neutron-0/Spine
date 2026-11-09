@@ -106,6 +106,7 @@ pub trait StorageBackend: Send + Sync {
     ) -> Result<()>;
     fn commit_volume_restore(&self, snapshot_id: &str, fencing_generation: u64) -> Result<()>;
     fn rollback_volume_restore(&self, snapshot_id: &str) -> Result<()>;
+    fn finalize_volume_restore(&self, snapshot_id: &str) -> Result<()>;
 }
 
 pub struct FileSystemStorageBackend {
@@ -124,14 +125,54 @@ impl FileSystemStorageBackend {
         fs::create_dir_all(root.join("staging"))?;
         fs::create_dir_all(root.join("chunks"))?;
         fs::create_dir_all(root.join("manifests"))?;
+
+        let fencing_path = root.join(".fencing_generation");
+        let initial_gen = if fencing_path.exists() {
+            let s = fs::read_to_string(&fencing_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to read fencing generation from {}: {}",
+                    fencing_path.display(),
+                    e
+                )
+            })?;
+            let gen = s.trim().parse::<u64>().map_err(|e| {
+                anyhow::anyhow!(
+                    "Corrupt fencing generation record in {}: {}",
+                    fencing_path.display(),
+                    e
+                )
+            })?;
+            if gen == 0 {
+                bail!("Invalid fencing generation 0 in {}", fencing_path.display());
+            }
+            gen
+        } else {
+            let _ = fs::write(&fencing_path, "1\n");
+            1
+        };
+
         Ok(Self {
             storage_root: root,
             total_capacity,
             in_maintenance: Arc::new(AtomicBool::new(false)),
-            fencing_generation: Arc::new(AtomicU64::new(1)),
+            fencing_generation: Arc::new(AtomicU64::new(initial_gen)),
             active_writers: Arc::new(AtomicUsize::new(0)),
             node_id: "storage-node".to_string(),
         })
+    }
+
+    pub fn persist_fencing_generation(&self, gen: u64) -> Result<()> {
+        let cur = self.fencing_generation.load(Ordering::SeqCst);
+        let target = std::cmp::max(cur, gen);
+        let fencing_path = self.storage_root.join(".fencing_generation");
+        let tmp = fencing_path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
+        fs::write(&tmp, format!("{}\n", target))?;
+        if fs::rename(&tmp, &fencing_path).is_err() {
+            let _ = fs::remove_file(&fencing_path);
+            fs::rename(&tmp, &fencing_path)?;
+        }
+        self.fencing_generation.store(target, Ordering::SeqCst);
+        Ok(())
     }
 
     pub fn with_node_id(mut self, node_id: String) -> Self {
@@ -300,6 +341,7 @@ impl StorageBackend for FileSystemStorageBackend {
 
         // Update generation
         self.set_generation(repo_id, new_generation)?;
+        self.persist_fencing_generation(new_generation)?;
         Ok(())
     }
 
@@ -457,20 +499,12 @@ impl StorageBackend for FileSystemStorageBackend {
 
     fn enter_maintenance(&self, fencing_generation: u64) -> Result<()> {
         self.in_maintenance.store(true, Ordering::SeqCst);
-        let cur = self.fencing_generation.load(Ordering::SeqCst);
-        if fencing_generation > cur {
-            self.fencing_generation
-                .store(fencing_generation, Ordering::SeqCst);
-        }
+        self.persist_fencing_generation(fencing_generation)?;
         Ok(())
     }
 
     fn exit_maintenance(&self, fencing_generation: u64) -> Result<()> {
-        let cur = self.fencing_generation.load(Ordering::SeqCst);
-        if fencing_generation >= cur {
-            self.fencing_generation
-                .store(fencing_generation, Ordering::SeqCst);
-        }
+        self.persist_fencing_generation(fencing_generation)?;
         self.in_maintenance.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -604,12 +638,12 @@ impl StorageBackend for FileSystemStorageBackend {
         let gen_file = self.storage_root.join(".spine_storage_generation");
         fs::write(&gen_file, format!("{}\n", fencing_generation))?;
 
-        // Clean up old_root and staged_root
-        let _ = fs::remove_dir_all(&old_root);
+        // Staged root is now active live data; clean up staging directory
         let _ = fs::remove_dir_all(&staged_root);
+        // NOTE: old_root is deliberately RETAINED until global finalize_volume_restore
+        // to guarantee rollback is possible if other cluster participants fail.
 
-        self.fencing_generation
-            .store(fencing_generation, Ordering::SeqCst);
+        self.persist_fencing_generation(fencing_generation)?;
         self.in_maintenance.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -627,6 +661,22 @@ impl StorageBackend for FileSystemStorageBackend {
                     let _ = fs::rename(&old_sub, &live_sub);
                 }
             }
+            let _ = fs::remove_dir_all(&old_root);
+        }
+        let staged_root = self
+            .storage_root
+            .join(format!(".staged_restore_{}", snapshot_id));
+        if staged_root.exists() {
+            let _ = fs::remove_dir_all(&staged_root);
+        }
+        Ok(())
+    }
+
+    fn finalize_volume_restore(&self, snapshot_id: &str) -> Result<()> {
+        let old_root = self
+            .storage_root
+            .join(format!(".old_restore_{}", snapshot_id));
+        if old_root.exists() {
             let _ = fs::remove_dir_all(&old_root);
         }
         let staged_root = self

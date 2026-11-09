@@ -81,3 +81,62 @@ fn test_storage_node_artifact_persistence_and_restart() {
         );
     }
 }
+
+#[test]
+fn test_fencing_generation_persistence_and_restore_finalization() {
+    let tmp = tempdir().unwrap();
+    let node_dir = tmp.path().join("node_fencing");
+    let capacity = 100 * 1024 * 1024;
+
+    let snapshot_id = "snap_42";
+    let fencing_gen = 55u64;
+    let original_payload = b"ORIGINAL_STORAGE_PAYLOAD_GEN_1";
+    let original_hash = blake3::hash(original_payload).to_hex().to_string();
+
+    {
+        let backend = FileSystemStorageBackend::new(&node_dir, capacity).unwrap();
+        backend
+            .store_chunk(&original_hash, original_payload)
+            .unwrap();
+        assert_eq!(backend.get_maintenance_status().1, 1);
+
+        // Stage and commit a volume restore to bump fencing generation
+        let (snap_manifest, snap_tar) = backend
+            .capture_volume_snapshot(snapshot_id, fencing_gen)
+            .unwrap();
+        assert_eq!(snap_manifest.fencing_generation, fencing_gen);
+
+        backend
+            .stage_volume_restore(snapshot_id, fencing_gen, &snap_tar)
+            .unwrap();
+        backend
+            .commit_volume_restore(snapshot_id, fencing_gen)
+            .unwrap();
+
+        assert_eq!(backend.get_maintenance_status().1, fencing_gen);
+
+        // Verify .old_restore_<id> is retained
+        let old_restore_dir = node_dir.join(format!(".old_restore_{}", snapshot_id));
+        assert!(
+            old_restore_dir.exists(),
+            "old_restore must be retained after commit"
+        );
+
+        // Finalize volume restore
+        backend.finalize_volume_restore(snapshot_id).unwrap();
+        assert!(
+            !old_restore_dir.exists(),
+            "old_restore must be cleaned up after finalize"
+        );
+    }
+
+    // Restart backend on same directory: verify fencing generation reloaded from disk
+    {
+        let restarted = FileSystemStorageBackend::new(&node_dir, capacity).unwrap();
+        assert_eq!(
+            restarted.get_maintenance_status().1,
+            fencing_gen,
+            "Fencing generation must survive process restart"
+        );
+    }
+}
