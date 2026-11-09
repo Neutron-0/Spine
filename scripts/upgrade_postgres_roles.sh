@@ -13,6 +13,39 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 psql -v ON_ERROR_STOP=1 -U "${ADMIN_USER}" -d "${DB_NAME}" -f "${SCRIPT_DIR}/upgrade_postgres_roles.sql"
 
+# Update credentials securely via stdin if provided via environment or secret file
+if [ -n "${POSTGRES_MIGRATOR_PASSWORD_FILE:-}" ] && [ -r "$POSTGRES_MIGRATOR_PASSWORD_FILE" ]; then
+    MIGRATOR_PASSWORD="$(cat "$POSTGRES_MIGRATOR_PASSWORD_FILE")"
+elif [ -n "${POSTGRES_MIGRATOR_PASSWORD:-}" ]; then
+    MIGRATOR_PASSWORD="${POSTGRES_MIGRATOR_PASSWORD}"
+else
+    MIGRATOR_PASSWORD=""
+fi
+
+if [ -n "${POSTGRES_APP_PASSWORD_FILE:-}" ] && [ -r "$POSTGRES_APP_PASSWORD_FILE" ]; then
+    APP_PASSWORD="$(cat "$POSTGRES_APP_PASSWORD_FILE")"
+elif [ -n "${POSTGRES_APP_PASSWORD:-}" ]; then
+    APP_PASSWORD="${POSTGRES_APP_PASSWORD}"
+else
+    APP_PASSWORD=""
+fi
+
+if [ -n "$MIGRATOR_PASSWORD" ]; then
+    echo "[INFO] Updating spine_migrator password securely..."
+    ESC_MIGRATOR_PASS="$(printf '%s' "$MIGRATOR_PASSWORD" | sed "s/'/''/g")"
+    psql -v ON_ERROR_STOP=1 -U "${ADMIN_USER}" -d "${DB_NAME}" <<EOSQL
+ALTER ROLE spine_migrator WITH PASSWORD '${ESC_MIGRATOR_PASS}';
+EOSQL
+fi
+
+if [ -n "$APP_PASSWORD" ]; then
+    echo "[INFO] Updating spine_app password securely..."
+    ESC_APP_PASS="$(printf '%s' "$APP_PASSWORD" | sed "s/'/''/g")"
+    psql -v ON_ERROR_STOP=1 -U "${ADMIN_USER}" -d "${DB_NAME}" <<EOSQL
+ALTER ROLE spine_app WITH PASSWORD '${ESC_APP_PASS}';
+EOSQL
+fi
+
 echo "[INFO] Verifying spine_app cannot create tables via non-destructive catalog query..."
 CAN_CREATE="$(psql -U "${ADMIN_USER}" -d "${DB_NAME}" -t -A -c "SELECT has_schema_privilege('spine_app', 'public', 'CREATE');")"
 

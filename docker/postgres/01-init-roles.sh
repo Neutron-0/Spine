@@ -44,66 +44,70 @@ else
     exit 1
 fi
 
-echo "Initializing dynamic PostgreSQL roles for database '${DB_NAME}' with safe SQL identifier/literal quoting via \\gexec..."
+if [ -z "$MIGRATOR_PASSWORD" ]; then
+    echo "FATAL: Resolved MIGRATOR_PASSWORD is empty" >&2
+    exit 1
+fi
+if [ -z "$APP_PASSWORD" ]; then
+    echo "FATAL: Resolved APP_PASSWORD is empty" >&2
+    exit 1
+fi
 
-# 1. Create or update migrator and app roles using safe PostgreSQL format() and \gexec
-# Variables are passed to format() outside dollar-quoted blocks to prevent psql expansion failures.
-psql -v ON_ERROR_STOP=1 \
-     -v db_name="$DB_NAME" \
-     -v migrator_user="$MIGRATOR_USER" \
-     -v migrator_password="$MIGRATOR_PASSWORD" \
-     -v app_user="$APP_USER" \
-     -v app_password="$APP_PASSWORD" \
-     --username "$ADMIN_USER" --dbname "$DB_NAME" <<-'EOSQL'
-    -- Create or alter migrator role
-    SELECT format(
-        'DO $B$ BEGIN
-            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %L) THEN
-                CREATE ROLE %I WITH LOGIN PASSWORD %L;
-            ELSE
-                ALTER ROLE %I WITH PASSWORD %L;
-            END IF;
-        END $B$;',
-        :'migrator_user', :'migrator_user', :'migrator_password',
-        :'migrator_user', :'migrator_password'
-    ) \gexec
+echo "Initializing dynamic PostgreSQL roles for database '${DB_NAME}' without command-line password exposure..."
 
-    -- Create or alter application runtime role
-    SELECT format(
-        'DO $B$ BEGIN
-            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %L) THEN
-                CREATE ROLE %I WITH LOGIN PASSWORD %L;
-            ELSE
-                ALTER ROLE %I WITH PASSWORD %L;
-            END IF;
-        END $B$;',
-        :'app_user', :'app_user', :'app_password',
-        :'app_user', :'app_password'
-    ) \gexec
+# Helper function to escape single quotes in SQL string literals
+escape_sql_literal() {
+    printf '%s' "$1" | sed "s/'/''/g"
+}
 
-    -- Enforce non-admin privileges
-    SELECT format('ALTER ROLE %I NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;', :'migrator_user') \gexec
-    SELECT format('ALTER ROLE %I NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;', :'app_user') \gexec
+# Helper function to escape double quotes in SQL identifiers
+escape_sql_identifier() {
+    printf '%s' "$1" | sed 's/"/""/g'
+}
 
-    -- Transfer database ownership to migrator role
-    SELECT format('ALTER DATABASE %I OWNER TO %I;', :'db_name', :'migrator_user') \gexec
+ESC_MIGRATOR_PASS="$(escape_sql_literal "$MIGRATOR_PASSWORD")"
+ESC_APP_PASS="$(escape_sql_literal "$APP_PASSWORD")"
+ESC_MIGRATOR_USER="$(escape_sql_identifier "$MIGRATOR_USER")"
+ESC_APP_USER="$(escape_sql_identifier "$APP_USER")"
+ESC_DB_NAME="$(escape_sql_identifier "$DB_NAME")"
 
-    -- Schema ownership and DDL rights
-    SELECT format('ALTER SCHEMA public OWNER TO %I;', :'migrator_user') \gexec
-    SELECT format('GRANT ALL ON SCHEMA public TO %I;', :'migrator_user') \gexec
+# Execute role initialization by streaming SQL over stdin.
+# Passwords are NEVER passed via command line flags (-v) to prevent exposure in /proc/cmdline and ps.
+psql -v ON_ERROR_STOP=1 --username "$ADMIN_USER" --dbname "$DB_NAME" <<EOSQL
+DO \$B\$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${ESC_MIGRATOR_USER}') THEN
+        CREATE ROLE "${ESC_MIGRATOR_USER}" WITH LOGIN PASSWORD '${ESC_MIGRATOR_PASS}';
+    ELSE
+        ALTER ROLE "${ESC_MIGRATOR_USER}" WITH PASSWORD '${ESC_MIGRATOR_PASS}';
+    END IF;
 
-    -- Strict least privilege for application role
-    SELECT format('GRANT CONNECT ON DATABASE %I TO %I;', :'db_name', :'app_user') \gexec
-    SELECT format('GRANT USAGE ON SCHEMA public TO %I;', :'app_user') \gexec
-    SELECT format('REVOKE CREATE ON SCHEMA public FROM %I;', :'app_user') \gexec
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${ESC_APP_USER}') THEN
+        CREATE ROLE "${ESC_APP_USER}" WITH LOGIN PASSWORD '${ESC_APP_PASS}';
+    ELSE
+        ALTER ROLE "${ESC_APP_USER}" WITH PASSWORD '${ESC_APP_PASS}';
+    END IF;
+END \$B\$;
 
-    -- DML permissions on existing tables and sequences
-    SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO %I;', :'app_user') \gexec
-    SELECT format('GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO %I;', :'app_user') \gexec
+ALTER ROLE "${ESC_MIGRATOR_USER}" NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+ALTER ROLE "${ESC_APP_USER}" NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
 
-    -- Default privileges for future objects created by migrator
-    SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %I;', :'migrator_user', :'app_user') \gexec
-    SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I;', :'migrator_user', :'app_user') \gexec
+ALTER DATABASE "${ESC_DB_NAME}" OWNER TO "${ESC_MIGRATOR_USER}";
+
+ALTER SCHEMA public OWNER TO "${ESC_MIGRATOR_USER}";
+GRANT ALL ON SCHEMA public TO "${ESC_MIGRATOR_USER}";
+
+GRANT CONNECT ON DATABASE "${ESC_DB_NAME}" TO "${ESC_APP_USER}";
+GRANT USAGE ON SCHEMA public TO "${ESC_APP_USER}";
+REVOKE CREATE ON SCHEMA public FROM "${ESC_APP_USER}";
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO "${ESC_APP_USER}";
+GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO "${ESC_APP_USER}";
+
+ALTER DEFAULT PRIVILEGES FOR ROLE "${ESC_MIGRATOR_USER}" IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO "${ESC_APP_USER}";
+ALTER DEFAULT PRIVILEGES FOR ROLE "${ESC_MIGRATOR_USER}" IN SCHEMA public
+    GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO "${ESC_APP_USER}";
 EOSQL
 
 echo "Role provisioning complete for database '${DB_NAME}'."
