@@ -189,7 +189,7 @@ impl ParticipantRegistry {
                     p.participant_id
                 )));
             }
-            if p.byte_length == 0 && p.participant_id != "spine_storage" {
+            if p.byte_length == 0 {
                 return Err(ForgeError::Internal(format!(
                     "Participant '{}' ({}) has 0 bytes: empty participant snapshots are rejected",
                     p.participant_id, p.volume_name

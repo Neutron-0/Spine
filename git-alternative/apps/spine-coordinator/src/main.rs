@@ -58,7 +58,9 @@ impl CoordinatorConfig {
             .or_else(|_| std::env::var("COORDINATOR_BIND"))
             .ok();
 
-        let listen_addr = if let Ok(listen) = std::env::var("SPINE_LISTEN").or_else(|_| std::env::var("COORDINATOR_LISTEN")) {
+        let listen_addr = if let Ok(listen) =
+            std::env::var("SPINE_LISTEN").or_else(|_| std::env::var("COORDINATOR_LISTEN"))
+        {
             listen.trim().to_string()
         } else if let Some(port) = port_env {
             let bind = bind_env.unwrap_or_else(|| "0.0.0.0".to_string());
@@ -187,7 +189,10 @@ mod tests {
         let cfg = CoordinatorConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.cluster_id, "prod-cluster");
         assert_eq!(cfg.listen_addr, "0.0.0.0:8400");
-        assert_eq!(cfg.store_file, PathBuf::from("/var/lib/spine/coordinator.state"));
+        assert_eq!(
+            cfg.store_file,
+            PathBuf::from("/var/lib/spine/coordinator.state")
+        );
 
         std::env::remove_var("SPINE_COORDINATOR_PORT");
         std::env::remove_var("SPINE_BIND");

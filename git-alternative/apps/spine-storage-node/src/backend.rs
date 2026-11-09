@@ -743,14 +743,18 @@ mod tests {
 
         // Acquire writer without generation requirement
         {
-            let _guard = backend.acquire_writer(None).expect("Acquire writer without generation");
+            let _guard = backend
+                .acquire_writer(None)
+                .expect("Acquire writer without generation");
             assert_eq!(backend.get_maintenance_status(), (false, 1, 1));
         }
         assert_eq!(backend.get_maintenance_status(), (false, 1, 0));
 
         // Acquire writer with matching/higher generation requirement
         {
-            let _guard = backend.acquire_writer(Some(2)).expect("Acquire writer with gen 2 >= 1");
+            let _guard = backend
+                .acquire_writer(Some(2))
+                .expect("Acquire writer with gen 2 >= 1");
             assert_eq!(backend.get_maintenance_status(), (false, 1, 1));
         }
         assert_eq!(backend.get_maintenance_status(), (false, 1, 0));
@@ -761,7 +765,10 @@ mod tests {
 
         // Stale generation must be rejected
         let stale_res = backend.acquire_writer(Some(9));
-        assert!(stale_res.is_err(), "Writer with stale generation 9 < 10 must fail");
+        assert!(
+            stale_res.is_err(),
+            "Writer with stale generation 9 < 10 must fail"
+        );
 
         // Enter maintenance
         backend.enter_maintenance(15).unwrap();
@@ -769,7 +776,10 @@ mod tests {
 
         // In maintenance, any writer must be rejected
         let mut_res = backend.acquire_writer(None);
-        assert!(mut_res.is_err(), "Writer must be rejected during maintenance");
+        assert!(
+            mut_res.is_err(),
+            "Writer must be rejected during maintenance"
+        );
 
         // Exit maintenance
         backend.exit_maintenance(15).unwrap();

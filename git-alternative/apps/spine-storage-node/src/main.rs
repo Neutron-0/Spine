@@ -65,7 +65,9 @@ impl StorageNodeConfig {
             .or_else(|_| std::env::var("STORAGE_NODE_BIND"))
             .ok();
 
-        let listen_addr = if let Ok(listen) = std::env::var("SPINE_LISTEN").or_else(|_| std::env::var("STORAGE_NODE_LISTEN")) {
+        let listen_addr = if let Ok(listen) =
+            std::env::var("SPINE_LISTEN").or_else(|_| std::env::var("STORAGE_NODE_LISTEN"))
+        {
             listen.trim().to_string()
         } else if let Some(port) = port_env {
             let bind = bind_env.unwrap_or_else(|| "0.0.0.0".to_string());

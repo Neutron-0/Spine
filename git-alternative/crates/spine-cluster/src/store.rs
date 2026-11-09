@@ -675,25 +675,36 @@ mod tests {
         assert_eq!(store.get_maintenance_status(), (false, 1, 0));
 
         {
-            let _guard = store.acquire_writer().expect("Acquire writer should succeed");
+            let _guard = store
+                .acquire_writer()
+                .expect("Acquire writer should succeed");
             assert_eq!(store.get_maintenance_status(), (false, 1, 1));
         }
         assert_eq!(store.get_maintenance_status(), (false, 1, 0));
 
         // Enter maintenance barrier
-        store.enter_maintenance(5).expect("Enter maintenance should succeed");
+        store
+            .enter_maintenance(5)
+            .expect("Enter maintenance should succeed");
         assert_eq!(store.get_maintenance_status(), (true, 5, 0));
 
         // Attempt mutation while in maintenance must fail
         let mut_res = store.acquire_writer();
-        assert!(mut_res.is_err(), "Writer must be rejected during maintenance");
+        assert!(
+            mut_res.is_err(),
+            "Writer must be rejected during maintenance"
+        );
 
         // Exit maintenance
-        store.exit_maintenance(5).expect("Exit maintenance should succeed");
+        store
+            .exit_maintenance(5)
+            .expect("Exit maintenance should succeed");
         assert_eq!(store.get_maintenance_status(), (false, 5, 0));
 
         // Now writer succeeds again
-        let _guard = store.acquire_writer().expect("Writer should succeed after exit maintenance");
+        let _guard = store
+            .acquire_writer()
+            .expect("Writer should succeed after exit maintenance");
         assert_eq!(store.get_maintenance_status(), (false, 5, 1));
     }
 }

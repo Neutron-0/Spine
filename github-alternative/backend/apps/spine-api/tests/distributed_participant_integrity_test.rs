@@ -11,6 +11,24 @@ fn test_participant_registry_production_enforcement() {
 
     let valid_participants = vec![
         BackupParticipantRecord {
+            participant_id: "postgres_data".to_string(),
+            volume_name: "postgres_data".to_string(),
+            snapshot_id: "snap_pg".to_string(),
+            fencing_generation: fencing_gen,
+            byte_length: 8192,
+            sha256_checksum: "f".repeat(64),
+            archive_rel_path: "database/catalog_dump.jsonl".to_string(),
+        },
+        BackupParticipantRecord {
+            participant_id: "spine_storage".to_string(),
+            volume_name: "spine_storage".to_string(),
+            snapshot_id: "snap_storage".to_string(),
+            fencing_generation: fencing_gen,
+            byte_length: 16384,
+            sha256_checksum: "0".repeat(64),
+            archive_rel_path: "storage/live_storage.tar.gz".to_string(),
+        },
+        BackupParticipantRecord {
             participant_id: "node-1".to_string(),
             volume_name: "storage_1_data".to_string(),
             snapshot_id: "snap_1".to_string(),

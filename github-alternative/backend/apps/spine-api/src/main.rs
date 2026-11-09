@@ -531,8 +531,12 @@ async fn main() -> anyhow::Result<()> {
                     &["SPINE_BACKUP_PASSPHRASE", "BACKUP_PASSPHRASE"],
                 )?;
 
-                let storage_root = if storage_root == std::path::Path::new("./.spine-dev-cluster/node-1") {
-                    if let Ok(r) = std::env::var("SPINE_STORAGE_ROOT").or_else(|_| std::env::var("STORAGE_ROOT")) {
+                let storage_root = if storage_root
+                    == std::path::Path::new("./.spine-dev-cluster/node-1")
+                {
+                    if let Ok(r) = std::env::var("SPINE_STORAGE_ROOT")
+                        .or_else(|_| std::env::var("STORAGE_ROOT"))
+                    {
                         std::path::PathBuf::from(r.trim())
                     } else if prof.requires_persistent_database() {
                         anyhow::bail!(
@@ -767,7 +771,11 @@ async fn main() -> anyhow::Result<()> {
                     let mut storage_hasher = sha2::Sha256::new();
                     let mut s_files = Vec::new();
                     if storage_root.exists() {
-                        spine_api::backup::BackupManager::collect_files_recursive(&storage_root, &storage_root, &mut s_files)?;
+                        spine_api::backup::BackupManager::collect_files_recursive(
+                            &storage_root,
+                            &storage_root,
+                            &mut s_files,
+                        )?;
                     }
                     for (rel_p, abs_p) in &s_files {
                         if let Ok(m) = std::fs::metadata(abs_p) {
@@ -864,8 +872,12 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 let prof = parse_cli_profile(profile.as_deref())?;
 
-                let target_storage = if target_storage == std::path::Path::new("./.spine-dev-cluster/node-1") {
-                    if let Ok(r) = std::env::var("SPINE_STORAGE_ROOT").or_else(|_| std::env::var("STORAGE_ROOT")) {
+                let target_storage = if target_storage
+                    == std::path::Path::new("./.spine-dev-cluster/node-1")
+                {
+                    if let Ok(r) = std::env::var("SPINE_STORAGE_ROOT")
+                        .or_else(|_| std::env::var("STORAGE_ROOT"))
+                    {
                         std::path::PathBuf::from(r.trim())
                     } else if prof.requires_persistent_database() {
                         anyhow::bail!(
@@ -1119,7 +1131,9 @@ async fn main() -> anyhow::Result<()> {
                 session
                     .journal
                     .persist(spine_api::backup::RestorePhase::Prepared)
-                    .map_err(|e| anyhow::anyhow!("Failed to record Prepared phase in journal: {}", e))?;
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to record Prepared phase in journal: {}", e)
+                    })?;
 
                 // ------------------------------------------------------------------------
                 // Phase 3: COMMIT DECISION (Durable Pre-Cutover Transaction Record)
@@ -1142,9 +1156,14 @@ async fn main() -> anyhow::Result<()> {
                 };
                 session
                     .journal
-                    .persist(spine_api::backup::RestorePhase::CommitDecision(decision_record))
+                    .persist(spine_api::backup::RestorePhase::CommitDecision(
+                        decision_record,
+                    ))
                     .map_err(|e| {
-                        anyhow::anyhow!("Failed to persist CommitDecisionRecord to restore journal: {}", e)
+                        anyhow::anyhow!(
+                            "Failed to persist CommitDecisionRecord to restore journal: {}",
+                            e
+                        )
                     })?;
                 println!("Durable CommitDecisionRecord logged to journal before any irreversible participant mutations.");
 
@@ -1586,12 +1605,16 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
     });
 
     // 3. Resolve and ensure Storage Root exists
-    let storage_root_path = if let Ok(root_str) = std::env::var("SPINE_STORAGE_ROOT").or_else(|_| std::env::var("STORAGE_ROOT")) {
+    let storage_root_path = if let Ok(root_str) =
+        std::env::var("SPINE_STORAGE_ROOT").or_else(|_| std::env::var("STORAGE_ROOT"))
+    {
         std::path::PathBuf::from(root_str.trim())
     } else {
         args.storage_root
     };
-    if profile.requires_persistent_database() && storage_root_path == std::path::Path::new("./.spine-dev-cluster/node-1") {
+    if profile.requires_persistent_database()
+        && storage_root_path == std::path::Path::new("./.spine-dev-cluster/node-1")
+    {
         anyhow::bail!(
             "CRITICAL CONFIGURATION ERROR: Production profile '{}' disallows default development storage root './.spine-dev-cluster/node-1'. Configure SPINE_STORAGE_ROOT, STORAGE_ROOT, or --storage-root.",
             profile
