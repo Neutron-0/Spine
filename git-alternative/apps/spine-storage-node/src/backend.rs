@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -93,6 +93,7 @@ pub trait StorageBackend: Send + Sync {
     fn enter_maintenance(&self, fencing_generation: u64) -> Result<()>;
     fn exit_maintenance(&self, fencing_generation: u64) -> Result<()>;
     fn get_maintenance_status(&self) -> (bool, u64, usize);
+    fn node_id(&self) -> &str;
     fn capture_volume_snapshot(
         &self,
         snapshot_id: &str,
@@ -116,6 +117,32 @@ pub struct StorageWriterGuard {
 impl Drop for StorageWriterGuard {
     fn drop(&mut self) {
         self.active_writers.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+pub fn safe_atomic_replace(from: &Path, to: &Path) -> Result<()> {
+    if fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    if to.exists() {
+        let backup = to.with_extension(format!("bak.{}", uuid::Uuid::new_v4()));
+        fs::rename(to, &backup)
+            .with_context(|| format!("Failed to backup {} during replace", to.display()))?;
+        match fs::rename(from, to) {
+            Ok(()) => {
+                let _ = fs::remove_file(&backup);
+                Ok(())
+            }
+            Err(e) => {
+                let _ = fs::rename(&backup, to);
+                Err(e).with_context(|| format!("Failed to move {} into place", to.display()))
+            }
+        }
+    } else {
+        fs::copy(from, to)
+            .with_context(|| format!("Failed to copy {} to {}", from.display(), to.display()))?;
+        let _ = fs::remove_file(from);
+        Ok(())
     }
 }
 
@@ -215,9 +242,13 @@ impl FileSystemStorageBackend {
             f.flush()?;
             f.sync_all()?;
         }
-        if fs::rename(&tmp, &fencing_path).is_err() {
-            let _ = fs::copy(&tmp, &fencing_path);
+        if let Err(e) = safe_atomic_replace(&tmp, &fencing_path) {
             let _ = fs::remove_file(&tmp);
+            bail!(
+                "Failed to durably persist storage node fencing generation {}: {}",
+                target,
+                e
+            );
         }
         self.fencing_generation.store(target, Ordering::SeqCst);
         Ok(())
@@ -226,6 +257,10 @@ impl FileSystemStorageBackend {
     pub fn with_node_id(mut self, node_id: String) -> Self {
         self.node_id = node_id;
         self
+    }
+
+    pub fn node_id(&self) -> &str {
+        &self.node_id
     }
 
     pub fn acquire_writer(&self, required_generation: Option<u64>) -> Result<StorageWriterGuard> {
@@ -278,6 +313,10 @@ impl FileSystemStorageBackend {
 }
 
 impl StorageBackend for FileSystemStorageBackend {
+    fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
     fn repo_path(&self, repo_id: &str) -> PathBuf {
         self.storage_root.join("repos").join(repo_id)
     }
@@ -644,9 +683,21 @@ impl StorageBackend for FileSystemStorageBackend {
     fn stage_volume_restore(
         &self,
         snapshot_id: &str,
-        _fencing_generation: u64,
+        fencing_generation: u64,
         payload_tar_gz: &[u8],
     ) -> Result<()> {
+        if !self.in_maintenance.load(Ordering::SeqCst) {
+            bail!("Storage node must be in maintenance mode to stage volume restore");
+        }
+        let cur_gen = self.fencing_generation.load(Ordering::SeqCst);
+        if fencing_generation < cur_gen {
+            bail!(
+                "Cannot stage volume restore with stale fencing generation {} < {}",
+                fencing_generation,
+                cur_gen
+            );
+        }
+
         let staged_root = self
             .storage_root
             .join(format!(".staged_restore_{}", snapshot_id));
@@ -682,6 +733,18 @@ impl StorageBackend for FileSystemStorageBackend {
     }
 
     fn commit_volume_restore(&self, snapshot_id: &str, fencing_generation: u64) -> Result<()> {
+        if !self.in_maintenance.load(Ordering::SeqCst) {
+            bail!("Storage node must be in maintenance mode to commit volume restore");
+        }
+        let cur_gen = self.fencing_generation.load(Ordering::SeqCst);
+        if fencing_generation < cur_gen {
+            bail!(
+                "Cannot commit volume restore with stale fencing generation {} < {}",
+                fencing_generation,
+                cur_gen
+            );
+        }
+
         let staged_root = self
             .storage_root
             .join(format!(".staged_restore_{}", snapshot_id));

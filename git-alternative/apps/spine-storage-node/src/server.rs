@@ -277,6 +277,7 @@ async fn handle_connection(
                 in_maintenance,
                 fencing_generation,
                 active_writers,
+                node_id: Some(backend.node_id().to_string()),
             }
         }
         ClusterRpcRequest::CaptureVolumeSnapshot {

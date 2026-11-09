@@ -100,6 +100,9 @@ fn test_fencing_generation_persistence_and_restore_finalization() {
             .unwrap();
         assert_eq!(backend.get_maintenance_status().1, 1);
 
+        // Enter maintenance mode before volume restore operations
+        backend.enter_maintenance(fencing_gen).unwrap();
+
         // Stage and commit a volume restore to bump fencing generation
         let (snap_manifest, snap_tar) = backend
             .capture_volume_snapshot(snapshot_id, fencing_gen)
@@ -112,6 +115,8 @@ fn test_fencing_generation_persistence_and_restore_finalization() {
         backend
             .commit_volume_restore(snapshot_id, fencing_gen)
             .unwrap();
+
+        backend.exit_maintenance(fencing_gen).unwrap();
 
         assert_eq!(backend.get_maintenance_status().1, fencing_gen);
 

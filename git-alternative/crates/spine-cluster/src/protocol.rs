@@ -194,6 +194,8 @@ pub enum ClusterRpcResponse {
         in_maintenance: bool,
         fencing_generation: u64,
         active_writers: usize,
+        #[serde(default)]
+        node_id: Option<String>,
     },
     MaintenanceBarrierAck {
         success: bool,

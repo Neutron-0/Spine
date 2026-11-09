@@ -109,13 +109,21 @@ impl ClusterNodeClient {
     }
 
     pub async fn query_maintenance_status(&self) -> Result<(bool, u64), ForgeError> {
+        let (in_maint, gen, _, _) = self.query_node_details().await?;
+        Ok((in_maint, gen))
+    }
+
+    pub async fn query_node_details(
+        &self,
+    ) -> Result<(bool, u64, usize, Option<String>), ForgeError> {
         let req = ClusterRpcRequest::QueryMaintenanceStatus;
         match self.send_rpc(&req).await? {
             ClusterRpcResponse::MaintenanceStatus {
                 in_maintenance,
                 fencing_generation,
-                ..
-            } => Ok((in_maintenance, fencing_generation)),
+                active_writers,
+                node_id,
+            } => Ok((in_maintenance, fencing_generation, active_writers, node_id)),
             ClusterRpcResponse::Error(msg) => Err(ForgeError::Internal(format!(
                 "Query maintenance status failed: {}",
                 msg
@@ -321,6 +329,12 @@ impl CoordinatorClient {
 
     pub async fn query_maintenance_status(&self) -> Result<(bool, u64), ForgeError> {
         self.node_client.query_maintenance_status().await
+    }
+
+    pub async fn query_node_details(
+        &self,
+    ) -> Result<(bool, u64, usize, Option<String>), ForgeError> {
+        self.node_client.query_node_details().await
     }
 
     pub async fn capture_snapshot(

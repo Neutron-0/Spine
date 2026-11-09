@@ -133,6 +133,32 @@ pub struct FileBackedCoordinatorStore {
     previous_committed_state: RwLock<Option<(String, StateSnapshot, u64)>>,
 }
 
+pub fn safe_atomic_replace(from: &Path, to: &Path) -> Result<()> {
+    if fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    if to.exists() {
+        let backup = to.with_extension(format!("bak.{}", uuid::Uuid::new_v4()));
+        fs::rename(to, &backup)
+            .with_context(|| format!("Failed to backup {} during replace", to.display()))?;
+        match fs::rename(from, to) {
+            Ok(()) => {
+                let _ = fs::remove_file(&backup);
+                Ok(())
+            }
+            Err(e) => {
+                let _ = fs::rename(&backup, to);
+                Err(e).with_context(|| format!("Failed to move {} into place", to.display()))
+            }
+        }
+    } else {
+        fs::copy(from, to)
+            .with_context(|| format!("Failed to copy {} to {}", from.display(), to.display()))?;
+        let _ = fs::remove_file(from);
+        Ok(())
+    }
+}
+
 impl FileBackedCoordinatorStore {
     pub fn new_in_memory() -> Self {
         Self {
@@ -256,9 +282,13 @@ impl FileBackedCoordinatorStore {
                 f.flush()?;
                 f.sync_all()?;
             }
-            if fs::rename(&tmp, &fencing_path).is_err() {
-                let _ = fs::copy(&tmp, &fencing_path);
+            if let Err(e) = safe_atomic_replace(&tmp, &fencing_path) {
                 let _ = fs::remove_file(&tmp);
+                bail!(
+                    "Failed to durably persist coordinator fencing generation {}: {}",
+                    target,
+                    e
+                );
             }
         }
         self.fencing_generation.store(target, Ordering::SeqCst);
@@ -625,6 +655,18 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
         fencing_generation: u64,
         payload: &[u8],
     ) -> Result<()> {
+        if !self.in_maintenance.load(Ordering::SeqCst) {
+            bail!("Coordinator must be in maintenance mode to stage restore");
+        }
+        let cur_gen = self.fencing_generation.load(Ordering::SeqCst);
+        if fencing_generation < cur_gen {
+            bail!(
+                "Cannot stage restore with stale fencing generation {} < {}",
+                fencing_generation,
+                cur_gen
+            );
+        }
+
         // Validate JSON payload
         let _test_snap: StateSnapshot = serde_json::from_slice(payload)
             .with_context(|| "Invalid coordinator state snapshot JSON")?;
@@ -647,9 +689,9 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
                 f.flush()?;
                 f.sync_all()?;
             }
-            if fs::rename(&tmp, &staged_path).is_err() {
-                let _ = fs::copy(&tmp, &staged_path);
+            if let Err(e) = safe_atomic_replace(&tmp, &staged_path) {
                 let _ = fs::remove_file(&tmp);
+                bail!("Failed to persist staged coordinator restore: {}", e);
             }
         }
 
@@ -659,6 +701,18 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
     }
 
     fn commit_restore(&self, snapshot_id: &str, fencing_generation: u64) -> Result<()> {
+        if !self.in_maintenance.load(Ordering::SeqCst) {
+            bail!("Coordinator must be in maintenance mode to commit restore");
+        }
+        let cur_gen = self.fencing_generation.load(Ordering::SeqCst);
+        if fencing_generation < cur_gen {
+            bail!(
+                "Cannot commit restore with stale fencing generation {} < {}",
+                fencing_generation,
+                cur_gen
+            );
+        }
+
         let payload = {
             let mut staged = self.staged_restore.write().unwrap();
             match staged.take() {
@@ -684,7 +738,6 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
         };
 
         let new_snap: StateSnapshot = serde_json::from_slice(&payload)?;
-        let cur_gen = self.fencing_generation.load(Ordering::SeqCst);
         let prev_record = (
             snapshot_id.to_string(),
             self.state.read().unwrap().clone(),
@@ -704,9 +757,9 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
                 f.flush()?;
                 f.sync_all()?;
             }
-            if fs::rename(&tmp, &prev_path).is_err() {
-                let _ = fs::copy(&tmp, &prev_path);
+            if let Err(e) = safe_atomic_replace(&tmp, &prev_path) {
                 let _ = fs::remove_file(&tmp);
+                bail!("Failed to persist previous coordinator state backup: {}", e);
             }
 
             let staged_path =

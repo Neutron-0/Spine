@@ -335,6 +335,7 @@ async fn handle_coordinator_connection(
                 in_maintenance,
                 fencing_generation,
                 active_writers,
+                node_id: Some("coordinator".to_string()),
             }
         }
         ClusterRpcRequest::CaptureVolumeSnapshot {
