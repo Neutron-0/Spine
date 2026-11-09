@@ -12,11 +12,16 @@ fi
 
 DB_NAME="${POSTGRES_DB:-${SPINE_POSTGRES_DB:-spine_forge}}"
 ADMIN_USER="${POSTGRES_ADMIN_USER:-postgres}"
+MIGRATOR_USER="${POSTGRES_MIGRATOR_USER:-${SPINE_MIGRATOR_USER:-spine_migrator}}"
+APP_USER="${POSTGRES_APP_USER:-${SPINE_APP_USER:-spine_app}}"
 
-echo "[INFO] Upgrading database '${DB_NAME}' roles using administrative user '${ADMIN_USER}'..."
+ESC_MIGRATOR_USER_IDENT="$(printf '%s' "$MIGRATOR_USER" | sed 's/"/""/g')"
+ESC_APP_USER_IDENT="$(printf '%s' "$APP_USER" | sed 's/"/""/g')"
+
+echo "[INFO] Upgrading database '${DB_NAME}' roles ('${MIGRATOR_USER}', '${APP_USER}') using administrative user '${ADMIN_USER}'..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-psql -v ON_ERROR_STOP=1 -U "${ADMIN_USER}" -d "${DB_NAME}" -f "${SCRIPT_DIR}/upgrade_postgres_roles.sql"
+psql -v ON_ERROR_STOP=1 -U "${ADMIN_USER}" -d "${DB_NAME}" -v migrator_user="${MIGRATOR_USER}" -v app_user="${APP_USER}" -f "${SCRIPT_DIR}/upgrade_postgres_roles.sql"
 
 # Update credentials securely via stdin if provided via environment or secret file
 if [ -n "${POSTGRES_MIGRATOR_PASSWORD_FILE:-}" ]; then
@@ -52,29 +57,29 @@ else
 fi
 
 if [ -n "$MIGRATOR_PASSWORD" ]; then
-    echo "[INFO] Updating spine_migrator password securely..."
+    echo "[INFO] Updating ${MIGRATOR_USER} password securely..."
     ESC_MIGRATOR_PASS="$(printf '%s' "$MIGRATOR_PASSWORD" | sed "s/'/''/g")"
     psql -v ON_ERROR_STOP=1 -U "${ADMIN_USER}" -d "${DB_NAME}" <<EOSQL
-ALTER ROLE spine_migrator WITH PASSWORD '${ESC_MIGRATOR_PASS}';
+ALTER ROLE "${ESC_MIGRATOR_USER_IDENT}" WITH PASSWORD '${ESC_MIGRATOR_PASS}';
 EOSQL
 fi
 
 if [ -n "$APP_PASSWORD" ]; then
-    echo "[INFO] Updating spine_app password securely..."
+    echo "[INFO] Updating ${APP_USER} password securely..."
     ESC_APP_PASS="$(printf '%s' "$APP_PASSWORD" | sed "s/'/''/g")"
     psql -v ON_ERROR_STOP=1 -U "${ADMIN_USER}" -d "${DB_NAME}" <<EOSQL
-ALTER ROLE spine_app WITH PASSWORD '${ESC_APP_PASS}';
+ALTER ROLE "${ESC_APP_USER_IDENT}" WITH PASSWORD '${ESC_APP_PASS}';
 EOSQL
 fi
 
-echo "[INFO] Verifying spine_app cannot create tables via non-destructive catalog query..."
-CAN_CREATE="$(psql -U "${ADMIN_USER}" -d "${DB_NAME}" -t -A -c "SELECT has_schema_privilege('spine_app', 'public', 'CREATE');")"
+echo "[INFO] Verifying ${APP_USER} cannot create tables via non-destructive catalog query..."
+CAN_CREATE="$(psql -U "${ADMIN_USER}" -d "${DB_NAME}" -t -A -c "SELECT has_schema_privilege('${ESC_APP_USER_IDENT}', 'public', 'CREATE');")"
 
 if [ "$CAN_CREATE" = "t" ] || [ "$CAN_CREATE" = "true" ]; then
-    echo "[ERROR] Verification failed: spine_app retains CREATE privilege on schema public!" >&2
+    echo "[ERROR] Verification failed: ${APP_USER} retains CREATE privilege on schema public!" >&2
     exit 1
 else
-    echo "[OK] Verified: spine_app is correctly forbidden from CREATE ON SCHEMA public (has_schema_privilege returned false)."
+    echo "[OK] Verified: ${APP_USER} is correctly forbidden from CREATE ON SCHEMA public (has_schema_privilege returned false)."
 fi
 
 echo "POSTGRES_ROLES_UPGRADE_SUCCESS"

@@ -255,8 +255,6 @@ services:
       POSTGRES_MIGRATOR_PASSWORD: "${POSTGRES_MIGRATOR_PASSWORD:?POSTGRES_MIGRATOR_PASSWORD_required}"
       POSTGRES_APP_USER: "${POSTGRES_APP_USER:-spine_app}"
       POSTGRES_APP_PASSWORD: "${POSTGRES_APP_PASSWORD:?POSTGRES_APP_PASSWORD_required}"
-      MIGRATION_DATABASE_URL: "postgres://${POSTGRES_MIGRATOR_USER:-spine_migrator}:${POSTGRES_MIGRATOR_PASSWORD:?POSTGRES_MIGRATOR_PASSWORD_required}@postgres:5432/${POSTGRES_DB:-spine_forge}"
-      DATABASE_URL: "postgres://${POSTGRES_APP_USER:-spine_app}:${POSTGRES_APP_PASSWORD:?POSTGRES_APP_PASSWORD_required}@postgres:5432/${POSTGRES_DB:-spine_forge}"
       COORDINATOR_ADDR: "coordinator:8400"
       SPINE_COORDINATOR_ADDR: "coordinator:8400"
       STORAGE_NODES: "node-1=storage-node-1:8401,node-2=storage-node-2:8401,node-3=storage-node-3:8401"
