@@ -22,7 +22,7 @@ pub mod participants;
 pub mod v2;
 
 pub use consistency::{ConsistencyBarrier, MaintenanceGuard, SPINE_CLUSTER_MAINTENANCE_LOCK_ID};
-pub use journal::{RestoreJournal, RestorePhase};
+pub use journal::{CommitDecisionRecord, RestoreJournal, RestorePhase};
 pub use participants::{DeploymentResource, ParticipantClassification, ParticipantRegistry};
 pub use v2::{BackupHeaderV2, StreamSummary};
 
@@ -1412,6 +1412,36 @@ impl BackupManager {
             }
         }
 
+        // Verify that every participant declared in manifest has matching archive payload
+        for participant in &manifest.participants {
+            if participant.participant_id == "spine_storage" {
+                continue;
+            }
+            let (rel, _staged_p) = files_to_verify
+                .iter()
+                .find(|(p_rel, _)| p_rel == &participant.archive_rel_path)
+                .ok_or_else(|| {
+                    ForgeError::Internal(format!(
+                        "FATAL RESTORE REJECTION: Participant '{}' declared in manifest is missing its payload '{}' in archive!",
+                        participant.participant_id, participant.archive_rel_path
+                    ))
+                })?;
+            let sz = verified_sizes.get(rel).copied().unwrap_or(0);
+            if sz != participant.byte_length {
+                return Err(ForgeError::Internal(format!(
+                    "FATAL RESTORE REJECTION: Participant '{}' byte length mismatch: manifest says {}, payload has {}",
+                    participant.participant_id, participant.byte_length, sz
+                )));
+            }
+            let h = manifest.file_hashes.get(rel).unwrap();
+            if h != &participant.sha256_checksum {
+                return Err(ForgeError::Internal(format!(
+                    "FATAL RESTORE REJECTION: Participant '{}' checksum mismatch: manifest says {}, payload hash is {}",
+                    participant.participant_id, participant.sha256_checksum, h
+                )));
+            }
+        }
+
         let mut verified_files_list = Vec::new();
         for (rel_path, staged_path) in files_to_verify {
             let size = verified_sizes.get(&rel_path).copied().unwrap_or(0);
@@ -1478,7 +1508,7 @@ impl BackupManager {
         Ok((manifest, report, db_str))
     }
 
-    fn collect_files_recursive(
+    pub fn collect_files_recursive(
         base: &Path,
         current: &Path,
         files: &mut Vec<(String, PathBuf)>,

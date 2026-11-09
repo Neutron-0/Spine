@@ -2,6 +2,19 @@ use crate::core::error::ForgeError;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Durable commit decision record persisted before any irreversible participant mutations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommitDecisionRecord {
+    pub restore_id: String,
+    pub backup_id: String,
+    pub old_generation: Option<String>,
+    pub new_generation: String,
+    pub required_participants: Vec<String>,
+    pub staged_manifest_digests: std::collections::BTreeMap<String, String>,
+    pub decision_timestamp_nanos: i64,
+    pub schema_identity: String,
+}
+
 /// Discrete phases of the cross-resource restore state machine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RestorePhase {
@@ -11,6 +24,10 @@ pub enum RestorePhase {
     StagedStorage,
     /// Database snapshot staged and verified.
     StagedDb,
+    /// All participant snapshots staged and verified in isolated temporary areas.
+    Prepared,
+    /// Durable commit decision logged to disk before irreversible cutover begins.
+    CommitDecision(CommitDecisionRecord),
     /// Database snapshot verified and restored to target database before storage publication.
     DbPublished,
     /// Backward-compatible alias for DbPublished
@@ -251,6 +268,7 @@ impl RestoreJournal {
                 RestorePhase::Initialized
                 | RestorePhase::StagedStorage
                 | RestorePhase::StagedDb
+                | RestorePhase::Prepared
                 | RestorePhase::RolledBack(_) => {
                     tracing::warn!(
                         "Detected interrupted restore session '{}' in phase '{:?}'. Cleaning up staging directory {:?}...",
@@ -267,7 +285,8 @@ impl RestoreJournal {
                         journal.restore_id
                     )))
                 }
-                RestorePhase::DbPublished
+                RestorePhase::CommitDecision(_)
+                | RestorePhase::DbPublished
                 | RestorePhase::DatabaseRestored
                 | RestorePhase::StoragePublished
                 | RestorePhase::Failed(_) => {

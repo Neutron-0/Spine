@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use rand::Rng;
+use sha2::Digest;
 use spine_api::{
     auth::{hash_password, DevMailCatcher, RateLimiter},
     build_router,
@@ -732,6 +733,64 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
 
+                // Register PostgreSQL database participant record
+                let has_db_snap = _maintenance_guard.is_some();
+                if has_db_snap {
+                    let pg_meta = std::fs::metadata(&snap_file_path)?;
+                    let mut pg_f = std::fs::File::open(&snap_file_path)?;
+                    let mut pg_hasher = sha2::Sha256::new();
+                    std::io::copy(&mut pg_f, &mut pg_hasher)?;
+                    let pg_hash = hex::encode(pg_hasher.finalize());
+                    participant_snapshots.push((
+                        spine_api::BackupParticipantRecord {
+                            participant_id: "postgres_data".to_string(),
+                            volume_name: "postgres_data".to_string(),
+                            snapshot_id: format!("pg_snap_{}", uuid::Uuid::new_v4().simple()),
+                            fencing_generation,
+                            byte_length: pg_meta.len(),
+                            sha256_checksum: pg_hash,
+                            archive_rel_path: "database/snapshot.jsonl".to_string(),
+                        },
+                        vec![],
+                    ));
+                    println!("PostgreSQL database snapshot participant record registered.");
+                } else if prof.requires_persistent_database() {
+                    anyhow::bail!(
+                        "Under deployment profile '{}', PostgreSQL database snapshot ('postgres_data') is required.",
+                        prof
+                    );
+                }
+
+                // Register Spine API storage volume participant record
+                if prof.requires_persistent_database() {
+                    let mut storage_bytes = 0u64;
+                    let mut storage_hasher = sha2::Sha256::new();
+                    let mut s_files = Vec::new();
+                    if storage_root.exists() {
+                        spine_api::backup::BackupManager::collect_files_recursive(&storage_root, &storage_root, &mut s_files)?;
+                    }
+                    for (rel_p, abs_p) in &s_files {
+                        if let Ok(m) = std::fs::metadata(abs_p) {
+                            storage_bytes += m.len();
+                        }
+                        storage_hasher.update(rel_p.as_bytes());
+                    }
+                    let storage_hash = hex::encode(storage_hasher.finalize());
+                    participant_snapshots.push((
+                        spine_api::BackupParticipantRecord {
+                            participant_id: "spine_storage".to_string(),
+                            volume_name: "spine_storage".to_string(),
+                            snapshot_id: format!("storage_snap_{}", uuid::Uuid::new_v4().simple()),
+                            fencing_generation,
+                            byte_length: storage_bytes,
+                            sha256_checksum: storage_hash,
+                            archive_rel_path: "storage".to_string(),
+                        },
+                        vec![],
+                    ));
+                    println!("Spine storage volume participant record registered.");
+                }
+
                 // Enforce participant registry validation before archive assembly
                 let participant_records: Vec<_> = participant_snapshots
                     .iter()
@@ -743,8 +802,6 @@ async fn main() -> anyhow::Result<()> {
                     fencing_generation,
                 )
                 .map_err(|e| anyhow::anyhow!("Participant validation failed: {}", e))?;
-
-                let has_db_snap = _maintenance_guard.is_some();
 
                 println!(
                     "Creating coordinated backup from {} to {}",
@@ -1056,9 +1113,45 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 // ------------------------------------------------------------------------
-                // Phase 2: PREPARED (SSH Host Identity & Target Database Restore)
+                // Phase 2: PREPARED (All Participants Staged and Verified)
                 // ------------------------------------------------------------------------
-                println!("=== Phase 2: PREPARED (Restoring SSH Identity & Database) ===");
+                println!("=== Phase 2: PREPARED (All Participants Staged and Verified) ===");
+                session
+                    .journal
+                    .persist(spine_api::backup::RestorePhase::Prepared)
+                    .map_err(|e| anyhow::anyhow!("Failed to record Prepared phase in journal: {}", e))?;
+
+                // ------------------------------------------------------------------------
+                // Phase 3: COMMIT DECISION (Durable Pre-Cutover Transaction Record)
+                // ------------------------------------------------------------------------
+                println!("=== Phase 3: COMMIT DECISION (Durable Pre-Cutover Ledger Invariant) ===");
+                let decision_record = spine_api::backup::CommitDecisionRecord {
+                    restore_id: session.journal.restore_id.clone(),
+                    backup_id: session.manifest.backup_id.clone(),
+                    old_generation: session.journal.previous_storage_generation.clone(),
+                    new_generation: session.journal.target_generation.clone(),
+                    required_participants: session
+                        .manifest
+                        .participants
+                        .iter()
+                        .map(|p| p.participant_id.clone())
+                        .collect(),
+                    staged_manifest_digests: session.manifest.file_hashes.clone(),
+                    decision_timestamp_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                    schema_identity: session.manifest.schema_version.clone(),
+                };
+                session
+                    .journal
+                    .persist(spine_api::backup::RestorePhase::CommitDecision(decision_record))
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to persist CommitDecisionRecord to restore journal: {}", e)
+                    })?;
+                println!("Durable CommitDecisionRecord logged to journal before any irreversible participant mutations.");
+
+                // ------------------------------------------------------------------------
+                // Phase 4: PUBLISH (SSH Identity, Database, Cluster Volumes, and Storage Root)
+                // ------------------------------------------------------------------------
+                println!("=== Phase 4: PUBLISH (Executing Distributed Cutover) ===");
                 // Restore SSH host identity snapshot if present
                 let has_ssh = session
                     .manifest
@@ -1146,10 +1239,10 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 // ------------------------------------------------------------------------
-                // Phase 3: COMMIT DECISION & Phase 4: PUBLISH
+                // Phase 4: PUBLISH (Cluster Volume Commits)
                 // Commit cluster nodes (retaining .old_restore) and publish storage (retaining .old_generation)
                 // ------------------------------------------------------------------------
-                println!("=== Phase 3 & 4: COMMIT DECISION & PUBLISH ===");
+                println!("=== Phase 4: PUBLISH (Cluster Volume Commits) ===");
                 let mut committed_cluster_restores: Vec<(
                     String,
                     u64,

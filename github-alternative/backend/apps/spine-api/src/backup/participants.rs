@@ -189,7 +189,7 @@ impl ParticipantRegistry {
                     p.participant_id
                 )));
             }
-            if p.byte_length == 0 {
+            if p.byte_length == 0 && p.participant_id != "spine_storage" {
                 return Err(ForgeError::Internal(format!(
                     "Participant '{}' ({}) has 0 bytes: empty participant snapshots are rejected",
                     p.participant_id, p.volume_name
@@ -212,10 +212,6 @@ impl ParticipantRegistry {
         if profile.requires_persistent_database() {
             let required = Self::production_registry();
             for req in &required {
-                // postgres_data and spine_storage are stored at root of archive
-                if req.participant_id == "postgres_data" || req.participant_id == "spine_storage" {
-                    continue;
-                }
                 if !seen_ids.contains(req.participant_id.as_str()) {
                     return Err(ForgeError::Internal(format!(
                         "FATAL BACKUP INCOMPLETE: Under deployment profile '{}', required participant '{}' ({}) is missing from archive! Incomplete cluster backups are strictly forbidden.",
