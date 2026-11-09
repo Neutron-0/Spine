@@ -1,7 +1,7 @@
 # SPINE — RELEASE CANDIDATE MANIFEST
 ## Release Candidate v0.1.0-rc2 — Production Packaging & Artifact Inventory
 
-**Target Milestone:** Batch 21H Final Deployment Architecture Integration & Release Verification  
+**Target Milestone:** Batch 21J Distributed Restore Convergence, Database Consistency, Backup Security & Production Integrity  
 **Target Profile:** `core-forge-v1` (Mandatory PostgreSQL, TLS Ingress, Strict Role Separation)  
 
 ---
@@ -10,10 +10,10 @@
 Artifacts compiled and verified in `target/release-candidate/`:
 
 ```
-c700af4ca653557bc3eef089076f68198a7a6c75e65b8aaf51f16013c7db0579  spine-api.exe
-b2aaa1974d53e434debc12a789652827fc12230b1ebf894a2b1256d3dd5c2676  spine-coordinator.exe
-694208c62134d4f69d0cace9ae05fd9b95ced3e1964e43a7ab68079e6172bb98  spine-storage-node.exe
-519429b3c8f426ae05e86a2004cbfa570590cb131083399d35738d20894d33a6  spine.exe
+06038a8050933a8d16f790146a7e5b8c9ff2b438b55d0d3b5e878248f48895de  spine-api.exe
+50374c13103fc94dfb20c2d6e2d4ea9b0f613b27d021dfa82dfc49443041fa54  spine-coordinator.exe
+a72f02ded65c79c2c6f92963ccefa04b6d4f4e96c461b2724d048d851c97bfdc  spine-storage-node.exe
+593ebb979850ecb4d310bd390d5719be18a14fccf1fd9038675d7a1454ef64fa  spine.exe
 ```
 
 ---
@@ -21,11 +21,11 @@ b2aaa1974d53e434debc12a789652827fc12230b1ebf894a2b1256d3dd5c2676  spine-coordina
 ### 2. Service Architecture & Security Topology
 - **Edge Reverse Proxy (`ingress`):** Hardened NGINX edge gateway; mandatory HTTP 80 -> HTTPS 443 redirection, TLS 1.2/1.3 only, HSTS headers.
 - **Frontend (`spine-frontend`):** Attached strictly to `spine-ingress-proxy`. Public network `spine-public` removed, eliminating ingress bypass risks.
-- **Control Plane API (`spine-api`):** Unprivileged user (UID 10001). Connects to PostgreSQL using least-privilege DML role `spine_app` with structured connection URL building and credential percent-encoding. Participates in global fencing barrier and enforces non-default storage root under `core-forge-v1`.
-- **Database Engine (`postgres`):** Bound to internal private network `spine-internal`. No host port publication. Parameterized dynamic role setup via `01-init-roles.sh` with stdin SQL piping (no passwords on process command lines) and distinct secrets (`POSTGRES_*_PASSWORD_FILE`, `POSTGRES_ADMIN_PASSWORD:?required`). Supports online credential updates via `scripts/upgrade_postgres_roles.sh`.
-- **Consensus Coordinator (`spine-coordinator`):** Raft consensus node on `spine-internal`. Port reconciled to `8400`. Guarded by RAII `CoordinatorWriterGuard`, `active_writers` atomic counter, mutation barrier, draining maintenance barrier, persisted monotonic fencing generation (`.coordinator_fencing_generation`), and crash-resilient rollback state.
-- **Storage Nodes (`spine-storage-node-1/2/3`):** Chunked BLAKE3 storage nodes on `spine-internal`. Port reconciled to `8401`. Guarded by RAII `StorageWriterGuard`, `active_writers` atomic counter, mutation barrier, draining maintenance barrier, persisted monotonic fencing generation (`.fencing_generation`), and 6-phase distributed cutover with `.old_restore_<id>` retention.
-- **Container Hardening:** All services specify `security_opt: [no-new-privileges:true]`, `cap_drop: [ALL]`, `read_only: true`, non-root users, isolated internal bridge networks, and memory-limited tmpfs mounts (`/tmp`).
+- **Control Plane API (`spine-api`):** Unprivileged user (UID 10001). Connects to PostgreSQL using least-privilege DML role `spine_app` with structured connection URL building, percent-encoding of credentials, and elimination of raw environment variable credential interpolations in `docker-compose.prod.yml`. Enforces non-default storage root under `core-forge-v1`.
+- **Database Engine (`postgres`):** Bound to internal private network `spine-internal`. No host port publication. Configurable role setup supporting `POSTGRES_MIGRATOR_USER` and `POSTGRES_APP_USER` via `upgrade_postgres_roles.sh` with stdin SQL piping and parameterized psql identifiers (no credentials on process command lines).
+- **Consensus Coordinator (`spine-coordinator`):** Raft consensus node on `spine-internal` (port `8400`). Guarded by RAII `CoordinatorWriterGuard`, atomic writer tracking, mutation barrier, draining maintenance barrier, persisted monotonic fencing generation (`.coordinator_fencing_generation` with `safe_atomic_replace`), and crash-resilient rollback state.
+- **Storage Nodes (`spine-storage-node-1/2/3`):** Chunked BLAKE3 storage nodes on `spine-internal` (port `8401`). Responding with explicit logical node IDs (`node-1`, `node-2`, `node-3`). Guarded by RAII `StorageWriterGuard`, atomic writer tracking, mutation barrier, draining maintenance barrier, persisted monotonic fencing generation (`.fencing_generation` with error propagation and atomic replacement), and distributed volume restore verification.
+- **Readiness Probes (`/api/v1/health/ready`):** Validates database connectivity, storage root availability, distinct storage node identities (`node-1`, `node-2`, `node-3`), rejection of duplicate endpoints/identities, uniform generation convergence across all participants and coordinator, and verifies that no active restore journal is in progress.
 
 ---
 
@@ -39,22 +39,23 @@ b2aaa1974d53e434debc12a789652827fc12230b1ebf894a2b1256d3dd5c2676  spine-coordina
 ---
 
 ### 4. Distributed Multi-Volume Backup & Disaster Recovery Architecture
-- **Format:** `SPNEBAK v2` authenticated streaming encryption (AES-256-GCM, PBKDF2 100,000 iterations).
-- **Mandatory 7-Resource Production Participant Inventory:**
-  1. `postgres_data` (streaming JSON Lines catalog export with generation injection)
-  2. `spine_storage` (control plane application repository storage)
-  3. `storage_1_data` (storage node 1 volume snapshot)
-  4. `storage_2_data` (storage node 2 volume snapshot)
-  5. `storage_3_data` (storage node 3 volume snapshot)
-  6. `coordinator_data` (consensus coordinator Raft snapshot)
-  7. `spine_ssh` (authoritative host Ed25519 private/public key identity pair)
+- **Format:** `SPNEBAK v2` authenticated streaming AEAD encryption (AES-256-GCM, PBKDF2 100,000 iterations). Mandatory encryption for all production backups containing SSH identity or database snapshots. Plaintext production backups fail closed.
+- **Mandatory 7-Resource Canonical Production Participant Inventory:**
+  1. `postgres_data` (streaming JSON Lines catalog export with generation injection) -> `database/snapshot.jsonl`
+  2. `spine_storage` (control plane application repository storage) -> `storage/spine_storage_snapshot.tar.gz`
+  3. `storage_1_data` (storage node 1 volume snapshot) -> `storage_nodes/node-1_snapshot.tar.gz`
+  4. `storage_2_data` (storage node 2 volume snapshot) -> `storage_nodes/node-2_snapshot.tar.gz`
+  5. `storage_3_data` (storage node 3 volume snapshot) -> `storage_nodes/node-3_snapshot.tar.gz`
+  6. `coordinator_data` (consensus coordinator Raft snapshot) -> `coordinator/coordinator_snapshot.tar.gz`
+  7. `spine_ssh` (authoritative host Ed25519 private/public key identity pair) -> `ssh/ssh_identity_snapshot.tar.gz`
+- **Canonical Participant Contract:** Rejects duplicate participant IDs, duplicate archive paths, unexpected path structures, and volume substitutions.
 - **Active Writer Tracking & Draining:** Every mutation acquires an RAII writer permit incrementing `active_writers: Arc<AtomicUsize>`. Maintenance barrier requests poll until `active_writers == 0` before establishing fencing tokens, guaranteeing zero in-flight mutations during backups.
-- **Persistent Monotonic Fencing Tokens:** Fencing tokens are persisted to disk atomically (`.fencing_generation` and `.coordinator_fencing_generation`) and reloaded across process restarts. Generations can never regress.
-- **6-Phase Distributed Cutover & Durable Pre-Cutover Decision Ledger:**
-  - `Phase 1: PREPARE` — Staged volume restoration across all cluster nodes in isolated directories.
-  - `Phase 2: PREPARED` — Target database restoration and SSH host identity unpack/fingerprint verification. Journaled as `RestorePhase::Prepared`.
-  - `Phase 3: COMMIT DECISION` — Durable `CommitDecisionRecord` logged to restore journal before any irreversible mutations or live symlink/directory cutovers take place.
-  - `Phase 4: PUBLISH` — Atomic directory cutover on coordinator, storage nodes, and API storage while retaining `.old_restore_<id>` and `.old_generation_<id>`.
-  - `Phase 5: VERIFY` — Distributed health check, generation check, and integrity validation across all participants. On failure, all participants execute distributed rollback to prior generations.
-  - `Phase 6: FINALIZE` — Retained old generation directories are purged only after global verification succeeds.
-- **Fail-Closed Startup Recovery:** Interrupted staging sessions are safely cleaned up. Interrupted cutover states (`CommitDecision`, `DbPublished`, `StoragePublished`) fail closed on node startup, halting execution with a fatal diagnostic to prevent split-brain data corruption.
+- **Persistent Monotonic Fencing Tokens:** Fencing tokens are persisted to disk atomically (`.fencing_generation` and `.coordinator_fencing_generation`) using `safe_atomic_replace` and never advance in-memory state on persistence failure.
+- **Global Restore Protocol & Roll-Forward Convergence:**
+  - `Phase 1: PREPARE` — Staged volume restoration across all cluster nodes and participants in isolated staging directories; records `ParticipantAcknowledgement`.
+  - `Phase 2: PREPARED` — All 7 participants staged and verified against manifest SHA-256 checksums. Journal records `RestorePhase::Prepared`.
+  - `Phase 3: GLOBAL COMMIT DECISION` — Durable `CommitDecisionRecord` logged with platform-appropriate atomic durability and `.last_valid` backup before any participant publication. **This decision is irreversible.**
+  - `Phase 4: PUBLISH` — Strict ordered publication: Database (`postgres_data`) -> Storage (`spine_storage`) -> Cluster Volumes (`node-1`, `node-2`, `node-3`, `coordinator`) -> Host Identity (`spine_ssh`). Each participant tracks individual publication progress.
+  - `Phase 5: VERIFY` — Distributed health check, generation check, and integrity validation across all 7 participants.
+  - `Phase 6: GLOBAL FINALIZE` — Retained old generation directories are purged and journal removed only after global verification succeeds across all participants.
+- **Deterministic Startup Recovery:** Pre-decision crashes safely abort staging leaving live storage and database untouched. Post-decision crashes roll forward across all participants, ensuring that database, storage, cluster volumes, and SSH converge on the committed target generation without split-brain risk.
