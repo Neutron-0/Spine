@@ -130,6 +130,21 @@ pub struct VolumeSnapshotManifest {
     pub created_at_nanos: i64,
 }
 
+/// Durable preparation acknowledgement for an authoritative restore participant.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParticipantAcknowledgement {
+    pub restore_id: String,
+    pub backup_id: String,
+    pub participant_id: String,
+    pub volume_name: String,
+    pub previous_generation: Option<String>,
+    pub target_generation: String,
+    pub staged_digest: String,
+    pub staged_byte_length: u64,
+    pub prepared_at_nanos: i64,
+    pub prepared: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClusterRpcResponse {
     EnrollSuccess(EnrollmentResponse),
@@ -207,6 +222,8 @@ pub enum ClusterRpcResponse {
     VolumeRestoreStaged {
         snapshot_id: String,
         success: bool,
+        #[serde(default)]
+        acknowledgement: Option<ParticipantAcknowledgement>,
     },
     VolumeRestoreCommitted {
         snapshot_id: String,

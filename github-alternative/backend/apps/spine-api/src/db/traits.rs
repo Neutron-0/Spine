@@ -11,6 +11,10 @@ pub trait Database: Send + Sync {
         Ok(())
     }
 
+    async fn get_restore_generation(&self) -> Result<Option<String>, ForgeError> {
+        Ok(None)
+    }
+
     // -------------------------------------------------------------------------
     // Users
     // -------------------------------------------------------------------------

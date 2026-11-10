@@ -168,3 +168,93 @@ test result: ok. 22 test suites passed; 0 failed; 0 ignored; 100% pass rate.
 - **Frontend Build (`npm run build`):** PASSED with `tsc && vite build`.
 - **NPM Vulnerability Audit (`npm audit`):** PASSED with 0 vulnerabilities.
 - **Production Compose (`docker compose -f docker-compose.yml -f docker-compose.prod.yml config --quiet`):** Validated with strict mandatory environment variables.
+
+---
+
+## 4. Batch 21K Master Remediation Test Evidence
+
+**Milestone:** Batch 21K — Production Global Restore Recovery, PostgreSQL Staging, Journal Durability, and Backup Confidentiality<br>
+**Baseline Commit:** `fa7bd142d4f42d8d86bb04d3c713067b944c77a9`<br>
+**Environment:** Windows 11 Native Host (`x86_64-pc-windows-msvc`)<br>
+**Execution Date:** 2026-11-10<br>
+**Pass Rate:** 100% across all suites (zero failures, zero warnings).
+
+### 4.1 SPNEBAK v2 Streaming AEAD Encryption (`backup_v2_streaming_test.rs`)
+```text
+running 6 tests
+test test_spnebak_v2_header_bounds_validation ... ok
+test test_consistency_barrier_draining_window ... ok
+test test_spnebak_v2_rejects_trailing_bytes_after_final_manifest ... ok
+test test_spnebak_v2_streaming_chunked_roundtrip ... ok
+test test_spnebak_v2_tampering_and_authentication_rejection ... ok
+test test_spnebak_v2_streaming_key_rotation ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.32s
+```
+
+### 4.2 Global Restore Convergence & Readiness Gate (`global_restore_convergence_test.rs`)
+```text
+running 6 tests
+test test_canonical_seven_participants_contract_validation ... ok
+test test_api_readiness_blocks_during_restore_and_clears_on_convergence ... ok
+test test_crash_matrix_point_14_and_15_recovery_idempotence ... ok
+test test_crash_matrix_point_5_to_9_post_decision_rolls_forward ... ok
+test test_crash_matrix_point_4_decision_write_fallback_to_last_valid ... ok
+test test_crash_matrix_point_1_to_3_pre_decision_aborts_cleanly ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+```
+
+### 4.3 Restore Failure Injection & Cutover Safety (`restore_failure_injection_test.rs`)
+```text
+running 6 tests
+test test_startup_crash_recovery_cleans_interrupted_staging ... ok
+test test_startup_recovery_rolls_forward_on_interrupted_db_cutover ... ok
+test test_whole_generation_cutover_absent_files_do_not_survive ... ok
+test test_multi_volume_cluster_backup_manifest_and_cutover_isolation ... ok
+test test_restore_database_success_publishes_storage_atomically ... ok
+test test_restore_database_failure_leaves_live_storage_untouched ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.56s
+```
+
+### 4.4 Distributed Participant Integrity (`distributed_participant_integrity_test.rs`)
+```text
+running 3 tests
+test test_participant_registry_production_enforcement ... ok
+test test_ssh_host_identity_capture_and_restore_roundtrip ... ok
+test test_distributed_cutover_multi_phase_rollback_preservation ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.42s
+```
+
+### 4.5 Production Backup/Restore Roundtrip (`production_backup_restore_roundtrip_test.rs`)
+```text
+running 5 tests
+test test_fencing_generation_monotonicity_and_fail_closed ... ok
+test test_ssh_identity_staged_publication_and_rollback_preservation ... ok
+test test_forward_recovery_from_storage_published ... ok
+test test_participant_corruption_and_mismatch_rejection ... ok
+test test_full_cluster_participant_contract_and_streaming_payload ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+```
+
+### 4.6 Complete Backend Test Suite (`github-alternative/backend`)
+```text
+41 integration and unit test binaries executed.
+test result: ok. 100% passed; 0 failed; 0 ignored; 0 warnings.
+```
+
+### 4.7 Complete Native Cluster Test Suite (`git-alternative`)
+```text
+22 integration, unit, and doc test suites executed.
+test result: ok. 100% passed; 0 failed; 0 ignored; 0 warnings.
+```
+
+### 4.8 Quality, Linting & Release Assets
+- **Cargo Format:** `cargo fmt --all -- --check` exited with code 0 on both workspaces.
+- **Cargo Clippy:** `cargo clippy --all-targets -- -D warnings` exited with code 0 on both workspaces.
+- **Frontend SPA Build:** `npm --prefix github-alternative/frontend run build` exited with code 0.
+- **Docker Compose Production Config:** Exited with code 0 with mandatory production secrets enforced.
+- **Release Binaries:** `spine-api.exe`, `spine.exe`, `spine-coordinator.exe`, `spine-storage-node.exe` built in release mode and checksummed in `target/release-candidate/SHA256SUMS`.

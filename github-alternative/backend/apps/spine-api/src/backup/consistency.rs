@@ -20,6 +20,7 @@ pub struct ConsistencyBarrier {
     fencing_generation: Arc<AtomicU64>,
     pool: Option<PgPool>,
     connect_options: Option<Arc<PgConnectOptions>>,
+    storage_root: Option<Arc<std::path::PathBuf>>,
 }
 
 impl Default for ConsistencyBarrier {
@@ -36,6 +37,7 @@ impl ConsistencyBarrier {
             fencing_generation: Arc::new(AtomicU64::new(1)),
             pool: None,
             connect_options: None,
+            storage_root: None,
         }
     }
 
@@ -47,6 +49,7 @@ impl ConsistencyBarrier {
             fencing_generation: Arc::new(AtomicU64::new(1)),
             pool: Some(pool),
             connect_options: Some(connect_options),
+            storage_root: None,
         }
     }
 
@@ -57,7 +60,13 @@ impl ConsistencyBarrier {
             fencing_generation: Arc::new(AtomicU64::new(1)),
             pool: Some(pool),
             connect_options: Some(Arc::new(options)),
+            storage_root: None,
         }
+    }
+
+    pub fn with_storage_root(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.storage_root = Some(Arc::new(path.into()));
+        self
     }
 
     pub fn pool(&self) -> Option<&PgPool> {
@@ -114,6 +123,44 @@ impl ConsistencyBarrier {
                 "Cluster write pipeline is currently paused for coordinated maintenance"
                     .to_string(),
             ));
+        }
+
+        if let Some(storage_root) = &self.storage_root {
+            if let Ok(Some(journal)) =
+                crate::backup::journal::RestoreJournal::load(storage_root.as_ref())
+            {
+                if !matches!(journal.phase, crate::backup::RestorePhase::Completed) {
+                    return Err(ForgeError::ServiceUnavailable(
+                        format!(
+                            "Cluster write pipeline is currently paused: restore session '{}' in progress (phase: {:?})",
+                            journal.restore_id, journal.phase
+                        ),
+                    ));
+                }
+            }
+
+            if let Some(pool) = &self.pool {
+                let db_gen_res: Result<Option<(String,)>, _> =
+                    sqlx::query_as("SELECT generation_token FROM _restore_generation WHERE id = 1")
+                        .fetch_optional(pool)
+                        .await;
+                if let Ok(Some((db_gen,))) = db_gen_res {
+                    if let Some(s_gen) =
+                        crate::backup::journal::RestoreJournal::read_storage_generation(
+                            storage_root.as_ref(),
+                        )
+                    {
+                        if db_gen != s_gen {
+                            return Err(ForgeError::ServiceUnavailable(
+                                format!(
+                                    "Cluster write pipeline is paused: unaligned generation! Database is '{}' but storage is '{}'",
+                                    db_gen, s_gen
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
         }
 
         let mut permit_gen = self.fencing_generation.load(Ordering::SeqCst);
@@ -201,6 +248,22 @@ impl ConsistencyBarrier {
                     .to_string(),
             ));
         }
+
+        if let Some(storage_root) = &self.storage_root {
+            if let Ok(Some(journal)) =
+                crate::backup::journal::RestoreJournal::load(storage_root.as_ref())
+            {
+                if !matches!(journal.phase, crate::backup::RestorePhase::Completed) {
+                    return Err(ForgeError::ServiceUnavailable(
+                        format!(
+                            "Cluster write pipeline is currently paused: restore session '{}' in progress (phase: {:?})",
+                            journal.restore_id, journal.phase
+                        ),
+                    ));
+                }
+            }
+        }
+
         let permit_gen = self.fencing_generation.load(Ordering::SeqCst);
         self.in_flight_writes.fetch_add(1, Ordering::SeqCst);
         Ok(WritePermit {

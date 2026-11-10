@@ -4,19 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Durable preparation acknowledgement for an authoritative restore participant.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ParticipantAcknowledgement {
-    pub restore_id: String,
-    pub backup_id: String,
-    pub participant_id: String,
-    pub volume_name: String,
-    pub previous_generation: Option<String>,
-    pub target_generation: String,
-    pub staged_digest: String,
-    pub staged_byte_length: u64,
-    pub prepared_at_nanos: i64,
-    pub prepared: bool,
-}
+pub use spine_cluster::protocol::ParticipantAcknowledgement;
 
 /// Durable commit decision record persisted before any irreversible participant mutations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -278,9 +266,32 @@ impl RestoreJournal {
         &mut self,
         ack: ParticipantAcknowledgement,
     ) -> Result<(), ForgeError> {
+        if !ack.prepared {
+            return Err(ForgeError::Internal(format!(
+                "Participant '{}' acknowledgement indicates preparation failed",
+                ack.participant_id
+            )));
+        }
+        if ack.staged_digest.is_empty() {
+            return Err(ForgeError::Internal(format!(
+                "Participant '{}' acknowledgement contains empty digest",
+                ack.participant_id
+            )));
+        }
         self.acknowledgements
             .insert(ack.participant_id.clone(), ack);
         self.persist(self.phase.clone())
+    }
+
+    /// Check if all required participants have valid preparation acknowledgements.
+    pub fn has_all_required_acks(&self, required_participants: &[String]) -> bool {
+        for p in required_participants {
+            match self.acknowledgements.get(p) {
+                Some(ack) if ack.prepared && !ack.staged_digest.is_empty() => continue,
+                _ => return false,
+            }
+        }
+        true
     }
 
     /// Record participant publication progress.
@@ -370,7 +381,13 @@ impl RestoreJournal {
         // Preserve previous valid journal as last_valid backup
         let last_valid = Self::last_valid_journal_path(&self.target_storage_root);
         if path.exists() {
-            let _ = std::fs::copy(&path, &last_valid);
+            if let Ok(mut lv_file) = std::fs::File::create(&last_valid) {
+                if let Ok(existing_bytes) = std::fs::read(&path) {
+                    let _ = lv_file.write_all(&existing_bytes);
+                    let _ = lv_file.flush();
+                    let _ = lv_file.sync_all();
+                }
+            }
         }
 
         let tmp_path = parent.join(format!(".tmp_jnl_{}.json", uuid::Uuid::new_v4().simple()));
@@ -388,6 +405,20 @@ impl RestoreJournal {
                 .map_err(|e| ForgeError::Internal(e.to_string()))?;
         }
         super::safe_atomic_replace(&tmp_path, &path)?;
+
+        // Readback verification of primary journal
+        if let Ok(c) = std::fs::read_to_string(&path) {
+            if let Err(e) = serde_json::from_str::<Self>(&c) {
+                return Err(ForgeError::Internal(format!(
+                    "Journal readback verification failed after persist: {}",
+                    e
+                )));
+            }
+        } else {
+            return Err(ForgeError::Internal(
+                "Journal readback failed: file could not be read after persist".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -488,7 +519,7 @@ impl RestoreJournal {
                                     && name != Self::JOURNAL_FILE_NAME
                                 {
                                     let dst = old_dir.join(&name);
-                                    let _ = super::safe_move_file(&p, &dst);
+                                    let _ = super::safe_move_path(&p, &dst);
                                 }
                             }
                         }
@@ -503,7 +534,7 @@ impl RestoreJournal {
                                     && !name.starts_with(".tmp")
                                 {
                                     let dst = storage_root.join(&name);
-                                    let _ = super::safe_move_file(&p, &dst);
+                                    let _ = super::safe_move_path(&p, &dst);
                                 }
                             }
                         }
@@ -582,7 +613,22 @@ impl RestoreJournal {
         storage_root: &Path,
         pool: Option<&sqlx::PgPool>,
     ) -> Result<Option<String>, ForgeError> {
+        Self::handle_startup_recovery_cluster(storage_root, pool, None, &[]).await
+    }
+
+    /// Asynchronous crash detection, cleanup and full cluster generation verification across all 7 participants.
+    /// Checks durable journal, database generation identity, coordinator generation, and storage nodes.
+    /// FAILS CLOSED if incomplete restoration or generation mismatch is detected.
+    pub async fn handle_startup_recovery_cluster(
+        storage_root: &Path,
+        pool: Option<&sqlx::PgPool>,
+        coordinator: Option<&crate::CoordinatorClient>,
+        storage_nodes: &[(String, String)],
+    ) -> Result<Option<String>, ForgeError> {
         let sync_msg = Self::handle_startup_recovery_sync(storage_root)?;
+
+        let mut reconciled_storage_gen: Option<String> =
+            Self::read_storage_generation(storage_root);
 
         if let Some(pool) = pool {
             // Check if database is empty or initialized
@@ -608,13 +654,14 @@ impl RestoreJournal {
                     Ok(Some((db_gen,))) => {
                         let storage_gen = Self::read_storage_generation(storage_root);
                         match storage_gen {
-                            Some(s_gen) if s_gen == db_gen => {
+                            Some(ref s_gen) if s_gen == &db_gen => {
                                 tracing::info!(
                                     "Verified consistent generation token '{}' across database and storage root.",
                                     db_gen
                                 );
+                                reconciled_storage_gen = Some(db_gen);
                             }
-                            Some(s_gen) => {
+                            Some(ref s_gen) => {
                                 return Err(ForgeError::Internal(format!(
                                     "FATAL STARTUP BLOCKED: Generation mismatch! Database generation is '{}' but storage generation is '{}'. Startup aborted to prevent split-brain data corruption.",
                                     db_gen, s_gen
@@ -637,6 +684,74 @@ impl RestoreJournal {
                         return Err(ForgeError::Internal(format!(
                             "FATAL STARTUP BLOCKED: Failed to query _restore_generation table: {}. Missing generation tables and query errors cannot be ignored.",
                             e
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Reconcile and verify coordinator generation if configured
+        if let Some(coord) = coordinator {
+            let (in_maint, coord_gen) = coord.query_maintenance_status().await.map_err(|e| {
+                ForgeError::Internal(format!(
+                    "FATAL STARTUP BLOCKED: Failed to query coordinator maintenance status during recovery: {}",
+                    e
+                ))
+            })?;
+
+            if in_maint {
+                return Err(ForgeError::Internal(
+                    "FATAL STARTUP BLOCKED: Coordinator is in maintenance mode on startup."
+                        .to_string(),
+                ));
+            }
+
+            if let Some(ref s_gen) = reconciled_storage_gen {
+                if let Ok(expected_fencing_gen) = s_gen.parse::<u64>() {
+                    if coord_gen != expected_fencing_gen {
+                        return Err(ForgeError::Internal(format!(
+                            "FATAL STARTUP BLOCKED: Coordinator generation ({}) does not match cluster storage generation ({})",
+                            coord_gen, expected_fencing_gen
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Reconcile and verify storage nodes if configured
+        for (expected_id, addr) in storage_nodes {
+            let client = crate::ClusterNodeClient::new(addr.clone());
+            let (in_maint, node_gen, _, responding_id) =
+                client.query_node_details().await.map_err(|e| {
+                    ForgeError::Internal(format!(
+                        "FATAL STARTUP BLOCKED: Failed to query storage node '{}' at {}: {}",
+                        expected_id, addr, e
+                    ))
+                })?;
+
+            if in_maint {
+                return Err(ForgeError::Internal(format!(
+                    "FATAL STARTUP BLOCKED: Storage node '{}' at {} is in maintenance mode on startup.",
+                    expected_id, addr
+                )));
+            }
+
+            match responding_id {
+                Some(ref r_id) if r_id == expected_id => {}
+                other => {
+                    return Err(ForgeError::Internal(format!(
+                        "FATAL STARTUP BLOCKED: Storage node at {} responded with ID {:?}, expected '{}'",
+                        addr, other, expected_id
+                    )));
+                }
+            }
+
+            if let Some(ref s_gen) = reconciled_storage_gen {
+                if let Ok(expected_fencing_gen) = s_gen.parse::<u64>() {
+                    if node_gen != expected_fencing_gen {
+                        return Err(ForgeError::Internal(format!(
+                            "FATAL STARTUP BLOCKED: Storage node '{}' generation ({}) does not match cluster storage generation ({})",
+                            expected_id, node_gen, expected_fencing_gen
                         )));
                     }
                 }

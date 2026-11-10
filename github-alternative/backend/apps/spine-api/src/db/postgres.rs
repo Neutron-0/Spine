@@ -53,6 +53,21 @@ impl Database for PgDatabase {
             .map_err(|e| ForgeError::ServiceUnavailable(format!("PostgreSQL ping failed: {}", e)))
     }
 
+    async fn get_restore_generation(&self) -> Result<Option<String>, ForgeError> {
+        let row: Result<Option<(String,)>, _> =
+            sqlx::query_as("SELECT generation_token FROM _restore_generation WHERE id = 1")
+                .fetch_optional(&self.pool)
+                .await;
+        match row {
+            Ok(Some((gen,))) => Ok(Some(gen)),
+            Ok(None) => Ok(None),
+            Err(e) => Err(ForgeError::Internal(format!(
+                "Failed to query _restore_generation: {}",
+                e
+            ))),
+        }
+    }
+
     async fn create_user(&self, user: User) -> Result<User, ForgeError> {
         let query = r#"
             INSERT INTO users (id, username, normalized_username, email, normalized_email, display_name, password_hash, account_status, avatar_url, created_at_nanos, updated_at_nanos, last_login_nanos)

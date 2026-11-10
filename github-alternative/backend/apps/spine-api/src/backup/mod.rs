@@ -22,7 +22,7 @@ pub mod participants;
 pub mod v2;
 
 pub use consistency::{ConsistencyBarrier, MaintenanceGuard, SPINE_CLUSTER_MAINTENANCE_LOCK_ID};
-pub use journal::{CommitDecisionRecord, RestoreJournal, RestorePhase};
+pub use journal::{CommitDecisionRecord, ParticipantAcknowledgement, RestoreJournal, RestorePhase};
 pub use participants::{DeploymentResource, ParticipantClassification, ParticipantRegistry};
 pub use v2::{BackupHeaderV2, StreamSummary};
 
@@ -67,6 +67,24 @@ pub enum ParticipantPayloadSource {
     File(PathBuf),
 }
 
+/// Recursively copies a directory and all its contents.
+pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), ForgeError> {
+    fs::create_dir_all(dst).map_err(|e| ForgeError::Internal(e.to_string()))?;
+    for entry in fs::read_dir(src).map_err(|e| ForgeError::Internal(e.to_string()))? {
+        let entry = entry.map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let ty = entry
+            .file_type()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let dest_path = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &dest_path)?;
+        } else {
+            fs::copy(entry.path(), &dest_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
 /// Safely moves a file across filesystems or drive letters with copy+delete fallback.
 pub fn safe_move_file(from: &Path, to: &Path) -> Result<(), ForgeError> {
     if fs::rename(from, to).is_ok() {
@@ -82,18 +100,93 @@ pub fn safe_move_file(from: &Path, to: &Path) -> Result<(), ForgeError> {
     Ok(())
 }
 
-/// Safely replaces a destination file atomically, accommodating Windows rename semantics.
+/// Safely moves a file or directory across filesystems or drive letters.
+pub fn safe_move_path(from: &Path, to: &Path) -> Result<(), ForgeError> {
+    if fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    if from.is_dir() {
+        copy_dir_all(from, to)?;
+        let _ = fs::remove_dir_all(from);
+        Ok(())
+    } else {
+        safe_move_file(from, to)
+    }
+}
+
+/// Safely replaces a destination file atomically, preserving previous destination until replacement is confirmed.
+/// Never deletes destination file prior to verification. Accommodates Windows rename semantics.
 pub fn safe_atomic_replace(from: &Path, to: &Path) -> Result<(), ForgeError> {
-    if fs::rename(from, to).is_ok() {
+    if fs::rename(from, to).is_ok() && to.exists() && fs::metadata(to).is_ok() {
+        if let Some(parent) = to.parent() {
+            if let Ok(p_file) = fs::File::open(parent) {
+                let _ = p_file.sync_all();
+            }
+        }
         return Ok(());
     }
-    let _ = fs::remove_file(to);
-    if fs::rename(from, to).is_ok() {
-        return Ok(());
+    if to.exists() {
+        let backup = to.with_extension(format!("bak_replace_{}", uuid::Uuid::new_v4().simple()));
+        fs::rename(to, &backup).map_err(|e| {
+            ForgeError::Internal(format!(
+                "Failed to backup {} during replace: {}",
+                to.display(),
+                e
+            ))
+        })?;
+        match fs::rename(from, to) {
+            Ok(()) => {
+                if to.exists() && fs::metadata(to).is_ok() {
+                    if let Some(parent) = to.parent() {
+                        if let Ok(p_file) = fs::File::open(parent) {
+                            let _ = p_file.sync_all();
+                        }
+                    }
+                    let _ = fs::remove_file(&backup);
+                    Ok(())
+                } else {
+                    let _ = fs::rename(&backup, to);
+                    Err(ForgeError::Internal(format!(
+                        "Readback verification failed after replacing {}",
+                        to.display()
+                    )))
+                }
+            }
+            Err(e) => {
+                let _ = fs::rename(&backup, to);
+                Err(ForgeError::Internal(format!(
+                    "Failed to replace destination {} from {}: {}",
+                    to.display(),
+                    from.display(),
+                    e
+                )))
+            }
+        }
+    } else {
+        fs::copy(from, to).map_err(|e| {
+            ForgeError::Internal(format!(
+                "Failed to copy {} to {}: {}",
+                from.display(),
+                to.display(),
+                e
+            ))
+        })?;
+        if to.exists() && fs::metadata(to).is_ok() {
+            if let Some(parent) = to.parent() {
+                if let Ok(p_file) = fs::File::open(parent) {
+                    let _ = p_file.sync_all();
+                }
+            }
+            let _ = fs::remove_file(from);
+            Ok(())
+        } else {
+            let _ = fs::remove_file(to);
+            Err(ForgeError::Internal(format!(
+                "Readback verification failed after copying {}",
+                to.display()
+            )))
+        }
     }
-    fs::copy(from, to).map_err(|e| ForgeError::Internal(format!("Failed to copy file: {}", e)))?;
-    let _ = fs::remove_file(from);
-    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -191,7 +284,7 @@ impl StagedRestoreSession {
                     && name != RestoreJournal::JOURNAL_FILE_NAME
                 {
                     let dst = old_dir.join(&name);
-                    let _ = safe_move_file(&p, &dst);
+                    let _ = safe_move_path(&p, &dst);
                 }
             }
         }
@@ -544,15 +637,13 @@ impl BackupManager {
             }
             let tmp_output = parent.join(format!(".tmp_bak_{}.spnebak", Uuid::new_v4()));
             let res = (|| {
-                let temp_dir = tempfile::tempdir().map_err(|e| {
-                    ForgeError::Internal(format!("Failed to create temp staging directory: {}", e))
+                let file = File::create(&tmp_output).map_err(|e| {
+                    ForgeError::Internal(format!("Failed to create output archive: {}", e))
                 })?;
-                let staging_tar_gz = temp_dir.path().join("staging.tar.gz");
-                let file = File::create(&staging_tar_gz).map_err(|e| {
-                    ForgeError::Internal(format!("Failed to create staging file: {}", e))
-                })?;
-                let enc = GzEncoder::new(file, Compression::default());
-                let (manifest, _) = Self::create_archive_internal(
+                let enc_writer =
+                    v2::EncryptingWriter::new(file, pass, key_version, v2::DEFAULT_CHUNK_SIZE)?;
+                let enc = GzEncoder::new(enc_writer, Compression::default());
+                let (manifest, enc) = Self::create_archive_internal(
                     storage_root,
                     None,
                     db_snapshot_file,
@@ -560,13 +651,11 @@ impl BackupManager {
                     fencing_generation,
                     enc,
                 )?;
-                let reader = File::open(&staging_tar_gz).map_err(|e| {
-                    ForgeError::Internal(format!("Failed to open staging file: {}", e))
-                })?;
-                let writer = File::create(&tmp_output).map_err(|e| {
-                    ForgeError::Internal(format!("Failed to create output archive: {}", e))
-                })?;
-                v2::encrypt_stream(reader, writer, pass, key_version, v2::DEFAULT_CHUNK_SIZE)?;
+                let enc_writer = enc
+                    .finish()
+                    .map_err(|e| ForgeError::Internal(format!("Failed to finalize gzip: {}", e)))?;
+                let _ = enc_writer.finish()?;
+
                 let verify_file = File::open(&tmp_output).map_err(|e| {
                     ForgeError::Internal(format!(
                         "Failed to reopen archive for verification: {}",
@@ -663,17 +752,14 @@ impl BackupManager {
         let tmp_output = output_parent.join(format!(".tmp_bak_{}.spnebak", Uuid::new_v4()));
 
         let res = (|| {
-            // 1. Pack tar.gz into temporary staging file to avoid unbounded RAM consumption
-            let temp_dir = tempfile::tempdir().map_err(|e| {
-                ForgeError::Internal(format!("Failed to create temp staging directory: {}", e))
+            // 1. Directly stream compressed tar archive through Authenticated EncryptingWriter (SPNEBAK v2)
+            let file = File::create(&tmp_output).map_err(|e| {
+                ForgeError::Internal(format!("Failed to create output archive: {}", e))
             })?;
-            let staging_tar_gz = temp_dir.path().join("staging.tar.gz");
-
-            let file = File::create(&staging_tar_gz).map_err(|e| {
-                ForgeError::Internal(format!("Failed to create staging file: {}", e))
-            })?;
-            let enc = GzEncoder::new(file, Compression::default());
-            let (manifest, _) = Self::create_archive_internal(
+            let enc_writer =
+                v2::EncryptingWriter::new(file, passphrase, key_version, v2::DEFAULT_CHUNK_SIZE)?;
+            let enc = GzEncoder::new(enc_writer, Compression::default());
+            let (manifest, enc) = Self::create_archive_internal(
                 storage_root,
                 db_snapshot_json,
                 db_snapshot_file,
@@ -681,23 +767,12 @@ impl BackupManager {
                 None,
                 enc,
             )?;
+            let enc_writer = enc
+                .finish()
+                .map_err(|e| ForgeError::Internal(format!("Failed to finalize gzip: {}", e)))?;
+            let _ = enc_writer.finish()?;
 
-            // 2. Stream chunked authenticated encryption (SPNEBAK v2)
-            let reader = File::open(&staging_tar_gz)
-                .map_err(|e| ForgeError::Internal(format!("Failed to open staging file: {}", e)))?;
-            let writer = File::create(&tmp_output).map_err(|e| {
-                ForgeError::Internal(format!("Failed to create output archive: {}", e))
-            })?;
-
-            v2::encrypt_stream(
-                reader,
-                writer,
-                passphrase,
-                key_version,
-                v2::DEFAULT_CHUNK_SIZE,
-            )?;
-
-            // 3. Verify temporary encrypted output completely before publication
+            // 2. Verify temporary encrypted output completely before publication
             let verify_file = File::open(&tmp_output).map_err(|e| {
                 ForgeError::Internal(format!("Failed to reopen archive for verification: {}", e))
             })?;

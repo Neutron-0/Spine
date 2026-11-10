@@ -1014,7 +1014,6 @@ async fn main() -> anyhow::Result<()> {
                 })?;
 
                 // FAIL-SAFE: Validate target database BEFORE modifying repository storage on disk
-                let mut target_db_pool = None;
                 if let Some(ref db_url) = target_db {
                     println!(
                         "Connecting and verifying target database: {}...",
@@ -1035,7 +1034,7 @@ async fn main() -> anyhow::Result<()> {
                             "Target database is not empty. Full database restoration requires a clean, empty target database to prevent data corruption."
                         );
                     }
-                    target_db_pool = Some(pool);
+                    pool.close().await;
                 }
 
                 let coord_addr_opt = coordinator_addr
@@ -1089,9 +1088,104 @@ async fn main() -> anyhow::Result<()> {
 
                 // ------------------------------------------------------------------------
                 // DISTRIBUTED CUTOVER PROTOCOL
-                // Phase 1: PREPARE (Stage restore on coordinator and storage nodes)
+                // Phase 1: PREPARE (Stage restore on all 7 participants)
                 // ------------------------------------------------------------------------
-                println!("=== Phase 1: PREPARE (Staging Cluster Volume Restores) ===");
+                println!("=== Phase 1: PREPARE (Staging All Participants in Isolation) ===");
+
+                // 1. Stage PostgreSQL Database in isolated staging database before modifying live state
+                let mut staged_db_restore: Option<spine_api::db::StagedDatabaseRestore> = None;
+                if let Some(ref db_url) = target_db {
+                    if let Some(ref snap_path) = session.db_snapshot_path {
+                        println!("Staging database restore into isolated staging before commit decision...");
+                        let s_db = spine_api::db::StagedDatabaseRestore::prepare_from_file(
+                            db_url,
+                            &session.journal.restore_id,
+                            &session.journal.target_generation,
+                            &session.manifest.backup_id,
+                            snap_path,
+                        )
+                        .await
+                        .map_err(|e| {
+                            let _ = session.abort(&format!("Database staging failed: {}", e));
+                            anyhow::anyhow!("Database staging failed: {}", e)
+                        })?;
+
+                        let db_ack = spine_api::backup::ParticipantAcknowledgement {
+                            restore_id: session.journal.restore_id.clone(),
+                            backup_id: session.manifest.backup_id.clone(),
+                            participant_id: "postgres_data".to_string(),
+                            volume_name: "postgres_data".to_string(),
+                            previous_generation: session
+                                .journal
+                                .previous_storage_generation
+                                .clone(),
+                            target_generation: session.journal.target_generation.clone(),
+                            staged_digest: s_db.staged_digest.clone(),
+                            staged_byte_length: s_db.staged_byte_length,
+                            prepared_at_nanos: chrono::Utc::now()
+                                .timestamp_nanos_opt()
+                                .unwrap_or(0),
+                            prepared: true,
+                        };
+                        session
+                            .journal
+                            .record_participant_ack(db_ack)
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "Failed to record postgres_data acknowledgement: {}",
+                                    e
+                                )
+                            })?;
+                        println!(
+                            "Database restore staged successfully: {} tables, {} rows, digest={}",
+                            s_db.tables_restored, s_db.rows_restored, s_db.staged_digest
+                        );
+                        staged_db_restore = Some(s_db);
+                    }
+                }
+
+                // 2. Stage Local Repository Storage (spine_storage)
+                if session
+                    .manifest
+                    .participants
+                    .iter()
+                    .any(|p| p.participant_id == "spine_storage")
+                {
+                    let storage_digest = session
+                        .manifest
+                        .file_hashes
+                        .get("storage/spine_storage_snapshot.tar.gz")
+                        .cloned()
+                        .unwrap_or_else(|| "staged_verified".to_string());
+                    let storage_bytes = session
+                        .manifest
+                        .participants
+                        .iter()
+                        .find(|p| p.participant_id == "spine_storage")
+                        .map(|p| p.byte_length)
+                        .unwrap_or(0);
+
+                    let storage_ack = spine_api::backup::ParticipantAcknowledgement {
+                        restore_id: session.journal.restore_id.clone(),
+                        backup_id: session.manifest.backup_id.clone(),
+                        participant_id: "spine_storage".to_string(),
+                        volume_name: "spine_storage".to_string(),
+                        previous_generation: session.journal.previous_storage_generation.clone(),
+                        target_generation: session.journal.target_generation.clone(),
+                        staged_digest: storage_digest,
+                        staged_byte_length: storage_bytes,
+                        prepared_at_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                        prepared: true,
+                    };
+                    session
+                        .journal
+                        .record_participant_ack(storage_ack)
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to record spine_storage acknowledgement: {}", e)
+                        })?;
+                }
+
+                // 3. Stage Coordinator and Storage Node Volumes via typed RPC
                 let mut staged_cluster_restores: Vec<(String, u64, spine_api::CoordinatorClient)> =
                     Vec::new();
                 let manifest_participants = session.manifest.participants.clone();
@@ -1119,19 +1213,31 @@ async fn main() -> anyhow::Result<()> {
                                         sha256_checksum: participant.sha256_checksum.clone(),
                                         created_at_nanos: 0,
                                     };
-                                if let Err(e) = client.stage_restore(vol_manifest, data).await {
-                                    for (r_snap, _, r_client) in &staged_cluster_restores {
-                                        let _ = r_client.rollback_restore(r_snap).await;
+                                let ack = match client.stage_restore(vol_manifest, data).await {
+                                    Ok(ack) => ack,
+                                    Err(e) => {
+                                        for (r_snap, _, r_client) in &staged_cluster_restores {
+                                            let _ = r_client.rollback_restore(r_snap).await;
+                                        }
+                                        if let Some(ref sdb) = staged_db_restore {
+                                            let _ = sdb.rollback().await;
+                                        }
+                                        let _ = session.abort(&format!(
+                                            "Failed to stage volume restore on coordinator: {}",
+                                            e
+                                        ));
+                                        anyhow::bail!(
+                                            "Failed to stage volume restore on coordinator: {}",
+                                            e
+                                        );
                                     }
-                                    let _ = session.abort(&format!(
-                                        "Failed to stage volume restore on coordinator: {}",
+                                };
+                                session.journal.record_participant_ack(ack).map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "Failed to record coordinator acknowledgement: {}",
                                         e
-                                    ));
-                                    anyhow::bail!(
-                                        "Failed to stage volume restore on coordinator: {}",
-                                        e
-                                    );
-                                }
+                                    )
+                                })?;
                                 staged_cluster_restores.push((
                                     participant.snapshot_id.clone(),
                                     participant.fencing_generation,
@@ -1158,20 +1264,32 @@ async fn main() -> anyhow::Result<()> {
                                 sha256_checksum: participant.sha256_checksum.clone(),
                                 created_at_nanos: 0,
                             };
-                            if let Err(e) = client.stage_restore(vol_manifest, data).await {
-                                for (r_snap, _, r_client) in &staged_cluster_restores {
-                                    let _ = r_client.rollback_restore(r_snap).await;
+                            let ack = match client.stage_restore(vol_manifest, data).await {
+                                Ok(ack) => ack,
+                                Err(e) => {
+                                    for (r_snap, _, r_client) in &staged_cluster_restores {
+                                        let _ = r_client.rollback_restore(r_snap).await;
+                                    }
+                                    if let Some(ref sdb) = staged_db_restore {
+                                        let _ = sdb.rollback().await;
+                                    }
+                                    let _ = session.abort(&format!(
+                                        "Failed to stage volume restore on storage node '{}': {}",
+                                        participant.participant_id, e
+                                    ));
+                                    anyhow::bail!(
+                                        "Failed to stage volume restore on storage node '{}': {}",
+                                        participant.participant_id,
+                                        e
+                                    );
                                 }
-                                let _ = session.abort(&format!(
-                                    "Failed to stage volume restore on storage node '{}': {}",
-                                    participant.participant_id, e
-                                ));
-                                anyhow::bail!(
-                                    "Failed to stage volume restore on storage node '{}': {}",
-                                    participant.participant_id,
+                            };
+                            session.journal.record_participant_ack(ack).map_err(|e| {
+                                anyhow::anyhow!(
+                                    "Failed to record storage node acknowledgement: {}",
                                     e
-                                );
-                            }
+                                )
+                            })?;
                             staged_cluster_restores.push((
                                 participant.snapshot_id.clone(),
                                 participant.fencing_generation,
@@ -1181,7 +1299,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // Prepare SSH identity staging if present
+                // 4. Prepare SSH identity staging if present
                 let has_ssh = session
                     .manifest
                     .participants
@@ -1204,6 +1322,41 @@ async fn main() -> anyhow::Result<()> {
                             anyhow::anyhow!("SSH identity staging validation failed: {}", e)
                         })?;
                         println!("Staged SSH identity verified with fingerprint: {}", fp);
+
+                        let ssh_digest = session
+                            .manifest
+                            .file_hashes
+                            .get("ssh/ssh_identity_snapshot.tar.gz")
+                            .cloned()
+                            .unwrap_or_else(|| fp.clone());
+                        let ssh_bytes = session
+                            .manifest
+                            .participants
+                            .iter()
+                            .find(|p| p.participant_id == "spine_ssh")
+                            .map(|p| p.byte_length)
+                            .unwrap_or(0);
+
+                        let ssh_ack = spine_api::backup::ParticipantAcknowledgement {
+                            restore_id: session.journal.restore_id.clone(),
+                            backup_id: session.manifest.backup_id.clone(),
+                            participant_id: "spine_ssh".to_string(),
+                            volume_name: "spine_ssh".to_string(),
+                            previous_generation: None,
+                            target_generation: session.journal.target_generation.clone(),
+                            staged_digest: ssh_digest,
+                            staged_byte_length: ssh_bytes,
+                            prepared_at_nanos: chrono::Utc::now()
+                                .timestamp_nanos_opt()
+                                .unwrap_or(0),
+                            prepared: true,
+                        };
+                        session
+                            .journal
+                            .record_participant_ack(ssh_ack)
+                            .map_err(|e| {
+                                anyhow::anyhow!("Failed to record spine_ssh acknowledgement: {}", e)
+                            })?;
                     }
                     Some(s_dir)
                 } else {
@@ -1214,6 +1367,29 @@ async fn main() -> anyhow::Result<()> {
                 // Phase 2: PREPARED (All Participants Staged and Verified)
                 // ------------------------------------------------------------------------
                 println!("=== Phase 2: PREPARED (All Participants Staged and Verified) ===");
+                let missing_participant = session
+                    .manifest
+                    .participants
+                    .iter()
+                    .map(|p| p.participant_id.clone())
+                    .find(|id| !session.journal.acknowledgements.contains_key(id));
+
+                if let Some(missing_id) = missing_participant {
+                    for (r_snap, _, r_client) in &staged_cluster_restores {
+                        let _ = r_client.rollback_restore(r_snap).await;
+                    }
+                    if let Some(ref sdb) = staged_db_restore {
+                        let _ = sdb.rollback().await;
+                    }
+                    let _ = session.abort(&format!(
+                        "Missing preparation acknowledgement for participant '{}'",
+                        missing_id
+                    ));
+                    anyhow::bail!(
+                        "Missing preparation acknowledgement for participant '{}'. Global commit decision prevented.",
+                        missing_id
+                    );
+                }
                 session
                     .journal
                     .persist(spine_api::backup::RestorePhase::Prepared)
@@ -1265,52 +1441,21 @@ async fn main() -> anyhow::Result<()> {
                 // ------------------------------------------------------------------------
                 println!("=== Phase 4: PUBLISH (Executing Distributed Cutover) ===");
 
-                // Step 1: Restore database BEFORE modifying storage or SSH keys
-                if let Some(ref snap_path) = session.db_snapshot_path {
-                    if let Some(ref pool) = target_db_pool {
-                        println!("Restoring streaming database snapshot into target database...");
-                        let file = std::fs::File::open(snap_path).map_err(|e| {
-                            anyhow::anyhow!("Failed to open extracted database snapshot: {}", e)
-                        })?;
-                        let mut reader = std::io::BufReader::new(file);
-                        let db_report = match spine_api::restore_database_with_generation(
-                            pool,
-                            &mut reader,
-                            Some(&session.journal.target_generation),
-                            Some(&session.manifest.backup_id),
-                        )
-                        .await
-                        {
-                            Ok(r) => {
-                                session
-                                    .journal
-                                    .record_participant_published("postgres_data")
-                                    .map_err(|e| {
-                                        anyhow::anyhow!("Failed to update restore journal: {}", e)
-                                    })?;
-                                r
-                            }
-                            Err(e) => {
-                                for (snap_id, _, client) in &staged_cluster_restores {
-                                    let _ = client.rollback_restore(snap_id).await;
-                                }
-                                let _ = session.abort(&format!("Database restore failed: {}", e));
-                                anyhow::bail!("Failed to restore database snapshot: {}. Target repository storage was left untouched.", e);
-                            }
-                        };
-                        println!("Database restore completed successfully:");
-                        println!("  Tables restored: {}", db_report.tables_restored);
-                        println!("  Rows restored:   {}", db_report.rows_restored);
-                        println!("  Duration:        {} ms", db_report.duration_ms);
-                    } else if prof.requires_persistent_database() {
-                        let _ = session.abort("Target database required under current profile");
-                        anyhow::bail!(
-                            "Under deployment profile '{}', a target PostgreSQL database URL is required for restoring backups containing database snapshots (--target-database-url-file, or TARGET_DATABASE_URL).",
-                            prof
-                        );
-                    } else {
-                        println!("WARNING: Backup archive contains a database snapshot, but no target database URL was specified. Database was not restored.");
+                // Step 1: Database cutover
+                if let Some(ref sdb) = staged_db_restore {
+                    println!("Atomically cutting over staged database to live target database...");
+                    if let Err(e) = sdb.commit_cutover().await {
+                        for (snap_id, _, client) in &staged_cluster_restores {
+                            let _ = client.rollback_restore(snap_id).await;
+                        }
+                        let _ = session.abort(&format!("Database cutover failed: {}", e));
+                        anyhow::bail!("Failed to cut over database: {}. Target repository storage was left untouched.", e);
                     }
+                    session
+                        .journal
+                        .record_participant_published("postgres_data")
+                        .map_err(|e| anyhow::anyhow!("Failed to update restore journal: {}", e))?;
+                    println!("Database cutover completed successfully.");
                 }
 
                 // Step 2: Publish verified repository storage to live root (retaining rollback generation)
@@ -1329,6 +1474,9 @@ async fn main() -> anyhow::Result<()> {
                         );
                         for (r_snap, _, r_client) in &staged_cluster_restores {
                             let _ = r_client.rollback_restore(r_snap).await;
+                        }
+                        if let Some(ref sdb) = staged_db_restore {
+                            let _ = sdb.rollback().await;
                         }
                         let _ = session.rollback();
                         anyhow::bail!("Failed to publish verified storage to live root: {}", e);
@@ -1351,6 +1499,9 @@ async fn main() -> anyhow::Result<()> {
                         }
                         for (r_snap, _, r_client) in &staged_cluster_restores {
                             let _ = r_client.rollback_restore(r_snap).await;
+                        }
+                        if let Some(ref sdb) = staged_db_restore {
+                            let _ = sdb.rollback().await;
                         }
                         let _ = session.rollback();
                         let _ = session
@@ -1402,6 +1553,9 @@ async fn main() -> anyhow::Result<()> {
                                 }
                                 for (r_snap, _, r_client) in &committed_cluster_restores {
                                     let _ = r_client.rollback_restore(r_snap).await;
+                                }
+                                if let Some(ref sdb) = staged_db_restore {
+                                    let _ = sdb.rollback().await;
                                 }
                                 let _ = session.rollback();
                                 anyhow::bail!("Failed to copy staged SSH identity: {}", e);
@@ -1464,6 +1618,9 @@ async fn main() -> anyhow::Result<()> {
                     for (r_snap, _, r_client) in &committed_cluster_restores {
                         let _ = r_client.rollback_restore(r_snap).await;
                     }
+                    if let Some(ref sdb) = staged_db_restore {
+                        let _ = sdb.rollback().await;
+                    }
                     let _ = session.rollback();
                     anyhow::bail!("Restore failed post-cutover verification: {}. All participants rolled back to previous generation.", verify_err_msg);
                 }
@@ -1481,6 +1638,9 @@ async fn main() -> anyhow::Result<()> {
                 println!("=== Phase 6: FINALIZE (Purging Retained Old Generations) ===");
                 if old_ssh_dir.exists() {
                     let _ = std::fs::remove_dir_all(&old_ssh_dir);
+                }
+                if let Some(ref sdb) = staged_db_restore {
+                    let _ = sdb.finalize().await;
                 }
                 for (snap_id, _, client) in &committed_cluster_restores {
                     if let Err(e) = client.finalize_restore(snap_id).await {
@@ -1765,9 +1925,11 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
     tracing::info!("Storage root: {}", storage_root_canonical.display());
 
     // 3.1 Restore state machine crash recovery & generation validation
-    if let Some(msg) = spine_api::backup::RestoreJournal::handle_startup_recovery(
+    if let Some(msg) = spine_api::backup::RestoreJournal::handle_startup_recovery_cluster(
         &storage_root_canonical,
         pg_pool.as_ref(),
+        coordinator.as_ref(),
+        &storage_nodes,
     )
     .await
     .map_err(|e| anyhow::anyhow!("FATAL RESTORE RECOVERY FAILURE: {}", e))?
@@ -1795,8 +1957,10 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
 
     let ssrf = SsrfValidator::new(false);
     let consistency_barrier = Arc::new(match pg_pool {
-        Some(pool) => spine_api::backup::ConsistencyBarrier::with_pool(pool),
-        None => spine_api::backup::ConsistencyBarrier::new(),
+        Some(pool) => spine_api::backup::ConsistencyBarrier::with_pool(pool)
+            .with_storage_root(storage_root_canonical.clone()),
+        None => spine_api::backup::ConsistencyBarrier::new()
+            .with_storage_root(storage_root_canonical.clone()),
     });
 
     let webhooks = Arc::new(WebhookService::new(Arc::clone(&db), ssrf.clone()));

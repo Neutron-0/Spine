@@ -5,7 +5,7 @@ use flate2::Compression;
 use sha2::Digest;
 use spine_cluster::fencing::OwnershipEpoch;
 use spine_cluster::node::NodeCapacity;
-use spine_cluster::protocol::VolumeSnapshotManifest;
+use spine_cluster::protocol::{ParticipantAcknowledgement, VolumeSnapshotManifest};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -104,7 +104,7 @@ pub trait StorageBackend: Send + Sync {
         snapshot_id: &str,
         fencing_generation: u64,
         payload_tar_gz: &[u8],
-    ) -> Result<()>;
+    ) -> Result<ParticipantAcknowledgement>;
     fn commit_volume_restore(&self, snapshot_id: &str, fencing_generation: u64) -> Result<()>;
     fn rollback_volume_restore(&self, snapshot_id: &str) -> Result<()>;
     fn finalize_volume_restore(&self, snapshot_id: &str) -> Result<()>;
@@ -121,7 +121,12 @@ impl Drop for StorageWriterGuard {
 }
 
 pub fn safe_atomic_replace(from: &Path, to: &Path) -> Result<()> {
-    if fs::rename(from, to).is_ok() {
+    if fs::rename(from, to).is_ok() && to.exists() && fs::metadata(to).is_ok() {
+        if let Some(parent) = to.parent() {
+            if let Ok(p_file) = fs::File::open(parent) {
+                let _ = p_file.sync_all();
+            }
+        }
         return Ok(());
     }
     if to.exists() {
@@ -130,8 +135,21 @@ pub fn safe_atomic_replace(from: &Path, to: &Path) -> Result<()> {
             .with_context(|| format!("Failed to backup {} during replace", to.display()))?;
         match fs::rename(from, to) {
             Ok(()) => {
-                let _ = fs::remove_file(&backup);
-                Ok(())
+                if to.exists() && fs::metadata(to).is_ok() {
+                    if let Some(parent) = to.parent() {
+                        if let Ok(p_file) = fs::File::open(parent) {
+                            let _ = p_file.sync_all();
+                        }
+                    }
+                    let _ = fs::remove_file(&backup);
+                    Ok(())
+                } else {
+                    let _ = fs::rename(&backup, to);
+                    bail!(
+                        "Readback verification failed after replacing {}",
+                        to.display()
+                    );
+                }
             }
             Err(e) => {
                 let _ = fs::rename(&backup, to);
@@ -141,8 +159,21 @@ pub fn safe_atomic_replace(from: &Path, to: &Path) -> Result<()> {
     } else {
         fs::copy(from, to)
             .with_context(|| format!("Failed to copy {} to {}", from.display(), to.display()))?;
-        let _ = fs::remove_file(from);
-        Ok(())
+        if to.exists() && fs::metadata(to).is_ok() {
+            if let Some(parent) = to.parent() {
+                if let Ok(p_file) = fs::File::open(parent) {
+                    let _ = p_file.sync_all();
+                }
+            }
+            let _ = fs::remove_file(from);
+            Ok(())
+        } else {
+            let _ = fs::remove_file(to);
+            bail!(
+                "Readback verification failed after copying {}",
+                to.display()
+            );
+        }
     }
 }
 
@@ -685,7 +716,7 @@ impl StorageBackend for FileSystemStorageBackend {
         snapshot_id: &str,
         fencing_generation: u64,
         payload_tar_gz: &[u8],
-    ) -> Result<()> {
+    ) -> Result<ParticipantAcknowledgement> {
         if !self.in_maintenance.load(Ordering::SeqCst) {
             bail!("Storage node must be in maintenance mode to stage volume restore");
         }
@@ -729,7 +760,29 @@ impl StorageBackend for FileSystemStorageBackend {
             file.unpack(&dest)?;
         }
 
-        Ok(())
+        use sha2::Sha256;
+        let mut hasher = Sha256::new();
+        hasher.update(payload_tar_gz);
+        let staged_digest = hex::encode(hasher.finalize());
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+
+        let ack = ParticipantAcknowledgement {
+            restore_id: format!("rst_{}", snapshot_id),
+            backup_id: snapshot_id.to_string(),
+            participant_id: self.node_id.clone(),
+            volume_name: format!("{}_data", self.node_id.replace('-', "_")),
+            previous_generation: Some(cur_gen.to_string()),
+            target_generation: fencing_generation.to_string(),
+            staged_digest,
+            staged_byte_length: payload_tar_gz.len() as u64,
+            prepared_at_nanos: now_nanos,
+            prepared: true,
+        };
+
+        Ok(ack)
     }
 
     fn commit_volume_restore(&self, snapshot_id: &str, fencing_generation: u64) -> Result<()> {

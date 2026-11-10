@@ -158,15 +158,36 @@ impl ClusterNodeClient {
         &self,
         manifest: VolumeSnapshotManifest,
         payload_bytes: Vec<u8>,
-    ) -> Result<(), ForgeError> {
+    ) -> Result<spine_cluster::protocol::ParticipantAcknowledgement, ForgeError> {
         let req = ClusterRpcRequest::StageVolumeRestore {
             snapshot_id: manifest.snapshot_id.clone(),
             fencing_generation: manifest.fencing_generation,
-            manifest,
+            manifest: manifest.clone(),
             payload_bytes,
         };
         match self.send_rpc(&req).await? {
-            ClusterRpcResponse::VolumeRestoreStaged { success, .. } if success => Ok(()),
+            ClusterRpcResponse::VolumeRestoreStaged {
+                success,
+                acknowledgement,
+                snapshot_id,
+            } if success => {
+                if let Some(ack) = acknowledgement {
+                    Ok(ack)
+                } else {
+                    Ok(spine_cluster::protocol::ParticipantAcknowledgement {
+                        restore_id: format!("rst_{}", snapshot_id),
+                        backup_id: snapshot_id,
+                        participant_id: manifest.participant_id,
+                        volume_name: manifest.volume_name,
+                        previous_generation: None,
+                        target_generation: manifest.fencing_generation.to_string(),
+                        staged_digest: manifest.sha256_checksum,
+                        staged_byte_length: manifest.total_bytes,
+                        prepared_at_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                        prepared: true,
+                    })
+                }
+            }
             ClusterRpcResponse::VolumeRestoreStaged { .. } => {
                 Err(ForgeError::Internal("Stage restore rejected".into()))
             }
@@ -351,7 +372,7 @@ impl CoordinatorClient {
         &self,
         manifest: VolumeSnapshotManifest,
         payload_bytes: Vec<u8>,
-    ) -> Result<(), ForgeError> {
+    ) -> Result<spine_cluster::protocol::ParticipantAcknowledgement, ForgeError> {
         self.node_client
             .stage_restore(manifest, payload_bytes)
             .await

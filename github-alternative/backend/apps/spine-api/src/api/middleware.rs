@@ -64,7 +64,12 @@ impl AppState {
         storage_root: &std::path::Path,
         coordinator: Option<CoordinatorClient>,
     ) -> Result<Self, anyhow::Error> {
-        Self::new_with_profile(DeploymentProfile::CoreForge, db, storage_root, coordinator)
+        Self::new_with_profile(
+            DeploymentProfile::Development,
+            db,
+            storage_root,
+            coordinator,
+        )
     }
 
     pub fn new_with_profile(
@@ -141,7 +146,9 @@ impl AppState {
             .or_else(|_| std::env::var("APP_URL"))
             .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
 
-        let consistency_barrier = Arc::new(crate::backup::ConsistencyBarrier::new());
+        let consistency_barrier = Arc::new(
+            crate::backup::ConsistencyBarrier::new().with_storage_root(vcs.storage_root()),
+        );
 
         Ok(Self {
             profile,

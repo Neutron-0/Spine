@@ -1,8 +1,8 @@
-# Spine Release Candidate Manifest (Batch 21C Deployment Candidate)
+# Spine Release Candidate Manifest (Batch 21K Deployment Candidate)
 
-**Milestone:** Spine Batch 21C — Critical Backup Consistency, Restore Atomicity, Database Roles, and Deployment Remediation<br>
-**Baseline Commit:** `cc075d488dc78a506545465eb59a5d2e927d892e`<br>
-**Target Release:** Deployment Candidate for Independent Codex Re-Audit<br>
+**Milestone:** Spine Batch 21K — Production Global Restore Recovery, PostgreSQL Staging, Journal Durability, and Backup Confidentiality<br>
+**Baseline Commit:** `fa7bd142d4f42d8d86bb04d3c713067b944c77a9`<br>
+**Target Release:** Deployment Candidate for Thirteenth Independent Codex Audit<br>
 **Target Platform:** Linux x86_64, Windows x86_64  
 
 ---
@@ -14,6 +14,14 @@
 - **`spine-coordinator`**: Raft-based cluster state manager, distributed lease coordinator, and node health arbiter.
 - **`spine-storage-node`**: Object store engine hosting native `.spine` repositories, BLAKE3 `.spack` packfiles, and artifact stores.
 - **`spine`**: Native CLI version-control tool for developers (commits, branches, snapshots, diffs, remotes).
+
+#### Release Binary Hashes (`target/release-candidate/SHA256SUMS`):
+```text
+b3046c7b4bfd03c731ae7d9ef2771bf7fdd0fb0d4a18c5819025188ee88a5c9f  spine-api.exe
+09f06490a69c2211709dc26ae787cd808d3255d14f0c2627e05589da97fa5ea9  spine-coordinator.exe
+1c15ea3b4bfe99510ae27f575d1936cf01897379b5c9b315513d74a39597b2b1  spine-storage-node.exe
+db092b762833b7c25c75035b055869ccbad1afec14c6c288f6bf8e269414b7c3  spine.exe
+```
 
 ### 1.2. Frontend Web Assets
 - **`github-alternative/frontend/dist/`**: Production-optimized Single Page Application (Vite 6.4.5 + TypeScript + React/Tailwind), compiled cleanly with zero TypeScript errors and 0 vulnerabilities from `npm audit`.
@@ -75,3 +83,16 @@ All findings from the Tenth Independent Codex Audit (SPINE-21H-01 through SPINE-
 - **SPINE-21H-03 (P1)**: Coordinator `record_heartbeat` acquires writer guard; rejected during maintenance. Generation monotonicity enforced. Existing participants with missing fencing markers fail closed immediately (`bail!`). Safe atomic replace with `sync_all()`.
 - **SPINE-21H-04 (P1)**: Production readiness endpoint `/api/v1/health/ready` checking DB, storage root, coordinator, and all storage nodes with 2s bounded timeouts. Requires >=3 storage nodes under `CoreForge`. Healthchecks configured in `docker-compose.prod.yml` with service dependency wiring.
 - **SPINE-21H-05 (P1)**: Fixed SQL identifier vs literal quoting in `01-init-roles.sh`. Canonical database name contract detecting conflicts between `POSTGRES_DB` and `SPINE_POSTGRES_DB`. Immediate fail-fast termination on unreadable or empty password files.
+
+---
+
+## 6. Batch 21K Twelfth Audit Master Remediation Status
+
+All findings from the Twelfth Independent Codex Audit have been systematically resolved, end-to-end integrated, and verified:
+- **P0-A (Participant Acknowledgement Integration)**: `record_participant_ack` connected directly to production restore orchestration (`main.rs`) across all 7 participants (`postgres_data`, `spine_storage`, `storage_1_data`, `storage_2_data`, `storage_3_data`, `coordinator_data`, `spine_ssh`). RPC interfaces updated from generic boolean responses to typed `ParticipantAcknowledgement`. Journal strictly blocks `CommitDecision` if any participant is missing or unverified.
+- **P0-B (Distributed Startup Recovery & Fencing)**: Startup recovery reconciles all 7 participants across local storage, database, coordinator, and storage nodes. Node fencing generation monotonicity and write-rejection barriers prevent writes during unaligned generations. Incomplete restores fail closed immediately.
+- **P0-C (PostgreSQL Isolated Staging & Atomic Cutover)**: Completely eliminated direct restoration into the active production database pool prior to commit decision. Restores are staged in an isolated database `<db>_staged_<restore_id>` (or schema) and validated for completeness and generation token before `CommitDecision`. Atomic cutover (`ALTER DATABASE RENAME`) safely preserves the previous generation until finalization.
+- **P0-D (Global Journal Durability)**: Hardened `safe_atomic_replace` with readback validation, parent directory `sync_all()`, and temporary backups so `.last_valid` journal decisions are never destroyed during replace.
+- **P1 (Eliminated Plaintext Backup Staging)**: Removed intermediate unencrypted `staging.tar.gz`. Backups stream directly from compression (`GzEncoder`) into `SPNEBAK v2` authenticated ciphertext (`EncryptingWriter`), enforcing zero plaintext on disk for SSH keys and sensitive data.
+- **P1 (Readiness & Consistency Barrier Write Gate)**: `/api/v1/health/ready` strictly checks responding node IDs against expected IDs (rejecting `None`) and enforces cluster generation alignment. Consistency barrier write permit acquisition inspects restore journals and rejects writes with `ServiceUnavailable` during active restores or generation divergence.
+- **P1 (Regression Defect Resolution)**: Fixed recursive directory migration via `safe_move_path` ensuring absent files/directories in newer generations do not survive cutovers, resolving Windows OS error 650. Passed all tests in `git-alternative` and `github-alternative` 100%.

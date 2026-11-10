@@ -109,12 +109,10 @@ pub async fn health_readiness(State(state): State<AppState>) -> impl IntoRespons
                         if in_maint {
                             return None;
                         }
-                        if let Some(ref r_id) = responding_id {
-                            if r_id != expected_id {
-                                return None;
-                            }
+                        match responding_id {
+                            Some(ref r_id) if r_id == expected_id => Some(gen),
+                            _ => None,
                         }
-                        Some(gen)
                     }
                     Err(_) => None,
                 }
@@ -141,6 +139,20 @@ pub async fn health_readiness(State(state): State<AppState>) -> impl IntoRespons
 
     // Check generation consistency across all responsive cluster participants
     let mut cluster_consistent = true;
+    let storage_gen = RestoreJournal::read_storage_generation(storage_root);
+    let db_gen_res = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.db.get_restore_generation(),
+    )
+    .await;
+    let db_gen = db_gen_res.ok().and_then(|r| r.ok()).flatten();
+
+    if let (Some(ref d_gen), Some(ref s_gen)) = (&db_gen, &storage_gen) {
+        if d_gen != s_gen {
+            cluster_consistent = false;
+        }
+    }
+
     if let Some(c_gen) = coord_gen {
         for n_gen in &node_generations {
             if *n_gen != c_gen {

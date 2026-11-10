@@ -152,152 +152,222 @@ pub fn build_chunk_aad(
     aad
 }
 
+/// Streaming authenticated encrypting writer (SPNEBAK v2).
+/// Wraps any `Write` sink, derives keys, writes header, and seals plaintext in bounded chunks.
+/// Enables streaming TAR and GZ generation directly into AEAD ciphertext without temporary disk staging.
+pub struct EncryptingWriter<W: Write> {
+    writer: W,
+    key_bytes: [u8; 32],
+    archive_id: [u8; 16],
+    nonce_prefix: [u8; NONCE_PREFIX_LEN],
+    chunk_size: usize,
+    buffer: Vec<u8>,
+    chunk_index: u64,
+    total_bytes: u64,
+    stream_hasher: Sha256,
+    finished: bool,
+}
+
+impl<W: Write> EncryptingWriter<W> {
+    pub fn new(
+        mut writer: W,
+        passphrase: &str,
+        key_version: u16,
+        chunk_size: u32,
+    ) -> Result<Self, ForgeError> {
+        if passphrase.trim().is_empty() {
+            return Err(ForgeError::Internal(
+                "Backup encryption passphrase cannot be empty".to_string(),
+            ));
+        }
+
+        let rng = SystemRandom::new();
+        let mut salt = [0u8; SALT_LEN];
+        rng.fill(&mut salt)
+            .map_err(|_| ForgeError::Internal("Failed to generate random salt".to_string()))?;
+
+        let mut nonce_prefix = [0u8; NONCE_PREFIX_LEN];
+        rng.fill(&mut nonce_prefix).map_err(|_| {
+            ForgeError::Internal("Failed to generate random nonce prefix".to_string())
+        })?;
+
+        let archive_uuid = Uuid::new_v4();
+        let archive_id = *archive_uuid.as_bytes();
+
+        let header = BackupHeaderV2 {
+            key_version,
+            pbkdf2_iterations: DEFAULT_PBKDF2_ITERATIONS,
+            salt,
+            archive_id,
+            nonce_prefix,
+            chunk_size,
+        };
+
+        writer
+            .write_all(&header.to_bytes())
+            .map_err(|e| ForgeError::Internal(format!("Failed to write header: {}", e)))?;
+
+        let key_bytes = derive_key(passphrase, &salt, DEFAULT_PBKDF2_ITERATIONS);
+
+        Ok(Self {
+            writer,
+            key_bytes,
+            archive_id,
+            nonce_prefix,
+            chunk_size: chunk_size as usize,
+            buffer: Vec::with_capacity(chunk_size as usize),
+            chunk_index: 0,
+            total_bytes: 0,
+            stream_hasher: Sha256::new(),
+            finished: false,
+        })
+    }
+
+    fn write_chunk(&mut self, data: &[u8]) -> Result<(), ForgeError> {
+        self.total_bytes += data.len() as u64;
+        self.stream_hasher.update(data);
+
+        let nonce = build_chunk_nonce(&self.nonce_prefix, self.chunk_index);
+        let aad = build_chunk_aad(
+            &self.archive_id,
+            self.chunk_index,
+            CHUNK_TYPE_DATA,
+            data.len() as u32,
+        );
+
+        let unbound_key = UnboundKey::new(&AES_256_GCM, &self.key_bytes)
+            .map_err(|e| ForgeError::Internal(format!("AEAD key error: {:?}", e)))?;
+        let mut sealing_key = SealingKey::new(unbound_key, OneNonce(Some(nonce)));
+
+        let mut payload = data.to_vec();
+        sealing_key
+            .seal_in_place_append_tag(Aad::from(&aad), &mut payload)
+            .map_err(|e| ForgeError::Internal(format!("AEAD seal error: {:?}", e)))?;
+
+        let ct_len = payload.len() as u32;
+        self.writer
+            .write_all(&[CHUNK_TYPE_DATA])
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        self.writer
+            .write_all(&self.chunk_index.to_be_bytes())
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        self.writer
+            .write_all(&ct_len.to_be_bytes())
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        self.writer
+            .write_all(&payload)
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        self.chunk_index += 1;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<StreamSummary, ForgeError> {
+        if self.finished {
+            return Err(ForgeError::Internal(
+                "EncryptingWriter already finished".into(),
+            ));
+        }
+        self.finished = true;
+
+        if !self.buffer.is_empty() {
+            let data = std::mem::take(&mut self.buffer);
+            self.write_chunk(&data)?;
+        }
+
+        // Write final authenticated manifest chunk (CHUNK_TYPE_FINAL)
+        let stream_hash: [u8; 32] = self.stream_hasher.finalize().into();
+        let mut manifest_payload = Vec::with_capacity(8 + 8 + 32);
+        manifest_payload.extend_from_slice(&self.chunk_index.to_be_bytes()); // total data chunks
+        manifest_payload.extend_from_slice(&self.total_bytes.to_be_bytes()); // total bytes
+        manifest_payload.extend_from_slice(&stream_hash);
+
+        let manifest_plain_len = manifest_payload.len() as u32;
+        let nonce = build_chunk_nonce(&self.nonce_prefix, self.chunk_index);
+        let aad = build_chunk_aad(
+            &self.archive_id,
+            self.chunk_index,
+            CHUNK_TYPE_FINAL,
+            manifest_plain_len,
+        );
+
+        let unbound_key = UnboundKey::new(&AES_256_GCM, &self.key_bytes)
+            .map_err(|e| ForgeError::Internal(format!("AEAD key error: {:?}", e)))?;
+        let mut sealing_key = SealingKey::new(unbound_key, OneNonce(Some(nonce)));
+
+        sealing_key
+            .seal_in_place_append_tag(Aad::from(&aad), &mut manifest_payload)
+            .map_err(|e| {
+                ForgeError::Internal(format!("AEAD seal error on final manifest: {:?}", e))
+            })?;
+
+        let final_ct_len = manifest_payload.len() as u32;
+        self.writer
+            .write_all(&[CHUNK_TYPE_FINAL])
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        self.writer
+            .write_all(&self.chunk_index.to_be_bytes())
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        self.writer
+            .write_all(&final_ct_len.to_be_bytes())
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        self.writer
+            .write_all(&manifest_payload)
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        self.writer
+            .flush()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        Ok(StreamSummary {
+            total_chunks: self.chunk_index,
+            total_plaintext_bytes: self.total_bytes,
+            stream_sha256: stream_hash,
+        })
+    }
+}
+
+impl<W: Write> Write for EncryptingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buffer.extend_from_slice(buf);
+        while self.buffer.len() >= self.chunk_size {
+            let chunk: Vec<u8> = self.buffer.drain(..self.chunk_size).collect();
+            self.write_chunk(&chunk)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+}
+
 /// Streams plaintext from `reader`, encrypts in bounded chunks using AES-256-GCM,
 /// and writes the SPNEBAK v2 framed archive to `writer`.
 ///
 /// Memory footprint is strictly bounded to O(chunk_size) regardless of stream length.
 pub fn encrypt_stream<R: Read, W: Write>(
     mut reader: R,
-    mut writer: W,
+    writer: W,
     passphrase: &str,
     key_version: u16,
     chunk_size: u32,
 ) -> Result<StreamSummary, ForgeError> {
-    if passphrase.trim().is_empty() {
-        return Err(ForgeError::Internal(
-            "Backup encryption passphrase cannot be empty".to_string(),
-        ));
-    }
-
-    let rng = SystemRandom::new();
-    let mut salt = [0u8; SALT_LEN];
-    rng.fill(&mut salt)
-        .map_err(|_| ForgeError::Internal("Failed to generate random salt".to_string()))?;
-
-    let mut nonce_prefix = [0u8; NONCE_PREFIX_LEN];
-    rng.fill(&mut nonce_prefix)
-        .map_err(|_| ForgeError::Internal("Failed to generate random nonce prefix".to_string()))?;
-
-    let archive_uuid = Uuid::new_v4();
-    let archive_id = *archive_uuid.as_bytes();
-
-    let header = BackupHeaderV2 {
-        key_version,
-        pbkdf2_iterations: DEFAULT_PBKDF2_ITERATIONS,
-        salt,
-        archive_id,
-        nonce_prefix,
-        chunk_size,
-    };
-
-    writer
-        .write_all(&header.to_bytes())
-        .map_err(|e| ForgeError::Internal(format!("Failed to write header: {}", e)))?;
-
-    let key_bytes = derive_key(passphrase, &salt, DEFAULT_PBKDF2_ITERATIONS);
-
-    let mut chunk_index = 0u64;
-    let mut total_bytes = 0u64;
-    let mut stream_hasher = Sha256::new();
-
-    let mut read_buf = vec![0u8; chunk_size as usize];
-
+    let mut enc_writer = EncryptingWriter::new(writer, passphrase, key_version, chunk_size)?;
+    let mut buf = vec![0u8; chunk_size as usize];
     loop {
-        let mut chunk_len = 0usize;
-        while chunk_len < read_buf.len() {
-            let n = reader
-                .read(&mut read_buf[chunk_len..])
-                .map_err(|e| ForgeError::Internal(format!("Read error: {}", e)))?;
-            if n == 0 {
-                break;
-            }
-            chunk_len += n;
-        }
-
-        if chunk_len == 0 {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| ForgeError::Internal(format!("Read error: {}", e)))?;
+        if n == 0 {
             break;
         }
-
-        total_bytes += chunk_len as u64;
-        stream_hasher.update(&read_buf[..chunk_len]);
-
-        let nonce = build_chunk_nonce(&nonce_prefix, chunk_index);
-        let aad = build_chunk_aad(&archive_id, chunk_index, CHUNK_TYPE_DATA, chunk_len as u32);
-
-        let unbound_key = UnboundKey::new(&AES_256_GCM, &key_bytes)
-            .map_err(|e| ForgeError::Internal(format!("AEAD key error: {:?}", e)))?;
-        let mut sealing_key = SealingKey::new(unbound_key, OneNonce(Some(nonce)));
-
-        let mut payload = read_buf[..chunk_len].to_vec();
-        sealing_key
-            .seal_in_place_append_tag(Aad::from(&aad), &mut payload)
-            .map_err(|e| ForgeError::Internal(format!("AEAD seal error: {:?}", e)))?;
-
-        // Write frame: [Type: 1B][Index: 8B BE][Ciphertext Len: 4B BE][Payload (Ciphertext + Tag)]
-        let ct_len = payload.len() as u32;
-        writer
-            .write_all(&[CHUNK_TYPE_DATA])
-            .map_err(|e| ForgeError::Internal(e.to_string()))?;
-        writer
-            .write_all(&chunk_index.to_be_bytes())
-            .map_err(|e| ForgeError::Internal(e.to_string()))?;
-        writer
-            .write_all(&ct_len.to_be_bytes())
-            .map_err(|e| ForgeError::Internal(e.to_string()))?;
-        writer
-            .write_all(&payload)
-            .map_err(|e| ForgeError::Internal(e.to_string()))?;
-
-        chunk_index += 1;
+        enc_writer
+            .write_all(&buf[..n])
+            .map_err(|e| ForgeError::Internal(format!("Write error: {}", e)))?;
     }
-
-    // Write final authenticated manifest chunk (CHUNK_TYPE_FINAL)
-    let stream_hash: [u8; 32] = stream_hasher.finalize().into();
-    let mut manifest_payload = Vec::with_capacity(8 + 8 + 32);
-    manifest_payload.extend_from_slice(&chunk_index.to_be_bytes()); // total data chunks
-    manifest_payload.extend_from_slice(&total_bytes.to_be_bytes()); // total bytes
-    manifest_payload.extend_from_slice(&stream_hash);
-
-    let manifest_plain_len = manifest_payload.len() as u32;
-    let nonce = build_chunk_nonce(&nonce_prefix, chunk_index);
-    let aad = build_chunk_aad(
-        &archive_id,
-        chunk_index,
-        CHUNK_TYPE_FINAL,
-        manifest_plain_len,
-    );
-
-    let unbound_key = UnboundKey::new(&AES_256_GCM, &key_bytes)
-        .map_err(|e| ForgeError::Internal(format!("AEAD key error: {:?}", e)))?;
-    let mut sealing_key = SealingKey::new(unbound_key, OneNonce(Some(nonce)));
-
-    sealing_key
-        .seal_in_place_append_tag(Aad::from(&aad), &mut manifest_payload)
-        .map_err(|e| ForgeError::Internal(format!("AEAD seal error on final manifest: {:?}", e)))?;
-
-    let final_ct_len = manifest_payload.len() as u32;
-    writer
-        .write_all(&[CHUNK_TYPE_FINAL])
-        .map_err(|e| ForgeError::Internal(e.to_string()))?;
-    writer
-        .write_all(&chunk_index.to_be_bytes())
-        .map_err(|e| ForgeError::Internal(e.to_string()))?;
-    writer
-        .write_all(&final_ct_len.to_be_bytes())
-        .map_err(|e| ForgeError::Internal(e.to_string()))?;
-    writer
-        .write_all(&manifest_payload)
-        .map_err(|e| ForgeError::Internal(e.to_string()))?;
-
-    writer
-        .flush()
-        .map_err(|e| ForgeError::Internal(format!("Flush error: {}", e)))?;
-
-    Ok(StreamSummary {
-        total_chunks: chunk_index,
-        total_plaintext_bytes: total_bytes,
-        stream_sha256: stream_hash,
-    })
+    enc_writer.finish()
 }
 
 /// Streams encrypted chunks from `reader`, authenticates and decrypts with AES-256-GCM,

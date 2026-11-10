@@ -6,7 +6,7 @@ use crate::gc::TombstoneRecord;
 use crate::heartbeat::NodeHeartbeat;
 use crate::node::{NodeStatus, StorageNodeInfo};
 use crate::placement::PlacementPlan;
-use crate::protocol::VolumeSnapshotManifest;
+use crate::protocol::{ParticipantAcknowledgement, VolumeSnapshotManifest};
 use crate::repair::RepairJob;
 use crate::transaction::ReplicationTransaction;
 use anyhow::{bail, Context, Result};
@@ -116,7 +116,7 @@ pub trait CoordinatorStore: Send + Sync {
         snapshot_id: &str,
         fencing_generation: u64,
         payload: &[u8],
-    ) -> Result<()>;
+    ) -> Result<ParticipantAcknowledgement>;
     fn commit_restore(&self, snapshot_id: &str, fencing_generation: u64) -> Result<()>;
     fn rollback_restore(&self, snapshot_id: &str) -> Result<()>;
     fn finalize_restore(&self, snapshot_id: &str) -> Result<()>;
@@ -134,7 +134,12 @@ pub struct FileBackedCoordinatorStore {
 }
 
 pub fn safe_atomic_replace(from: &Path, to: &Path) -> Result<()> {
-    if fs::rename(from, to).is_ok() {
+    if fs::rename(from, to).is_ok() && to.exists() && fs::metadata(to).is_ok() {
+        if let Some(parent) = to.parent() {
+            if let Ok(p_file) = fs::File::open(parent) {
+                let _ = p_file.sync_all();
+            }
+        }
         return Ok(());
     }
     if to.exists() {
@@ -143,8 +148,21 @@ pub fn safe_atomic_replace(from: &Path, to: &Path) -> Result<()> {
             .with_context(|| format!("Failed to backup {} during replace", to.display()))?;
         match fs::rename(from, to) {
             Ok(()) => {
-                let _ = fs::remove_file(&backup);
-                Ok(())
+                if to.exists() && fs::metadata(to).is_ok() {
+                    if let Some(parent) = to.parent() {
+                        if let Ok(p_file) = fs::File::open(parent) {
+                            let _ = p_file.sync_all();
+                        }
+                    }
+                    let _ = fs::remove_file(&backup);
+                    Ok(())
+                } else {
+                    let _ = fs::rename(&backup, to);
+                    bail!(
+                        "Readback verification failed after replacing {}",
+                        to.display()
+                    );
+                }
             }
             Err(e) => {
                 let _ = fs::rename(&backup, to);
@@ -154,8 +172,21 @@ pub fn safe_atomic_replace(from: &Path, to: &Path) -> Result<()> {
     } else {
         fs::copy(from, to)
             .with_context(|| format!("Failed to copy {} to {}", from.display(), to.display()))?;
-        let _ = fs::remove_file(from);
-        Ok(())
+        if to.exists() && fs::metadata(to).is_ok() {
+            if let Some(parent) = to.parent() {
+                if let Ok(p_file) = fs::File::open(parent) {
+                    let _ = p_file.sync_all();
+                }
+            }
+            let _ = fs::remove_file(from);
+            Ok(())
+        } else {
+            let _ = fs::remove_file(to);
+            bail!(
+                "Readback verification failed after copying {}",
+                to.display()
+            );
+        }
     }
 }
 
@@ -654,7 +685,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
         snapshot_id: &str,
         fencing_generation: u64,
         payload: &[u8],
-    ) -> Result<()> {
+    ) -> Result<ParticipantAcknowledgement> {
         if !self.in_maintenance.load(Ordering::SeqCst) {
             bail!("Coordinator must be in maintenance mode to stage restore");
         }
@@ -697,7 +728,30 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
 
         let mut staged = self.staged_restore.write().unwrap();
         *staged = Some(staged_record);
-        Ok(())
+
+        use sha2::Sha256;
+        let mut hasher = Sha256::new();
+        hasher.update(payload);
+        let staged_digest = hex::encode(hasher.finalize());
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+
+        let ack = ParticipantAcknowledgement {
+            restore_id: format!("rst_{}", snapshot_id),
+            backup_id: snapshot_id.to_string(),
+            participant_id: "coordinator".to_string(),
+            volume_name: "coordinator_data".to_string(),
+            previous_generation: Some(cur_gen.to_string()),
+            target_generation: fencing_generation.to_string(),
+            staged_digest,
+            staged_byte_length: payload.len() as u64,
+            prepared_at_nanos: now_nanos,
+            prepared: true,
+        };
+
+        Ok(ack)
     }
 
     fn commit_restore(&self, snapshot_id: &str, fencing_generation: u64) -> Result<()> {

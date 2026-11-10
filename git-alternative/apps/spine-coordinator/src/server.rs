@@ -354,9 +354,10 @@ async fn handle_coordinator_connection(
             manifest: _,
             payload_bytes,
         } => match store.stage_restore(&snapshot_id, fencing_generation, &payload_bytes) {
-            Ok(_) => ClusterRpcResponse::VolumeRestoreStaged {
+            Ok(ack) => ClusterRpcResponse::VolumeRestoreStaged {
                 snapshot_id,
                 success: true,
+                acknowledgement: Some(ack),
             },
             Err(e) => ClusterRpcResponse::Error(e.to_string()),
         },
