@@ -507,12 +507,39 @@ impl RestoreJournal {
             let existing_bytes = std::fs::read(&path).map_err(|e| {
                 ForgeError::Internal(format!("Failed to read existing journal for backup: {}", e))
             })?;
-            serde_json::from_slice::<Self>(&existing_bytes).map_err(|e| {
+            let existing: Self = serde_json::from_slice(&existing_bytes).map_err(|e| {
                 ForgeError::Internal(format!(
                     "Existing journal is corrupt, cannot create last_valid backup: {}",
                     e
                 ))
             })?;
+
+            if existing.restore_id == candidate.restore_id {
+                // Sequence monotonicity check
+                if candidate.sequence_number <= existing.sequence_number {
+                    return Err(ForgeError::Internal(format!(
+                        "Restore journal sequence monotonicity violation: candidate sequence {} <= existing sequence {}",
+                        candidate.sequence_number, existing.sequence_number
+                    )));
+                }
+                // Once CommitDecision is made, subsequent transitions MUST retain it
+                if existing.commit_decision.is_some() && candidate.commit_decision.is_none() {
+                    return Err(ForgeError::Internal(
+                        "Restore journal invariant violation: cannot erase durable commit_decision once established"
+                            .to_string(),
+                    ));
+                }
+            } else if existing.commit_decision.is_some()
+                && existing.phase != RestorePhase::Committed
+                && existing.phase != RestorePhase::Completed
+            {
+                // Prevent starting or persisting a different restore over an unrecovered committed restore
+                return Err(ForgeError::Internal(format!(
+                    "Cannot overwrite unrecovered committed restore session '{}' with new restore '{}'",
+                    existing.restore_id, candidate.restore_id
+                )));
+            }
+
             let tmp_lv = parent.join(format!(".tmp_lv_{}.json", uuid::Uuid::new_v4().simple()));
             let mut lv_file = std::fs::File::create(&tmp_lv).map_err(|e| {
                 ForgeError::Internal(format!(
@@ -532,10 +559,16 @@ impl RestoreJournal {
             super::safe_atomic_replace(&tmp_lv, &last_valid)?;
         }
 
-        // 3. Serialize candidate and write to temporary file
+        // 3. Serialize candidate, pre-validate deserialization, and write to temporary file
         let tmp_path = parent.join(format!(".tmp_jnl_{}.json", uuid::Uuid::new_v4().simple()));
         let json_data = serde_json::to_string_pretty(&candidate)
             .map_err(|e| ForgeError::Internal(format!("Failed to serialize journal: {}", e)))?;
+        serde_json::from_str::<Self>(&json_data).map_err(|e| {
+            ForgeError::Internal(format!(
+                "Candidate journal serialization validation failed: {}",
+                e
+            ))
+        })?;
         {
             let mut f = std::fs::File::create(&tmp_path).map_err(|e| {
                 ForgeError::Internal(format!("Failed to create temporary journal: {}", e))

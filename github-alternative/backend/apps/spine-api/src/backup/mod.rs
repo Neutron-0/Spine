@@ -117,7 +117,15 @@ pub fn safe_move_path(from: &Path, to: &Path) -> Result<(), ForgeError> {
     }
 }
 
-/// Safely flush a directory handle across platforms (propagates Unix directory flush errors and checks Windows existence).
+/// Safely flush a directory handle across platforms.
+///
+/// On POSIX systems, opens the directory file descriptor and executes `fsync` (`sync_all`).
+/// On Windows systems, directory handles cannot be passed to `FlushFileBuffers` without triggering
+/// Win32 OS error 650 (`ERROR_DIRECTORY_NOT_SUPPORTED` / `STATUS_DIRECTORY_IS_A_FILE`) or error 1 (`ERROR_INVALID_FUNCTION`).
+/// Windows durability is instead guaranteed by file-level `FlushFileBuffers` combined with atomic replacements
+/// via `ReplaceFileW` and `MoveFileExW` using `REPLACEFILE_WRITE_THROUGH` and `MOVEFILE_WRITE_THROUGH`, which flush
+/// both the file payload and the containing directory's MFT metadata to physical media. `sync_dir` on Windows
+/// verifies directory presence without issuing unsupported flush calls.
 pub fn sync_dir(dir: &Path) -> Result<(), ForgeError> {
     #[cfg(windows)]
     {

@@ -53,14 +53,25 @@ All binaries were staged into `target/release-candidate/` and authenticated via 
 | `spine.exe` | 8,829,440 | `3f83d398ca2ed473e081b65e5c23f8d8b1b894eb8a656fc99a15f4835321f17f` | Native CLI client and repository management |
 | `spine-coordinator.exe` | 2,654,720 | `3b6a3b948dd5987aebabcd370698f056e23edac1a4dc94113fef2615f9363e16` | Distributed cluster consensus and routing coordinator |
 | `spine-storage-node.exe` | 2,441,728 | `4c27906172fb63b9fe9ef0c68feaec9ec4e673a12d7be4837dfb2f7be91835e6` | Storage-node volume daemon with fenced write-guards |
-| `spine-api.exe` | 22,324,736 | `a28f828430ead4b8459b6e3ffa9fa0e84a260670430aeb5c08719da6afe0d840` | Production Web API, Auth, and Backup/Restore orchestrator |
+| `spine-api.exe` | 22,516,736 | `2ceeb6db2b8307f607b87cb02ffb55a18dffa7fa64720ce11670b59a21da5e50` | Production Web API, Auth, and Backup/Restore orchestrator |
 
 ---
 
-## 5. Security & Verification Assertions
+## 5. Machine-Readable CycloneDX SBOM
+
+A complete, machine-readable Software Bill of Materials conforming to the [CycloneDX v1.5 specification](http://cyclonedx.org/schema/bom-1.5.json) is published alongside this document at:
+
+- **JSON Document:** `docs/sbom.json`
+- **Component Count:** 465 verified dependencies with package URLs (purl) and SHA-256 package digests
+- **Format:** CycloneDX JSON 1.5
+
+---
+
+## 6. Security & Verification Assertions
 
 1. **Selector Authority:** Single source of database selection truth (`_spine_active_database_selector` in maintenance database) via transactional row-locking (`SELECT FOR UPDATE`) CAS updates. Filesystem selector cache removed from write gates and readback validation.
-2. **Participant Integrity:** Pre-decision revalidation verifies extracted content hashes and counts directly on disk before committing restore state transitions.
-3. **Fail-Closed Write Gating:** Database readiness, write-permit acquisition, and HTTP route pipelines reject mutations unless authoritative database generation matches storage generation and active journal state is clear.
-4. **Win32 Durability:** All journal, state, and selector atomic replacements use native Win32 `ReplaceFileW` and `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` (or POSIX `rename` + parent directory `sync_all`), completely resolving Windows error 650.
-5. **Decryption Confidentiality:** Zero unencrypted intermediate archives written to disk during backup decompression; stream decryption executes chunk-by-chunk in bounded memory via AES-256-GCM.
+2. **Post-Decision Invariant:** Zero participant rollbacks permitted after `CommitDecision` is durably persisted. Failed post-decision transitions fail closed with write fencing preserved, and restart recovery converges forward idempotently.
+3. **Seven-Participant Binding:** Pre-decision revalidation verifies all 7 participants (`postgres_data`, `spine_storage`, `storage_1_data`, `storage_2_data`, `storage_3_data`, `coordinator_data`, `spine_ssh`) with exact field-level comparison of `restore_id`, `backup_id`, `target_generation`, and payload SHA-256 digests.
+4. **Fail-Closed Write Gating:** Database readiness, write-permit acquisition, and HTTP route pipelines reject mutations unless authoritative database generation matches storage generation and active journal state is clear.
+5. **Win32 Durability:** All journal, state, and selector atomic replacements use native Win32 `ReplaceFileW` and `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` (or POSIX `rename` + parent directory `sync_all`), completely resolving Windows error 650.
+6. **Decryption Confidentiality:** Zero unencrypted intermediate archives written to disk during backup decompression; stream decryption executes chunk-by-chunk in bounded memory via AES-256-GCM.

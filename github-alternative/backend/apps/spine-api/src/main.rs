@@ -406,11 +406,26 @@ async fn main() -> anyhow::Result<()> {
                     "DATABASE_URL or MIGRATION_DATABASE_URL must be provided for migration"
                 )
             })?;
+
+            let storage_root = std::env::var("SPINE_STORAGE_ROOT")
+                .or_else(|_| std::env::var("STORAGE_ROOT"))
+                .ok()
+                .map(PathBuf::from);
+
+            let active_db_url = spine_api::db::DatabaseSelector::resolve_active_db_url(
+                &db_url,
+                storage_root.as_deref(),
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Database selector resolution failed for migration: {}", e)
+            })?;
+
             println!(
                 "Connecting to PostgreSQL database for migration: {}",
-                sanitize_db_url(&db_url)
+                sanitize_db_url(&active_db_url)
             );
-            let pool = sqlx::PgPool::connect(&db_url).await.map_err(|e| {
+            let pool = sqlx::PgPool::connect(&active_db_url).await.map_err(|e| {
                 anyhow::anyhow!("Failed to connect to PostgreSQL for migration: {}", e)
             })?;
             spine_api::db::migrations::run_migrations(&pool)
@@ -441,6 +456,12 @@ async fn main() -> anyhow::Result<()> {
                 Some("POSTGRES_APP_PASSWORD"),
                 Some("POSTGRES_APP_PASSWORD_FILE"),
             )?;
+
+            let storage_root = std::env::var("SPINE_STORAGE_ROOT")
+                .or_else(|_| std::env::var("STORAGE_ROOT"))
+                .ok()
+                .map(PathBuf::from);
+
             let db: Arc<dyn Database> = if prof.requires_persistent_database() {
                 if in_memory_db {
                     anyhow::bail!(
@@ -454,15 +475,37 @@ async fn main() -> anyhow::Result<()> {
                         prof
                     )
                 })?;
-                println!("Connecting to PostgreSQL database for admin bootstrap...");
-                Arc::new(PgDatabase::connect_and_migrate(&url).await?)
+                let active_url = spine_api::db::DatabaseSelector::resolve_active_db_url(
+                    &url,
+                    storage_root.as_deref(),
+                )
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("Database selector resolution failed for bootstrap: {}", e)
+                })?;
+                println!(
+                    "Connecting to PostgreSQL database for admin bootstrap ({})...",
+                    sanitize_db_url(&active_url)
+                );
+                Arc::new(PgDatabase::connect_and_migrate(&active_url).await?)
             } else if in_memory_db || db_url.is_none() {
                 println!("Initializing bootstrap with in-memory database...");
                 Arc::new(InMemoryDatabase::new())
             } else {
                 let url = db_url.unwrap();
-                println!("Connecting to PostgreSQL database for admin bootstrap...");
-                Arc::new(PgDatabase::connect_and_migrate(&url).await?)
+                let active_url = spine_api::db::DatabaseSelector::resolve_active_db_url(
+                    &url,
+                    storage_root.as_deref(),
+                )
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("Database selector resolution failed for bootstrap: {}", e)
+                })?;
+                println!(
+                    "Connecting to PostgreSQL database for admin bootstrap ({})...",
+                    sanitize_db_url(&active_url)
+                );
+                Arc::new(PgDatabase::connect_and_migrate(&active_url).await?)
             };
 
             // Single execution lockout check
@@ -648,11 +691,20 @@ async fn main() -> anyhow::Result<()> {
                 let snap_file_path = tmp_snap_dir.path().join("snapshot.jsonl");
 
                 let (_guard_barrier, _maintenance_guard) = if let Some(url) = db_url {
+                    let resolved_url = spine_api::db::DatabaseSelector::resolve_active_db_url(
+                        &url,
+                        Some(&storage_root),
+                    )
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("Database selector resolution failed for backup: {}", e)
+                    })?;
+
                     println!(
                         "Connecting to PostgreSQL to coordinate maintenance barrier: {}...",
-                        sanitize_db_url(&url)
+                        sanitize_db_url(&resolved_url)
                     );
-                    let pool = sqlx::PgPool::connect(&url).await.map_err(|e| {
+                    let pool = sqlx::PgPool::connect(&resolved_url).await.map_err(|e| {
                         anyhow::anyhow!("Failed to connect to PostgreSQL for backup: {}", e)
                     })?;
 
@@ -1418,6 +1470,20 @@ async fn main() -> anyhow::Result<()> {
                     for (snap_id, _, client) in &staged_cluster_restores {
                         match client.query_staged_restore(snap_id).await {
                             Ok(Some(ack)) if ack.prepared => {
+                                if ack.restore_id != session.journal.restore_id {
+                                    revalidation_failed = Some(format!(
+                                        "Cluster node restore_id mismatch for snapshot '{}': expected {}, got {}",
+                                        snap_id, session.journal.restore_id, ack.restore_id
+                                    ));
+                                    break;
+                                }
+                                if ack.backup_id != session.manifest.backup_id {
+                                    revalidation_failed = Some(format!(
+                                        "Cluster node backup_id mismatch for snapshot '{}': expected {}, got {}",
+                                        snap_id, session.manifest.backup_id, ack.backup_id
+                                    ));
+                                    break;
+                                }
                                 if ack.target_generation != session.journal.target_generation {
                                     revalidation_failed = Some(format!(
                                         "Cluster node target generation mismatch for snapshot '{}': expected {}, got {}",
@@ -1427,12 +1493,26 @@ async fn main() -> anyhow::Result<()> {
                                 }
                                 if ack.staged_digest.trim().is_empty() {
                                     revalidation_failed = Some(format!(
-                                        "Cluster node for snapshot '{}' returned empty digest",
+                                        "Cluster node for snapshot '{}' returned empty staged digest",
                                         snap_id
                                     ));
                                     break;
                                 }
-                                tracing::info!("Decision boundary: Cluster participant for snapshot '{}' verified prepared.", snap_id);
+                                if let Some(m) = session.manifest.participants.iter().find(|p| {
+                                    p.snapshot_id == *snap_id
+                                        || p.participant_id == ack.participant_id
+                                }) {
+                                    if !ack.archive_payload_sha256.is_empty()
+                                        && ack.archive_payload_sha256 != m.sha256_checksum
+                                    {
+                                        revalidation_failed = Some(format!(
+                                            "Cluster node '{}' archive payload SHA-256 mismatch: manifest has {}, ack has {}",
+                                            ack.participant_id, m.sha256_checksum, ack.archive_payload_sha256
+                                        ));
+                                        break;
+                                    }
+                                }
+                                tracing::info!("Decision boundary: Cluster participant for snapshot '{}' verified prepared across all fields.", snap_id);
                             }
                             Ok(Some(_)) => {
                                 revalidation_failed = Some(format!(
@@ -1525,17 +1605,20 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(ref sdb) = staged_db_restore {
                     println!("Atomically cutting over staged database to live target database...");
                     if let Err(e) = sdb.commit_cutover(&target_storage).await {
-                        for (snap_id, _, client) in &staged_cluster_restores {
-                            let _ = client.rollback_restore(snap_id).await;
-                        }
-                        if let Some(ref s_storage) = staged_storage_adapter {
-                            let _ = s_storage.rollback();
-                        }
-                        if let Some(ref s_ssh) = staged_ssh_adapter {
-                            let _ = s_ssh.rollback();
-                        }
-                        let _ = session.abort(&format!("Database cutover failed: {}", e));
-                        anyhow::bail!("Failed to cut over database: {}. Target repository storage was left untouched.", e);
+                        // After CommitDecision, NEVER roll back participants. Fencing remains active.
+                        let _ =
+                            session
+                                .journal
+                                .persist(spine_api::backup::RestorePhase::Publishing {
+                                    published_participants: session
+                                        .journal
+                                        .published_participants
+                                        .clone(),
+                                });
+                        anyhow::bail!(
+                            "FATAL: Database cutover failed after durable CommitDecision: {}. Writes remain fenced; restart recovery will resume forward convergence.",
+                            e
+                        );
                     }
                     session
                         .journal
@@ -1549,18 +1632,20 @@ async fn main() -> anyhow::Result<()> {
                 let manifest = session.manifest.clone();
                 let report = if let Some(ref s_storage) = staged_storage_adapter {
                     if let Err(e) = s_storage.publish() {
-                        for (r_snap, _, r_client) in &staged_cluster_restores {
-                            let _ = r_client.rollback_restore(r_snap).await;
-                        }
-                        if let Some(ref sdb) = staged_db_restore {
-                            let _ = sdb.rollback().await;
-                        }
-                        if let Some(ref s_ssh) = staged_ssh_adapter {
-                            let _ = s_ssh.rollback();
-                        }
-                        let _ = s_storage.rollback();
-                        let _ = session.rollback();
-                        anyhow::bail!("Failed to publish verified storage to live root: {}", e);
+                        // After CommitDecision, NEVER roll back participants. Fencing remains active.
+                        let _ =
+                            session
+                                .journal
+                                .persist(spine_api::backup::RestorePhase::Publishing {
+                                    published_participants: session
+                                        .journal
+                                        .published_participants
+                                        .clone(),
+                                });
+                        anyhow::bail!(
+                            "FATAL: Storage publication failed after durable CommitDecision: {}. Writes remain fenced; restart recovery will resume forward convergence.",
+                            e
+                        );
                     }
                     let _ = session
                         .journal
@@ -1581,17 +1666,19 @@ async fn main() -> anyhow::Result<()> {
                             r
                         }
                         Err(e) => {
-                            for (r_snap, _, r_client) in &staged_cluster_restores {
-                                let _ = r_client.rollback_restore(r_snap).await;
-                            }
-                            if let Some(ref sdb) = staged_db_restore {
-                                let _ = sdb.rollback().await;
-                            }
-                            if let Some(ref s_ssh) = staged_ssh_adapter {
-                                let _ = s_ssh.rollback();
-                            }
-                            let _ = session.rollback();
-                            anyhow::bail!("Failed to publish verified storage to live root: {}", e);
+                            // After CommitDecision, NEVER roll back participants. Fencing remains active.
+                            let _ = session.journal.persist(
+                                spine_api::backup::RestorePhase::Publishing {
+                                    published_participants: session
+                                        .journal
+                                        .published_participants
+                                        .clone(),
+                                },
+                            );
+                            anyhow::bail!(
+                                "FATAL: Storage publication failed after durable CommitDecision: {}. Writes remain fenced; restart recovery will resume forward convergence.",
+                                e
+                            );
                         }
                     }
                 };
@@ -1606,26 +1693,21 @@ async fn main() -> anyhow::Result<()> {
                 for (snap_id, fencing_gen, client) in &staged_cluster_restores {
                     println!("Committing volume restore for snapshot {}...", snap_id);
                     if let Err(e) = client.commit_restore(snap_id, *fencing_gen).await {
-                        // Rollback already-committed cluster participants
-                        for (r_snap, _, r_client) in &committed_cluster_restores {
-                            let _ = r_client.rollback_restore(r_snap).await;
-                        }
-                        for (r_snap, _, r_client) in &staged_cluster_restores {
-                            let _ = r_client.rollback_restore(r_snap).await;
-                        }
-                        if let Some(ref sdb) = staged_db_restore {
-                            let _ = sdb.rollback().await;
-                        }
-                        if let Some(ref s_storage) = staged_storage_adapter {
-                            let _ = s_storage.rollback();
-                        }
-                        if let Some(ref s_ssh) = staged_ssh_adapter {
-                            let _ = s_ssh.rollback();
-                        }
-                        let _ = session.rollback();
-                        let _ = session
-                            .abort(&format!("Failed to commit cluster volume restore: {}", e));
-                        anyhow::bail!("Failed to commit cluster volume restore: {}. Repository storage rolled back.", e);
+                        // After CommitDecision, NEVER roll back participants. Fencing remains active.
+                        let _ =
+                            session
+                                .journal
+                                .persist(spine_api::backup::RestorePhase::Publishing {
+                                    published_participants: session
+                                        .journal
+                                        .published_participants
+                                        .clone(),
+                                });
+                        anyhow::bail!(
+                            "FATAL: Cluster volume commit for snapshot '{}' failed after durable CommitDecision: {}. Writes remain fenced; restart recovery will resume forward convergence.",
+                            snap_id,
+                            e
+                        );
                     }
                     let _ = session.journal.record_participant_published(snap_id);
                     committed_cluster_restores.push((
@@ -1639,18 +1721,20 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(ref s_ssh) = staged_ssh_adapter {
                     println!("Publishing staged SSH host identity...");
                     if let Err(e) = s_ssh.publish() {
-                        for (r_snap, _, r_client) in &committed_cluster_restores {
-                            let _ = r_client.rollback_restore(r_snap).await;
-                        }
-                        if let Some(ref sdb) = staged_db_restore {
-                            let _ = sdb.rollback().await;
-                        }
-                        if let Some(ref s_storage) = staged_storage_adapter {
-                            let _ = s_storage.rollback();
-                        }
-                        let _ = s_ssh.rollback();
-                        let _ = session.rollback();
-                        anyhow::bail!("Failed to publish staged SSH identity: {}", e);
+                        // After CommitDecision, NEVER roll back participants. Fencing remains active.
+                        let _ =
+                            session
+                                .journal
+                                .persist(spine_api::backup::RestorePhase::Publishing {
+                                    published_participants: session
+                                        .journal
+                                        .published_participants
+                                        .clone(),
+                                });
+                        anyhow::bail!(
+                            "FATAL: SSH identity publish failed after durable CommitDecision: {}. Writes remain fenced; restart recovery will resume forward convergence.",
+                            e
+                        );
                     }
                     let _ = session.journal.record_participant_published("spine_ssh");
                     println!("SSH host identity published successfully.");
@@ -1691,23 +1775,13 @@ async fn main() -> anyhow::Result<()> {
 
                 if verification_failed {
                     println!(
-                        "Post-cutover verification failed: {}. Executing distributed rollback...",
+                        "Post-cutover verification failed: {}. Writes remain fenced; restart recovery will resume forward convergence.",
                         verify_err_msg
                     );
-                    if let Some(ref s_ssh) = staged_ssh_adapter {
-                        let _ = s_ssh.rollback();
-                    }
-                    for (r_snap, _, r_client) in &committed_cluster_restores {
-                        let _ = r_client.rollback_restore(r_snap).await;
-                    }
-                    if let Some(ref sdb) = staged_db_restore {
-                        let _ = sdb.rollback().await;
-                    }
-                    if let Some(ref s_storage) = staged_storage_adapter {
-                        let _ = s_storage.rollback();
-                    }
-                    let _ = session.rollback();
-                    anyhow::bail!("Restore failed post-cutover verification: {}. All participants rolled back to previous generation.", verify_err_msg);
+                    anyhow::bail!(
+                        "FATAL: Restore failed post-cutover verification after CommitDecision: {}. Writes remain fenced; restart recovery will resume forward convergence.",
+                        verify_err_msg
+                    );
                 }
 
                 session

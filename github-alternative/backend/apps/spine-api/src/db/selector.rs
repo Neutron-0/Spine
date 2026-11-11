@@ -35,6 +35,9 @@ impl ActiveDatabaseRecord {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Compute unkeyed SHA-256 accidental-corruption integrity checksum for the record.
+    /// Note: This is an integrity check against accidental corruption, serialization mismatch,
+    /// or unintentional column bitrot, not a keyed cryptographic HMAC.
     pub fn compute_integrity_hash(
         selector_schema_version: u32,
         sequence_number: u64,
@@ -618,23 +621,32 @@ impl DatabaseSelector {
                 })?;
 
         if base_exists.0 {
-            // Check if it contains existing user tables
-            if let Ok(base_pool) = PgPool::connect(configured_url).await {
-                let table_count: (i64,) = sqlx::query_as(
-                    "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public'",
-                )
-                .fetch_one(&base_pool)
-                .await
-                .unwrap_or((0,));
-                base_pool.close().await;
+            // Check if it contains existing user tables (strictly fail closed on error)
+            let base_pool = PgPool::connect(configured_url).await.map_err(|e| {
+                ForgeError::Internal(format!(
+                    "Base database '{}' exists in pg_database but connecting to verify user tables failed: {}. Refusing to unmanage or bootstrap without verified empty catalog.",
+                    base_db_name, e
+                ))
+            })?;
+            let table_count: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public'",
+            )
+            .fetch_one(&base_pool)
+            .await
+            .map_err(|e| {
+                ForgeError::Internal(format!(
+                    "Failed to inspect information_schema.tables in base database '{}': {}. Refusing to proceed.",
+                    base_db_name, e
+                ))
+            })?;
+            base_pool.close().await;
 
-                if table_count.0 > 0 {
-                    maint_pool.close().await;
-                    return Err(ForgeError::Internal(format!(
-                        "FATAL: Existing database '{}' contains {} tables but lacks an authoritative selector record in the maintenance database. Refusing to operate unmanaged database without an authoritative selector.",
-                        base_db_name, table_count.0
-                    )));
-                }
+            if table_count.0 > 0 {
+                maint_pool.close().await;
+                return Err(ForgeError::Internal(format!(
+                    "FATAL: Existing database '{}' contains {} tables but lacks an authoritative selector record in the maintenance database. Refusing to operate unmanaged database without an authoritative selector.",
+                    base_db_name, table_count.0
+                )));
             }
         }
 
