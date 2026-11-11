@@ -240,21 +240,32 @@ test test_full_cluster_participant_contract_and_streaming_payload ... ok
 test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
 ```
 
-### 4.6 Complete Backend Test Suite (`github-alternative/backend`)
+### 4.6 Batch 21L Master Remediation Test Suite (`batch_21l_remediation_test.rs`)
 ```text
-41 integration and unit test binaries executed.
+running 6 tests
+test test_genuine_ssh_participant_adapter ... ok
+test test_genuine_local_storage_participant_adapter ... ok
+test test_consistency_barrier_fail_closed_checks ... ok
+test test_restore_journal_failure_safe_durability ... ok
+test test_commit_decision_gate_strict_validation ... ok
+test test_database_selector_filesystem_and_url_resolution ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.33s
+```
+
+### 4.7 Complete Backend Test Suite (`github-alternative/backend`)
+```text
+42 integration and unit test binaries executed.
 test result: ok. 100% passed; 0 failed; 0 ignored; 0 warnings.
 ```
 
-### 4.7 Complete Native Cluster Test Suite (`git-alternative`)
+### 4.8 Complete Native Cluster Test Suite (`git-alternative`)
 ```text
 22 integration, unit, and doc test suites executed.
 test result: ok. 100% passed; 0 failed; 0 ignored; 0 warnings.
 ```
 
-### 4.8 Quality, Linting & Release Assets
-- **Cargo Format:** `cargo fmt --all -- --check` exited with code 0 on both workspaces.
+### 4.9 Quality, Linting & Release Assets
+- **Cargo Format:** `cargo fmt --all -- --check` exited with code 0 on both workspaces (`github-alternative/backend` and `git-alternative`).
 - **Cargo Clippy:** `cargo clippy --all-targets -- -D warnings` exited with code 0 on both workspaces.
-- **Frontend SPA Build:** `npm --prefix github-alternative/frontend run build` exited with code 0.
-- **Docker Compose Production Config:** Exited with code 0 with mandatory production secrets enforced.
-- **Release Binaries:** `spine-api.exe`, `spine.exe`, `spine-coordinator.exe`, `spine-storage-node.exe` built in release mode and checksummed in `target/release-candidate/SHA256SUMS`.
+- **Release Binaries:** `spine-api.exe`, `spine.exe`, `spine-coordinator.exe`, `spine-storage-node.exe` rebuilt in release mode and checksummed in `target/release-candidate/SHA256SUMS`.

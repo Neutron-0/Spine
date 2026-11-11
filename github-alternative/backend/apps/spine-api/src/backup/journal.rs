@@ -89,6 +89,8 @@ pub struct RestoreJournal {
     pub acknowledgements: BTreeMap<String, ParticipantAcknowledgement>,
     #[serde(default)]
     pub commit_decision: Option<CommitDecisionRecord>,
+    #[serde(default)]
+    pub sequence_number: u64,
 }
 
 impl RestoreJournal {
@@ -123,6 +125,7 @@ impl RestoreJournal {
             published_participants: Vec::new(),
             acknowledgements: BTreeMap::new(),
             commit_decision: None,
+            sequence_number: 1,
         }
     }
 
@@ -266,18 +269,67 @@ impl RestoreJournal {
         &mut self,
         ack: ParticipantAcknowledgement,
     ) -> Result<(), ForgeError> {
+        // 1. Validate bound restore ID
+        if ack.restore_id != self.restore_id && !ack.restore_id.contains(&self.restore_id) {
+            return Err(ForgeError::Internal(format!(
+                "Acknowledgement restore_id mismatch: expected '{}', got '{}'",
+                self.restore_id, ack.restore_id
+            )));
+        }
+        // 2. Validate bound backup ID
+        if ack.backup_id != self.backup_id && !ack.backup_id.contains(&self.backup_id) {
+            return Err(ForgeError::Internal(format!(
+                "Acknowledgement backup_id mismatch: expected '{}', got '{}'",
+                self.backup_id, ack.backup_id
+            )));
+        }
+        // 3. Validate target generation
+        if ack.target_generation != self.target_generation {
+            return Err(ForgeError::Internal(format!(
+                "Acknowledgement target_generation mismatch: expected '{}', got '{}'",
+                self.target_generation, ack.target_generation
+            )));
+        }
+        // 4. Validate prepared state
         if !ack.prepared {
             return Err(ForgeError::Internal(format!(
-                "Participant '{}' acknowledgement indicates preparation failed",
+                "Participant '{}' acknowledgement indicates preparation failed (prepared=false)",
                 ack.participant_id
             )));
         }
-        if ack.staged_digest.is_empty() {
+        // 5. Validate non-empty payload digest
+        if ack.staged_digest.trim().is_empty() {
             return Err(ForgeError::Internal(format!(
                 "Participant '{}' acknowledgement contains empty digest",
                 ack.participant_id
             )));
         }
+        // 6. Validate canonical resource ID and durable staging record ID
+        if ack.canonical_resource_id.trim().is_empty() {
+            return Err(ForgeError::Internal(format!(
+                "Participant '{}' acknowledgement missing canonical resource identity",
+                ack.participant_id
+            )));
+        }
+        if ack.durable_staging_record_id.trim().is_empty() {
+            return Err(ForgeError::Internal(format!(
+                "Participant '{}' acknowledgement missing durable staging record identity",
+                ack.participant_id
+            )));
+        }
+
+        // 7. Reject contradictory duplicate acknowledgement
+        if let Some(existing) = self.acknowledgements.get(&ack.participant_id) {
+            if existing.staged_digest != ack.staged_digest
+                || existing.durable_staging_record_id != ack.durable_staging_record_id
+            {
+                return Err(ForgeError::Internal(format!(
+                    "Contradictory duplicate acknowledgement for participant '{}'",
+                    ack.participant_id
+                )));
+            }
+        }
+
         self.acknowledgements
             .insert(ack.participant_id.clone(), ack);
         self.persist(self.phase.clone())
@@ -287,11 +339,75 @@ impl RestoreJournal {
     pub fn has_all_required_acks(&self, required_participants: &[String]) -> bool {
         for p in required_participants {
             match self.acknowledgements.get(p) {
-                Some(ack) if ack.prepared && !ack.staged_digest.is_empty() => continue,
+                Some(ack)
+                    if ack.prepared
+                        && !ack.staged_digest.is_empty()
+                        && !ack.canonical_resource_id.is_empty()
+                        && !ack.durable_staging_record_id.is_empty() =>
+                {
+                    continue
+                }
                 _ => return false,
             }
         }
         true
+    }
+
+    /// Strict commit-decision gate validator: rejects missing, duplicate, stale or unverified participants.
+    pub fn validate_commit_decision_gate(
+        &self,
+        expected_participants: &[String],
+    ) -> Result<(), ForgeError> {
+        for exp in expected_participants {
+            match self.acknowledgements.get(exp) {
+                Some(ack) => {
+                    if ack.target_generation != self.target_generation {
+                        return Err(ForgeError::Internal(format!(
+                            "Participant '{}' target generation mismatch: expected {}, got {}",
+                            exp, self.target_generation, ack.target_generation
+                        )));
+                    }
+                    if !ack.prepared {
+                        return Err(ForgeError::Internal(format!(
+                            "Participant '{}' acknowledgement is not prepared",
+                            exp
+                        )));
+                    }
+                    if ack.staged_digest.trim().is_empty() {
+                        return Err(ForgeError::Internal(format!(
+                            "Participant '{}' acknowledgement has empty digest",
+                            exp
+                        )));
+                    }
+                    if ack.canonical_resource_id.trim().is_empty() {
+                        return Err(ForgeError::Internal(format!(
+                            "Participant '{}' missing canonical resource ID",
+                            exp
+                        )));
+                    }
+                    if ack.durable_staging_record_id.trim().is_empty() {
+                        return Err(ForgeError::Internal(format!(
+                            "Participant '{}' missing durable staging record ID",
+                            exp
+                        )));
+                    }
+                }
+                None => {
+                    return Err(ForgeError::Internal(format!(
+                        "Commit decision gate rejected: missing required preparation acknowledgement for participant '{}'",
+                        exp
+                    )));
+                }
+            }
+        }
+        if self.acknowledgements.len() < expected_participants.len() {
+            return Err(ForgeError::Internal(format!(
+                "Commit decision gate rejected: required {} participants, found {}",
+                expected_participants.len(),
+                self.acknowledgements.len()
+            )));
+        }
+        Ok(())
     }
 
     /// Record participant publication progress.
@@ -366,32 +482,53 @@ impl RestoreJournal {
     }
 
     /// Persist the updated state machine phase to disk with sync_all and atomic replacement.
-    /// Preserves last_valid backup to ensure power-loss safety and non-destructive roll forward.
-    pub fn persist(&mut self, phase: RestorePhase) -> Result<(), ForgeError> {
+    /// In-memory state is strictly mutated ONLY after durable disk persistence succeeds.
+    pub fn persist(&mut self, next_phase: RestorePhase) -> Result<(), ForgeError> {
         use std::io::Write;
-        self.phase = phase.clone();
-        if let RestorePhase::CommitDecision(ref cdr) = phase {
-            self.commit_decision = Some(cdr.clone());
-        }
-        self.updated_at_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let path = Self::journal_path(&self.target_storage_root);
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let _ = std::fs::create_dir_all(parent);
 
-        // Preserve previous valid journal as last_valid backup
-        let last_valid = Self::last_valid_journal_path(&self.target_storage_root);
+        // 1. Construct candidate next state independently
+        let mut candidate = self.clone();
+        candidate.phase = next_phase.clone();
+        if let RestorePhase::CommitDecision(ref cdr) = next_phase {
+            candidate.commit_decision = Some(cdr.clone());
+        }
+        candidate.sequence_number += 1;
+        candidate.updated_at_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+        let path = Self::journal_path(&candidate.target_storage_root);
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        // 2. Preserve previous valid journal as last_valid backup
+        let last_valid = Self::last_valid_journal_path(&candidate.target_storage_root);
         if path.exists() {
-            if let Ok(mut lv_file) = std::fs::File::create(&last_valid) {
-                if let Ok(existing_bytes) = std::fs::read(&path) {
-                    let _ = lv_file.write_all(&existing_bytes);
-                    let _ = lv_file.flush();
-                    let _ = lv_file.sync_all();
+            if let Ok(existing_bytes) = std::fs::read(&path) {
+                if serde_json::from_slice::<Self>(&existing_bytes).is_ok() {
+                    let tmp_lv =
+                        parent.join(format!(".tmp_lv_{}.json", uuid::Uuid::new_v4().simple()));
+                    let mut lv_file = std::fs::File::create(&tmp_lv).map_err(|e| {
+                        ForgeError::Internal(format!(
+                            "Failed to create temporary last_valid journal: {}",
+                            e
+                        ))
+                    })?;
+                    lv_file
+                        .write_all(&existing_bytes)
+                        .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                    lv_file
+                        .flush()
+                        .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                    lv_file
+                        .sync_all()
+                        .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                    let _ = super::safe_atomic_replace(&tmp_lv, &last_valid);
                 }
             }
         }
 
+        // 3. Serialize candidate and write to temporary file
         let tmp_path = parent.join(format!(".tmp_jnl_{}.json", uuid::Uuid::new_v4().simple()));
-        let json_data = serde_json::to_string_pretty(self)
+        let json_data = serde_json::to_string_pretty(&candidate)
             .map_err(|e| ForgeError::Internal(format!("Failed to serialize journal: {}", e)))?;
         {
             let mut f = std::fs::File::create(&tmp_path).map_err(|e| {
@@ -404,21 +541,32 @@ impl RestoreJournal {
             f.sync_all()
                 .map_err(|e| ForgeError::Internal(e.to_string()))?;
         }
+
+        // 4. Atomic replacement to primary journal path
         super::safe_atomic_replace(&tmp_path, &path)?;
 
-        // Readback verification of primary journal
-        if let Ok(c) = std::fs::read_to_string(&path) {
-            if let Err(e) = serde_json::from_str::<Self>(&c) {
-                return Err(ForgeError::Internal(format!(
-                    "Journal readback verification failed after persist: {}",
-                    e
-                )));
-            }
-        } else {
+        // 5. Readback verification of primary journal
+        let readback_content = std::fs::read_to_string(&path).map_err(|e| {
+            ForgeError::Internal(format!("Journal readback failed after persist: {}", e))
+        })?;
+        let readback_journal = serde_json::from_str::<Self>(&readback_content).map_err(|e| {
+            ForgeError::Internal(format!("Journal readback verification failed: {}", e))
+        })?;
+
+        if readback_journal.restore_id != candidate.restore_id
+            || readback_journal.sequence_number != candidate.sequence_number
+            || readback_journal.phase != candidate.phase
+        {
             return Err(ForgeError::Internal(
-                "Journal readback failed: file could not be read after persist".into(),
+                "Journal readback mismatch: persisted record does not match candidate".into(),
             ));
         }
+
+        // 6. Synchronize directory
+        let _ = super::sync_dir(parent);
+
+        // 7. ONLY AFTER successful persistence: mutate in-memory state
+        *self = candidate;
         Ok(())
     }
 

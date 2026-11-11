@@ -137,12 +137,18 @@ pub struct ParticipantAcknowledgement {
     pub backup_id: String,
     pub participant_id: String,
     pub volume_name: String,
+    #[serde(default)]
+    pub canonical_resource_id: String,
     pub previous_generation: Option<String>,
     pub target_generation: String,
     pub staged_digest: String,
     pub staged_byte_length: u64,
     pub prepared_at_nanos: i64,
     pub prepared: bool,
+    #[serde(default)]
+    pub durable_staging_record_id: String,
+    #[serde(default)]
+    pub current_state: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

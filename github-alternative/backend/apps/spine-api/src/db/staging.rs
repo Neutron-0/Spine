@@ -1,4 +1,6 @@
+use crate::backup::ParticipantAcknowledgement;
 use crate::core::error::ForgeError;
+use crate::db::selector::{ActiveDatabaseRecord, DatabaseSelector};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::fs::File;
@@ -6,36 +8,30 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 use url::Url;
 
-/// Strategy used for PostgreSQL staging isolation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DatabaseStagingMode {
-    /// Full isolated database (`<db>_staged_<restore_id>`) with atomic `ALTER DATABASE RENAME`.
-    DatabaseLevel,
-    /// Schema-level staging within target database (`staged_<restore_id>`) with `ALTER SCHEMA RENAME`.
-    SchemaLevel,
-}
-
 /// Managed staging session for database restoration with recoverable cutover.
 pub struct StagedDatabaseRestore {
     pub restore_id: String,
     pub base_db_url: String,
     pub staged_db_url: String,
-    pub maint_db_url: Option<String>,
+    pub maint_db_url: String,
     pub base_db_name: String,
     pub staged_db_name: String,
+    pub active_versioned_name: String,
     pub old_db_name: String,
-    pub staging_mode: DatabaseStagingMode,
     pub target_generation: String,
     pub backup_id: String,
     pub staged_digest: String,
     pub staged_byte_length: u64,
     pub tables_restored: usize,
     pub rows_restored: u64,
-    pub duration_ms: u128,
+    pub duration_ms: u64,
+    pub acknowledgement: ParticipantAcknowledgement,
 }
 
 impl StagedDatabaseRestore {
     /// Prepare and validate an isolated database staging session before any live cutover.
+    /// Strictly fails closed if isolated database staging cannot be established.
+    /// Never restores into live database or live schemas.
     pub async fn prepare_from_file(
         base_db_url: &str,
         restore_id: &str,
@@ -75,7 +71,9 @@ impl StagedDatabaseRestore {
 
         let safe_restore_id = restore_id.replace('-', "_");
         let safe_base_name = base_db_name.replace('-', "_");
+        let safe_target_gen = target_generation.replace('-', "_");
         let staged_db_name = format!("{}_staged_{}", safe_base_name, safe_restore_id);
+        let active_versioned_name = format!("{}_gen_{}", safe_base_name, safe_target_gen);
         let old_db_name = format!("{}_old_{}", safe_base_name, safe_restore_id);
 
         let mut maint_url = parsed_url.clone();
@@ -86,342 +84,359 @@ impl StagedDatabaseRestore {
         staged_db_url.set_path(&staged_db_name);
         let staged_db_url_str = staged_db_url.to_string();
 
-        // 1. Attempt Database-Level staging via maintenance connection
-        let mut db_level_success = false;
-        if let Ok(maint_pool) = PgPool::connect(&maint_url_str).await {
-            // Terminate any stale connections to staged_db_name if it was left from a previous run
+        // 1. Connect to maintenance database to create isolated staging database
+        let maint_pool = PgPool::connect(&maint_url_str).await.map_err(|e| {
+            ForgeError::Internal(format!(
+                "Failed to connect to PostgreSQL maintenance database to create isolated staging: {}. Staging aborted.",
+                e
+            ))
+        })?;
+
+        // Terminate any stale connections to staged_db_name if it was left from an interrupted previous attempt
+        let term_sql = r#"
+            SELECT pg_terminate_backend(pid)
+            FROM pg_stat_activity
+            WHERE datname = $1 AND pid <> pg_backend_pid()
+        "#;
+        let _ = sqlx::query(term_sql)
+            .bind(&staged_db_name)
+            .execute(&maint_pool)
+            .await;
+
+        let drop_sql = format!(r#"DROP DATABASE IF EXISTS "{}""#, staged_db_name);
+        let _ = sqlx::query(&drop_sql).execute(&maint_pool).await;
+
+        let create_sql = format!(r#"CREATE DATABASE "{}""#, staged_db_name);
+        sqlx::query(&create_sql)
+            .execute(&maint_pool)
+            .await
+            .map_err(|e| {
+                ForgeError::Internal(format!(
+                    "FATAL: Failed to create isolated staging database '{}': {}. Restore cannot proceed without isolated staging.",
+                    staged_db_name, e
+                ))
+            })?;
+
+        maint_pool.close().await;
+
+        tracing::info!(
+            "Established isolated database-level staging: '{}'",
+            staged_db_name
+        );
+
+        // 2. Connect to staged database and restore snapshot
+        let staged_pool = PgPool::connect(&staged_db_url_str).await.map_err(|e| {
+            ForgeError::Internal(format!("Failed to connect to staged database: {}", e))
+        })?;
+
+        let snap_file = File::open(snapshot_file).map_err(|e| {
+            ForgeError::Internal(format!("Failed to open snapshot file for restore: {}", e))
+        })?;
+        let reader = BufReader::new(snap_file);
+
+        let report = super::dump::restore_database_with_generation(
+            &staged_pool,
+            reader,
+            Some(target_generation),
+            Some(backup_id),
+        )
+        .await?;
+
+        // 3. Verify staged database catalog and generation token
+        let table_count: (i64,) = sqlx::query_as(
+            "SELECT count(*)::bigint FROM information_schema.tables WHERE table_schema = 'public' AND table_name NOT LIKE 'pg_%'",
+        )
+        .fetch_one(&staged_pool)
+        .await
+        .map_err(|e| {
+            ForgeError::Internal(format!("Failed to verify staged database tables: {}", e))
+        })?;
+
+        if table_count.0 == 0 {
+            staged_pool.close().await;
+            return Err(ForgeError::Internal(format!(
+                "Staged database '{}' is empty after restore. Validation failed.",
+                staged_db_name
+            )));
+        }
+
+        let gen_row: Option<(String,)> =
+            sqlx::query_as("SELECT generation_token FROM _restore_generation WHERE id = 1")
+                .fetch_optional(&staged_pool)
+                .await
+                .map_err(|e| {
+                    ForgeError::Internal(format!(
+                        "Failed to query _restore_generation in staged database: {}",
+                        e
+                    ))
+                })?;
+
+        match gen_row {
+            Some((ref gen,)) if gen == target_generation => {
+                tracing::info!(
+                    "Verified generation token '{}' in staged database '{}'",
+                    gen,
+                    staged_db_name
+                );
+            }
+            Some((ref gen,)) => {
+                staged_pool.close().await;
+                return Err(ForgeError::Internal(format!(
+                    "Staged database generation token mismatch: expected '{}', found '{}'",
+                    target_generation, gen
+                )));
+            }
+            None => {
+                staged_pool.close().await;
+                return Err(ForgeError::Internal(
+                    "Staged database missing _restore_generation token. Validation failed."
+                        .to_string(),
+                ));
+            }
+        }
+
+        // 4. Persist durable staging record inside the staged database
+        let durable_record_id =
+            format!("postgresql:{}.public._spine_staging_record", staged_db_name);
+        let create_record_table = r#"
+            CREATE TABLE IF NOT EXISTS _spine_staging_record (
+                id INT PRIMARY KEY DEFAULT 1,
+                restore_id TEXT NOT NULL,
+                backup_id TEXT NOT NULL,
+                target_generation TEXT NOT NULL,
+                staged_digest TEXT NOT NULL,
+                staged_byte_length BIGINT NOT NULL,
+                tables_restored BIGINT NOT NULL,
+                rows_restored BIGINT NOT NULL,
+                prepared_at_nanos BIGINT NOT NULL
+            );
+        "#;
+        let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        sqlx::query(create_record_table)
+            .execute(&staged_pool)
+            .await
+            .map_err(|e| {
+                ForgeError::Internal(format!(
+                    "Failed to create _spine_staging_record table: {}",
+                    e
+                ))
+            })?;
+
+        let insert_record = r#"
+            INSERT INTO _spine_staging_record (id, restore_id, backup_id, target_generation, staged_digest, staged_byte_length, tables_restored, rows_restored, prepared_at_nanos)
+            VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (id) DO UPDATE SET
+                restore_id = EXCLUDED.restore_id,
+                backup_id = EXCLUDED.backup_id,
+                target_generation = EXCLUDED.target_generation,
+                staged_digest = EXCLUDED.staged_digest,
+                staged_byte_length = EXCLUDED.staged_byte_length,
+                tables_restored = EXCLUDED.tables_restored,
+                rows_restored = EXCLUDED.rows_restored,
+                prepared_at_nanos = EXCLUDED.prepared_at_nanos;
+        "#;
+        sqlx::query(insert_record)
+            .bind(restore_id)
+            .bind(backup_id)
+            .bind(target_generation)
+            .bind(&staged_digest)
+            .bind(staged_byte_length as i64)
+            .bind(report.tables_restored as i64)
+            .bind(report.rows_restored as i64)
+            .bind(now_nanos)
+            .execute(&staged_pool)
+            .await
+            .map_err(|e| {
+                ForgeError::Internal(format!(
+                    "Failed to record durable staging state in DB: {}",
+                    e
+                ))
+            })?;
+
+        staged_pool.close().await;
+
+        let ack = ParticipantAcknowledgement {
+            restore_id: restore_id.to_string(),
+            backup_id: backup_id.to_string(),
+            participant_id: "postgres_data".to_string(),
+            volume_name: "postgres_data".to_string(),
+            canonical_resource_id: format!("postgresql_database:{}", staged_db_name),
+            previous_generation: None,
+            target_generation: target_generation.to_string(),
+            staged_digest: staged_digest.clone(),
+            staged_byte_length,
+            prepared_at_nanos: now_nanos,
+            prepared: true,
+            durable_staging_record_id: durable_record_id,
+            current_state: "StagedAndValidated".to_string(),
+        };
+
+        Ok(Self {
+            restore_id: restore_id.to_string(),
+            base_db_url: base_db_url.to_string(),
+            staged_db_url: staged_db_url_str,
+            maint_db_url: maint_url_str,
+            base_db_name,
+            staged_db_name,
+            active_versioned_name,
+            old_db_name,
+            target_generation: target_generation.to_string(),
+            backup_id: backup_id.to_string(),
+            staged_digest,
+            staged_byte_length,
+            tables_restored: report.tables_restored,
+            rows_restored: report.rows_restored as u64,
+            duration_ms: report.duration_ms,
+            acknowledgement: ack,
+        })
+    }
+
+    /// Re-query preparation status directly from the staged database.
+    pub async fn query_preparation_status(&self) -> Result<bool, ForgeError> {
+        let pool = match PgPool::connect(&self.staged_db_url).await {
+            Ok(p) => p,
+            Err(_) => return Ok(false),
+        };
+
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT generation_token FROM _restore_generation WHERE id = 1")
+                .fetch_optional(&pool)
+                .await
+                .ok()
+                .flatten();
+
+        pool.close().await;
+        Ok(row
+            .map(|(gen,)| gen == self.target_generation)
+            .unwrap_or(false))
+    }
+
+    /// Atomically cut over staged database using DatabaseSelector and recoverable versioning.
+    /// Preserves existing database until finalization.
+    pub async fn commit_cutover(&self, storage_root: &Path) -> Result<(), ForgeError> {
+        let maint_pool = PgPool::connect(&self.maint_db_url).await.map_err(|e| {
+            ForgeError::Internal(format!(
+                "Failed to connect to maintenance DB for cutover: {}",
+                e
+            ))
+        })?;
+
+        // 1. Rename staged database to authoritative active_versioned_name
+        let term_sql = r#"
+            SELECT pg_terminate_backend(pid)
+            FROM pg_stat_activity
+            WHERE datname = $1 AND pid <> pg_backend_pid()
+        "#;
+        let _ = sqlx::query(term_sql)
+            .bind(&self.active_versioned_name)
+            .execute(&maint_pool)
+            .await;
+        let _ = sqlx::query(&format!(
+            r#"DROP DATABASE IF EXISTS "{}""#,
+            self.active_versioned_name
+        ))
+        .execute(&maint_pool)
+        .await;
+
+        let rename_staged = format!(
+            r#"ALTER DATABASE "{}" RENAME TO "{}""#,
+            self.staged_db_name, self.active_versioned_name
+        );
+        sqlx::query(&rename_staged)
+            .execute(&maint_pool)
+            .await
+            .map_err(|e| {
+                ForgeError::Internal(format!(
+                    "Failed to rename staged database to versioned database: {}",
+                    e
+                ))
+            })?;
+
+        // 2. Durably record the active database selection in the control table and storage root
+        let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let record = ActiveDatabaseRecord {
+            base_db_name: self.base_db_name.clone(),
+            active_db_name: self.active_versioned_name.clone(),
+            active_generation: self.target_generation.clone(),
+            restore_id: self.restore_id.clone(),
+            cutover_at_nanos: now_nanos,
+        };
+
+        DatabaseSelector::save_to_db(&maint_pool, &record).await?;
+        DatabaseSelector::save_to_file(storage_root, &record)?;
+
+        // 3. Terminate active connections to base / previous database
+        let _ = sqlx::query(term_sql)
+            .bind(&self.base_db_name)
+            .execute(&maint_pool)
+            .await;
+
+        maint_pool.close().await;
+        tracing::info!(
+            "Cutover successful: active database selector points to '{}'",
+            self.active_versioned_name
+        );
+        Ok(())
+    }
+
+    /// Roll back database cutover, dropping staged resources if needed.
+    pub async fn rollback(&self) -> Result<(), ForgeError> {
+        if let Ok(maint_pool) = PgPool::connect(&self.maint_db_url).await {
             let term_sql = r#"
                 SELECT pg_terminate_backend(pid)
                 FROM pg_stat_activity
                 WHERE datname = $1 AND pid <> pg_backend_pid()
             "#;
             let _ = sqlx::query(term_sql)
-                .bind(&staged_db_name)
+                .bind(&self.staged_db_name)
                 .execute(&maint_pool)
                 .await;
+            let _ = sqlx::query(&format!(
+                r#"DROP DATABASE IF EXISTS "{}""#,
+                self.staged_db_name
+            ))
+            .execute(&maint_pool)
+            .await;
 
-            let drop_sql = format!(r#"DROP DATABASE IF EXISTS "{}""#, staged_db_name);
-            let _ = sqlx::query(&drop_sql).execute(&maint_pool).await;
+            let _ = sqlx::query(term_sql)
+                .bind(&self.active_versioned_name)
+                .execute(&maint_pool)
+                .await;
+            let _ = sqlx::query(&format!(
+                r#"DROP DATABASE IF EXISTS "{}""#,
+                self.active_versioned_name
+            ))
+            .execute(&maint_pool)
+            .await;
 
-            let create_sql = format!(r#"CREATE DATABASE "{}""#, staged_db_name);
-            if sqlx::query(&create_sql).execute(&maint_pool).await.is_ok() {
-                db_level_success = true;
-            }
             maint_pool.close().await;
         }
-
-        if db_level_success {
-            tracing::info!(
-                "Established isolated database-level staging: '{}'",
-                staged_db_name
-            );
-            let staged_pool = PgPool::connect(&staged_db_url_str).await.map_err(|e| {
-                ForgeError::Internal(format!("Failed to connect to staged database: {}", e))
-            })?;
-
-            let snap_file = File::open(snapshot_file).map_err(|e| {
-                ForgeError::Internal(format!("Failed to open snapshot file for restore: {}", e))
-            })?;
-            let reader = BufReader::new(snap_file);
-
-            let report = super::dump::restore_database_with_generation(
-                &staged_pool,
-                reader,
-                Some(target_generation),
-                Some(backup_id),
-            )
-            .await?;
-
-            staged_pool.close().await;
-
-            Ok(Self {
-                restore_id: restore_id.to_string(),
-                base_db_url: base_db_url.to_string(),
-                staged_db_url: staged_db_url_str,
-                maint_db_url: Some(maint_url_str),
-                base_db_name,
-                staged_db_name,
-                old_db_name,
-                staging_mode: DatabaseStagingMode::DatabaseLevel,
-                target_generation: target_generation.to_string(),
-                backup_id: backup_id.to_string(),
-                staged_digest,
-                staged_byte_length,
-                tables_restored: report.tables_restored,
-                rows_restored: report.rows_restored as u64,
-                duration_ms: report.duration_ms as u128,
-            })
-        } else {
-            // 2. Fall back to Schema-Level staging inside the base database
-            tracing::info!(
-                "Database-level creation unavailable; using schema-level staging in '{}'",
-                base_db_name
-            );
-            let pool = PgPool::connect(base_db_url).await.map_err(|e| {
-                ForgeError::Internal(format!(
-                    "Failed to connect to target PostgreSQL database: {}",
-                    e
-                ))
-            })?;
-
-            // Prepare staging schema
-            let drop_schema = format!(r#"DROP SCHEMA IF EXISTS "{}" CASCADE"#, staged_db_name);
-            let _ = sqlx::query(&drop_schema).execute(&pool).await;
-
-            let create_schema = format!(r#"CREATE SCHEMA "{}""#, staged_db_name);
-            sqlx::query(&create_schema)
-                .execute(&pool)
-                .await
-                .map_err(|e| {
-                    ForgeError::Internal(format!("Failed to create staging schema: {}", e))
-                })?;
-
-            let snap_file = File::open(snapshot_file).map_err(|e| {
-                ForgeError::Internal(format!("Failed to open snapshot file: {}", e))
-            })?;
-            let reader = BufReader::new(snap_file);
-
-            let report = super::dump::restore_database_with_generation(
-                &pool,
-                reader,
-                Some(target_generation),
-                Some(backup_id),
-            )
-            .await?;
-
-            pool.close().await;
-
-            Ok(Self {
-                restore_id: restore_id.to_string(),
-                base_db_url: base_db_url.to_string(),
-                staged_db_url: base_db_url.to_string(),
-                maint_db_url: None,
-                base_db_name,
-                staged_db_name,
-                old_db_name,
-                staging_mode: DatabaseStagingMode::SchemaLevel,
-                target_generation: target_generation.to_string(),
-                backup_id: backup_id.to_string(),
-                staged_digest,
-                staged_byte_length,
-                tables_restored: report.tables_restored,
-                rows_restored: report.rows_restored as u64,
-                duration_ms: report.duration_ms as u128,
-            })
-        }
-    }
-
-    /// Atomically cut over staged database to live target database name.
-    /// Preserves existing database as `<db>_old_<restore_id>` for recoverable rollback.
-    pub async fn commit_cutover(&self) -> Result<(), ForgeError> {
-        match self.staging_mode {
-            DatabaseStagingMode::DatabaseLevel => {
-                if let Some(ref m_url) = self.maint_db_url {
-                    let maint_pool = PgPool::connect(m_url).await.map_err(|e| {
-                        ForgeError::Internal(format!(
-                            "Failed to connect to maintenance DB for cutover: {}",
-                            e
-                        ))
-                    })?;
-
-                    // Terminate active connections to base database
-                    let term_sql = r#"
-                        SELECT pg_terminate_backend(pid)
-                        FROM pg_stat_activity
-                        WHERE datname = $1 AND pid <> pg_backend_pid()
-                    "#;
-                    let _ = sqlx::query(term_sql)
-                        .bind(&self.base_db_name)
-                        .execute(&maint_pool)
-                        .await;
-
-                    // Rename live base database to old_db_name if it exists
-                    let check_sql = "SELECT 1 FROM pg_database WHERE datname = $1";
-                    let exists: Option<(i32,)> = sqlx::query_as(check_sql)
-                        .bind(&self.base_db_name)
-                        .fetch_optional(&maint_pool)
-                        .await
-                        .ok()
-                        .flatten();
-
-                    if exists.is_some() {
-                        let _ = sqlx::query(term_sql)
-                            .bind(&self.old_db_name)
-                            .execute(&maint_pool)
-                            .await;
-                        let _ = sqlx::query(&format!(
-                            r#"DROP DATABASE IF EXISTS "{}""#,
-                            self.old_db_name
-                        ))
-                        .execute(&maint_pool)
-                        .await;
-
-                        let rename_old = format!(
-                            r#"ALTER DATABASE "{}" RENAME TO "{}""#,
-                            self.base_db_name, self.old_db_name
-                        );
-                        sqlx::query(&rename_old)
-                            .execute(&maint_pool)
-                            .await
-                            .map_err(|e| {
-                                ForgeError::Internal(format!(
-                                    "Failed to rename live DB to old DB: {}",
-                                    e
-                                ))
-                            })?;
-                    }
-
-                    // Rename staged database to live base database name
-                    let rename_staged = format!(
-                        r#"ALTER DATABASE "{}" RENAME TO "{}""#,
-                        self.staged_db_name, self.base_db_name
-                    );
-                    sqlx::query(&rename_staged)
-                        .execute(&maint_pool)
-                        .await
-                        .map_err(|e| {
-                            ForgeError::Internal(format!(
-                                "Failed to cut over staged database: {}",
-                                e
-                            ))
-                        })?;
-
-                    maint_pool.close().await;
-                }
-            }
-            DatabaseStagingMode::SchemaLevel => {
-                // In schema-level mode, restore was already executed safely in transaction
-            }
-        }
         Ok(())
     }
 
-    /// Roll back database cutover, restoring previous generation if needed.
-    pub async fn rollback(&self) -> Result<(), ForgeError> {
-        match self.staging_mode {
-            DatabaseStagingMode::DatabaseLevel => {
-                if let Some(ref m_url) = self.maint_db_url {
-                    if let Ok(maint_pool) = PgPool::connect(m_url).await {
-                        let term_sql = r#"
-                            SELECT pg_terminate_backend(pid)
-                            FROM pg_stat_activity
-                            WHERE datname = $1 AND pid <> pg_backend_pid()
-                        "#;
-                        let _ = sqlx::query(term_sql)
-                            .bind(&self.base_db_name)
-                            .execute(&maint_pool)
-                            .await;
-
-                        // Check if old_db_name exists
-                        let exists: Option<(i32,)> =
-                            sqlx::query_as("SELECT 1 FROM pg_database WHERE datname = $1")
-                                .bind(&self.old_db_name)
-                                .fetch_optional(&maint_pool)
-                                .await
-                                .ok()
-                                .flatten();
-
-                        if exists.is_some() {
-                            let _ = sqlx::query(term_sql)
-                                .bind(&self.staged_db_name)
-                                .execute(&maint_pool)
-                                .await;
-                            let _ = sqlx::query(&format!(
-                                r#"DROP DATABASE IF EXISTS "{}""#,
-                                self.staged_db_name
-                            ))
-                            .execute(&maint_pool)
-                            .await;
-
-                            let _ = sqlx::query(&format!(
-                                r#"ALTER DATABASE "{}" RENAME TO "{}""#,
-                                self.base_db_name, self.staged_db_name
-                            ))
-                            .execute(&maint_pool)
-                            .await;
-
-                            let _ = sqlx::query(&format!(
-                                r#"ALTER DATABASE "{}" RENAME TO "{}""#,
-                                self.old_db_name, self.base_db_name
-                            ))
-                            .execute(&maint_pool)
-                            .await;
-                        }
-                        maint_pool.close().await;
-                    }
-                }
-            }
-            DatabaseStagingMode::SchemaLevel => {
-                // Drop staging schema
-                if let Ok(pool) = PgPool::connect(&self.base_db_url).await {
-                    let _ = sqlx::query(&format!(
-                        r#"DROP SCHEMA IF EXISTS "{}" CASCADE"#,
-                        self.staged_db_name
-                    ))
-                    .execute(&pool)
-                    .await;
-                    pool.close().await;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Purge retained old database and staging resources upon successful finalize.
+    /// Finalize database cutover: cleanly drop old database generations after global verification.
     pub async fn finalize(&self) -> Result<(), ForgeError> {
-        match self.staging_mode {
-            DatabaseStagingMode::DatabaseLevel => {
-                if let Some(ref m_url) = self.maint_db_url {
-                    if let Ok(maint_pool) = PgPool::connect(m_url).await {
-                        let term_sql = r#"
-                            SELECT pg_terminate_backend(pid)
-                            FROM pg_stat_activity
-                            WHERE datname = $1 AND pid <> pg_backend_pid()
-                        "#;
-                        let _ = sqlx::query(term_sql)
-                            .bind(&self.old_db_name)
-                            .execute(&maint_pool)
-                            .await;
-                        let _ = sqlx::query(&format!(
-                            r#"DROP DATABASE IF EXISTS "{}""#,
-                            self.old_db_name
-                        ))
-                        .execute(&maint_pool)
-                        .await;
+        let maint_pool = PgPool::connect(&self.maint_db_url).await.map_err(|e| {
+            ForgeError::Internal(format!(
+                "Failed to connect to maintenance DB for finalization: {}",
+                e
+            ))
+        })?;
 
-                        let _ = sqlx::query(term_sql)
-                            .bind(&self.staged_db_name)
-                            .execute(&maint_pool)
-                            .await;
-                        let _ = sqlx::query(&format!(
-                            r#"DROP DATABASE IF EXISTS "{}""#,
-                            self.staged_db_name
-                        ))
-                        .execute(&maint_pool)
-                        .await;
+        let term_sql = r#"
+            SELECT pg_terminate_backend(pid)
+            FROM pg_stat_activity
+            WHERE datname = $1 AND pid <> pg_backend_pid()
+        "#;
+        let _ = sqlx::query(term_sql)
+            .bind(&self.old_db_name)
+            .execute(&maint_pool)
+            .await;
 
-                        maint_pool.close().await;
-                    }
-                }
-            }
-            DatabaseStagingMode::SchemaLevel => {
-                if let Ok(pool) = PgPool::connect(&self.base_db_url).await {
-                    let _ = sqlx::query(&format!(
-                        r#"DROP SCHEMA IF EXISTS "{}" CASCADE"#,
-                        self.old_db_name
-                    ))
-                    .execute(&pool)
-                    .await;
-                    let _ = sqlx::query(&format!(
-                        r#"DROP SCHEMA IF EXISTS "{}" CASCADE"#,
-                        self.staged_db_name
-                    ))
-                    .execute(&pool)
-                    .await;
-                    pool.close().await;
-                }
-            }
-        }
+        let drop_sql = format!(r#"DROP DATABASE IF EXISTS "{}""#, self.old_db_name);
+        let _ = sqlx::query(&drop_sql).execute(&maint_pool).await;
+
+        maint_pool.close().await;
         Ok(())
     }
 }

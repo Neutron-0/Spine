@@ -743,12 +743,15 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
             backup_id: snapshot_id.to_string(),
             participant_id: "coordinator".to_string(),
             volume_name: "coordinator_data".to_string(),
+            canonical_resource_id: "coordinator_cluster_state".to_string(),
             previous_generation: Some(cur_gen.to_string()),
             target_generation: fencing_generation.to_string(),
             staged_digest,
             staged_byte_length: payload.len() as u64,
             prepared_at_nanos: now_nanos,
             prepared: true,
+            durable_staging_record_id: format!(".staged_coordinator_restore_{}.json", snapshot_id),
+            current_state: "Staged".to_string(),
         };
 
         Ok(ack)

@@ -1,7 +1,14 @@
 use crate::core::error::ForgeError;
 use crate::core::profile::DeploymentProfile;
+use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use spine_cluster::protocol::ParticipantAcknowledgement;
 use std::collections::HashSet;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use tar::Archive;
 
 /// Classification of participant requirement under a deployment profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,6 +317,426 @@ impl ParticipantRegistry {
             }
         }
 
+        Ok(())
+    }
+}
+
+/// Durable participant adapter for local VCS repository storage (`spine_storage`).
+pub struct LocalStorageParticipantAdapter {
+    pub storage_root: PathBuf,
+    pub staged_dir: PathBuf,
+    pub old_dir: PathBuf,
+    pub restore_id: String,
+    pub backup_id: String,
+    pub target_generation: String,
+    pub staged_digest: String,
+    pub staged_byte_length: u64,
+    pub acknowledgement: ParticipantAcknowledgement,
+}
+
+impl LocalStorageParticipantAdapter {
+    pub fn prepare(
+        storage_root: &Path,
+        restore_id: &str,
+        backup_id: &str,
+        target_generation: &str,
+        payload_bytes: &[u8],
+    ) -> Result<Self, ForgeError> {
+        if payload_bytes.is_empty() {
+            return Err(ForgeError::Internal(
+                "Local storage snapshot payload is empty".into(),
+            ));
+        }
+
+        let staged_dir = storage_root.join(format!(".staged_storage_{}", restore_id));
+        let old_dir = storage_root.join(format!(".old_generation_{}", restore_id));
+        if staged_dir.exists() {
+            let _ = fs::remove_dir_all(&staged_dir);
+        }
+        fs::create_dir_all(&staged_dir).map_err(|e| {
+            ForgeError::Internal(format!("Failed to create storage staging directory: {}", e))
+        })?;
+
+        let mut hasher = Sha256::new();
+        hasher.update(payload_bytes);
+        let staged_digest = hex::encode(hasher.finalize());
+        let staged_byte_length = payload_bytes.len() as u64;
+
+        // Unpack tar or tar.gz payload into staged_dir
+        let gz = GzDecoder::new(payload_bytes);
+        let mut archive = Archive::new(gz);
+        let entries = archive.entries().map_err(|e| {
+            ForgeError::Internal(format!(
+                "Failed to read storage snapshot tar entries: {}",
+                e
+            ))
+        })?;
+
+        for entry in entries {
+            let mut file = entry.map_err(|e| ForgeError::Internal(e.to_string()))?;
+            let path = file
+                .path()
+                .map_err(|e| ForgeError::Internal(e.to_string()))?
+                .to_path_buf();
+            if path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(ForgeError::Internal(format!(
+                    "Unsafe path traversal in storage snapshot: {:?}",
+                    path
+                )));
+            }
+            let dest = staged_dir.join(&path);
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
+            }
+            file.unpack(&dest).map_err(|e| {
+                ForgeError::Internal(format!("Failed to unpack storage file: {}", e))
+            })?;
+        }
+
+        // Persist durable staging record
+        let durable_record_id =
+            format!("{}/.participant_staging_record.json", staged_dir.display());
+        let rec_path = staged_dir.join(".participant_staging_record.json");
+        let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let prev_gen = super::journal::RestoreJournal::read_storage_generation(storage_root);
+
+        let ack = ParticipantAcknowledgement {
+            restore_id: restore_id.to_string(),
+            backup_id: backup_id.to_string(),
+            participant_id: "spine_storage".to_string(),
+            volume_name: "spine_storage".to_string(),
+            canonical_resource_id: "api_local_vcs_storage".to_string(),
+            previous_generation: prev_gen,
+            target_generation: target_generation.to_string(),
+            staged_digest: staged_digest.clone(),
+            staged_byte_length,
+            prepared_at_nanos: now_nanos,
+            prepared: true,
+            durable_staging_record_id: durable_record_id,
+            current_state: "StagedAndVerified".to_string(),
+        };
+
+        let json = serde_json::to_vec_pretty(&ack).map_err(|e| {
+            ForgeError::Internal(format!("Failed to serialize staging record: {}", e))
+        })?;
+        {
+            let mut f = fs::File::create(&rec_path).map_err(|e| {
+                ForgeError::Internal(format!("Failed to create staging record: {}", e))
+            })?;
+            f.write_all(&json)
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+            f.flush().map_err(|e| ForgeError::Internal(e.to_string()))?;
+            f.sync_all()
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        }
+
+        Ok(Self {
+            storage_root: storage_root.to_path_buf(),
+            staged_dir,
+            old_dir,
+            restore_id: restore_id.to_string(),
+            backup_id: backup_id.to_string(),
+            target_generation: target_generation.to_string(),
+            staged_digest,
+            staged_byte_length,
+            acknowledgement: ack,
+        })
+    }
+
+    pub fn query_preparation_status(
+        &self,
+    ) -> Result<Option<ParticipantAcknowledgement>, ForgeError> {
+        let rec_path = self.staged_dir.join(".participant_staging_record.json");
+        if !rec_path.exists() {
+            return Ok(None);
+        }
+        let content = fs::read_to_string(&rec_path)
+            .map_err(|e| ForgeError::Internal(format!("Failed to read staging record: {}", e)))?;
+        let ack: ParticipantAcknowledgement = serde_json::from_str(&content)
+            .map_err(|e| ForgeError::Internal(format!("Corrupt staging record: {}", e)))?;
+        Ok(Some(ack))
+    }
+
+    pub fn publish(&self) -> Result<(), ForgeError> {
+        if !self.staged_dir.exists() {
+            return Err(ForgeError::Internal(
+                "Staging directory missing during publish".into(),
+            ));
+        }
+
+        let _ = fs::create_dir_all(&self.old_dir);
+
+        // Move existing entries to old_dir
+        if let Ok(entries) = fs::read_dir(&self.storage_root) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p == self.old_dir || p == self.staged_dir {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !name.starts_with(".old_generation_")
+                    && !name.starts_with(".staged_")
+                    && !name.starts_with(".tmp")
+                    && !name.starts_with(".spine_restore_control")
+                    && name != "restore_journal.json"
+                {
+                    let dst = self.old_dir.join(&name);
+                    let _ = super::safe_move_path(&p, &dst);
+                }
+            }
+        }
+
+        // Move staged entries to storage_root
+        if let Ok(entries) = fs::read_dir(&self.staged_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name != "database"
+                    && name != "staged_ssh"
+                    && !name.starts_with(".tmp")
+                    && name != ".participant_staging_record.json"
+                {
+                    let dst = self.storage_root.join(&name);
+                    let _ = super::safe_move_path(&p, &dst);
+                }
+            }
+        }
+
+        super::journal::RestoreJournal::write_storage_generation(
+            &self.storage_root,
+            &self.target_generation,
+        )?;
+        Ok(())
+    }
+
+    pub fn finalize(&self) -> Result<(), ForgeError> {
+        if self.old_dir.exists() {
+            let _ = fs::remove_dir_all(&self.old_dir);
+        }
+        if self.staged_dir.exists() {
+            let _ = fs::remove_dir_all(&self.staged_dir);
+        }
+        Ok(())
+    }
+
+    pub fn rollback(&self) -> Result<(), ForgeError> {
+        if self.old_dir.exists() {
+            if let Ok(entries) = fs::read_dir(&self.old_dir) {
+                for entry in entries.flatten() {
+                    let dst = self.storage_root.join(entry.file_name());
+                    let _ = super::safe_move_path(&entry.path(), &dst);
+                }
+            }
+            let _ = fs::remove_dir_all(&self.old_dir);
+        }
+        if self.staged_dir.exists() {
+            let _ = fs::remove_dir_all(&self.staged_dir);
+        }
+        Ok(())
+    }
+}
+
+/// Durable participant adapter for SSH host keys (`spine_ssh`).
+pub struct SshParticipantAdapter {
+    pub storage_root: PathBuf,
+    pub ssh_dir: PathBuf,
+    pub staged_dir: PathBuf,
+    pub old_dir: PathBuf,
+    pub restore_id: String,
+    pub backup_id: String,
+    pub target_generation: String,
+    pub staged_digest: String,
+    pub staged_byte_length: u64,
+    pub acknowledgement: ParticipantAcknowledgement,
+}
+
+impl SshParticipantAdapter {
+    pub fn prepare(
+        storage_root: &Path,
+        restore_id: &str,
+        backup_id: &str,
+        target_generation: &str,
+        payload_bytes: &[u8],
+    ) -> Result<Self, ForgeError> {
+        if payload_bytes.is_empty() {
+            return Err(ForgeError::Internal("SSH snapshot payload is empty".into()));
+        }
+
+        let staged_dir = storage_root.join(format!(".staged_ssh_{}", restore_id));
+        let old_dir = storage_root.join(format!(".old_ssh_{}", restore_id));
+        let ssh_dir = crate::ssh::host_key::resolve_ssh_dir(storage_root);
+
+        if staged_dir.exists() {
+            let _ = fs::remove_dir_all(&staged_dir);
+        }
+        fs::create_dir_all(&staged_dir).map_err(|e| {
+            ForgeError::Internal(format!("Failed to create SSH staging directory: {}", e))
+        })?;
+
+        let mut hasher = Sha256::new();
+        hasher.update(payload_bytes);
+        let staged_digest = hex::encode(hasher.finalize());
+        let staged_byte_length = payload_bytes.len() as u64;
+
+        // Unpack payload
+        let gz = GzDecoder::new(payload_bytes);
+        let mut archive = Archive::new(gz);
+        let entries = archive.entries().map_err(|e| {
+            ForgeError::Internal(format!("Failed to read SSH snapshot tar entries: {}", e))
+        })?;
+
+        for entry in entries {
+            let mut file = entry.map_err(|e| ForgeError::Internal(e.to_string()))?;
+            let path = file
+                .path()
+                .map_err(|e| ForgeError::Internal(e.to_string()))?
+                .to_path_buf();
+            if path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(ForgeError::Internal(format!(
+                    "Unsafe path traversal in SSH snapshot: {:?}",
+                    path
+                )));
+            }
+            let dest = staged_dir.join(&path);
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
+            }
+            file.unpack(&dest).map_err(|e| {
+                ForgeError::Internal(format!("Failed to unpack SSH key file: {}", e))
+            })?;
+        }
+
+        // Persist durable staging record
+        let durable_record_id =
+            format!("{}/.participant_staging_record.json", staged_dir.display());
+        let rec_path = staged_dir.join(".participant_staging_record.json");
+        let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+        let ack = ParticipantAcknowledgement {
+            restore_id: restore_id.to_string(),
+            backup_id: backup_id.to_string(),
+            participant_id: "spine_ssh".to_string(),
+            volume_name: "spine_ssh".to_string(),
+            canonical_resource_id: "spine_ssh_host_identity".to_string(),
+            previous_generation: None,
+            target_generation: target_generation.to_string(),
+            staged_digest: staged_digest.clone(),
+            staged_byte_length,
+            prepared_at_nanos: now_nanos,
+            prepared: true,
+            durable_staging_record_id: durable_record_id,
+            current_state: "StagedAndVerified".to_string(),
+        };
+
+        let json = serde_json::to_vec_pretty(&ack).map_err(|e| {
+            ForgeError::Internal(format!("Failed to serialize SSH staging record: {}", e))
+        })?;
+        {
+            let mut f = fs::File::create(&rec_path).map_err(|e| {
+                ForgeError::Internal(format!("Failed to create SSH staging record: {}", e))
+            })?;
+            f.write_all(&json)
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+            f.flush().map_err(|e| ForgeError::Internal(e.to_string()))?;
+            f.sync_all()
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        }
+
+        Ok(Self {
+            storage_root: storage_root.to_path_buf(),
+            ssh_dir,
+            staged_dir,
+            old_dir,
+            restore_id: restore_id.to_string(),
+            backup_id: backup_id.to_string(),
+            target_generation: target_generation.to_string(),
+            staged_digest,
+            staged_byte_length,
+            acknowledgement: ack,
+        })
+    }
+
+    pub fn query_preparation_status(
+        &self,
+    ) -> Result<Option<ParticipantAcknowledgement>, ForgeError> {
+        let rec_path = self.staged_dir.join(".participant_staging_record.json");
+        if !rec_path.exists() {
+            return Ok(None);
+        }
+        let content = fs::read_to_string(&rec_path).map_err(|e| {
+            ForgeError::Internal(format!("Failed to read SSH staging record: {}", e))
+        })?;
+        let ack: ParticipantAcknowledgement = serde_json::from_str(&content)
+            .map_err(|e| ForgeError::Internal(format!("Corrupt SSH staging record: {}", e)))?;
+        Ok(Some(ack))
+    }
+
+    pub fn publish(&self) -> Result<(), ForgeError> {
+        if !self.staged_dir.exists() {
+            return Err(ForgeError::Internal(
+                "SSH staging directory missing during publish".into(),
+            ));
+        }
+
+        fs::create_dir_all(&self.ssh_dir)
+            .map_err(|e| ForgeError::Internal(format!("Failed to create SSH directory: {}", e)))?;
+        let _ = fs::create_dir_all(&self.old_dir);
+
+        // Backup existing ssh keys
+        if let Ok(entries) = fs::read_dir(&self.ssh_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let dst = self.old_dir.join(entry.file_name());
+                let _ = fs::copy(&p, &dst);
+            }
+        }
+
+        // Copy staged keys into ssh_dir
+        if let Ok(entries) = fs::read_dir(&self.staged_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.file_name()
+                    .map(|n| n == ".participant_staging_record.json")
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let dst = self.ssh_dir.join(entry.file_name());
+                let _ = fs::copy(&p, &dst);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn finalize(&self) -> Result<(), ForgeError> {
+        if self.old_dir.exists() {
+            let _ = fs::remove_dir_all(&self.old_dir);
+        }
+        if self.staged_dir.exists() {
+            let _ = fs::remove_dir_all(&self.staged_dir);
+        }
+        Ok(())
+    }
+
+    pub fn rollback(&self) -> Result<(), ForgeError> {
+        if self.old_dir.exists() {
+            if let Ok(entries) = fs::read_dir(&self.old_dir) {
+                for entry in entries.flatten() {
+                    let dst = self.ssh_dir.join(entry.file_name());
+                    let _ = fs::copy(entry.path(), &dst);
+                }
+            }
+            let _ = fs::remove_dir_all(&self.old_dir);
+        }
+        if self.staged_dir.exists() {
+            let _ = fs::remove_dir_all(&self.staged_dir);
+        }
         Ok(())
     }
 }

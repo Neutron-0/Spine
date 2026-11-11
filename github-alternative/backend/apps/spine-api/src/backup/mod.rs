@@ -23,7 +23,10 @@ pub mod v2;
 
 pub use consistency::{ConsistencyBarrier, MaintenanceGuard, SPINE_CLUSTER_MAINTENANCE_LOCK_ID};
 pub use journal::{CommitDecisionRecord, ParticipantAcknowledgement, RestoreJournal, RestorePhase};
-pub use participants::{DeploymentResource, ParticipantClassification, ParticipantRegistry};
+pub use participants::{
+    DeploymentResource, LocalStorageParticipantAdapter, ParticipantClassification,
+    ParticipantRegistry, SshParticipantAdapter,
+};
 pub use v2::{BackupHeaderV2, StreamSummary};
 
 pub const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
@@ -114,14 +117,35 @@ pub fn safe_move_path(from: &Path, to: &Path) -> Result<(), ForgeError> {
     }
 }
 
+/// Safely flush a directory handle across platforms (using FILE_FLAG_BACKUP_SEMANTICS on Windows).
+pub fn sync_dir(dir: &Path) -> Result<(), ForgeError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
+        if let Ok(f) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)
+        {
+            let _ = f.sync_all();
+        }
+    }
+    #[cfg(unix)]
+    {
+        if let Ok(f) = std::fs::File::open(dir) {
+            let _ = f.sync_all();
+        }
+    }
+    Ok(())
+}
+
 /// Safely replaces a destination file atomically, preserving previous destination until replacement is confirmed.
 /// Never deletes destination file prior to verification. Accommodates Windows rename semantics.
 pub fn safe_atomic_replace(from: &Path, to: &Path) -> Result<(), ForgeError> {
     if fs::rename(from, to).is_ok() && to.exists() && fs::metadata(to).is_ok() {
         if let Some(parent) = to.parent() {
-            if let Ok(p_file) = fs::File::open(parent) {
-                let _ = p_file.sync_all();
-            }
+            let _ = sync_dir(parent);
         }
         return Ok(());
     }
@@ -138,9 +162,7 @@ pub fn safe_atomic_replace(from: &Path, to: &Path) -> Result<(), ForgeError> {
             Ok(()) => {
                 if to.exists() && fs::metadata(to).is_ok() {
                     if let Some(parent) = to.parent() {
-                        if let Ok(p_file) = fs::File::open(parent) {
-                            let _ = p_file.sync_all();
-                        }
+                        let _ = sync_dir(parent);
                     }
                     let _ = fs::remove_file(&backup);
                     Ok(())
@@ -163,28 +185,36 @@ pub fn safe_atomic_replace(from: &Path, to: &Path) -> Result<(), ForgeError> {
             }
         }
     } else {
-        fs::copy(from, to).map_err(|e| {
-            ForgeError::Internal(format!(
-                "Failed to copy {} to {}: {}",
-                from.display(),
-                to.display(),
-                e
-            ))
-        })?;
-        if to.exists() && fs::metadata(to).is_ok() {
-            if let Some(parent) = to.parent() {
-                if let Ok(p_file) = fs::File::open(parent) {
-                    let _ = p_file.sync_all();
+        match fs::rename(from, to) {
+            Ok(()) => {
+                if let Some(parent) = to.parent() {
+                    let _ = sync_dir(parent);
+                }
+                Ok(())
+            }
+            Err(_) => {
+                fs::copy(from, to).map_err(|e| {
+                    ForgeError::Internal(format!(
+                        "Failed to copy {} to {}: {}",
+                        from.display(),
+                        to.display(),
+                        e
+                    ))
+                })?;
+                if to.exists() && fs::metadata(to).is_ok() {
+                    if let Some(parent) = to.parent() {
+                        let _ = sync_dir(parent);
+                    }
+                    let _ = fs::remove_file(from);
+                    Ok(())
+                } else {
+                    let _ = fs::remove_file(to);
+                    Err(ForgeError::Internal(format!(
+                        "Readback verification failed after copying {}",
+                        to.display()
+                    )))
                 }
             }
-            let _ = fs::remove_file(from);
-            Ok(())
-        } else {
-            let _ = fs::remove_file(to);
-            Err(ForgeError::Internal(format!(
-                "Readback verification failed after copying {}",
-                to.display()
-            )))
         }
     }
 }

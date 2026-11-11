@@ -1,8 +1,8 @@
-# Spine Release Candidate Manifest (Batch 21K Deployment Candidate)
+# Spine Release Candidate Manifest (Batch 21L Deployment Candidate)
 
-**Milestone:** Spine Batch 21K — Production Global Restore Recovery, PostgreSQL Staging, Journal Durability, and Backup Confidentiality<br>
-**Baseline Commit:** `fa7bd142d4f42d8d86bb04d3c713067b944c77a9`<br>
-**Target Release:** Deployment Candidate for Thirteenth Independent Codex Audit<br>
+**Milestone:** Spine Batch 21L — Genuine Participant Acknowledgements, Safe PostgreSQL Cutover, Durable Journal State, and Fail-Closed Production Writes<br>
+**Baseline Commit:** `80c07cc11fbacf49da0920cf003ef35bd58a464e`<br>
+**Target Release:** Deployment Candidate for Fourteenth Independent Codex Audit<br>
 **Target Platform:** Linux x86_64, Windows x86_64  
 
 ---
@@ -17,10 +17,10 @@
 
 #### Release Binary Hashes (`target/release-candidate/SHA256SUMS`):
 ```text
-b3046c7b4bfd03c731ae7d9ef2771bf7fdd0fb0d4a18c5819025188ee88a5c9f  spine-api.exe
-09f06490a69c2211709dc26ae787cd808d3255d14f0c2627e05589da97fa5ea9  spine-coordinator.exe
-1c15ea3b4bfe99510ae27f575d1936cf01897379b5c9b315513d74a39597b2b1  spine-storage-node.exe
-db092b762833b7c25c75035b055869ccbad1afec14c6c288f6bf8e269414b7c3  spine.exe
+5319a3d20e917e628f49260051a22376cb62f80139ad3573ec163db842242d6f  spine-api.exe
+4793b2f7e59aa4cedb296596e6dd1d7d59e8766ab81e57201b07beb35870ff72  spine-coordinator.exe
+2c8fcb87b1b6779842aee2164974d649e7ad78560a03d8910f152d404ddd6332  spine-storage-node.exe
+d81b5b43c674e9d1ccf72938865e137a8c21098c001d6e97e5b9a66f100aeba2  spine.exe
 ```
 
 ### 1.2. Frontend Web Assets

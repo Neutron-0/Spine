@@ -174,17 +174,26 @@ impl ClusterNodeClient {
                 if let Some(ack) = acknowledgement {
                     Ok(ack)
                 } else {
+                    let canonical_res =
+                        format!("{}_{}", manifest.participant_id, manifest.volume_name);
+                    let rec_id = format!(
+                        ".staged_volume_{}/.staged_restore_record.json",
+                        manifest.snapshot_id
+                    );
                     Ok(spine_cluster::protocol::ParticipantAcknowledgement {
                         restore_id: format!("rst_{}", snapshot_id),
                         backup_id: snapshot_id,
                         participant_id: manifest.participant_id,
                         volume_name: manifest.volume_name,
+                        canonical_resource_id: canonical_res,
                         previous_generation: None,
                         target_generation: manifest.fencing_generation.to_string(),
                         staged_digest: manifest.sha256_checksum,
                         staged_byte_length: manifest.total_bytes,
                         prepared_at_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
                         prepared: true,
+                        durable_staging_record_id: rec_id,
+                        current_state: "Staged".to_string(),
                     })
                 }
             }

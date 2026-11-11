@@ -769,17 +769,42 @@ impl StorageBackend for FileSystemStorageBackend {
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
 
+        let staging_rec_rel = format!(".staged_volume_{}/.staged_restore_record.json", snapshot_id);
+        let staging_rec_path = self.storage_root.join(&staging_rec_rel);
+        let staging_metadata = serde_json::json!({
+            "restore_id": format!("rst_{}", snapshot_id),
+            "snapshot_id": snapshot_id,
+            "node_id": self.node_id,
+            "fencing_generation": fencing_generation,
+            "staged_digest": staged_digest,
+            "staged_bytes": payload_tar_gz.len(),
+            "staged_at_nanos": now_nanos,
+        });
+        if let Ok(m_bytes) = serde_json::to_vec_pretty(&staging_metadata) {
+            let tmp_rec = staging_rec_path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
+            if let Ok(mut f) = fs::File::create(&tmp_rec) {
+                use std::io::Write;
+                let _ = f.write_all(&m_bytes);
+                let _ = f.flush();
+                let _ = f.sync_all();
+                let _ = safe_atomic_replace(&tmp_rec, &staging_rec_path);
+            }
+        }
+
         let ack = ParticipantAcknowledgement {
             restore_id: format!("rst_{}", snapshot_id),
             backup_id: snapshot_id.to_string(),
             participant_id: self.node_id.clone(),
             volume_name: format!("{}_data", self.node_id.replace('-', "_")),
+            canonical_resource_id: format!("{}_volume_data", self.node_id.replace('-', "_")),
             previous_generation: Some(cur_gen.to_string()),
             target_generation: fencing_generation.to_string(),
             staged_digest,
             staged_byte_length: payload_tar_gz.len() as u64,
             prepared_at_nanos: now_nanos,
             prepared: true,
+            durable_staging_record_id: staging_rec_rel,
+            current_state: "Staged".to_string(),
         };
 
         Ok(ack)

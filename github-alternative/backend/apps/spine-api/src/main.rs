@@ -1110,26 +1110,9 @@ async fn main() -> anyhow::Result<()> {
                             anyhow::anyhow!("Database staging failed: {}", e)
                         })?;
 
-                        let db_ack = spine_api::backup::ParticipantAcknowledgement {
-                            restore_id: session.journal.restore_id.clone(),
-                            backup_id: session.manifest.backup_id.clone(),
-                            participant_id: "postgres_data".to_string(),
-                            volume_name: "postgres_data".to_string(),
-                            previous_generation: session
-                                .journal
-                                .previous_storage_generation
-                                .clone(),
-                            target_generation: session.journal.target_generation.clone(),
-                            staged_digest: s_db.staged_digest.clone(),
-                            staged_byte_length: s_db.staged_byte_length,
-                            prepared_at_nanos: chrono::Utc::now()
-                                .timestamp_nanos_opt()
-                                .unwrap_or(0),
-                            prepared: true,
-                        };
                         session
                             .journal
-                            .record_participant_ack(db_ack)
+                            .record_participant_ack(s_db.acknowledgement.clone())
                             .map_err(|e| {
                                 anyhow::anyhow!(
                                     "Failed to record postgres_data acknowledgement: {}",
@@ -1145,44 +1128,43 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 // 2. Stage Local Repository Storage (spine_storage)
+                let mut staged_storage_adapter: Option<
+                    spine_api::backup::LocalStorageParticipantAdapter,
+                > = None;
                 if session
                     .manifest
                     .participants
                     .iter()
                     .any(|p| p.participant_id == "spine_storage")
                 {
-                    let storage_digest = session
-                        .manifest
-                        .file_hashes
-                        .get("storage/spine_storage_snapshot.tar.gz")
-                        .cloned()
-                        .unwrap_or_else(|| "staged_verified".to_string());
-                    let storage_bytes = session
-                        .manifest
-                        .participants
-                        .iter()
-                        .find(|p| p.participant_id == "spine_storage")
-                        .map(|p| p.byte_length)
-                        .unwrap_or(0);
-
-                    let storage_ack = spine_api::backup::ParticipantAcknowledgement {
-                        restore_id: session.journal.restore_id.clone(),
-                        backup_id: session.manifest.backup_id.clone(),
-                        participant_id: "spine_storage".to_string(),
-                        volume_name: "spine_storage".to_string(),
-                        previous_generation: session.journal.previous_storage_generation.clone(),
-                        target_generation: session.journal.target_generation.clone(),
-                        staged_digest: storage_digest,
-                        staged_byte_length: storage_bytes,
-                        prepared_at_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
-                        prepared: true,
-                    };
-                    session
-                        .journal
-                        .record_participant_ack(storage_ack)
+                    if let Some(storage_data) = session
+                        .get_participant_snapshot_data("storage/spine_storage_snapshot.tar.gz")
+                    {
+                        println!(
+                            "Staging local repository storage into isolated staging directory..."
+                        );
+                        let adapter = spine_api::backup::LocalStorageParticipantAdapter::prepare(
+                            &target_storage,
+                            &session.journal.restore_id,
+                            &session.manifest.backup_id,
+                            &session.journal.target_generation,
+                            &storage_data,
+                        )
                         .map_err(|e| {
-                            anyhow::anyhow!("Failed to record spine_storage acknowledgement: {}", e)
+                            let _ = session.abort(&format!("LocalStorage staging failed: {}", e));
+                            anyhow::anyhow!("LocalStorage staging failed: {}", e)
                         })?;
+                        session
+                            .journal
+                            .record_participant_ack(adapter.acknowledgement.clone())
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "Failed to record spine_storage acknowledgement: {}",
+                                    e
+                                )
+                            })?;
+                        staged_storage_adapter = Some(adapter);
+                    }
                 }
 
                 // 3. Stage Coordinator and Storage Node Volumes via typed RPC
@@ -1300,96 +1282,70 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 // 4. Prepare SSH identity staging if present
-                let has_ssh = session
+                let mut staged_ssh_adapter: Option<spine_api::backup::SshParticipantAdapter> = None;
+                if session
                     .manifest
                     .participants
                     .iter()
-                    .any(|p| p.participant_id == "spine_ssh");
-                let staged_ssh_dir = if has_ssh {
-                    let s_dir = session.staging_dir.path().join("staged_ssh");
+                    .any(|p| p.participant_id == "spine_ssh")
+                {
                     if let Some(data) =
                         session.get_participant_snapshot_data("ssh/ssh_identity_snapshot.tar.gz")
                     {
                         println!("Validating SSH host identity snapshot in isolated staging...");
-                        let fp = spine_api::backup::BackupManager::restore_ssh_identity_snapshot(
-                            &s_dir,
+                        let adapter = spine_api::backup::SshParticipantAdapter::prepare(
+                            &target_storage,
+                            &session.journal.restore_id,
+                            &session.manifest.backup_id,
+                            &session.journal.target_generation,
                             &data,
-                            session.manifest.ssh_host_key_fingerprint.as_deref(),
                         )
                         .map_err(|e| {
                             let _ = session
                                 .abort(&format!("SSH identity staging validation failed: {}", e));
                             anyhow::anyhow!("SSH identity staging validation failed: {}", e)
                         })?;
-                        println!("Staged SSH identity verified with fingerprint: {}", fp);
-
-                        let ssh_digest = session
-                            .manifest
-                            .file_hashes
-                            .get("ssh/ssh_identity_snapshot.tar.gz")
-                            .cloned()
-                            .unwrap_or_else(|| fp.clone());
-                        let ssh_bytes = session
-                            .manifest
-                            .participants
-                            .iter()
-                            .find(|p| p.participant_id == "spine_ssh")
-                            .map(|p| p.byte_length)
-                            .unwrap_or(0);
-
-                        let ssh_ack = spine_api::backup::ParticipantAcknowledgement {
-                            restore_id: session.journal.restore_id.clone(),
-                            backup_id: session.manifest.backup_id.clone(),
-                            participant_id: "spine_ssh".to_string(),
-                            volume_name: "spine_ssh".to_string(),
-                            previous_generation: None,
-                            target_generation: session.journal.target_generation.clone(),
-                            staged_digest: ssh_digest,
-                            staged_byte_length: ssh_bytes,
-                            prepared_at_nanos: chrono::Utc::now()
-                                .timestamp_nanos_opt()
-                                .unwrap_or(0),
-                            prepared: true,
-                        };
                         session
                             .journal
-                            .record_participant_ack(ssh_ack)
+                            .record_participant_ack(adapter.acknowledgement.clone())
                             .map_err(|e| {
                                 anyhow::anyhow!("Failed to record spine_ssh acknowledgement: {}", e)
                             })?;
+                        staged_ssh_adapter = Some(adapter);
                     }
-                    Some(s_dir)
-                } else {
-                    None
-                };
+                }
 
                 // ------------------------------------------------------------------------
                 // Phase 2: PREPARED (All Participants Staged and Verified)
                 // ------------------------------------------------------------------------
                 println!("=== Phase 2: PREPARED (All Participants Staged and Verified) ===");
-                let missing_participant = session
+                let expected_participants: Vec<String> = session
                     .manifest
                     .participants
                     .iter()
                     .map(|p| p.participant_id.clone())
-                    .find(|id| !session.journal.acknowledgements.contains_key(id));
+                    .collect();
 
-                if let Some(missing_id) = missing_participant {
+                if let Err(e) = session
+                    .journal
+                    .validate_commit_decision_gate(&expected_participants)
+                {
                     for (r_snap, _, r_client) in &staged_cluster_restores {
                         let _ = r_client.rollback_restore(r_snap).await;
                     }
                     if let Some(ref sdb) = staged_db_restore {
                         let _ = sdb.rollback().await;
                     }
-                    let _ = session.abort(&format!(
-                        "Missing preparation acknowledgement for participant '{}'",
-                        missing_id
-                    ));
-                    anyhow::bail!(
-                        "Missing preparation acknowledgement for participant '{}'. Global commit decision prevented.",
-                        missing_id
-                    );
+                    if let Some(ref s_storage) = staged_storage_adapter {
+                        let _ = s_storage.rollback();
+                    }
+                    if let Some(ref s_ssh) = staged_ssh_adapter {
+                        let _ = s_ssh.rollback();
+                    }
+                    let _ = session.abort(&format!("Commit decision gate failed: {}", e));
+                    anyhow::bail!("Commit decision gate failed: {}", e);
                 }
+
                 session
                     .journal
                     .persist(spine_api::backup::RestorePhase::Prepared)
@@ -1401,6 +1357,14 @@ async fn main() -> anyhow::Result<()> {
                 // Phase 3: COMMIT DECISION (Durable Pre-Cutover Transaction Record)
                 // ------------------------------------------------------------------------
                 println!("=== Phase 3: COMMIT DECISION (Durable Pre-Cutover Ledger Invariant) ===");
+                session
+                    .journal
+                    .validate_commit_decision_gate(&expected_participants)
+                    .map_err(|e| {
+                        let _ = session.abort(&format!("Commit decision validation failed: {}", e));
+                        anyhow::anyhow!("Commit decision validation failed: {}", e)
+                    })?;
+
                 let decision_token = format!(
                     "commit_{}_{}",
                     session.manifest.backup_id,
@@ -1444,9 +1408,15 @@ async fn main() -> anyhow::Result<()> {
                 // Step 1: Database cutover
                 if let Some(ref sdb) = staged_db_restore {
                     println!("Atomically cutting over staged database to live target database...");
-                    if let Err(e) = sdb.commit_cutover().await {
+                    if let Err(e) = sdb.commit_cutover(&target_storage).await {
                         for (snap_id, _, client) in &staged_cluster_restores {
                             let _ = client.rollback_restore(snap_id).await;
+                        }
+                        if let Some(ref s_storage) = staged_storage_adapter {
+                            let _ = s_storage.rollback();
+                        }
+                        if let Some(ref s_ssh) = staged_ssh_adapter {
+                            let _ = s_ssh.rollback();
                         }
                         let _ = session.abort(&format!("Database cutover failed: {}", e));
                         anyhow::bail!("Failed to cut over database: {}. Target repository storage was left untouched.", e);
@@ -1461,25 +1431,52 @@ async fn main() -> anyhow::Result<()> {
                 // Step 2: Publish verified repository storage to live root (retaining rollback generation)
                 println!("Atomically publishing verified repository storage to live root (retaining rollback generation)...");
                 let manifest = session.manifest.clone();
-                let report = match session.publish_storage() {
-                    Ok(r) => {
-                        let _ = session
-                            .journal
-                            .record_participant_published("spine_storage");
-                        r
-                    }
-                    Err(e) => {
-                        println!(
-                            "Storage publication failed, rolling back cluster participants..."
-                        );
+                let report = if let Some(ref s_storage) = staged_storage_adapter {
+                    if let Err(e) = s_storage.publish() {
                         for (r_snap, _, r_client) in &staged_cluster_restores {
                             let _ = r_client.rollback_restore(r_snap).await;
                         }
                         if let Some(ref sdb) = staged_db_restore {
                             let _ = sdb.rollback().await;
                         }
+                        if let Some(ref s_ssh) = staged_ssh_adapter {
+                            let _ = s_ssh.rollback();
+                        }
+                        let _ = s_storage.rollback();
                         let _ = session.rollback();
                         anyhow::bail!("Failed to publish verified storage to live root: {}", e);
+                    }
+                    let _ = session
+                        .journal
+                        .record_participant_published("spine_storage");
+                    spine_api::backup::RestoreReport {
+                        backup_id: manifest.backup_id.clone(),
+                        files_restored: 1,
+                        bytes_restored: s_storage.staged_byte_length,
+                        integrity_verified: true,
+                        duration_ms: 0,
+                    }
+                } else {
+                    match session.publish_storage() {
+                        Ok(r) => {
+                            let _ = session
+                                .journal
+                                .record_participant_published("spine_storage");
+                            r
+                        }
+                        Err(e) => {
+                            for (r_snap, _, r_client) in &staged_cluster_restores {
+                                let _ = r_client.rollback_restore(r_snap).await;
+                            }
+                            if let Some(ref sdb) = staged_db_restore {
+                                let _ = sdb.rollback().await;
+                            }
+                            if let Some(ref s_ssh) = staged_ssh_adapter {
+                                let _ = s_ssh.rollback();
+                            }
+                            let _ = session.rollback();
+                            anyhow::bail!("Failed to publish verified storage to live root: {}", e);
+                        }
                     }
                 };
 
@@ -1503,6 +1500,12 @@ async fn main() -> anyhow::Result<()> {
                         if let Some(ref sdb) = staged_db_restore {
                             let _ = sdb.rollback().await;
                         }
+                        if let Some(ref s_storage) = staged_storage_adapter {
+                            let _ = s_storage.rollback();
+                        }
+                        if let Some(ref s_ssh) = staged_ssh_adapter {
+                            let _ = s_ssh.rollback();
+                        }
                         let _ = session.rollback();
                         let _ = session
                             .abort(&format!("Failed to commit cluster volume restore: {}", e));
@@ -1517,50 +1520,21 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 // Step 4: Publish staged SSH host identity with rollback preservation
-                let ssh_dir = spine_api::ssh::host_key::resolve_ssh_dir(&target_storage);
-                let old_ssh_dir =
-                    target_storage.join(format!(".old_ssh_{}", session.journal.restore_id));
-                if let Some(ref s_dir) = staged_ssh_dir {
-                    println!(
-                        "Publishing staged SSH host identity to {}...",
-                        ssh_dir.display()
-                    );
-                    if ssh_dir.exists() {
-                        let _ = std::fs::create_dir_all(&old_ssh_dir);
-                        if let Ok(entries) = std::fs::read_dir(&ssh_dir) {
-                            for entry in entries.flatten() {
-                                let dst = old_ssh_dir.join(entry.file_name());
-                                let _ = spine_api::backup::safe_move_file(&entry.path(), &dst);
-                            }
+                if let Some(ref s_ssh) = staged_ssh_adapter {
+                    println!("Publishing staged SSH host identity...");
+                    if let Err(e) = s_ssh.publish() {
+                        for (r_snap, _, r_client) in &committed_cluster_restores {
+                            let _ = r_client.rollback_restore(r_snap).await;
                         }
-                    }
-                    let _ = std::fs::create_dir_all(&ssh_dir);
-                    if let Ok(entries) = std::fs::read_dir(s_dir) {
-                        for entry in entries.flatten() {
-                            let dst = ssh_dir.join(entry.file_name());
-                            if let Err(e) = std::fs::copy(entry.path(), &dst) {
-                                // Revert SSH keys
-                                if old_ssh_dir.exists() {
-                                    if let Ok(old_entries) = std::fs::read_dir(&old_ssh_dir) {
-                                        for old_e in old_entries.flatten() {
-                                            let _ = spine_api::backup::safe_move_file(
-                                                &old_e.path(),
-                                                &ssh_dir.join(old_e.file_name()),
-                                            );
-                                        }
-                                    }
-                                    let _ = std::fs::remove_dir_all(&old_ssh_dir);
-                                }
-                                for (r_snap, _, r_client) in &committed_cluster_restores {
-                                    let _ = r_client.rollback_restore(r_snap).await;
-                                }
-                                if let Some(ref sdb) = staged_db_restore {
-                                    let _ = sdb.rollback().await;
-                                }
-                                let _ = session.rollback();
-                                anyhow::bail!("Failed to copy staged SSH identity: {}", e);
-                            }
+                        if let Some(ref sdb) = staged_db_restore {
+                            let _ = sdb.rollback().await;
                         }
+                        if let Some(ref s_storage) = staged_storage_adapter {
+                            let _ = s_storage.rollback();
+                        }
+                        let _ = s_ssh.rollback();
+                        let _ = session.rollback();
+                        anyhow::bail!("Failed to publish staged SSH identity: {}", e);
                     }
                     let _ = session.journal.record_participant_published("spine_ssh");
                     println!("SSH host identity published successfully.");
@@ -1604,22 +1578,17 @@ async fn main() -> anyhow::Result<()> {
                         "Post-cutover verification failed: {}. Executing distributed rollback...",
                         verify_err_msg
                     );
-                    if old_ssh_dir.exists() {
-                        if let Ok(old_entries) = std::fs::read_dir(&old_ssh_dir) {
-                            for old_e in old_entries.flatten() {
-                                let _ = spine_api::backup::safe_move_file(
-                                    &old_e.path(),
-                                    &ssh_dir.join(old_e.file_name()),
-                                );
-                            }
-                        }
-                        let _ = std::fs::remove_dir_all(&old_ssh_dir);
+                    if let Some(ref s_ssh) = staged_ssh_adapter {
+                        let _ = s_ssh.rollback();
                     }
                     for (r_snap, _, r_client) in &committed_cluster_restores {
                         let _ = r_client.rollback_restore(r_snap).await;
                     }
                     if let Some(ref sdb) = staged_db_restore {
                         let _ = sdb.rollback().await;
+                    }
+                    if let Some(ref s_storage) = staged_storage_adapter {
+                        let _ = s_storage.rollback();
                     }
                     let _ = session.rollback();
                     anyhow::bail!("Restore failed post-cutover verification: {}. All participants rolled back to previous generation.", verify_err_msg);
@@ -1636,11 +1605,14 @@ async fn main() -> anyhow::Result<()> {
                 // Purge .old_restore, .old_generation, and .old_ssh across all participants
                 // ------------------------------------------------------------------------
                 println!("=== Phase 6: FINALIZE (Purging Retained Old Generations) ===");
-                if old_ssh_dir.exists() {
-                    let _ = std::fs::remove_dir_all(&old_ssh_dir);
+                if let Some(ref s_ssh) = staged_ssh_adapter {
+                    let _ = s_ssh.finalize();
                 }
                 if let Some(ref sdb) = staged_db_restore {
                     let _ = sdb.finalize().await;
+                }
+                if let Some(ref s_storage) = staged_storage_adapter {
+                    let _ = s_storage.finalize();
                 }
                 for (snap_id, _, client) in &committed_cluster_restores {
                     if let Err(e) = client.finalize_restore(snap_id).await {
@@ -1817,7 +1789,59 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
         }
     }
 
-    // 1. Initialize Database backend
+    // 1. Resolve and ensure Storage Root exists
+    let storage_root_path = if let Ok(root_str) =
+        std::env::var("SPINE_STORAGE_ROOT").or_else(|_| std::env::var("STORAGE_ROOT"))
+    {
+        std::path::PathBuf::from(root_str.trim())
+    } else {
+        args.storage_root
+    };
+    if profile.requires_persistent_database()
+        && storage_root_path == std::path::Path::new("./.spine-dev-cluster/node-1")
+    {
+        anyhow::bail!(
+            "CRITICAL CONFIGURATION ERROR: Production profile '{}' disallows default development storage root './.spine-dev-cluster/node-1'. Configure SPINE_STORAGE_ROOT, STORAGE_ROOT, or --storage-root.",
+            profile
+        );
+    }
+    std::fs::create_dir_all(&storage_root_path)?;
+    let storage_root_canonical = std::fs::canonicalize(&storage_root_path)?;
+    tracing::info!("Storage root: {}", storage_root_canonical.display());
+
+    // Resolve authoritative active database URLs using DatabaseSelector
+    let database_url = match database_url {
+        Some(raw_url) => {
+            let active_url = spine_api::db::DatabaseSelector::resolve_active_db_url(
+                &raw_url,
+                &storage_root_canonical,
+            )
+            .await
+            .unwrap_or(raw_url.clone());
+            if active_url != raw_url {
+                tracing::info!(
+                    "DatabaseSelector resolved active database URL: {}",
+                    sanitize_db_url(&active_url)
+                );
+            }
+            Some(active_url)
+        }
+        None => None,
+    };
+    let migration_database_url = match migration_database_url {
+        Some(raw_mig_url) => {
+            let active_mig_url = spine_api::db::DatabaseSelector::resolve_active_db_url(
+                &raw_mig_url,
+                &storage_root_canonical,
+            )
+            .await
+            .unwrap_or(raw_mig_url.clone());
+            Some(active_mig_url)
+        }
+        None => None,
+    };
+
+    // 2. Initialize Database backend
     let (db, pg_pool): (Arc<dyn Database>, Option<sqlx::PgPool>) = match database_url {
         Some(db_url) => {
             if let Some(mig_url) = migration_database_url {
@@ -1898,31 +1922,11 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
         }
     };
 
-    // 2. Initialize Coordinator Client
+    // 3. Initialize Coordinator Client
     let coordinator = coordinator_addr.map(|addr| {
         tracing::info!("Configured Spine Coordinator at {}", addr);
         CoordinatorClient::new(addr)
     });
-
-    // 3. Resolve and ensure Storage Root exists
-    let storage_root_path = if let Ok(root_str) =
-        std::env::var("SPINE_STORAGE_ROOT").or_else(|_| std::env::var("STORAGE_ROOT"))
-    {
-        std::path::PathBuf::from(root_str.trim())
-    } else {
-        args.storage_root
-    };
-    if profile.requires_persistent_database()
-        && storage_root_path == std::path::Path::new("./.spine-dev-cluster/node-1")
-    {
-        anyhow::bail!(
-            "CRITICAL CONFIGURATION ERROR: Production profile '{}' disallows default development storage root './.spine-dev-cluster/node-1'. Configure SPINE_STORAGE_ROOT, STORAGE_ROOT, or --storage-root.",
-            profile
-        );
-    }
-    std::fs::create_dir_all(&storage_root_path)?;
-    let storage_root_canonical = std::fs::canonicalize(&storage_root_path)?;
-    tracing::info!("Storage root: {}", storage_root_canonical.display());
 
     // 3.1 Restore state machine crash recovery & generation validation
     if let Some(msg) = spine_api::backup::RestoreJournal::handle_startup_recovery_cluster(

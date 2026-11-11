@@ -126,16 +126,42 @@ impl ConsistencyBarrier {
         }
 
         if let Some(storage_root) = &self.storage_root {
-            if let Ok(Some(journal)) =
-                crate::backup::journal::RestoreJournal::load(storage_root.as_ref())
-            {
-                if !matches!(journal.phase, crate::backup::RestorePhase::Completed) {
+            match crate::backup::journal::RestoreJournal::load(storage_root.as_ref()) {
+                Ok(Some(journal)) => {
+                    if !matches!(journal.phase, crate::backup::RestorePhase::Completed) {
+                        return Err(ForgeError::ServiceUnavailable(
+                            format!(
+                                "Cluster write pipeline is currently paused: restore session '{}' in progress (phase: {:?})",
+                                journal.restore_id, journal.phase
+                            ),
+                        ));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
                     return Err(ForgeError::ServiceUnavailable(
                         format!(
-                            "Cluster write pipeline is currently paused: restore session '{}' in progress (phase: {:?})",
-                            journal.restore_id, journal.phase
+                            "Cluster write pipeline is currently paused: corrupt or unreadable restore journal: {}",
+                            e
                         ),
                     ));
+                }
+            }
+
+            if let Ok(Some(rec)) =
+                crate::db::DatabaseSelector::load_from_file(storage_root.as_ref())
+            {
+                if let Some(s_gen) = crate::backup::journal::RestoreJournal::read_storage_generation(
+                    storage_root.as_ref(),
+                ) {
+                    if rec.active_generation != s_gen {
+                        return Err(ForgeError::ServiceUnavailable(
+                            format!(
+                                "Cluster write pipeline is paused: active database selector generation '{}' does not match storage generation '{}'",
+                                rec.active_generation, s_gen
+                            ),
+                        ));
+                    }
                 }
             }
 
@@ -250,16 +276,42 @@ impl ConsistencyBarrier {
         }
 
         if let Some(storage_root) = &self.storage_root {
-            if let Ok(Some(journal)) =
-                crate::backup::journal::RestoreJournal::load(storage_root.as_ref())
-            {
-                if !matches!(journal.phase, crate::backup::RestorePhase::Completed) {
+            match crate::backup::journal::RestoreJournal::load(storage_root.as_ref()) {
+                Ok(Some(journal)) => {
+                    if !matches!(journal.phase, crate::backup::RestorePhase::Completed) {
+                        return Err(ForgeError::ServiceUnavailable(
+                            format!(
+                                "Cluster write pipeline is currently paused: restore session '{}' in progress (phase: {:?})",
+                                journal.restore_id, journal.phase
+                            ),
+                        ));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
                     return Err(ForgeError::ServiceUnavailable(
                         format!(
-                            "Cluster write pipeline is currently paused: restore session '{}' in progress (phase: {:?})",
-                            journal.restore_id, journal.phase
+                            "Cluster write pipeline is currently paused: corrupt or unreadable restore journal: {}",
+                            e
                         ),
                     ));
+                }
+            }
+
+            if let Ok(Some(rec)) =
+                crate::db::DatabaseSelector::load_from_file(storage_root.as_ref())
+            {
+                if let Some(s_gen) = crate::backup::journal::RestoreJournal::read_storage_generation(
+                    storage_root.as_ref(),
+                ) {
+                    if rec.active_generation != s_gen {
+                        return Err(ForgeError::ServiceUnavailable(
+                            format!(
+                                "Cluster write pipeline is paused: active database selector generation '{}' does not match storage generation '{}'",
+                                rec.active_generation, s_gen
+                            ),
+                        ));
+                    }
                 }
             }
         }

@@ -43,13 +43,34 @@ pub async fn health_readiness(State(state): State<AppState>) -> impl IntoRespons
     let storage_root = state.vcs.storage_root();
     let storage_ok = storage_root.exists();
 
-    // Check for active or incomplete restore journals
-    let restore_in_progress = match RestoreJournal::load(storage_root) {
-        Ok(Some(journal)) => !matches!(
-            journal.phase,
-            RestorePhase::Committed | RestorePhase::Completed
-        ),
-        _ => false,
+    // Check for active, incomplete or corrupted restore journals
+    let (restore_in_progress, journal_healthy) = match RestoreJournal::load(storage_root) {
+        Ok(Some(journal)) => {
+            let in_progress = !matches!(journal.phase, RestorePhase::Completed);
+            (in_progress, true)
+        }
+        Ok(None) => {
+            // Verify no pending unrecovered staging or cutover artifacts remain in storage root
+            let has_pending_staging = storage_root
+                .read_dir()
+                .ok()
+                .map(|entries| {
+                    entries.flatten().any(|e| {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        name.starts_with(".staged_") || name.starts_with(".old_generation_")
+                    })
+                })
+                .unwrap_or(false);
+            (has_pending_staging, true)
+        }
+        Err(e) => {
+            tracing::error!(
+                "Readiness check: restore journal corruption or read failure: {}",
+                e
+            );
+            // Fail closed on any journal read, parse, or integrity error
+            (true, false)
+        }
     };
 
     let mut coord_gen: Option<u64> = None;
@@ -72,7 +93,10 @@ pub async fn health_readiness(State(state): State<AppState>) -> impl IntoRespons
                 .await
                 .unwrap_or(false)
         }
-        None => true, // Standalone mode without external coordinator
+        None => {
+            // Coordinator is strictly required under CoreForge production profile
+            state.profile != DeploymentProfile::CoreForge
+        }
     };
 
     // Canonical node configuration checks
@@ -175,6 +199,7 @@ pub async fn health_readiness(State(state): State<AppState>) -> impl IntoRespons
         && coord_ok
         && storage_nodes_ok
         && cluster_consistent
+        && journal_healthy
         && !restore_in_progress;
 
     let status_code = if overall {
