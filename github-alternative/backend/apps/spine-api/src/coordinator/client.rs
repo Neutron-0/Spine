@@ -257,6 +257,35 @@ impl ClusterNodeClient {
             _ => Err(ForgeError::Internal("Unexpected RPC response".into())),
         }
     }
+
+    pub async fn query_staged_restore(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Option<spine_cluster::protocol::ParticipantAcknowledgement>, ForgeError> {
+        let req = ClusterRpcRequest::QueryStagedVolumeRestore {
+            snapshot_id: snapshot_id.to_string(),
+        };
+        match self.send_rpc(&req).await? {
+            ClusterRpcResponse::StagedVolumeRestoreStatus {
+                prepared,
+                acknowledgement,
+                ..
+            } => {
+                if prepared {
+                    Ok(acknowledgement)
+                } else {
+                    Ok(None)
+                }
+            }
+            ClusterRpcResponse::Error(msg) => Err(ForgeError::Internal(format!(
+                "Query staged restore failed: {}",
+                msg
+            ))),
+            _ => Err(ForgeError::Internal(
+                "Unexpected RPC response for query staged restore".into(),
+            )),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -403,5 +432,12 @@ impl CoordinatorClient {
 
     pub async fn finalize_restore(&self, snapshot_id: &str) -> Result<(), ForgeError> {
         self.node_client.finalize_restore(snapshot_id).await
+    }
+
+    pub async fn query_staged_restore(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Option<spine_cluster::protocol::ParticipantAcknowledgement>, ForgeError> {
+        self.node_client.query_staged_restore(snapshot_id).await
     }
 }

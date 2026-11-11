@@ -354,16 +354,36 @@ impl StagedDatabaseRestore {
 
         // 2. Durably record the active database selection in the control table and storage root
         let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let record = ActiveDatabaseRecord {
-            base_db_name: self.base_db_name.clone(),
-            active_db_name: self.active_versioned_name.clone(),
-            active_generation: self.target_generation.clone(),
-            restore_id: self.restore_id.clone(),
-            cutover_at_nanos: now_nanos,
-        };
+        let current_rec = DatabaseSelector::load_from_db(&maint_pool)
+            .await
+            .ok()
+            .flatten();
+        let prev_seq = current_rec.as_ref().map(|r| r.sequence_number).unwrap_or(0);
+        let prev_db = current_rec
+            .as_ref()
+            .map(|r| r.active_db_name.clone())
+            .unwrap_or_else(|| self.base_db_name.clone());
+        let prev_gen = current_rec
+            .as_ref()
+            .map(|r| r.target_generation.clone())
+            .unwrap_or_else(|| "0".to_string());
+
+        let record = ActiveDatabaseRecord::new_record(
+            prev_seq + 1,
+            self.restore_id.clone(),
+            format!("decision_{}", self.restore_id),
+            self.staged_digest.clone(),
+            prev_db,
+            prev_gen,
+            self.active_versioned_name.clone(),
+            self.target_generation.clone(),
+            "Committed".to_string(),
+            now_nanos,
+            self.base_db_name.clone(),
+        );
 
         DatabaseSelector::save_to_db(&maint_pool, &record).await?;
-        DatabaseSelector::save_to_file(storage_root, &record)?;
+        DatabaseSelector::save_diagnostic_cache(storage_root, &record)?;
 
         // 3. Terminate active connections to base / previous database
         let _ = sqlx::query(term_sql)

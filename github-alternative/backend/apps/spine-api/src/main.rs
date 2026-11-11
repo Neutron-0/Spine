@@ -1355,8 +1355,136 @@ async fn main() -> anyhow::Result<()> {
 
                 // ------------------------------------------------------------------------
                 // Phase 3: COMMIT DECISION (Durable Pre-Cutover Transaction Record)
+                // Active Decision Boundary Revalidation across all 7 participants
                 // ------------------------------------------------------------------------
                 println!("=== Phase 3: COMMIT DECISION (Durable Pre-Cutover Ledger Invariant) ===");
+                println!("Actively revalidating durable staging across all participants prior to commit decision...");
+
+                let mut revalidation_failed: Option<String> = None;
+
+                // 1. Re-query PostgreSQL staged database
+                if let Some(ref sdb) = staged_db_restore {
+                    match sdb.query_preparation_status().await {
+                        Ok(true) => {
+                            tracing::info!(
+                                "Decision boundary: PostgreSQL staged database verified prepared."
+                            );
+                        }
+                        Ok(false) => {
+                            revalidation_failed = Some("PostgreSQL staged database preparation query returned false or generation mismatch".into());
+                        }
+                        Err(e) => {
+                            revalidation_failed = Some(format!(
+                                "PostgreSQL staged database revalidation error: {}",
+                                e
+                            ));
+                        }
+                    }
+                }
+
+                // 2. Re-query local repository storage adapter
+                if revalidation_failed.is_none() {
+                    if let Some(ref s_storage) = staged_storage_adapter {
+                        match s_storage.query_preparation_status() {
+                            Ok(Some(ack))
+                                if ack.prepared && ack.staged_digest == s_storage.staged_digest =>
+                            {
+                                tracing::info!("Decision boundary: Local repository storage verified prepared.");
+                            }
+                            Ok(Some(ack)) => {
+                                revalidation_failed = Some(format!(
+                                    "LocalStorage staging revalidation mismatch: prepared={}, digest_match={}",
+                                    ack.prepared, ack.staged_digest == s_storage.staged_digest
+                                ));
+                            }
+                            Ok(None) => {
+                                revalidation_failed = Some(
+                                    "LocalStorage durable staging record missing on disk".into(),
+                                );
+                            }
+                            Err(e) => {
+                                revalidation_failed =
+                                    Some(format!("LocalStorage staging revalidation error: {}", e));
+                            }
+                        }
+                    }
+                }
+
+                // 3. Re-query SSH identity adapter
+                if revalidation_failed.is_none() {
+                    if let Some(ref s_ssh) = staged_ssh_adapter {
+                        match s_ssh.query_preparation_status() {
+                            Ok(Some(ack))
+                                if ack.prepared && ack.staged_digest == s_ssh.staged_digest =>
+                            {
+                                tracing::info!(
+                                    "Decision boundary: SSH identity staging verified prepared."
+                                );
+                            }
+                            Ok(Some(ack)) => {
+                                revalidation_failed = Some(format!(
+                                    "SSH staging revalidation mismatch: prepared={}, digest_match={}",
+                                    ack.prepared, ack.staged_digest == s_ssh.staged_digest
+                                ));
+                            }
+                            Ok(None) => {
+                                revalidation_failed =
+                                    Some("SSH durable staging record missing on disk".into());
+                            }
+                            Err(e) => {
+                                revalidation_failed =
+                                    Some(format!("SSH staging revalidation error: {}", e));
+                            }
+                        }
+                    }
+                }
+
+                // 4. Re-query Coordinator and Storage Nodes via RPC
+                if revalidation_failed.is_none() {
+                    for (snap_id, _, client) in &staged_cluster_restores {
+                        match client.query_staged_restore(snap_id).await {
+                            Ok(Some(ack)) if ack.prepared => {
+                                tracing::info!("Decision boundary: Cluster participant for snapshot '{}' verified prepared.", snap_id);
+                            }
+                            Ok(Some(_)) => {
+                                revalidation_failed = Some(format!(
+                                    "Cluster node for snapshot '{}' is not in prepared state",
+                                    snap_id
+                                ));
+                                break;
+                            }
+                            Ok(None) => {
+                                revalidation_failed = Some(format!("Cluster node for snapshot '{}' returned no staged restore status", snap_id));
+                                break;
+                            }
+                            Err(e) => {
+                                revalidation_failed = Some(format!("Cluster node query_staged_restore failed for snapshot '{}': {}", snap_id, e));
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if let Some(err_msg) = revalidation_failed {
+                    for (r_snap, _, r_client) in &staged_cluster_restores {
+                        let _ = r_client.rollback_restore(r_snap).await;
+                    }
+                    if let Some(ref sdb) = staged_db_restore {
+                        let _ = sdb.rollback().await;
+                    }
+                    if let Some(ref s_storage) = staged_storage_adapter {
+                        let _ = s_storage.rollback();
+                    }
+                    if let Some(ref s_ssh) = staged_ssh_adapter {
+                        let _ = s_ssh.rollback();
+                    }
+                    let _ = session.abort(&format!(
+                        "Decision boundary revalidation failed: {}",
+                        err_msg
+                    ));
+                    anyhow::bail!("Decision boundary revalidation failed: {}", err_msg);
+                }
+
                 session
                     .journal
                     .validate_commit_decision_gate(&expected_participants)
@@ -1809,15 +1937,14 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
     let storage_root_canonical = std::fs::canonicalize(&storage_root_path)?;
     tracing::info!("Storage root: {}", storage_root_canonical.display());
 
-    // Resolve authoritative active database URLs using DatabaseSelector
+    // Resolve authoritative active database URLs using DatabaseSelector (Fail closed, no fallback)
     let database_url = match database_url {
         Some(raw_url) => {
             let active_url = spine_api::db::DatabaseSelector::resolve_active_db_url(
                 &raw_url,
-                &storage_root_canonical,
+                Some(&storage_root_canonical),
             )
-            .await
-            .unwrap_or(raw_url.clone());
+            .await?;
             if active_url != raw_url {
                 tracing::info!(
                     "DatabaseSelector resolved active database URL: {}",
@@ -1832,10 +1959,9 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
         Some(raw_mig_url) => {
             let active_mig_url = spine_api::db::DatabaseSelector::resolve_active_db_url(
                 &raw_mig_url,
-                &storage_root_canonical,
+                Some(&storage_root_canonical),
             )
-            .await
-            .unwrap_or(raw_mig_url.clone());
+            .await?;
             Some(active_mig_url)
         }
         None => None,

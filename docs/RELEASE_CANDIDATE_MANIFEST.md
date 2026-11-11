@@ -1,8 +1,8 @@
-# Spine Release Candidate Manifest (Batch 21L Deployment Candidate)
+# Spine Release Candidate Manifest (Batch 21M Deployment Candidate)
 
-**Milestone:** Spine Batch 21L — Genuine Participant Acknowledgements, Safe PostgreSQL Cutover, Durable Journal State, and Fail-Closed Production Writes<br>
-**Baseline Commit:** `80c07cc11fbacf49da0920cf003ef35bd58a464e`<br>
-**Target Release:** Deployment Candidate for Fourteenth Independent Codex Audit<br>
+**Milestone:** Spine Batch 21M — Single-Authority Database Selection, Strict Participant Verification, Journal Durability and Fail-Closed Recovery<br>
+**Baseline Commit:** `ad38ff2df69ddc0267f6cbfdd34113132911063e`<br>
+**Target Release:** Deployment Candidate for Fifteenth Independent Codex Audit<br>
 **Target Platform:** Linux x86_64, Windows x86_64  
 
 ---
@@ -17,10 +17,10 @@
 
 #### Release Binary Hashes (`target/release-candidate/SHA256SUMS`):
 ```text
-5319a3d20e917e628f49260051a22376cb62f80139ad3573ec163db842242d6f  spine-api.exe
-4793b2f7e59aa4cedb296596e6dd1d7d59e8766ab81e57201b07beb35870ff72  spine-coordinator.exe
-2c8fcb87b1b6779842aee2164974d649e7ad78560a03d8910f152d404ddd6332  spine-storage-node.exe
-d81b5b43c674e9d1ccf72938865e137a8c21098c001d6e97e5b9a66f100aeba2  spine.exe
+7a4266699df3ed34a4db37c18cef5edf53a81a7ebdaf808451c4a18138df68d8  spine-api.exe
+a7741f64e9278d4c2be9ab6bf697c6e11d8aa6fc78f0462f46d48efb06268d21  spine-coordinator.exe
+33430a7171e44ce950a99d71589132cd636218c51a6bfc5d369c2aea9b0e683b  spine-storage-node.exe
+2bb13d680b0e2ec39ca1559f461e0a2c602a4b097d361f79c60b2a64c6a2e3f9  spine.exe
 ```
 
 ### 1.2. Frontend Web Assets
@@ -96,3 +96,15 @@ All findings from the Twelfth Independent Codex Audit have been systematically r
 - **P1 (Eliminated Plaintext Backup Staging)**: Removed intermediate unencrypted `staging.tar.gz`. Backups stream directly from compression (`GzEncoder`) into `SPNEBAK v2` authenticated ciphertext (`EncryptingWriter`), enforcing zero plaintext on disk for SSH keys and sensitive data.
 - **P1 (Readiness & Consistency Barrier Write Gate)**: `/api/v1/health/ready` strictly checks responding node IDs against expected IDs (rejecting `None`) and enforces cluster generation alignment. Consistency barrier write permit acquisition inspects restore journals and rejects writes with `ServiceUnavailable` during active restores or generation divergence.
 - **P1 (Regression Defect Resolution)**: Fixed recursive directory migration via `safe_move_path` ensuring absent files/directories in newer generations do not survive cutovers, resolving Windows OS error 650. Passed all tests in `git-alternative` and `github-alternative` 100%.
+
+---
+
+## 7. Batch 21M Fourteenth Audit Master Remediation Status
+
+All findings from the Fourteenth Independent Codex Audit have been systematically resolved, end-to-end integrated, and verified:
+- **P0-A (Single-Authority Database Selector)**: Maintenance database table `_spine_active_database_selector` (in `postgres` maintenance DB) established as the sole authoritative transactional pointer. Control file demoted to non-authoritative diagnostic cache. Added comprehensive schema versioning, monotonic sequence numbers, previous DB/generation records, and SHA-256 integrity hash verification. Startup `resolve_active_db_url` strictly validates against maintenance DB and `pg_database` catalog, failing closed with fatal errors on missing or divergent selectors (zero silent fallback to base URL).
+- **P0-B (Strict Participant Identity Binding & Boundary Revalidation)**: Replaced weak substring matching (`contains()`) with exact equality (`==`) across `restore_id`, `backup_id`, and `target_generation`. Enforced strict 64-hex SHA-256 digest formatting and canonical resource IDs. Active Phase 3 pre-commit boundary revalidation queries all 7 participants (`postgres_data`, `spine_storage`, `storage_1_data`, `storage_2_data`, `storage_3_data`, `coordinator_data`, `spine_ssh`) for staged presence and valid acknowledgement before recording `CommitDecisionRecord`. Halts and rolls back without committing on any failure.
+- **P0-C (Journal Durability, Sequencing & Win32 OS Error 650 Fix)**: Identified root cause of Win32 OS error 650 (`STATUS_INVALID_DEVICE_REQUEST` from `FlushFileBuffers` on directory handles). `sync_dir` verifies directory existence on Windows while invoking `sync_all()` on Unix. `safe_atomic_replace` hardened with atomic backup rename and guaranteed error propagation. `RestoreJournal::persist` guarantees monotonic sequence increments, propagates `.last_valid` errors, performs exhaustive all-field readback verification, and defers in-memory state mutation (`*self = candidate`) strictly after durability is confirmed.
+- **P1 (Distributed Cluster Staged Restore Verification)**: Extended cluster RPC protocol with `QueryStagedVolumeRestore` and `StagedVolumeRestoreStatus` across coordinator and storage node server backends.
+- **P1 (Fail-Closed Startup & Write Gating Integration)**: Eliminated `.unwrap_or(raw_url.clone())` fallbacks across API entrypoints. Fails closed immediately on missing or corrupt database selectors, and enforces generation alignment in `/api/v1/health/ready` and `ConsistencyBarrier`. Passed all 43 backend test suites and 22 native cluster test suites 100%.
+

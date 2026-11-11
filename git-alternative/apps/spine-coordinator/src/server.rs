@@ -389,6 +389,21 @@ async fn handle_coordinator_connection(
                 Err(e) => ClusterRpcResponse::Error(e.to_string()),
             }
         }
+        ClusterRpcRequest::QueryStagedVolumeRestore { snapshot_id } => {
+            match store.query_staged_restore(&snapshot_id) {
+                Ok(Some(ack)) => ClusterRpcResponse::StagedVolumeRestoreStatus {
+                    snapshot_id,
+                    prepared: ack.prepared,
+                    acknowledgement: Some(ack),
+                },
+                Ok(None) => ClusterRpcResponse::StagedVolumeRestoreStatus {
+                    snapshot_id,
+                    prepared: false,
+                    acknowledgement: None,
+                },
+                Err(e) => ClusterRpcResponse::Error(e.to_string()),
+            }
+        }
         _ => ClusterRpcResponse::Error("Unsupported coordinator request".into()),
     };
 

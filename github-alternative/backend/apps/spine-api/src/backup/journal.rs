@@ -269,21 +269,21 @@ impl RestoreJournal {
         &mut self,
         ack: ParticipantAcknowledgement,
     ) -> Result<(), ForgeError> {
-        // 1. Validate bound restore ID
-        if ack.restore_id != self.restore_id && !ack.restore_id.contains(&self.restore_id) {
+        // 1. Validate bound restore ID (strict equality)
+        if ack.restore_id != self.restore_id {
             return Err(ForgeError::Internal(format!(
                 "Acknowledgement restore_id mismatch: expected '{}', got '{}'",
                 self.restore_id, ack.restore_id
             )));
         }
-        // 2. Validate bound backup ID
-        if ack.backup_id != self.backup_id && !ack.backup_id.contains(&self.backup_id) {
+        // 2. Validate bound backup ID (strict equality)
+        if ack.backup_id != self.backup_id {
             return Err(ForgeError::Internal(format!(
                 "Acknowledgement backup_id mismatch: expected '{}', got '{}'",
                 self.backup_id, ack.backup_id
             )));
         }
-        // 3. Validate target generation
+        // 3. Validate target generation (strict equality)
         if ack.target_generation != self.target_generation {
             return Err(ForgeError::Internal(format!(
                 "Acknowledgement target_generation mismatch: expected '{}', got '{}'",
@@ -297,11 +297,13 @@ impl RestoreJournal {
                 ack.participant_id
             )));
         }
-        // 5. Validate non-empty payload digest
-        if ack.staged_digest.trim().is_empty() {
+        // 5. Validate non-empty, exactly 64-hex SHA-256 payload digest
+        if ack.staged_digest.len() != 64
+            || !ack.staged_digest.chars().all(|c| c.is_ascii_hexdigit())
+        {
             return Err(ForgeError::Internal(format!(
-                "Participant '{}' acknowledgement contains empty digest",
-                ack.participant_id
+                "Participant '{}' acknowledgement contains invalid SHA-256 digest: '{}' (must be exactly 64 hex characters)",
+                ack.participant_id, ack.staged_digest
             )));
         }
         // 6. Validate canonical resource ID and durable staging record ID
@@ -521,7 +523,7 @@ impl RestoreJournal {
                     lv_file
                         .sync_all()
                         .map_err(|e| ForgeError::Internal(e.to_string()))?;
-                    let _ = super::safe_atomic_replace(&tmp_lv, &last_valid);
+                    super::safe_atomic_replace(&tmp_lv, &last_valid)?;
                 }
             }
         }
@@ -545,7 +547,7 @@ impl RestoreJournal {
         // 4. Atomic replacement to primary journal path
         super::safe_atomic_replace(&tmp_path, &path)?;
 
-        // 5. Readback verification of primary journal
+        // 5. Readback verification of primary journal across ALL fields
         let readback_content = std::fs::read_to_string(&path).map_err(|e| {
             ForgeError::Internal(format!("Journal readback failed after persist: {}", e))
         })?;
@@ -554,16 +556,20 @@ impl RestoreJournal {
         })?;
 
         if readback_journal.restore_id != candidate.restore_id
+            || readback_journal.backup_id != candidate.backup_id
+            || readback_journal.target_generation != candidate.target_generation
             || readback_journal.sequence_number != candidate.sequence_number
             || readback_journal.phase != candidate.phase
+            || readback_journal.acknowledgements.len() != candidate.acknowledgements.len()
+            || readback_journal.commit_decision != candidate.commit_decision
         {
             return Err(ForgeError::Internal(
-                "Journal readback mismatch: persisted record does not match candidate".into(),
+                "Journal readback mismatch: persisted record does not match candidate across all fields".into(),
             ));
         }
 
         // 6. Synchronize directory
-        let _ = super::sync_dir(parent);
+        super::sync_dir(parent)?;
 
         // 7. ONLY AFTER successful persistence: mutate in-memory state
         *self = candidate;

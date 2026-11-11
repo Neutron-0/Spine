@@ -116,6 +116,9 @@ pub enum ClusterRpcRequest {
     FinalizeVolumeRestore {
         snapshot_id: String,
     },
+    QueryStagedVolumeRestore {
+        snapshot_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -242,6 +245,12 @@ pub enum ClusterRpcResponse {
     VolumeRestoreFinalized {
         snapshot_id: String,
         success: bool,
+    },
+    StagedVolumeRestoreStatus {
+        snapshot_id: String,
+        prepared: bool,
+        #[serde(default)]
+        acknowledgement: Option<ParticipantAcknowledgement>,
     },
     Error(String),
 }

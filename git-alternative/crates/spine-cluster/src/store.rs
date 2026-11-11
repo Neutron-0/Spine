@@ -120,6 +120,8 @@ pub trait CoordinatorStore: Send + Sync {
     fn commit_restore(&self, snapshot_id: &str, fencing_generation: u64) -> Result<()>;
     fn rollback_restore(&self, snapshot_id: &str) -> Result<()>;
     fn finalize_restore(&self, snapshot_id: &str) -> Result<()>;
+    fn query_staged_restore(&self, snapshot_id: &str)
+        -> Result<Option<ParticipantAcknowledgement>>;
 }
 
 pub struct FileBackedCoordinatorStore {
@@ -134,11 +136,20 @@ pub struct FileBackedCoordinatorStore {
 }
 
 pub fn safe_atomic_replace(from: &Path, to: &Path) -> Result<()> {
+    #[cfg(unix)]
+    let sync_dir = |p: &Path| {
+        if let Ok(p_file) = fs::File::open(p) {
+            let _ = p_file.sync_all();
+        }
+    };
+    #[cfg(windows)]
+    let sync_dir = |p: &Path| {
+        let _ = p.exists();
+    };
+
     if fs::rename(from, to).is_ok() && to.exists() && fs::metadata(to).is_ok() {
         if let Some(parent) = to.parent() {
-            if let Ok(p_file) = fs::File::open(parent) {
-                let _ = p_file.sync_all();
-            }
+            sync_dir(parent);
         }
         return Ok(());
     }
@@ -150,9 +161,7 @@ pub fn safe_atomic_replace(from: &Path, to: &Path) -> Result<()> {
             Ok(()) => {
                 if to.exists() && fs::metadata(to).is_ok() {
                     if let Some(parent) = to.parent() {
-                        if let Ok(p_file) = fs::File::open(parent) {
-                            let _ = p_file.sync_all();
-                        }
+                        sync_dir(parent);
                     }
                     let _ = fs::remove_file(&backup);
                     Ok(())
@@ -174,9 +183,7 @@ pub fn safe_atomic_replace(from: &Path, to: &Path) -> Result<()> {
             .with_context(|| format!("Failed to copy {} to {}", from.display(), to.display()))?;
         if to.exists() && fs::metadata(to).is_ok() {
             if let Some(parent) = to.parent() {
-                if let Ok(p_file) = fs::File::open(parent) {
-                    let _ = p_file.sync_all();
-                }
+                sync_dir(parent);
             }
             let _ = fs::remove_file(from);
             Ok(())
@@ -891,6 +898,80 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
             let _ = fs::remove_file(&staged_path);
         }
         Ok(())
+    }
+
+    fn query_staged_restore(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Option<ParticipantAcknowledgement>> {
+        // 1. Check in-memory staged_restore
+        {
+            let staged = self.staged_restore.read().unwrap();
+            if let Some((ref s_id, gen, ref payload)) = *staged {
+                if s_id == snapshot_id {
+                    use sha2::{Digest, Sha256};
+                    let mut hasher = Sha256::new();
+                    hasher.update(payload);
+                    let staged_digest = hex::encode(hasher.finalize());
+                    let ack = ParticipantAcknowledgement {
+                        restore_id: format!("rst_{}", snapshot_id),
+                        backup_id: snapshot_id.to_string(),
+                        participant_id: "coordinator".to_string(),
+                        volume_name: "coordinator_data".to_string(),
+                        canonical_resource_id: "coordinator_cluster_state".to_string(),
+                        previous_generation: None,
+                        target_generation: gen.to_string(),
+                        staged_digest,
+                        staged_byte_length: payload.len() as u64,
+                        prepared_at_nanos: 0,
+                        prepared: true,
+                        durable_staging_record_id: format!(
+                            ".staged_coordinator_restore_{}.json",
+                            snapshot_id
+                        ),
+                        current_state: "Staged".to_string(),
+                    };
+                    return Ok(Some(ack));
+                }
+            }
+        }
+
+        // 2. Check disk staged restore record
+        if let Some(ref p) = self.path {
+            let parent_dir = p.parent().unwrap_or_else(|| Path::new("."));
+            let staged_path =
+                parent_dir.join(format!(".staged_coordinator_restore_{}.json", snapshot_id));
+            if staged_path.exists() {
+                let bytes = fs::read(&staged_path)?;
+                let (s_id, gen, payload): (String, u64, Vec<u8>) = serde_json::from_slice(&bytes)?;
+                if s_id == snapshot_id {
+                    use sha2::{Digest, Sha256};
+                    let mut hasher = Sha256::new();
+                    hasher.update(&payload);
+                    let staged_digest = hex::encode(hasher.finalize());
+                    let ack = ParticipantAcknowledgement {
+                        restore_id: format!("rst_{}", snapshot_id),
+                        backup_id: snapshot_id.to_string(),
+                        participant_id: "coordinator".to_string(),
+                        volume_name: "coordinator_data".to_string(),
+                        canonical_resource_id: "coordinator_cluster_state".to_string(),
+                        previous_generation: None,
+                        target_generation: gen.to_string(),
+                        staged_digest,
+                        staged_byte_length: payload.len() as u64,
+                        prepared_at_nanos: 0,
+                        prepared: true,
+                        durable_staging_record_id: format!(
+                            ".staged_coordinator_restore_{}.json",
+                            snapshot_id
+                        ),
+                        current_state: "Staged".to_string(),
+                    };
+                    return Ok(Some(ack));
+                }
+            }
+        }
+        Ok(None)
     }
 }
 

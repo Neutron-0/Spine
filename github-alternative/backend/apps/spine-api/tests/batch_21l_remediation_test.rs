@@ -278,41 +278,42 @@ async fn test_database_selector_filesystem_and_url_resolution() {
     let root = tmp.path().join("storage_root");
     fs::create_dir_all(&root).unwrap();
 
-    let record = ActiveDatabaseRecord {
-        base_db_name: "spine_forge".to_string(),
-        active_db_name: "spine_forge_gen_42".to_string(),
-        active_generation: "42".to_string(),
-        restore_id: "rst_sel_test".to_string(),
-        cutover_at_nanos: 1_700_000_000_000_000,
-    };
+    let record = ActiveDatabaseRecord::new_record(
+        1,
+        "rst_sel_test".to_string(),
+        "dec_sel_test".to_string(),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+        "spine_forge".to_string(),
+        "41".to_string(),
+        "spine_forge_gen_42".to_string(),
+        "42".to_string(),
+        "Committed".to_string(),
+        1_700_000_000_000_000,
+        "spine_forge".to_string(),
+    );
 
-    // 1. Save and load from control file
+    // 1. Save and load from control file (diagnostic cache)
     DatabaseSelector::save_to_file(&root, &record).expect("save_to_file should succeed");
     let loaded = DatabaseSelector::load_from_file(&root)
         .expect("load_from_file should succeed")
         .expect("record must exist");
     assert_eq!(loaded.base_db_name, "spine_forge");
     assert_eq!(loaded.active_db_name, "spine_forge_gen_42");
-    assert_eq!(loaded.active_generation, "42");
+    assert_eq!(loaded.active_generation(), "42");
     assert_eq!(loaded.restore_id, "rst_sel_test");
 
-    // 2. Resolve active DB URL using filesystem control file
+    // 2. Resolve active DB URL: fails closed when PostgreSQL maintenance database is unreachable
     let base_url = "postgres://app_user:secret@localhost:5432/spine_forge";
-    let resolved_url = DatabaseSelector::resolve_active_db_url(base_url, &root)
-        .await
-        .expect("resolve_active_db_url should succeed");
+    let resolution_res = DatabaseSelector::resolve_active_db_url(base_url, Some(&root)).await;
+    // Without active PostgreSQL maintenance DB, resolve_active_db_url must fail closed (NEVER silently fall back)
+    assert!(resolution_res.is_err());
+    let err_str = resolution_res.unwrap_err().to_string();
+    assert!(err_str.contains("Failed to connect to PostgreSQL maintenance database"));
 
-    assert_eq!(
-        resolved_url,
-        "postgres://app_user:secret@localhost:5432/spine_forge_gen_42"
-    );
-
-    // Unrelated database name is untouched
-    let other_url = "postgres://app_user:secret@localhost:5432/other_db";
-    let resolved_other = DatabaseSelector::resolve_active_db_url(other_url, &root)
-        .await
-        .expect("resolve_active_db_url should succeed");
-    assert_eq!(resolved_other, other_url);
+    // 3. Non-PostgreSQL URL passes through cleanly
+    let sqlite_url = "sqlite::memory:";
+    let pass_res = DatabaseSelector::resolve_active_db_url(sqlite_url, Some(&root)).await;
+    assert_eq!(pass_res.unwrap(), sqlite_url);
 }
 
 #[test]
@@ -373,13 +374,19 @@ async fn test_consistency_barrier_fail_closed_checks() {
     assert!(permit.is_ok());
 
     // 2. Introduce unaligned database selector generation ("20" != "10")
-    let record = ActiveDatabaseRecord {
-        base_db_name: "test_db".to_string(),
-        active_db_name: "test_db_gen_20".to_string(),
-        active_generation: "20".to_string(), // Mismatched!
-        restore_id: "rst_unaligned".to_string(),
-        cutover_at_nanos: 1_000_000,
-    };
+    let record = ActiveDatabaseRecord::new_record(
+        2,
+        "rst_unaligned".to_string(),
+        "dec_unaligned".to_string(),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+        "test_db".to_string(),
+        "10".to_string(),
+        "test_db_gen_20".to_string(),
+        "20".to_string(), // Mismatched!
+        "Committed".to_string(),
+        1_000_000,
+        "test_db".to_string(),
+    );
     DatabaseSelector::save_to_file(&root, &record).unwrap();
 
     let unaligned_res = barrier.acquire_write_permit().await;
@@ -394,10 +401,19 @@ async fn test_consistency_barrier_fail_closed_checks() {
     }
 
     // 3. Fix selector to match storage generation "10"
-    let aligned_record = ActiveDatabaseRecord {
-        active_generation: "10".to_string(),
-        ..record
-    };
+    let aligned_record = ActiveDatabaseRecord::new_record(
+        3,
+        "rst_aligned".to_string(),
+        "dec_aligned".to_string(),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+        "test_db".to_string(),
+        "9".to_string(),
+        "test_db_gen_10".to_string(),
+        "10".to_string(),
+        "Committed".to_string(),
+        1_000_000,
+        "test_db".to_string(),
+    );
     DatabaseSelector::save_to_file(&root, &aligned_record).unwrap();
     assert!(barrier.acquire_write_permit().await.is_ok());
 

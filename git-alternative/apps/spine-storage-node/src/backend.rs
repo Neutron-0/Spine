@@ -108,6 +108,10 @@ pub trait StorageBackend: Send + Sync {
     fn commit_volume_restore(&self, snapshot_id: &str, fencing_generation: u64) -> Result<()>;
     fn rollback_volume_restore(&self, snapshot_id: &str) -> Result<()>;
     fn finalize_volume_restore(&self, snapshot_id: &str) -> Result<()>;
+    fn query_staged_volume_restore(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Option<ParticipantAcknowledgement>>;
 }
 
 pub struct StorageWriterGuard {
@@ -121,11 +125,20 @@ impl Drop for StorageWriterGuard {
 }
 
 pub fn safe_atomic_replace(from: &Path, to: &Path) -> Result<()> {
+    #[cfg(unix)]
+    let sync_dir = |p: &Path| {
+        if let Ok(p_file) = fs::File::open(p) {
+            let _ = p_file.sync_all();
+        }
+    };
+    #[cfg(windows)]
+    let sync_dir = |p: &Path| {
+        let _ = p.exists();
+    };
+
     if fs::rename(from, to).is_ok() && to.exists() && fs::metadata(to).is_ok() {
         if let Some(parent) = to.parent() {
-            if let Ok(p_file) = fs::File::open(parent) {
-                let _ = p_file.sync_all();
-            }
+            sync_dir(parent);
         }
         return Ok(());
     }
@@ -137,9 +150,7 @@ pub fn safe_atomic_replace(from: &Path, to: &Path) -> Result<()> {
             Ok(()) => {
                 if to.exists() && fs::metadata(to).is_ok() {
                     if let Some(parent) = to.parent() {
-                        if let Ok(p_file) = fs::File::open(parent) {
-                            let _ = p_file.sync_all();
-                        }
+                        sync_dir(parent);
                     }
                     let _ = fs::remove_file(&backup);
                     Ok(())
@@ -161,9 +172,7 @@ pub fn safe_atomic_replace(from: &Path, to: &Path) -> Result<()> {
             .with_context(|| format!("Failed to copy {} to {}", from.display(), to.display()))?;
         if to.exists() && fs::metadata(to).is_ok() {
             if let Some(parent) = to.parent() {
-                if let Ok(p_file) = fs::File::open(parent) {
-                    let _ = p_file.sync_all();
-                }
+                sync_dir(parent);
             }
             let _ = fs::remove_file(from);
             Ok(())
@@ -905,6 +914,61 @@ impl StorageBackend for FileSystemStorageBackend {
             let _ = fs::remove_dir_all(&staged_root);
         }
         Ok(())
+    }
+
+    fn query_staged_volume_restore(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Option<ParticipantAcknowledgement>> {
+        let staging_rec_rel = format!(".staged_volume_{}/.staged_restore_record.json", snapshot_id);
+        let staging_rec_path = self.storage_root.join(&staging_rec_rel);
+        if !staging_rec_path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&staging_rec_path)?;
+        let val: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let s_id = val
+            .get("snapshot_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if s_id != snapshot_id {
+            return Ok(None);
+        }
+        let f_gen = val
+            .get("fencing_generation")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let staged_digest = val
+            .get("staged_digest")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let staged_bytes = val
+            .get("staged_bytes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let now_nanos = val
+            .get("staged_at_nanos")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let cur_gen = self.fencing_generation.load(Ordering::SeqCst);
+
+        let ack = ParticipantAcknowledgement {
+            restore_id: format!("rst_{}", snapshot_id),
+            backup_id: snapshot_id.to_string(),
+            participant_id: self.node_id.clone(),
+            volume_name: format!("{}_data", self.node_id.replace('-', "_")),
+            canonical_resource_id: format!("{}_volume_data", self.node_id.replace('-', "_")),
+            previous_generation: Some(cur_gen.to_string()),
+            target_generation: f_gen.to_string(),
+            staged_digest,
+            staged_byte_length: staged_bytes,
+            prepared_at_nanos: now_nanos,
+            prepared: true,
+            durable_staging_record_id: staging_rec_rel,
+            current_state: "Staged".to_string(),
+        };
+        Ok(Some(ack))
     }
 }
 

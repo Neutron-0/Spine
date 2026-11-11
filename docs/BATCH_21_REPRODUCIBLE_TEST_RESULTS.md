@@ -255,7 +255,7 @@ test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 ### 4.7 Complete Backend Test Suite (`github-alternative/backend`)
 ```text
-42 integration and unit test binaries executed.
+43 integration and unit test binaries executed.
 test result: ok. 100% passed; 0 failed; 0 ignored; 0 warnings.
 ```
 
@@ -265,7 +265,25 @@ test result: ok. 100% passed; 0 failed; 0 ignored; 0 warnings.
 test result: ok. 100% passed; 0 failed; 0 ignored; 0 warnings.
 ```
 
-### 4.9 Quality, Linting & Release Assets
+### 4.9 Batch 21M Master Remediation Test Suite (`batch_21m_remediation_test.rs`)
+```text
+running 5 tests
+test test_windows_sync_dir_and_atomic_replace_durability ... ok
+test test_resolve_active_db_url_fails_closed_without_fallback ... ok
+test test_participant_acknowledgement_strict_identity_matching ... ok
+test test_active_database_record_schema_and_integrity_hash ... ok
+test test_restore_journal_durability_and_sequence_monotonicity ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.58s
+```
+
+### 4.10 Quality, Linting & Release Assets
 - **Cargo Format:** `cargo fmt --all -- --check` exited with code 0 on both workspaces (`github-alternative/backend` and `git-alternative`).
 - **Cargo Clippy:** `cargo clippy --all-targets -- -D warnings` exited with code 0 on both workspaces.
-- **Release Binaries:** `spine-api.exe`, `spine.exe`, `spine-coordinator.exe`, `spine-storage-node.exe` rebuilt in release mode and checksummed in `target/release-candidate/SHA256SUMS`.
+- **Release Binaries:** `spine-api.exe`, `spine.exe`, `spine-coordinator.exe`, `spine-storage-node.exe` rebuilt in release mode and checksummed in `target/release-candidate/SHA256SUMS`:
+  ```text
+  7a4266699df3ed34a4db37c18cef5edf53a81a7ebdaf808451c4a18138df68d8  spine-api.exe
+  a7741f64e9278d4c2be9ab6bf697c6e11d8aa6fc78f0462f46d48efb06268d21  spine-coordinator.exe
+  33430a7171e44ce950a99d71589132cd636218c51a6bfc5d369c2aea9b0e683b  spine-storage-node.exe
+  2bb13d680b0e2ec39ca1559f461e0a2c602a4b097d361f79c60b2a64c6a2e3f9  spine.exe
+  ```

@@ -117,18 +117,15 @@ pub fn safe_move_path(from: &Path, to: &Path) -> Result<(), ForgeError> {
     }
 }
 
-/// Safely flush a directory handle across platforms (using FILE_FLAG_BACKUP_SEMANTICS on Windows).
+/// Safely flush a directory handle across platforms (avoiding invalid Win32 FlushFileBuffers on directory handles).
 pub fn sync_dir(dir: &Path) -> Result<(), ForgeError> {
     #[cfg(windows)]
     {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
-        if let Ok(f) = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(dir)
-        {
-            let _ = f.sync_all();
+        if !dir.exists() {
+            return Err(ForgeError::Internal(format!(
+                "Directory does not exist for sync: {}",
+                dir.display()
+            )));
         }
     }
     #[cfg(unix)]
@@ -809,9 +806,7 @@ impl BackupManager {
             v2::decrypt_stream(verify_file, std::io::sink(), passphrase)?;
 
             // 4. Atomically publish to final destination
-            fs::rename(&tmp_output, output_enc_path).map_err(|e| {
-                ForgeError::Internal(format!("Failed to publish encrypted archive: {}", e))
-            })?;
+            safe_atomic_replace(&tmp_output, output_enc_path)?;
 
             Ok(manifest)
         })();
