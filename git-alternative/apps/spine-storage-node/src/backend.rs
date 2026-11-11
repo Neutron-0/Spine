@@ -104,6 +104,20 @@ pub trait StorageBackend: Send + Sync {
         snapshot_id: &str,
         fencing_generation: u64,
         payload_tar_gz: &[u8],
+    ) -> Result<ParticipantAcknowledgement> {
+        self.stage_volume_restore_with_manifest(
+            snapshot_id,
+            fencing_generation,
+            None,
+            payload_tar_gz,
+        )
+    }
+    fn stage_volume_restore_with_manifest(
+        &self,
+        snapshot_id: &str,
+        fencing_generation: u64,
+        manifest: Option<&VolumeSnapshotManifest>,
+        payload_tar_gz: &[u8],
     ) -> Result<ParticipantAcknowledgement>;
     fn commit_volume_restore(&self, snapshot_id: &str, fencing_generation: u64) -> Result<()>;
     fn rollback_volume_restore(&self, snapshot_id: &str) -> Result<()>;
@@ -767,6 +781,8 @@ impl StorageBackend for FileSystemStorageBackend {
             participant_id: self.node_id.clone(),
             volume_name: format!("{}_data", self.node_id),
             snapshot_id: snapshot_id.to_string(),
+            restore_id: None,
+            backup_id: Some(snapshot_id.to_string()),
             fencing_generation,
             file_count,
             total_bytes,
@@ -781,6 +797,21 @@ impl StorageBackend for FileSystemStorageBackend {
         &self,
         snapshot_id: &str,
         fencing_generation: u64,
+        payload_tar_gz: &[u8],
+    ) -> Result<ParticipantAcknowledgement> {
+        self.stage_volume_restore_with_manifest(
+            snapshot_id,
+            fencing_generation,
+            None,
+            payload_tar_gz,
+        )
+    }
+
+    fn stage_volume_restore_with_manifest(
+        &self,
+        snapshot_id: &str,
+        fencing_generation: u64,
+        manifest: Option<&VolumeSnapshotManifest>,
         payload_tar_gz: &[u8],
     ) -> Result<ParticipantAcknowledgement> {
         if !self.in_maintenance.load(Ordering::SeqCst) {
@@ -835,10 +866,27 @@ impl StorageBackend for FileSystemStorageBackend {
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
 
+        let (restore_id, backup_id) = match manifest {
+            Some(m) => {
+                let r_id = m
+                    .restore_id
+                    .as_deref()
+                    .unwrap_or(&format!("rst_{}", snapshot_id))
+                    .to_string();
+                let b_id = m.backup_id.as_deref().unwrap_or(snapshot_id).to_string();
+                (r_id, b_id)
+            }
+            None => (format!("rst_{}", snapshot_id), snapshot_id.to_string()),
+        };
+
         let staging_rec_rel = format!(".staged_volume_{}/.staged_restore_record.json", snapshot_id);
         let staging_rec_path = self.storage_root.join(&staging_rec_rel);
+        if let Some(parent) = staging_rec_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let staging_metadata = serde_json::json!({
-            "restore_id": format!("rst_{}", snapshot_id),
+            "restore_id": restore_id,
+            "backup_id": backup_id,
             "snapshot_id": snapshot_id,
             "node_id": self.node_id,
             "fencing_generation": fencing_generation,
@@ -858,8 +906,8 @@ impl StorageBackend for FileSystemStorageBackend {
         }
 
         let ack = ParticipantAcknowledgement {
-            restore_id: format!("rst_{}", snapshot_id),
-            backup_id: snapshot_id.to_string(),
+            restore_id,
+            backup_id,
             participant_id: self.node_id.clone(),
             volume_name: format!("{}_data", self.node_id.replace('-', "_")),
             canonical_resource_id: format!("{}_volume_data", self.node_id.replace('-', "_")),
@@ -972,6 +1020,11 @@ impl StorageBackend for FileSystemStorageBackend {
         if staged_root.exists() {
             let _ = fs::remove_dir_all(&staged_root);
         }
+        let staging_rec_rel = format!(".staged_volume_{}", snapshot_id);
+        let staging_rec_dir = self.storage_root.join(&staging_rec_rel);
+        if staging_rec_dir.exists() {
+            let _ = fs::remove_dir_all(&staging_rec_dir);
+        }
         Ok(())
     }
 
@@ -993,6 +1046,16 @@ impl StorageBackend for FileSystemStorageBackend {
         if s_id != snapshot_id {
             return Ok(None);
         }
+        let restore_id = val
+            .get("restore_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&format!("rst_{}", snapshot_id))
+            .to_string();
+        let backup_id = val
+            .get("backup_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(snapshot_id)
+            .to_string();
         let f_gen = val
             .get("fencing_generation")
             .and_then(|v| v.as_u64())
@@ -1013,8 +1076,8 @@ impl StorageBackend for FileSystemStorageBackend {
         let cur_gen = self.fencing_generation.load(Ordering::SeqCst);
 
         let ack = ParticipantAcknowledgement {
-            restore_id: format!("rst_{}", snapshot_id),
-            backup_id: snapshot_id.to_string(),
+            restore_id,
+            backup_id,
             participant_id: self.node_id.clone(),
             volume_name: format!("{}_data", self.node_id.replace('-', "_")),
             canonical_resource_id: format!("{}_volume_data", self.node_id.replace('-', "_")),

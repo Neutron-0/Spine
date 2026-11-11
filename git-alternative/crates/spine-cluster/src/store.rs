@@ -116,6 +116,16 @@ pub trait CoordinatorStore: Send + Sync {
         snapshot_id: &str,
         fencing_generation: u64,
         payload: &[u8],
+    ) -> Result<ParticipantAcknowledgement> {
+        self.stage_restore_with_manifest(snapshot_id, fencing_generation, None, payload)
+    }
+
+    fn stage_restore_with_manifest(
+        &self,
+        snapshot_id: &str,
+        fencing_generation: u64,
+        manifest: Option<&VolumeSnapshotManifest>,
+        payload: &[u8],
     ) -> Result<ParticipantAcknowledgement>;
     fn commit_restore(&self, snapshot_id: &str, fencing_generation: u64) -> Result<()>;
     fn rollback_restore(&self, snapshot_id: &str) -> Result<()>;
@@ -735,6 +745,8 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
             participant_id: "coordinator".to_string(),
             volume_name: "coordinator_data".to_string(),
             snapshot_id: snapshot_id.to_string(),
+            restore_id: None,
+            backup_id: Some(snapshot_id.to_string()),
             fencing_generation,
             file_count: 1,
             total_bytes: payload.len() as u64,
@@ -748,6 +760,16 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
         &self,
         snapshot_id: &str,
         fencing_generation: u64,
+        payload: &[u8],
+    ) -> Result<ParticipantAcknowledgement> {
+        self.stage_restore_with_manifest(snapshot_id, fencing_generation, None, payload)
+    }
+
+    fn stage_restore_with_manifest(
+        &self,
+        snapshot_id: &str,
+        fencing_generation: u64,
+        manifest: Option<&VolumeSnapshotManifest>,
         payload: &[u8],
     ) -> Result<ParticipantAcknowledgement> {
         if !self.in_maintenance.load(Ordering::SeqCst) {
@@ -771,6 +793,22 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
             payload.to_vec(),
         );
 
+        let restore_id = manifest
+            .and_then(|m| m.restore_id.clone())
+            .unwrap_or_else(|| format!("rst_{}", snapshot_id));
+        let backup_id = manifest
+            .and_then(|m| m.backup_id.clone())
+            .unwrap_or_else(|| snapshot_id.to_string());
+
+        use sha2::Sha256;
+        let mut hasher = Sha256::new();
+        hasher.update(payload);
+        let staged_digest = hex::encode(hasher.finalize());
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+
         if let Some(ref p) = self.path {
             let parent_dir = p.parent().unwrap_or_else(|| Path::new("."));
             let staged_path =
@@ -788,23 +826,38 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
                 let _ = fs::remove_file(&tmp);
                 bail!("Failed to persist staged coordinator restore: {}", e);
             }
+
+            let meta_path = parent_dir.join(format!(
+                ".staged_coordinator_restore_record_{}.json",
+                snapshot_id
+            ));
+            let meta_tmp = meta_path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
+            let meta_json = serde_json::json!({
+                "restore_id": restore_id,
+                "backup_id": backup_id,
+                "snapshot_id": snapshot_id,
+                "fencing_generation": fencing_generation,
+                "staged_digest": staged_digest,
+                "staged_bytes": payload.len(),
+                "staged_at_nanos": now_nanos,
+            });
+            if let Ok(bytes) = serde_json::to_vec_pretty(&meta_json) {
+                if let Ok(mut f) = fs::File::create(&meta_tmp) {
+                    use std::io::Write;
+                    let _ = f.write_all(&bytes);
+                    let _ = f.flush();
+                    let _ = f.sync_all();
+                    let _ = safe_atomic_replace(&meta_tmp, &meta_path);
+                }
+            }
         }
 
         let mut staged = self.staged_restore.write().unwrap();
         *staged = Some(staged_record);
 
-        use sha2::Sha256;
-        let mut hasher = Sha256::new();
-        hasher.update(payload);
-        let staged_digest = hex::encode(hasher.finalize());
-        let now_nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as i64)
-            .unwrap_or(0);
-
         let ack = ParticipantAcknowledgement {
-            restore_id: format!("rst_{}", snapshot_id),
-            backup_id: snapshot_id.to_string(),
+            restore_id,
+            backup_id,
             participant_id: "coordinator".to_string(),
             volume_name: "coordinator_data".to_string(),
             canonical_resource_id: "coordinator_cluster_state".to_string(),
@@ -955,6 +1008,11 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
             let staged_path =
                 parent_dir.join(format!(".staged_coordinator_restore_{}.json", snapshot_id));
             let _ = fs::remove_file(&staged_path);
+            let meta_path = parent_dir.join(format!(
+                ".staged_coordinator_restore_record_{}.json",
+                snapshot_id
+            ));
+            let _ = fs::remove_file(&meta_path);
         }
         Ok(())
     }
@@ -963,6 +1021,29 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
         &self,
         snapshot_id: &str,
     ) -> Result<Option<ParticipantAcknowledgement>> {
+        let mut restore_id = format!("rst_{}", snapshot_id);
+        let mut backup_id = snapshot_id.to_string();
+
+        if let Some(ref p) = self.path {
+            let parent_dir = p.parent().unwrap_or_else(|| Path::new("."));
+            let meta_path = parent_dir.join(format!(
+                ".staged_coordinator_restore_record_{}.json",
+                snapshot_id
+            ));
+            if meta_path.exists() {
+                if let Ok(bytes) = fs::read(&meta_path) {
+                    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        if let Some(r) = val.get("restore_id").and_then(|v| v.as_str()) {
+                            restore_id = r.to_string();
+                        }
+                        if let Some(b) = val.get("backup_id").and_then(|v| v.as_str()) {
+                            backup_id = b.to_string();
+                        }
+                    }
+                }
+            }
+        }
+
         // 1. Check in-memory staged_restore
         {
             let staged = self.staged_restore.read().unwrap();
@@ -973,8 +1054,8 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
                     hasher.update(payload);
                     let staged_digest = hex::encode(hasher.finalize());
                     let ack = ParticipantAcknowledgement {
-                        restore_id: format!("rst_{}", snapshot_id),
-                        backup_id: snapshot_id.to_string(),
+                        restore_id: restore_id.clone(),
+                        backup_id: backup_id.clone(),
                         participant_id: "coordinator".to_string(),
                         volume_name: "coordinator_data".to_string(),
                         canonical_resource_id: "coordinator_cluster_state".to_string(),
@@ -1011,8 +1092,8 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
                     hasher.update(&payload);
                     let staged_digest = hex::encode(hasher.finalize());
                     let ack = ParticipantAcknowledgement {
-                        restore_id: format!("rst_{}", snapshot_id),
-                        backup_id: snapshot_id.to_string(),
+                        restore_id,
+                        backup_id,
                         participant_id: "coordinator".to_string(),
                         volume_name: "coordinator_data".to_string(),
                         canonical_resource_id: "coordinator_cluster_state".to_string(),

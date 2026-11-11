@@ -155,31 +155,45 @@ impl ConsistencyBarrier {
                         .await;
                 match db_gen_res {
                     Ok(Some((db_gen,))) => {
-                        if let Some(s_gen) =
+                        let s_gen_opt =
                             crate::backup::journal::RestoreJournal::read_storage_generation(
                                 storage_root.as_ref(),
-                            )
-                        {
-                            if db_gen != s_gen {
+                            );
+                        match s_gen_opt {
+                            Some(ref s_gen) if s_gen == &db_gen => {}
+                            Some(ref s_gen) => {
                                 return Err(ForgeError::ServiceUnavailable(format!(
                                     "Cluster write pipeline is paused: authoritative database generation '{}' does not match storage generation '{}'",
                                     db_gen, s_gen
+                                )));
+                            }
+                            None => {
+                                return Err(ForgeError::ServiceUnavailable(format!(
+                                    "Cluster write pipeline is paused: storage generation record missing while database has generation '{}'",
+                                    db_gen
                                 )));
                             }
                         }
                     }
                     Ok(None) => {
                         let table_count: Result<(i64,), _> = sqlx::query_as(
-                            "SELECT count(*)::bigint FROM information_schema.tables WHERE table_schema = 'public' AND table_name NOT LIKE 'pg_%'",
+                            "SELECT count(*)::bigint FROM information_schema.tables WHERE table_schema = 'public' AND table_name NOT LIKE 'pg_%' AND table_name NOT LIKE '_spine_%'",
                         )
                         .fetch_one(pool)
                         .await;
-                        if let Ok((count,)) = table_count {
-                            if count > 0 {
+                        match table_count {
+                            Ok((count,)) if count > 0 => {
                                 return Err(ForgeError::ServiceUnavailable(
                                     "Cluster write pipeline is paused: non-empty database missing generation record in _restore_generation".into(),
                                 ));
                             }
+                            Err(e) => {
+                                return Err(ForgeError::ServiceUnavailable(format!(
+                                    "Cluster write pipeline is paused: failed to query table count: {}",
+                                    e
+                                )));
+                            }
+                            _ => {}
                         }
                     }
                     Err(e) => {

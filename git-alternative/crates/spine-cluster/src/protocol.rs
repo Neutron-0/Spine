@@ -131,6 +131,10 @@ pub struct VolumeSnapshotManifest {
     pub total_bytes: u64,
     pub sha256_checksum: String,
     pub created_at_nanos: i64,
+    #[serde(default)]
+    pub restore_id: Option<String>,
+    #[serde(default)]
+    pub backup_id: Option<String>,
 }
 
 /// Durable preparation acknowledgement for an authoritative restore participant.

@@ -747,28 +747,49 @@ impl RestoreJournal {
 
                     // 3. Verify storage generation now matches
                     let updated_storage_gen = Self::read_storage_generation(storage_root);
-                    if updated_storage_gen.as_deref() == Some(&journal.target_generation) {
+                    if updated_storage_gen.as_deref() != Some(&journal.target_generation) {
+                        return Err(ForgeError::Internal(format!(
+                            "FATAL STARTUP BLOCKED: Committed restore '{}' in phase '{:?}' could not complete storage cutover. Staging directory may be missing.",
+                            journal.restore_id,
+                            journal.phase
+                        )));
+                    }
+
+                    if journal.staging_storage_root.exists() {
+                        let _ = std::fs::remove_dir_all(&journal.staging_storage_root);
+                    }
+
+                    // Check if local storage is the ONLY required participant (e.g. standalone test)
+                    let is_single_storage_participant = match journal.commit_decision.as_ref() {
+                        Some(cdr) => {
+                            cdr.required_participants.len() == 1
+                                && cdr.required_participants[0] == "spine_storage"
+                        }
+                        None => false,
+                    };
+
+                    if is_single_storage_participant {
                         let old_dir =
                             storage_root.join(format!(".old_generation_{}", journal.restore_id));
                         if old_dir.exists() {
                             let _ = std::fs::remove_dir_all(&old_dir);
                         }
-                        if journal.staging_storage_root.exists() {
-                            let _ = std::fs::remove_dir_all(&journal.staging_storage_root);
-                        }
-                        journal.persist(RestorePhase::Committed)?;
+                        journal.persist(RestorePhase::Completed)?;
                         let _ = Self::remove(storage_root);
                         Ok(Some(format!(
-                            "Interrupted restore '{}' at '{:?}' was forward-recovered to Committed and rolled forward to target generation '{}'.",
+                            "Interrupted restore '{}' at '{:?}' was forward-recovered to Completed and rolled forward to target generation '{}'.",
                             journal.restore_id,
                             journal.phase,
                             journal.target_generation
                         )))
                     } else {
-                        Err(ForgeError::Internal(format!(
-                            "FATAL STARTUP BLOCKED: Committed restore '{}' in phase '{:?}' could not complete storage cutover. Staging directory may be missing.",
+                        // DO NOT delete the journal! Multiple participants are required.
+                        // Full reconciliation across PostgreSQL, Coordinator, and Storage Nodes must complete in handle_startup_recovery_cluster.
+                        Ok(Some(format!(
+                            "Interrupted restore '{}' at '{:?}' forward-recovered local storage to target generation '{}'; awaiting full cluster participant convergence.",
                             journal.restore_id,
-                            journal.phase
+                            journal.phase,
+                            journal.target_generation
                         )))
                     }
                 }
@@ -818,13 +839,210 @@ impl RestoreJournal {
     ) -> Result<Option<String>, ForgeError> {
         let sync_msg = Self::handle_startup_recovery_sync(storage_root)?;
 
+        let journal_opt = Self::load(storage_root)?;
         let mut reconciled_storage_gen: Option<String> =
             Self::read_storage_generation(storage_root);
+
+        if let Some(mut journal) = journal_opt {
+            let target_gen = journal.target_generation.clone();
+            let decision_opt = journal.commit_decision.clone();
+            let default_parts = vec![
+                "postgres_data".to_string(),
+                "spine_storage".to_string(),
+                "spine_ssh".to_string(),
+                "coordinator".to_string(),
+                "node-1".to_string(),
+                "node-2".to_string(),
+                "node-3".to_string(),
+            ];
+            let required_participants = decision_opt
+                .as_ref()
+                .map(|d| &d.required_participants)
+                .unwrap_or(&default_parts);
+
+            // 1. Verify / Reconcile PostgreSQL Database
+            if required_participants.iter().any(|p| p == "postgres_data") {
+                if let Some(pool) = pool {
+                    let db_gen_res: Result<Option<(String,)>, _> = sqlx::query_as(
+                        "SELECT generation_token FROM _restore_generation WHERE id = 1",
+                    )
+                    .fetch_optional(pool)
+                    .await;
+
+                    match db_gen_res {
+                        Ok(Some((db_gen,))) => {
+                            if db_gen != target_gen {
+                                return Err(ForgeError::Internal(format!(
+                                    "FATAL RESTORE RECOVERY FAILURE: PostgreSQL generation '{}' != target generation '{}'",
+                                    db_gen, target_gen
+                                )));
+                            }
+                        }
+                        Ok(None) => {
+                            return Err(ForgeError::Internal(format!(
+                                "FATAL RESTORE RECOVERY FAILURE: PostgreSQL missing _restore_generation record during recovery of restore '{}'",
+                                journal.restore_id
+                            )));
+                        }
+                        Err(e) => {
+                            return Err(ForgeError::Internal(format!(
+                                "FATAL RESTORE RECOVERY FAILURE: Failed to query PostgreSQL _restore_generation: {}",
+                                e
+                            )));
+                        }
+                    }
+                } else if let Ok(Some(cached)) =
+                    crate::db::DatabaseSelector::load_diagnostic_cache(storage_root)
+                {
+                    if cached.target_generation != target_gen {
+                        return Err(ForgeError::Internal(format!(
+                            "FATAL RESTORE RECOVERY FAILURE: Cached DB generation '{}' != target generation '{}'",
+                            cached.target_generation, target_gen
+                        )));
+                    }
+                }
+            }
+
+            // 2. Verify Local Storage Generation
+            if required_participants.iter().any(|p| p == "spine_storage") {
+                let s_gen = Self::read_storage_generation(storage_root);
+                if s_gen.as_deref() != Some(&target_gen) {
+                    return Err(ForgeError::Internal(format!(
+                        "FATAL RESTORE RECOVERY FAILURE: Storage generation '{:?}' != target generation '{}'",
+                        s_gen, target_gen
+                    )));
+                }
+            }
+
+            // 3. Verify SSH Host Key
+            if decision_opt
+                .as_ref()
+                .map(|d| d.required_participants.iter().any(|p| p == "spine_ssh"))
+                .unwrap_or(false)
+            {
+                let ssh_dir = crate::ssh::host_key::resolve_ssh_dir(storage_root);
+                let host_key = ssh_dir.join("host_key_ed25519");
+                if !host_key.exists() {
+                    return Err(ForgeError::Internal(format!(
+                        "FATAL RESTORE RECOVERY FAILURE: Required SSH host key '{}' missing after restore",
+                        host_key.display()
+                    )));
+                }
+            }
+
+            // 4. Verify / Reconcile Coordinator
+            if required_participants.iter().any(|p| p == "coordinator") {
+                if let Some(coord) = coordinator {
+                    let (_in_maint, coord_gen) =
+                        coord.query_maintenance_status().await.map_err(|e| {
+                            ForgeError::Internal(format!(
+                                "FATAL RESTORE RECOVERY FAILURE: Failed to query coordinator maintenance status: {}",
+                                e
+                            ))
+                        })?;
+
+                    let expected_num_gen = target_gen.parse::<u64>().unwrap_or(0);
+                    if coord_gen != expected_num_gen {
+                        let snapshot_id = format!("rst_{}", journal.restore_id);
+                        if let Ok(Some(_)) = coord.query_staged_restore(&snapshot_id).await {
+                            coord
+                                .commit_restore(&snapshot_id, expected_num_gen)
+                                .await
+                                .map_err(|e| {
+                                    ForgeError::Internal(format!(
+                                        "Failed to commit staged restore on coordinator: {}",
+                                        e
+                                    ))
+                                })?;
+                        } else {
+                            return Err(ForgeError::Internal(format!(
+                                "FATAL RESTORE RECOVERY FAILURE: Coordinator generation ({}) != target generation ({})",
+                                coord_gen, expected_num_gen
+                            )));
+                        }
+                    }
+
+                    let snapshot_id = format!("rst_{}", journal.restore_id);
+                    let _ = coord.finalize_restore(&snapshot_id).await;
+                }
+            }
+
+            // 5. Verify / Reconcile Storage Nodes
+            for node_id in required_participants {
+                if node_id.starts_with("node-") {
+                    let addr_opt = storage_nodes
+                        .iter()
+                        .find(|(id, _)| id == node_id)
+                        .map(|(_, addr)| addr);
+                    if let Some(addr) = addr_opt {
+                        let client = crate::ClusterNodeClient::new(addr.clone());
+                        let (_in_maint, node_gen, _, responding_id) =
+                            client.query_node_details().await.map_err(|e| {
+                                ForgeError::Internal(format!(
+                                    "FATAL RESTORE RECOVERY FAILURE: Failed to query storage node '{}' at {}: {}",
+                                    node_id, addr, e
+                                ))
+                            })?;
+
+                        if let Some(ref r_id) = responding_id {
+                            if r_id != node_id {
+                                return Err(ForgeError::Internal(format!(
+                                    "FATAL RESTORE RECOVERY FAILURE: Storage node at {} responded with '{}', expected '{}'",
+                                    addr, r_id, node_id
+                                )));
+                            }
+                        }
+
+                        let expected_num_gen = target_gen.parse::<u64>().unwrap_or(0);
+                        if node_gen != expected_num_gen {
+                            let snapshot_id = format!("rst_{}", journal.restore_id);
+                            if let Ok(Some(_)) = client.query_staged_restore(&snapshot_id).await {
+                                client
+                                    .commit_restore(&snapshot_id, expected_num_gen)
+                                    .await
+                                    .map_err(|e| {
+                                        ForgeError::Internal(format!(
+                                            "Failed to commit staged restore on storage node '{}': {}",
+                                            node_id, e
+                                        ))
+                                    })?;
+                            } else {
+                                return Err(ForgeError::Internal(format!(
+                                    "FATAL RESTORE RECOVERY FAILURE: Storage node '{}' generation ({}) != target generation ({})",
+                                    node_id, node_gen, expected_num_gen
+                                )));
+                            }
+                        }
+
+                        let snapshot_id = format!("rst_{}", journal.restore_id);
+                        let _ = client.finalize_restore(&snapshot_id).await;
+                    }
+                }
+            }
+
+            // All required participants have successfully converged!
+            let old_dir = storage_root.join(format!(".old_generation_{}", journal.restore_id));
+            if old_dir.exists() {
+                let _ = std::fs::remove_dir_all(&old_dir);
+            }
+            journal.persist(RestorePhase::Completed)?;
+            let _ = Self::remove(storage_root);
+            tracing::info!(
+                "Global restore '{}' successfully converged across all {} required participants. Journal removed.",
+                journal.restore_id,
+                required_participants.len()
+            );
+
+            return Ok(Some(format!(
+                "Global restore '{}' fully recovered, committed, and rolled forward across all required participants to target generation '{}'.",
+                journal.restore_id, target_gen
+            )));
+        }
 
         if let Some(pool) = pool {
             // Check if database is empty or initialized
             let table_count: (i64,) = sqlx::query_as(
-                "SELECT count(*)::bigint FROM information_schema.tables WHERE table_schema = 'public' AND table_name NOT LIKE 'pg_%'",
+                "SELECT count(*)::bigint FROM information_schema.tables WHERE table_schema = 'public' AND table_name NOT LIKE 'pg_%' AND table_name NOT LIKE '_spine_%'",
             )
             .fetch_one(pool)
             .await

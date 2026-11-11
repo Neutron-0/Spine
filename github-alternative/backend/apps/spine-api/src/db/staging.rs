@@ -459,13 +459,60 @@ impl StagedDatabaseRestore {
 
     /// Atomically cut over staged database using DatabaseSelector and recoverable versioning.
     /// Preserves existing database until finalization.
-    pub async fn commit_cutover(&self, storage_root: &Path) -> Result<(), ForgeError> {
+    pub async fn commit_cutover(
+        &self,
+        storage_root: &Path,
+        decision: &crate::backup::CommitDecisionRecord,
+    ) -> Result<(), ForgeError> {
+        if decision.restore_id != self.restore_id {
+            return Err(ForgeError::Internal(format!(
+                "Cannot commit cutover: decision restore_id '{}' != staging restore_id '{}'",
+                decision.restore_id, self.restore_id
+            )));
+        }
+        if decision.backup_id != self.backup_id {
+            return Err(ForgeError::Internal(format!(
+                "Cannot commit cutover: decision backup_id '{}' != staging backup_id '{}'",
+                decision.backup_id, self.backup_id
+            )));
+        }
+        if decision.new_generation != self.target_generation {
+            return Err(ForgeError::Internal(format!(
+                "Cannot commit cutover: decision new_generation '{}' != staging target_generation '{}'",
+                decision.new_generation, self.target_generation
+            )));
+        }
+        if decision.decision_token.trim().is_empty() {
+            return Err(ForgeError::Internal(
+                "Cannot commit cutover: decision_token is empty".into(),
+            ));
+        }
+
         let maint_pool = PgPool::connect(&self.maint_db_url).await.map_err(|e| {
             ForgeError::Internal(format!(
                 "Failed to connect to maintenance DB for cutover: {}",
                 e
             ))
         })?;
+
+        // Check idempotency: if active record already matches this decision token and db name, cutover succeeded
+        let current_rec = DatabaseSelector::load_from_db(&maint_pool)
+            .await
+            .ok()
+            .flatten();
+        if let Some(ref r) = current_rec {
+            if r.decision_id == decision.decision_token
+                && r.active_db_name == self.active_versioned_name
+            {
+                tracing::info!(
+                    "Database cutover already committed for decision_token '{}'",
+                    decision.decision_token
+                );
+                let _ = DatabaseSelector::save_diagnostic_cache(storage_root, r);
+                maint_pool.close().await;
+                return Ok(());
+            }
+        }
 
         // 1. Rename staged database to authoritative active_versioned_name
         let term_sql = r#"
@@ -500,10 +547,6 @@ impl StagedDatabaseRestore {
 
         // 2. Durably record the active database selection in the control table and storage root
         let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let current_rec = DatabaseSelector::load_from_db(&maint_pool)
-            .await
-            .ok()
-            .flatten();
         let prev_seq = current_rec.as_ref().map(|r| r.sequence_number).unwrap_or(0);
         let prev_db = current_rec
             .as_ref()
@@ -517,7 +560,7 @@ impl StagedDatabaseRestore {
         let record = ActiveDatabaseRecord::new_record(
             prev_seq + 1,
             self.restore_id.clone(),
-            format!("decision_{}", self.restore_id),
+            decision.decision_token.clone(),
             self.staged_digest.clone(),
             prev_db,
             prev_gen,
@@ -539,7 +582,8 @@ impl StagedDatabaseRestore {
 
         maint_pool.close().await;
         tracing::info!(
-            "Cutover successful: active database selector points to '{}'",
+            "Cutover successful: active database selector bound to decision '{}' points to '{}'",
+            decision.decision_token,
             self.active_versioned_name
         );
         Ok(())

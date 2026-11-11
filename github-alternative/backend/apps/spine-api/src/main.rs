@@ -1,6 +1,5 @@
 use clap::{Parser, Subcommand};
 use rand::Rng;
-use sha2::Digest;
 use spine_api::{
     auth::{hash_password, DevMailCatcher, RateLimiter},
     build_router,
@@ -687,10 +686,9 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                let tmp_snap_dir = tempfile::Builder::new().prefix("spine_snap_").tempdir()?;
-                let snap_file_path = tmp_snap_dir.path().join("snapshot.jsonl");
-
-                let (_guard_barrier, _maintenance_guard) = if let Some(url) = db_url {
+                let (_guard_barrier, _maintenance_guard, captured_pg_bytes) = if let Some(url) =
+                    db_url
+                {
                     let resolved_url = spine_api::db::DatabaseSelector::resolve_active_db_url(
                         &url,
                         Some(&storage_root),
@@ -717,16 +715,19 @@ async fn main() -> anyhow::Result<()> {
                             anyhow::anyhow!("Failed to enter cluster maintenance: {}", e)
                         })?;
 
-                    let mut snap_file = std::fs::File::create(&snap_file_path)?;
-                    spine_api::dump_database_to_writer(&pool, &mut snap_file)
+                    let mut pg_bytes: Vec<u8> = Vec::new();
+                    spine_api::dump_database_to_writer(&pool, &mut pg_bytes)
                         .await
                         .map_err(|e| {
                             anyhow::anyhow!("Failed to stream PostgreSQL database dump: {}", e)
                         })?;
-                    println!("PostgreSQL streaming snapshot captured successfully.");
-                    (Some(barrier), Some(guard))
+                    println!(
+                        "PostgreSQL in-memory streaming snapshot captured successfully ({} bytes).",
+                        pg_bytes.len()
+                    );
+                    (Some(barrier), Some(guard), Some(pg_bytes))
                 } else {
-                    (None, None)
+                    (None, None, None)
                 };
 
                 let fencing_generation = _maintenance_guard
@@ -841,27 +842,24 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
 
-                // Register PostgreSQL database participant record
-                let has_db_snap = _maintenance_guard.is_some();
-                if has_db_snap {
-                    let pg_meta = std::fs::metadata(&snap_file_path)?;
-                    let mut pg_f = std::fs::File::open(&snap_file_path)?;
-                    let mut pg_hasher = sha2::Sha256::new();
-                    std::io::copy(&mut pg_f, &mut pg_hasher)?;
-                    let pg_hash = hex::encode(pg_hasher.finalize());
+                // Register PostgreSQL database participant record with bounded in-memory payload
+                if let Some(pg_bytes) = captured_pg_bytes {
+                    use sha2::Digest;
+                    let pg_len = pg_bytes.len() as u64;
+                    let pg_hash = format!("{:x}", sha2::Sha256::digest(&pg_bytes));
                     stream_participants.push((
                         spine_api::BackupParticipantRecord {
                             participant_id: "postgres_data".to_string(),
                             volume_name: "postgres_data".to_string(),
                             snapshot_id: format!("pg_snap_{}", uuid::Uuid::new_v4().simple()),
                             fencing_generation,
-                            byte_length: pg_meta.len(),
+                            byte_length: pg_len,
                             sha256_checksum: pg_hash,
                             archive_rel_path: "database/snapshot.jsonl".to_string(),
                         },
-                        spine_api::backup::ParticipantPayloadSource::File(snap_file_path.clone()),
+                        spine_api::backup::ParticipantPayloadSource::Memory(pg_bytes),
                     ));
-                    println!("PostgreSQL database snapshot participant record registered.");
+                    println!("PostgreSQL database snapshot participant record registered (in-memory streaming, 0 intermediate disk files).");
                 } else if prof.requires_persistent_database() {
                     anyhow::bail!(
                         "Under deployment profile '{}', PostgreSQL database snapshot ('postgres_data') is required.",
@@ -869,32 +867,29 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
 
-                // Register Spine API storage volume participant record with streaming tar.gz payload
+                // Register Spine API storage volume participant record with streaming in-memory payload
                 if prof.requires_persistent_database() {
-                    let storage_snap_path =
-                        tmp_snap_dir.path().join("spine_storage_snapshot.tar.gz");
-                    println!(
-                        "Capturing Spine storage volume snapshot into streaming payload {}...",
-                        storage_snap_path.display()
-                    );
+                    println!("Capturing Spine storage volume snapshot into in-memory streaming payload (0 intermediate disk files)...");
                     let (storage_bytes, storage_hash) =
-                        spine_api::backup::BackupManager::capture_storage_snapshot(
+                        spine_api::backup::BackupManager::capture_storage_snapshot_memory(
                             &storage_root,
-                            &storage_snap_path,
                         )?;
+                    let storage_len = storage_bytes.len() as u64;
                     stream_participants.push((
                         spine_api::BackupParticipantRecord {
                             participant_id: "spine_storage".to_string(),
                             volume_name: "spine_storage".to_string(),
                             snapshot_id: format!("storage_snap_{}", uuid::Uuid::new_v4().simple()),
                             fencing_generation,
-                            byte_length: storage_bytes,
+                            byte_length: storage_len,
                             sha256_checksum: storage_hash,
                             archive_rel_path: "storage/spine_storage_snapshot.tar.gz".to_string(),
                         },
-                        spine_api::backup::ParticipantPayloadSource::File(storage_snap_path),
+                        spine_api::backup::ParticipantPayloadSource::Memory(storage_bytes),
                     ));
-                    println!("Spine storage volume participant record registered.");
+                    println!(
+                        "Spine storage volume participant record registered (in-memory streaming)."
+                    );
                 }
 
                 // Enforce participant registry validation before archive assembly
@@ -912,14 +907,9 @@ async fn main() -> anyhow::Result<()> {
                     storage_root.display(),
                     output.display()
                 );
-                let snap_path_opt = if has_db_snap {
-                    Some(snap_file_path.as_path())
-                } else {
-                    None
-                };
                 let manifest = spine_api::backup::BackupManager::create_cluster_backup_streaming(
                     &storage_root,
-                    snap_path_opt,
+                    None,
                     stream_participants,
                     Some(fencing_generation),
                     &output,
@@ -1241,6 +1231,8 @@ async fn main() -> anyhow::Result<()> {
                                         participant_id: participant.participant_id.clone(),
                                         volume_name: participant.volume_name.clone(),
                                         snapshot_id: participant.snapshot_id.clone(),
+                                        restore_id: Some(session.journal.restore_id.clone()),
+                                        backup_id: Some(session.manifest.backup_id.clone()),
                                         fencing_generation: participant.fencing_generation,
                                         file_count: 0,
                                         total_bytes: participant.byte_length,
@@ -1292,6 +1284,8 @@ async fn main() -> anyhow::Result<()> {
                                 participant_id: participant.participant_id.clone(),
                                 volume_name: participant.volume_name.clone(),
                                 snapshot_id: participant.snapshot_id.clone(),
+                                restore_id: Some(session.journal.restore_id.clone()),
+                                backup_id: Some(session.manifest.backup_id.clone()),
                                 fencing_generation: participant.fencing_generation,
                                 file_count: 0,
                                 total_bytes: participant.byte_length,
@@ -1498,19 +1492,46 @@ async fn main() -> anyhow::Result<()> {
                                     ));
                                     break;
                                 }
-                                if let Some(m) = session.manifest.participants.iter().find(|p| {
+                                let m = match session.manifest.participants.iter().find(|p| {
                                     p.snapshot_id == *snap_id
-                                        || p.participant_id == ack.participant_id
+                                        && p.participant_id == ack.participant_id
                                 }) {
-                                    if !ack.archive_payload_sha256.is_empty()
-                                        && ack.archive_payload_sha256 != m.sha256_checksum
-                                    {
+                                    Some(m) => m,
+                                    None => {
                                         revalidation_failed = Some(format!(
-                                            "Cluster node '{}' archive payload SHA-256 mismatch: manifest has {}, ack has {}",
-                                            ack.participant_id, m.sha256_checksum, ack.archive_payload_sha256
+                                            "Cluster node '{}' with snapshot '{}' not found in manifest participants",
+                                            ack.participant_id, snap_id
                                         ));
                                         break;
                                     }
+                                };
+                                if ack.archive_payload_sha256.trim().is_empty() {
+                                    revalidation_failed = Some(format!(
+                                        "Cluster node '{}' returned empty archive payload SHA-256",
+                                        ack.participant_id
+                                    ));
+                                    break;
+                                }
+                                if ack.archive_payload_sha256 != m.sha256_checksum {
+                                    revalidation_failed = Some(format!(
+                                        "Cluster node '{}' archive payload SHA-256 mismatch: manifest has {}, ack has {}",
+                                        ack.participant_id, m.sha256_checksum, ack.archive_payload_sha256
+                                    ));
+                                    break;
+                                }
+                                if ack.canonical_resource_id.trim().is_empty() {
+                                    revalidation_failed = Some(format!(
+                                        "Cluster node '{}' returned empty canonical_resource_id",
+                                        ack.participant_id
+                                    ));
+                                    break;
+                                }
+                                if ack.durable_staging_record_id.trim().is_empty() {
+                                    revalidation_failed = Some(format!(
+                                        "Cluster node '{}' returned empty durable_staging_record_id",
+                                        ack.participant_id
+                                    ));
+                                    break;
                                 }
                                 tracing::info!("Decision boundary: Cluster participant for snapshot '{}' verified prepared across all fields.", snap_id);
                             }
@@ -1585,7 +1606,7 @@ async fn main() -> anyhow::Result<()> {
                 session
                     .journal
                     .persist(spine_api::backup::RestorePhase::CommitDecision(
-                        decision_record,
+                        decision_record.clone(),
                     ))
                     .map_err(|e| {
                         anyhow::anyhow!(
@@ -1604,7 +1625,7 @@ async fn main() -> anyhow::Result<()> {
                 // Step 1: Database cutover
                 if let Some(ref sdb) = staged_db_restore {
                     println!("Atomically cutting over staged database to live target database...");
-                    if let Err(e) = sdb.commit_cutover(&target_storage).await {
+                    if let Err(e) = sdb.commit_cutover(&target_storage, &decision_record).await {
                         // After CommitDecision, NEVER roll back participants. Fencing remains active.
                         let _ =
                             session
@@ -2029,7 +2050,39 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
         None => None,
     };
 
-    // 2. Initialize Database backend
+    // 2. Initialize Coordinator Client
+    let coordinator = coordinator_addr.map(|addr| {
+        tracing::info!("Configured Spine Coordinator at {}", addr);
+        CoordinatorClient::new(addr)
+    });
+
+    // 2.1 Restore state machine crash recovery & generation validation BEFORE running schema migrations
+    let recovery_pool = match database_url.as_ref() {
+        Some(url) => Some(sqlx::PgPool::connect(url).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to connect to active database for recovery verification: {}",
+                e
+            )
+        })?),
+        None => None,
+    };
+
+    if let Some(msg) = spine_api::backup::RestoreJournal::handle_startup_recovery_cluster(
+        &storage_root_canonical,
+        recovery_pool.as_ref(),
+        coordinator.as_ref(),
+        &storage_nodes,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("FATAL RESTORE RECOVERY FAILURE: {}", e))?
+    {
+        tracing::warn!("Restore state machine recovery: {}", msg);
+    }
+    if let Some(p) = recovery_pool {
+        p.close().await;
+    }
+
+    // 3. Initialize Database backend & apply migrations on verified cluster state
     let (db, pg_pool): (Arc<dyn Database>, Option<sqlx::PgPool>) = match database_url {
         Some(db_url) => {
             if let Some(mig_url) = migration_database_url {
@@ -2109,25 +2162,6 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
             }
         }
     };
-
-    // 3. Initialize Coordinator Client
-    let coordinator = coordinator_addr.map(|addr| {
-        tracing::info!("Configured Spine Coordinator at {}", addr);
-        CoordinatorClient::new(addr)
-    });
-
-    // 3.1 Restore state machine crash recovery & generation validation
-    if let Some(msg) = spine_api::backup::RestoreJournal::handle_startup_recovery_cluster(
-        &storage_root_canonical,
-        pg_pool.as_ref(),
-        coordinator.as_ref(),
-        &storage_nodes,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("FATAL RESTORE RECOVERY FAILURE: {}", e))?
-    {
-        tracing::warn!("Restore state machine recovery: {}", msg);
-    }
 
     let permissions = Arc::new(PermissionService::new(Arc::clone(&db)));
     let repositories = Arc::new(RepositoryService::new(

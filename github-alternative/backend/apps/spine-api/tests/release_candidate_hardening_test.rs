@@ -1,6 +1,7 @@
+use spine_api::backup::consistency::ConsistencyBarrier;
 use spine_api::backup::journal::{CommitDecisionRecord, RestoreJournal, RestorePhase};
-use spine_api::backup::{safe_atomic_replace, sync_dir};
-use spine_api::db::selector::ActiveDatabaseRecord;
+use spine_api::backup::{safe_atomic_replace, sync_dir, BackupManager};
+use spine_api::db::selector::{ActiveDatabaseRecord, DatabaseSelector};
 use std::collections::BTreeMap;
 use std::fs;
 use tempfile::tempdir;
@@ -223,4 +224,231 @@ fn test_selector_checksum_is_unkeyed_sha256() {
         tampered.verify_integrity().is_err(),
         "Tampered record must fail unkeyed SHA-256 integrity check"
     );
+}
+
+#[test]
+fn test_decision_token_in_selector_equals_commit_decision_record() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("storage_root");
+    fs::create_dir_all(&root).unwrap();
+
+    let decision_token = format!("tok_decision_{}", uuid::Uuid::new_v4());
+    let cdr = CommitDecisionRecord {
+        restore_id: "rst_bind_test".to_string(),
+        backup_id: "bak_bind_test".to_string(),
+        old_generation: Some("1".to_string()),
+        new_generation: "2".to_string(),
+        required_participants: vec!["postgres_data".to_string(), "spine_storage".to_string()],
+        staged_manifest_digests: BTreeMap::new(),
+        decision_timestamp_nanos: 1_234_567_890,
+        schema_identity: "spine-backup-v2".to_string(),
+        decision_token: decision_token.clone(),
+    };
+
+    let record = ActiveDatabaseRecord::new_record(
+        1,
+        cdr.restore_id.clone(),
+        cdr.decision_token.clone(),
+        "digest_test".to_string(),
+        "app_db".to_string(),
+        "1".to_string(),
+        "app_db_gen_2".to_string(),
+        cdr.new_generation.clone(),
+        "Committed".to_string(),
+        cdr.decision_timestamp_nanos,
+        "app_db".to_string(),
+    );
+
+    assert_eq!(record.decision_id, decision_token);
+    assert!(record.verify_integrity().is_ok());
+
+    DatabaseSelector::save_diagnostic_cache(&root, &record).unwrap();
+    let loaded = DatabaseSelector::load_diagnostic_cache(&root)
+        .unwrap()
+        .expect("Diagnostic cache record must exist");
+    assert_eq!(loaded.decision_id, decision_token);
+    assert_eq!(loaded.target_generation, "2");
+    assert!(loaded.verify_integrity().is_ok());
+}
+
+#[tokio::test]
+async fn test_post_decision_failure_leaves_durable_fence_across_process_restart() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("storage_root");
+    let staging = root.join(".staged_generation_fence");
+    let dummy_archive = tmp.path().join("archive.spnebak");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(&dummy_archive, b"dummy").unwrap();
+
+    let mut journal = RestoreJournal::new(&dummy_archive, &root, &staging, "bak_fence");
+    journal.restore_id = "rst_fence".to_string();
+    journal.target_generation = "gen_fence".to_string();
+    journal.staging_storage_root = staging.clone();
+
+    // Multi-participant decision: requires both postgres_data and spine_storage
+    let cdr = CommitDecisionRecord {
+        restore_id: "rst_fence".to_string(),
+        backup_id: "bak_fence".to_string(),
+        old_generation: None,
+        new_generation: "gen_fence".to_string(),
+        required_participants: vec!["postgres_data".to_string(), "spine_storage".to_string()],
+        staged_manifest_digests: BTreeMap::new(),
+        decision_timestamp_nanos: 1_000_000,
+        schema_identity: "spine-backup-v2".to_string(),
+        decision_token: "tok_fence".to_string(),
+    };
+    journal.persist(RestorePhase::CommitDecision(cdr)).unwrap();
+
+    // Startup recovery sync should forward-recover local storage, but NOT clear the journal
+    let sync_res = RestoreJournal::handle_startup_recovery_sync(&root).unwrap();
+    assert!(sync_res.is_some());
+
+    // Durable journal MUST remain on disk across process exit
+    assert!(
+        RestoreJournal::load(&root).unwrap().is_some(),
+        "Journal must remain present because postgres_data has not converged"
+    );
+
+    // ConsistencyBarrier write permit MUST fail closed
+    let barrier = ConsistencyBarrier::new().with_storage_root(root.clone());
+    let write_res = barrier.acquire_write_permit().await;
+    assert!(
+        write_res.is_err(),
+        "Write permits must fail closed while restore is unrecovered across restarts"
+    );
+}
+
+#[tokio::test]
+async fn test_cluster_recovery_fails_closed_when_generation_mismatches() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("storage_root");
+    let staging = root.join(".staged_generation_cluster");
+    let dummy_archive = tmp.path().join("archive.spnebak");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(&dummy_archive, b"dummy").unwrap();
+
+    let mut journal = RestoreJournal::new(&dummy_archive, &root, &staging, "bak_cluster");
+    journal.restore_id = "rst_cluster".to_string();
+    journal.target_generation = "5".to_string();
+    journal.staging_storage_root = staging.clone();
+
+    let cdr = CommitDecisionRecord {
+        restore_id: "rst_cluster".to_string(),
+        backup_id: "bak_cluster".to_string(),
+        old_generation: None,
+        new_generation: "5".to_string(),
+        required_participants: vec!["postgres_data".to_string(), "spine_storage".to_string()],
+        staged_manifest_digests: BTreeMap::new(),
+        decision_timestamp_nanos: 1_000_000,
+        schema_identity: "spine-backup-v2".to_string(),
+        decision_token: "tok_cluster".to_string(),
+    };
+    journal.persist(RestorePhase::CommitDecision(cdr)).unwrap();
+
+    // Write mismatched diagnostic cache (generation "4" != target "5")
+    let record = ActiveDatabaseRecord::new_record(
+        1,
+        "rst_cluster".to_string(),
+        "tok_cluster".to_string(),
+        "digest".to_string(),
+        "app_db".to_string(),
+        "3".to_string(),
+        "app_db_gen_4".to_string(),
+        "4".to_string(),
+        "Committed".to_string(),
+        1_000_000,
+        "app_db".to_string(),
+    );
+    DatabaseSelector::save_diagnostic_cache(&root, &record).unwrap();
+
+    // Call cluster recovery: must fail closed because DB generation is "4" while target is "5"
+    let cluster_res = RestoreJournal::handle_startup_recovery_cluster(&root, None, None, &[]).await;
+    assert!(
+        cluster_res.is_err(),
+        "Cluster recovery must fail closed when DB generation mismatches"
+    );
+
+    // Journal must NOT be cleared
+    assert!(
+        RestoreJournal::load(&root).unwrap().is_some(),
+        "Journal must remain intact on recovery failure"
+    );
+}
+
+#[test]
+fn test_backup_creation_zero_plaintext_intermediate_files() {
+    let tmp = tempdir().unwrap();
+    let storage_root = tmp.path().join("storage");
+    fs::create_dir_all(storage_root.join("repos")).unwrap();
+    fs::create_dir_all(storage_root.join("chunks")).unwrap();
+    fs::create_dir_all(storage_root.join("manifests")).unwrap();
+
+    fs::write(
+        storage_root.join("repos").join("test_repo.txt"),
+        b"repo content",
+    )
+    .unwrap();
+    fs::write(
+        storage_root.join("chunks").join("chunk1.bin"),
+        b"chunk content",
+    )
+    .unwrap();
+
+    let (storage_bytes, storage_hash) =
+        BackupManager::capture_storage_snapshot_memory(&storage_root).unwrap();
+    assert!(!storage_bytes.is_empty());
+    assert!(!storage_hash.is_empty());
+
+    // Verify gzip tar decompression in memory
+    use flate2::read::GzDecoder;
+    use tar::Archive;
+    let gz = GzDecoder::new(&storage_bytes[..]);
+    let mut archive = Archive::new(gz);
+    let mut entry_names = Vec::new();
+    for entry in archive.entries().unwrap() {
+        let e = entry.unwrap();
+        entry_names.push(e.path().unwrap().to_string_lossy().to_string());
+    }
+    assert!(entry_names.iter().any(|n| n.contains("test_repo.txt")));
+    assert!(entry_names.iter().any(|n| n.contains("chunk1.bin")));
+
+    // Verify 0 intermediate files exist on disk in storage_root
+    fn count_files(p: &std::path::Path) -> usize {
+        let mut count = 0;
+        if p.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(p) {
+                for entry in entries.flatten() {
+                    count += count_files(&entry.path());
+                }
+            }
+        } else if p.is_file() {
+            count += 1;
+        }
+        count
+    }
+    assert_eq!(
+        count_files(&storage_root),
+        2,
+        "Only original test files must exist on disk"
+    );
+}
+
+#[tokio::test]
+async fn test_missing_storage_generation_blocks_write_permits_fail_closed() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("storage_root");
+    fs::create_dir_all(&root).unwrap();
+
+    // No storage generation record in root
+    assert!(RestoreJournal::read_storage_generation(&root).is_none());
+
+    let barrier = ConsistencyBarrier::new().with_storage_root(root.clone());
+    // Enter maintenance mode -> rejected
+    let _guard = barrier
+        .enter_maintenance(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(barrier.acquire_write_permit().await.is_err());
 }

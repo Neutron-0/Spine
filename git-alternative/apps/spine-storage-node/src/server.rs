@@ -293,9 +293,14 @@ async fn handle_connection(
         ClusterRpcRequest::StageVolumeRestore {
             snapshot_id,
             fencing_generation,
-            manifest: _,
+            manifest,
             payload_bytes,
-        } => match backend.stage_volume_restore(&snapshot_id, fencing_generation, &payload_bytes) {
+        } => match backend.stage_volume_restore_with_manifest(
+            &snapshot_id,
+            fencing_generation,
+            Some(&manifest),
+            &payload_bytes,
+        ) {
             Ok(ack) => ClusterRpcResponse::VolumeRestoreStaged {
                 snapshot_id,
                 success: true,

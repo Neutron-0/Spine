@@ -585,6 +585,57 @@ impl BackupManager {
         res
     }
 
+    /// Captures the complete storage directory into an in-memory .tar.gz archive payload without touching disk.
+    /// Returns the raw compressed bytes and its SHA-256 digest, ensuring zero plaintext intermediate files on disk.
+    pub fn capture_storage_snapshot_memory(
+        storage_root: &Path,
+    ) -> Result<(Vec<u8>, String), ForgeError> {
+        let enc = GzEncoder::new(Vec::new(), Compression::default());
+        let mut tar = tar::Builder::new(enc);
+
+        let mut file_paths = Vec::new();
+        if storage_root.exists() {
+            Self::collect_files_recursive(storage_root, storage_root, &mut file_paths)?;
+        }
+        file_paths.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (rel_path, abs_path) in file_paths {
+            if rel_path.starts_with(".old_generation_")
+                || rel_path.starts_with(".old_ssh_")
+                || rel_path.starts_with(".staged_generation_")
+                || rel_path.starts_with(".tmp")
+                || rel_path.starts_with(".spine_restore_control")
+                || rel_path == RestoreJournal::JOURNAL_FILE_NAME
+            {
+                continue;
+            }
+
+            let meta = fs::metadata(&abs_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
+            let mut f =
+                fs::File::open(&abs_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
+            let mut header = tar::Header::new_gnu();
+            header.set_size(meta.len());
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, &rel_path, &mut f)
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        }
+
+        let enc = tar
+            .into_inner()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let bytes = enc
+            .finish()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        use sha2::Sha256;
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let digest = hex::encode(hasher.finalize());
+
+        Ok((bytes, digest))
+    }
+
     /// Captures the complete storage directory into a streaming .tar.gz archive payload on disk.
     /// Memory consumption is strictly O(1) (~64 KiB buffer), returning exact byte length and SHA-256 digest.
     pub fn capture_storage_snapshot(

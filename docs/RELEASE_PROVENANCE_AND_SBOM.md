@@ -14,7 +14,7 @@ This document establishes the build provenance, reproducibility manifest, and cr
 - **LLVM Version:** `22.1.6`
 - **Base Commit Hash:** `f496e5e819f02a2e6737b1c33f325aac8338574b`
 - **Branch:** `main`
-- **Build Timestamp (UTC):** `2026-11-11T16:37:00Z`
+- **Build Timestamp (UTC):** `2026-11-11T19:34:00Z`
 - **Compilation Mode:** Full release optimization (`--release`), LTO enabled in production profile.
 
 ---
@@ -50,10 +50,10 @@ All binaries were staged into `target/release-candidate/` and authenticated via 
 
 | Binary | Size (Bytes) | SHA-256 Checksum | Description |
 | :--- | :--- | :--- | :--- |
-| `spine.exe` | 8,829,440 | `3f83d398ca2ed473e081b65e5c23f8d8b1b894eb8a656fc99a15f4835321f17f` | Native CLI client and repository management |
-| `spine-coordinator.exe` | 2,654,720 | `3b6a3b948dd5987aebabcd370698f056e23edac1a4dc94113fef2615f9363e16` | Distributed cluster consensus and routing coordinator |
-| `spine-storage-node.exe` | 2,441,728 | `4c27906172fb63b9fe9ef0c68feaec9ec4e673a12d7be4837dfb2f7be91835e6` | Storage-node volume daemon with fenced write-guards |
-| `spine-api.exe` | 22,516,736 | `2ceeb6db2b8307f607b87cb02ffb55a18dffa7fa64720ce11670b59a21da5e50` | Production Web API, Auth, and Backup/Restore orchestrator |
+| `spine.exe` | 8,862,720 | `85ac6be2ae63aad5dbf2f874f628b411b252b9a3e3f42e203ad4f5f5638ce778` | Native CLI client and repository management |
+| `spine-coordinator.exe` | 2,691,584 | `9d17a03dd1d481f2e6a41162c322de5488d4ce2609316dac9c248404171a0b34` | Distributed cluster consensus and routing coordinator |
+| `spine-storage-node.exe` | 2,448,384 | `d59b35c11323c206e542f18de8e25227dd7d735af746431ae370e8d02609859a` | Storage-node volume daemon with fenced write-guards |
+| `spine-api.exe` | 22,470,144 | `9a0b5482adf248b1afdba21439099c0b4c69a1977762c00ddf36ce54d1adf0e9` | Production Web API, Auth, and Backup/Restore orchestrator |
 
 ---
 

@@ -171,7 +171,25 @@ pub async fn health_readiness(State(state): State<AppState>) -> impl IntoRespons
     .await;
     let db_gen = db_gen_res.ok().and_then(|r| r.ok()).flatten();
 
-    if let (Some(ref d_gen), Some(ref s_gen)) = (&db_gen, &storage_gen) {
+    if state.profile == DeploymentProfile::CoreForge {
+        match (&db_gen, &storage_gen) {
+            (Some(d_gen), Some(s_gen)) => {
+                if d_gen != s_gen {
+                    cluster_consistent = false;
+                }
+                if let Some(c_gen) = coord_gen {
+                    if c_gen.to_string() != *d_gen {
+                        cluster_consistent = false;
+                    }
+                } else {
+                    cluster_consistent = false;
+                }
+            }
+            _ => {
+                cluster_consistent = false;
+            }
+        }
+    } else if let (Some(ref d_gen), Some(ref s_gen)) = (&db_gen, &storage_gen) {
         if d_gen != s_gen {
             cluster_consistent = false;
         }
