@@ -529,6 +529,203 @@ pub fn decrypt_stream<R: Read, W: Write>(
     }
 }
 
+/// Streaming decryptor implementing `std::io::Read` for SPNEBAK v2 archives.
+/// Decrypts AES-256-GCM chunks chunk-by-chunk directly into memory in O(chunk_size) RAM.
+/// Strictly eliminates the need for any temporary decrypted ciphertext/tar file on disk.
+pub struct DecryptingReader<R: Read> {
+    reader: R,
+    header: BackupHeaderV2,
+    key_bytes: [u8; 32],
+    expected_chunk_index: u64,
+    total_bytes: u64,
+    stream_hasher: Sha256,
+    buffer: Vec<u8>,
+    buf_pos: usize,
+    finished: bool,
+}
+
+impl<R: Read> DecryptingReader<R> {
+    pub fn new(mut reader: R, passphrase: &str) -> Result<Self, ForgeError> {
+        let mut header_buf = [0u8; HEADER_V2_LEN];
+        reader
+            .read_exact(&mut header_buf)
+            .map_err(|e| ForgeError::Internal(format!("Failed to read backup header: {}", e)))?;
+
+        let header = BackupHeaderV2::from_bytes(&header_buf)?;
+        let key_bytes = derive_key(passphrase, &header.salt, header.pbkdf2_iterations);
+
+        Ok(Self {
+            reader,
+            header,
+            key_bytes,
+            expected_chunk_index: 0,
+            total_bytes: 0,
+            stream_hasher: Sha256::new(),
+            buffer: Vec::new(),
+            buf_pos: 0,
+            finished: false,
+        })
+    }
+
+    fn read_next_chunk(&mut self) -> Result<bool, ForgeError> {
+        if self.finished {
+            return Ok(false);
+        }
+
+        let mut type_buf = [0u8; 1];
+        match self.reader.read_exact(&mut type_buf) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(ForgeError::Internal(
+                    "Unexpected EOF: missing final authenticated manifest chunk".to_string(),
+                ));
+            }
+            Err(e) => return Err(ForgeError::Internal(format!("Read error: {}", e))),
+        }
+
+        let chunk_type = type_buf[0];
+
+        let mut idx_buf = [0u8; 8];
+        self.reader
+            .read_exact(&mut idx_buf)
+            .map_err(|e| ForgeError::Internal(format!("Failed to read chunk index: {}", e)))?;
+        let chunk_index = u64::from_be_bytes(idx_buf);
+
+        if chunk_index != self.expected_chunk_index {
+            return Err(ForgeError::Internal(format!(
+                "Chunk sequencing violation: expected index {}, got {}",
+                self.expected_chunk_index, chunk_index
+            )));
+        }
+
+        let mut len_buf = [0u8; 4];
+        self.reader
+            .read_exact(&mut len_buf)
+            .map_err(|e| ForgeError::Internal(format!("Failed to read chunk length: {}", e)))?;
+        let ct_len = u32::from_be_bytes(len_buf) as usize;
+
+        if ct_len < TAG_LEN || ct_len > (self.header.chunk_size as usize + TAG_LEN + 1024) {
+            return Err(ForgeError::Internal(format!(
+                "Invalid chunk ciphertext length: {} bytes",
+                ct_len
+            )));
+        }
+
+        let mut payload = vec![0u8; ct_len];
+        self.reader
+            .read_exact(&mut payload)
+            .map_err(|e| ForgeError::Internal(format!("Failed to read chunk payload: {}", e)))?;
+
+        let plain_len = (ct_len - TAG_LEN) as u32;
+        let nonce = build_chunk_nonce(&self.header.nonce_prefix, chunk_index);
+        let aad = build_chunk_aad(&self.header.archive_id, chunk_index, chunk_type, plain_len);
+
+        let unbound_key = UnboundKey::new(&AES_256_GCM, &self.key_bytes)
+            .map_err(|e| ForgeError::Internal(format!("AEAD key error: {:?}", e)))?;
+        let mut opening_key = OpeningKey::new(unbound_key, OneNonce(Some(nonce)));
+
+        let decrypted = opening_key
+            .open_in_place(Aad::from(&aad), &mut payload)
+            .map_err(|_| {
+                ForgeError::Internal(format!(
+                    "Authentication failure: invalid passphrase or corrupted chunk at index {}",
+                    chunk_index
+                ))
+            })?;
+
+        if chunk_type == CHUNK_TYPE_FINAL {
+            if decrypted.len() != (8 + 8 + 32) {
+                return Err(ForgeError::Internal(
+                    "Corrupt final manifest chunk: invalid size".to_string(),
+                ));
+            }
+            let reported_chunks = u64::from_be_bytes(decrypted[0..8].try_into().unwrap());
+            let reported_bytes = u64::from_be_bytes(decrypted[8..16].try_into().unwrap());
+            let reported_hash: [u8; 32] = decrypted[16..48].try_into().unwrap();
+
+            if reported_chunks != self.expected_chunk_index {
+                return Err(ForgeError::Internal(format!(
+                    "Manifest validation error: chunk count mismatch (reported: {}, actual: {})",
+                    reported_chunks, self.expected_chunk_index
+                )));
+            }
+
+            if reported_bytes != self.total_bytes {
+                return Err(ForgeError::Internal(format!(
+                    "Manifest validation error: byte count mismatch (reported: {}, actual: {})",
+                    reported_bytes, self.total_bytes
+                )));
+            }
+
+            let actual_hash: [u8; 32] = self.stream_hasher.clone().finalize().into();
+            if actual_hash != reported_hash {
+                return Err(ForgeError::Internal(
+                    "Manifest validation error: overall stream SHA-256 hash mismatch".to_string(),
+                ));
+            }
+
+            // Enforce strictly zero trailing bytes after final manifest
+            let mut trailing_buf = [0u8; 1];
+            match self.reader.read(&mut trailing_buf) {
+                Ok(0) => {}
+                Ok(_) => {
+                    return Err(ForgeError::Internal(
+                        "Security violation: unexpected trailing data after final manifest chunk"
+                            .to_string(),
+                    ));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+                Err(e) => {
+                    return Err(ForgeError::Internal(format!(
+                        "Error checking for trailing data: {}",
+                        e
+                    )));
+                }
+            }
+
+            self.finished = true;
+            self.expected_chunk_index += 1;
+            Ok(false)
+        } else if chunk_type == CHUNK_TYPE_DATA {
+            self.total_bytes += decrypted.len() as u64;
+            self.stream_hasher.update(&*decrypted);
+            self.buffer = decrypted.to_vec();
+            self.buf_pos = 0;
+            self.expected_chunk_index += 1;
+            Ok(true)
+        } else {
+            Err(ForgeError::Internal(format!(
+                "Unknown chunk type: {}",
+                chunk_type
+            )))
+        }
+    }
+}
+
+impl<R: Read> Read for DecryptingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        while self.buf_pos >= self.buffer.len() {
+            if self.finished {
+                return Ok(0);
+            }
+            let has_more = self
+                .read_next_chunk()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            if !has_more {
+                return Ok(0);
+            }
+        }
+        let available = self.buffer.len() - self.buf_pos;
+        let to_copy = std::cmp::min(buf.len(), available);
+        buf[..to_copy].copy_from_slice(&self.buffer[self.buf_pos..self.buf_pos + to_copy]);
+        self.buf_pos += to_copy;
+        Ok(to_copy)
+    }
+}
+
 /// Rotates encryption key/passphrase streaming directly from `reader` to `writer`,
 /// decrypting and re-encrypting chunk by chunk without writing unencrypted data to disk.
 ///

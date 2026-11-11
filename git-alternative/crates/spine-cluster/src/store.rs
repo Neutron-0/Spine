@@ -135,66 +135,123 @@ pub struct FileBackedCoordinatorStore {
     previous_committed_state: RwLock<Option<(String, StateSnapshot, u64)>>,
 }
 
+#[cfg(windows)]
+fn platform_atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide_from: Vec<u16> = from
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let wide_to: Vec<u16> = to
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    extern "system" {
+        fn MoveFileExW(
+            lpExistingFileName: *const u16,
+            lpNewFileName: *const u16,
+            dwFlags: u32,
+        ) -> i32;
+        fn ReplaceFileW(
+            lpReplacedFileName: *const u16,
+            lpReplacementFileName: *const u16,
+            lpBackupFileName: *const u16,
+            dwReplaceFlags: u32,
+            lpExclude: *mut std::ffi::c_void,
+            lpReserved: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    const REPLACEFILE_WRITE_THROUGH: u32 = 0x1;
+
+    if to.exists() {
+        let ret = unsafe {
+            ReplaceFileW(
+                wide_to.as_ptr(),
+                wide_from.as_ptr(),
+                std::ptr::null(),
+                REPLACEFILE_WRITE_THROUGH,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ret != 0 {
+            return Ok(());
+        }
+        let ret = unsafe {
+            MoveFileExW(
+                wide_from.as_ptr(),
+                wide_to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ret != 0 {
+            return Ok(());
+        }
+        Err(std::io::Error::last_os_error())
+    } else {
+        let ret = unsafe {
+            MoveFileExW(
+                wide_from.as_ptr(),
+                wide_to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ret != 0 {
+            return Ok(());
+        }
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn platform_atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
+}
+
 pub fn safe_atomic_replace(from: &Path, to: &Path) -> Result<()> {
     #[cfg(unix)]
-    let sync_dir = |p: &Path| {
+    let sync_dir = |p: &Path| -> Result<()> {
         if let Ok(p_file) = fs::File::open(p) {
-            let _ = p_file.sync_all();
+            p_file
+                .sync_all()
+                .with_context(|| format!("Failed to sync directory {}", p.display()))?;
         }
+        Ok(())
     };
     #[cfg(windows)]
-    let sync_dir = |p: &Path| {
-        let _ = p.exists();
+    let sync_dir = |p: &Path| -> Result<()> {
+        if !p.exists() {
+            bail!("Directory does not exist for sync: {}", p.display());
+        }
+        Ok(())
     };
 
-    if fs::rename(from, to).is_ok() && to.exists() && fs::metadata(to).is_ok() {
-        if let Some(parent) = to.parent() {
-            sync_dir(parent);
-        }
-        return Ok(());
+    platform_atomic_replace(from, to).with_context(|| {
+        format!(
+            "Failed atomic replace from {} to {}",
+            from.display(),
+            to.display()
+        )
+    })?;
+
+    if !to.exists() || fs::metadata(to).is_err() {
+        bail!(
+            "Readback verification failed after replacing {}",
+            to.display()
+        );
     }
-    if to.exists() {
-        let backup = to.with_extension(format!("bak.{}", uuid::Uuid::new_v4()));
-        fs::rename(to, &backup)
-            .with_context(|| format!("Failed to backup {} during replace", to.display()))?;
-        match fs::rename(from, to) {
-            Ok(()) => {
-                if to.exists() && fs::metadata(to).is_ok() {
-                    if let Some(parent) = to.parent() {
-                        sync_dir(parent);
-                    }
-                    let _ = fs::remove_file(&backup);
-                    Ok(())
-                } else {
-                    let _ = fs::rename(&backup, to);
-                    bail!(
-                        "Readback verification failed after replacing {}",
-                        to.display()
-                    );
-                }
-            }
-            Err(e) => {
-                let _ = fs::rename(&backup, to);
-                Err(e).with_context(|| format!("Failed to move {} into place", to.display()))
-            }
-        }
-    } else {
-        fs::copy(from, to)
-            .with_context(|| format!("Failed to copy {} to {}", from.display(), to.display()))?;
-        if to.exists() && fs::metadata(to).is_ok() {
-            if let Some(parent) = to.parent() {
-                sync_dir(parent);
-            }
-            let _ = fs::remove_file(from);
-            Ok(())
-        } else {
-            let _ = fs::remove_file(to);
-            bail!(
-                "Readback verification failed after copying {}",
-                to.display()
-            );
-        }
+
+    if let Some(parent) = to.parent() {
+        sync_dir(parent)?;
     }
+
+    Ok(())
 }
 
 impl FileBackedCoordinatorStore {
@@ -753,7 +810,9 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
             canonical_resource_id: "coordinator_cluster_state".to_string(),
             previous_generation: Some(cur_gen.to_string()),
             target_generation: fencing_generation.to_string(),
-            staged_digest,
+            staged_digest: staged_digest.clone(),
+            archive_payload_sha256: staged_digest.clone(),
+            staged_resource_digest: staged_digest,
             staged_byte_length: payload.len() as u64,
             prepared_at_nanos: now_nanos,
             prepared: true,
@@ -921,7 +980,9 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
                         canonical_resource_id: "coordinator_cluster_state".to_string(),
                         previous_generation: None,
                         target_generation: gen.to_string(),
-                        staged_digest,
+                        staged_digest: staged_digest.clone(),
+                        archive_payload_sha256: staged_digest.clone(),
+                        staged_resource_digest: staged_digest,
                         staged_byte_length: payload.len() as u64,
                         prepared_at_nanos: 0,
                         prepared: true,
@@ -957,7 +1018,9 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
                         canonical_resource_id: "coordinator_cluster_state".to_string(),
                         previous_generation: None,
                         target_generation: gen.to_string(),
-                        staged_digest,
+                        staged_digest: staged_digest.clone(),
+                        archive_payload_sha256: staged_digest.clone(),
+                        staged_resource_digest: staged_digest,
                         staged_byte_length: payload.len() as u64,
                         prepared_at_nanos: 0,
                         prepared: true,

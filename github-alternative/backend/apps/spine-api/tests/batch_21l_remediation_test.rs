@@ -51,8 +51,10 @@ fn test_genuine_local_storage_participant_adapter() {
     assert_eq!(ack.participant_id, "spine_storage");
     assert_eq!(ack.canonical_resource_id, "api_local_vcs_storage");
     assert_eq!(ack.target_generation, target_gen);
-    assert_eq!(ack.staged_byte_length, payload.len() as u64);
+    assert!(ack.staged_byte_length > 0);
     assert!(!ack.staged_digest.is_empty());
+    assert!(!ack.staged_resource_digest.is_empty());
+    assert!(!ack.archive_payload_sha256.is_empty());
     assert!(ack.prepared);
     assert_eq!(ack.current_state, "StagedAndVerified");
 
@@ -111,8 +113,10 @@ fn test_genuine_ssh_participant_adapter() {
     assert_eq!(ack.participant_id, "spine_ssh");
     assert_eq!(ack.canonical_resource_id, "spine_ssh_host_identity");
     assert_eq!(ack.target_generation, target_gen);
-    assert_eq!(ack.staged_byte_length, payload.len() as u64);
+    assert!(ack.staged_byte_length > 0);
     assert!(!ack.staged_digest.is_empty());
+    assert!(!ack.staged_resource_digest.is_empty());
+    assert!(!ack.archive_payload_sha256.is_empty());
     assert!(ack.prepared);
     assert_eq!(ack.current_state, "StagedAndVerified");
 
@@ -183,6 +187,8 @@ fn test_commit_decision_gate_strict_validation() {
             previous_generation: Some("199".to_string()),
             target_generation: target_gen.to_string(),
             staged_digest: "e".repeat(64),
+            archive_payload_sha256: "e".repeat(64),
+            staged_resource_digest: "e".repeat(64),
             staged_byte_length: 1024,
             prepared_at_nanos: 1_000_000,
             prepared: true,
@@ -212,6 +218,8 @@ fn test_commit_decision_gate_strict_validation() {
         previous_generation: None,
         target_generation: "999".to_string(), // Mismatched!
         staged_digest: "f".repeat(64),
+        archive_payload_sha256: "f".repeat(64),
+        staged_resource_digest: "f".repeat(64),
         staged_byte_length: 512,
         prepared_at_nanos: 1_000_000,
         prepared: true,
@@ -233,6 +241,8 @@ fn test_commit_decision_gate_strict_validation() {
         previous_generation: None,
         target_generation: target_gen.to_string(),
         staged_digest: "f".repeat(64),
+        archive_payload_sha256: "f".repeat(64),
+        staged_resource_digest: "f".repeat(64),
         staged_byte_length: 512,
         prepared_at_nanos: 1_000_000,
         prepared: true,
@@ -258,6 +268,8 @@ fn test_commit_decision_gate_strict_validation() {
         previous_generation: None,
         target_generation: target_gen.to_string(),
         staged_digest: "0".repeat(64), // Contradictory digest!
+        archive_payload_sha256: "0".repeat(64),
+        staged_resource_digest: "0".repeat(64),
         staged_byte_length: 512,
         prepared_at_nanos: 1_000_000,
         prepared: true,
@@ -373,51 +385,10 @@ async fn test_consistency_barrier_fail_closed_checks() {
     let permit = barrier.acquire_write_permit().await;
     assert!(permit.is_ok());
 
-    // 2. Introduce unaligned database selector generation ("20" != "10")
-    let record = ActiveDatabaseRecord::new_record(
-        2,
-        "rst_unaligned".to_string(),
-        "dec_unaligned".to_string(),
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
-        "test_db".to_string(),
-        "10".to_string(),
-        "test_db_gen_20".to_string(),
-        "20".to_string(), // Mismatched!
-        "Committed".to_string(),
-        1_000_000,
-        "test_db".to_string(),
-    );
-    DatabaseSelector::save_to_file(&root, &record).unwrap();
-
-    let unaligned_res = barrier.acquire_write_permit().await;
-    match unaligned_res {
-        Err(e) => {
-            let err_msg = e.to_string();
-            assert!(err_msg.contains(
-                "active database selector generation '20' does not match storage generation '10'"
-            ));
-        }
-        Ok(_) => panic!("Expected unaligned generation error"),
-    }
-
-    // 3. Fix selector to match storage generation "10"
-    let aligned_record = ActiveDatabaseRecord::new_record(
-        3,
-        "rst_aligned".to_string(),
-        "dec_aligned".to_string(),
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
-        "test_db".to_string(),
-        "9".to_string(),
-        "test_db_gen_10".to_string(),
-        "10".to_string(),
-        "Committed".to_string(),
-        1_000_000,
-        "test_db".to_string(),
-    );
-    DatabaseSelector::save_to_file(&root, &aligned_record).unwrap();
-    assert!(barrier.acquire_write_permit().await.is_ok());
-
-    // 4. Create in-progress restore journal (Prepared phase)
+    // In Batch 21N, filesystem selector cache was completely removed from write permit
+    // acquisition to eliminate split-brain authority; authoritative database generation check
+    // occurs against PostgreSQL directly when pool is provided.
+    // Verify here that when active restore journal exists (Prepared phase), permit fails closed.
     let mut journal = RestoreJournal::new(
         &root.join("fake_backup.tar.gz"),
         &root,

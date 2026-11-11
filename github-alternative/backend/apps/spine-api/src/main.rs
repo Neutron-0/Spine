@@ -1364,14 +1364,11 @@ async fn main() -> anyhow::Result<()> {
 
                 // 1. Re-query PostgreSQL staged database
                 if let Some(ref sdb) = staged_db_restore {
-                    match sdb.query_preparation_status().await {
-                        Ok(true) => {
+                    match sdb.revalidate_staged_database().await {
+                        Ok(()) => {
                             tracing::info!(
-                                "Decision boundary: PostgreSQL staged database verified prepared."
+                                "Decision boundary: PostgreSQL staged database fully revalidated."
                             );
-                        }
-                        Ok(false) => {
-                            revalidation_failed = Some("PostgreSQL staged database preparation query returned false or generation mismatch".into());
                         }
                         Err(e) => {
                             revalidation_failed = Some(format!(
@@ -1385,26 +1382,15 @@ async fn main() -> anyhow::Result<()> {
                 // 2. Re-query local repository storage adapter
                 if revalidation_failed.is_none() {
                     if let Some(ref s_storage) = staged_storage_adapter {
-                        match s_storage.query_preparation_status() {
-                            Ok(Some(ack))
-                                if ack.prepared && ack.staged_digest == s_storage.staged_digest =>
-                            {
-                                tracing::info!("Decision boundary: Local repository storage verified prepared.");
-                            }
-                            Ok(Some(ack)) => {
-                                revalidation_failed = Some(format!(
-                                    "LocalStorage staging revalidation mismatch: prepared={}, digest_match={}",
-                                    ack.prepared, ack.staged_digest == s_storage.staged_digest
-                                ));
-                            }
-                            Ok(None) => {
-                                revalidation_failed = Some(
-                                    "LocalStorage durable staging record missing on disk".into(),
-                                );
+                        match s_storage.revalidate_staged_contents() {
+                            Ok(()) => {
+                                tracing::info!("Decision boundary: Local repository storage contents fully revalidated.");
                             }
                             Err(e) => {
-                                revalidation_failed =
-                                    Some(format!("LocalStorage staging revalidation error: {}", e));
+                                revalidation_failed = Some(format!(
+                                    "LocalStorage staging content revalidation error: {}",
+                                    e
+                                ));
                             }
                         }
                     }
@@ -1413,27 +1399,15 @@ async fn main() -> anyhow::Result<()> {
                 // 3. Re-query SSH identity adapter
                 if revalidation_failed.is_none() {
                     if let Some(ref s_ssh) = staged_ssh_adapter {
-                        match s_ssh.query_preparation_status() {
-                            Ok(Some(ack))
-                                if ack.prepared && ack.staged_digest == s_ssh.staged_digest =>
-                            {
+                        match s_ssh.revalidate_staged_contents() {
+                            Ok(()) => {
                                 tracing::info!(
-                                    "Decision boundary: SSH identity staging verified prepared."
+                                    "Decision boundary: SSH identity staging contents fully revalidated."
                                 );
-                            }
-                            Ok(Some(ack)) => {
-                                revalidation_failed = Some(format!(
-                                    "SSH staging revalidation mismatch: prepared={}, digest_match={}",
-                                    ack.prepared, ack.staged_digest == s_ssh.staged_digest
-                                ));
-                            }
-                            Ok(None) => {
-                                revalidation_failed =
-                                    Some("SSH durable staging record missing on disk".into());
                             }
                             Err(e) => {
                                 revalidation_failed =
-                                    Some(format!("SSH staging revalidation error: {}", e));
+                                    Some(format!("SSH staging content revalidation error: {}", e));
                             }
                         }
                     }
@@ -1444,6 +1418,20 @@ async fn main() -> anyhow::Result<()> {
                     for (snap_id, _, client) in &staged_cluster_restores {
                         match client.query_staged_restore(snap_id).await {
                             Ok(Some(ack)) if ack.prepared => {
+                                if ack.target_generation != session.journal.target_generation {
+                                    revalidation_failed = Some(format!(
+                                        "Cluster node target generation mismatch for snapshot '{}': expected {}, got {}",
+                                        snap_id, session.journal.target_generation, ack.target_generation
+                                    ));
+                                    break;
+                                }
+                                if ack.staged_digest.trim().is_empty() {
+                                    revalidation_failed = Some(format!(
+                                        "Cluster node for snapshot '{}' returned empty digest",
+                                        snap_id
+                                    ));
+                                    break;
+                                }
                                 tracing::info!("Decision boundary: Cluster participant for snapshot '{}' verified prepared.", snap_id);
                             }
                             Ok(Some(_)) => {

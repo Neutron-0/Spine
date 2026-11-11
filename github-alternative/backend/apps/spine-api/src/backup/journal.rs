@@ -504,28 +504,32 @@ impl RestoreJournal {
         // 2. Preserve previous valid journal as last_valid backup
         let last_valid = Self::last_valid_journal_path(&candidate.target_storage_root);
         if path.exists() {
-            if let Ok(existing_bytes) = std::fs::read(&path) {
-                if serde_json::from_slice::<Self>(&existing_bytes).is_ok() {
-                    let tmp_lv =
-                        parent.join(format!(".tmp_lv_{}.json", uuid::Uuid::new_v4().simple()));
-                    let mut lv_file = std::fs::File::create(&tmp_lv).map_err(|e| {
-                        ForgeError::Internal(format!(
-                            "Failed to create temporary last_valid journal: {}",
-                            e
-                        ))
-                    })?;
-                    lv_file
-                        .write_all(&existing_bytes)
-                        .map_err(|e| ForgeError::Internal(e.to_string()))?;
-                    lv_file
-                        .flush()
-                        .map_err(|e| ForgeError::Internal(e.to_string()))?;
-                    lv_file
-                        .sync_all()
-                        .map_err(|e| ForgeError::Internal(e.to_string()))?;
-                    super::safe_atomic_replace(&tmp_lv, &last_valid)?;
-                }
-            }
+            let existing_bytes = std::fs::read(&path).map_err(|e| {
+                ForgeError::Internal(format!("Failed to read existing journal for backup: {}", e))
+            })?;
+            serde_json::from_slice::<Self>(&existing_bytes).map_err(|e| {
+                ForgeError::Internal(format!(
+                    "Existing journal is corrupt, cannot create last_valid backup: {}",
+                    e
+                ))
+            })?;
+            let tmp_lv = parent.join(format!(".tmp_lv_{}.json", uuid::Uuid::new_v4().simple()));
+            let mut lv_file = std::fs::File::create(&tmp_lv).map_err(|e| {
+                ForgeError::Internal(format!(
+                    "Failed to create temporary last_valid journal: {}",
+                    e
+                ))
+            })?;
+            lv_file
+                .write_all(&existing_bytes)
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+            lv_file
+                .flush()
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+            lv_file
+                .sync_all()
+                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+            super::safe_atomic_replace(&tmp_lv, &last_valid)?;
         }
 
         // 3. Serialize candidate and write to temporary file

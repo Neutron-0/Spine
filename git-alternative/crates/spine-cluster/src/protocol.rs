@@ -145,6 +145,10 @@ pub struct ParticipantAcknowledgement {
     pub previous_generation: Option<String>,
     pub target_generation: String,
     pub staged_digest: String,
+    #[serde(default)]
+    pub archive_payload_sha256: String,
+    #[serde(default)]
+    pub staged_resource_digest: String,
     pub staged_byte_length: u64,
     pub prepared_at_nanos: i64,
     pub prepared: bool,

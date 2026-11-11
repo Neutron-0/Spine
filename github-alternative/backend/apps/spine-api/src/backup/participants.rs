@@ -321,6 +321,53 @@ impl ParticipantRegistry {
     }
 }
 
+/// Deterministically computes the staged-resource digest, total byte length, and file count
+/// for a directory participant, ignoring the durable staging metadata record itself.
+pub fn compute_directory_staged_resource_digest(
+    dir: &Path,
+) -> Result<(String, u64, usize), ForgeError> {
+    fn collect_files(current: &Path, out: &mut Vec<PathBuf>) -> Result<(), ForgeError> {
+        if current.is_dir() {
+            let entries = fs::read_dir(current).map_err(|e| ForgeError::Internal(e.to_string()))?;
+            for entry in entries {
+                let entry = entry.map_err(|e| ForgeError::Internal(e.to_string()))?;
+                let path = entry.path();
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                if file_name == ".participant_staging_record.json"
+                    || file_name == ".staged_restore_record.json"
+                    || file_name.starts_with(".tmp")
+                {
+                    continue;
+                }
+                if path.is_dir() {
+                    collect_files(&path, out)?;
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = Vec::new();
+    collect_files(dir, &mut files)?;
+    files.sort();
+
+    let mut hasher = Sha256::new();
+    let mut total_bytes = 0u64;
+    for file_path in &files {
+        let rel_path = file_path.strip_prefix(dir).unwrap_or(file_path);
+        hasher.update(rel_path.to_string_lossy().as_bytes());
+        let meta = fs::metadata(file_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
+        hasher.update(meta.len().to_be_bytes());
+        total_bytes += meta.len();
+        let bytes = fs::read(file_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
+        hasher.update(&bytes);
+    }
+    let digest = hex::encode(hasher.finalize());
+    Ok((digest, total_bytes, files.len()))
+}
+
 /// Durable participant adapter for local VCS repository storage (`spine_storage`).
 pub struct LocalStorageParticipantAdapter {
     pub storage_root: PathBuf,
@@ -330,6 +377,8 @@ pub struct LocalStorageParticipantAdapter {
     pub backup_id: String,
     pub target_generation: String,
     pub staged_digest: String,
+    pub archive_payload_sha256: String,
+    pub staged_resource_digest: String,
     pub staged_byte_length: u64,
     pub acknowledgement: ParticipantAcknowledgement,
 }
@@ -359,8 +408,7 @@ impl LocalStorageParticipantAdapter {
 
         let mut hasher = Sha256::new();
         hasher.update(payload_bytes);
-        let staged_digest = hex::encode(hasher.finalize());
-        let staged_byte_length = payload_bytes.len() as u64;
+        let archive_payload_sha256 = hex::encode(hasher.finalize());
 
         // Unpack tar or tar.gz payload into staged_dir
         let gz = GzDecoder::new(payload_bytes);
@@ -396,6 +444,15 @@ impl LocalStorageParticipantAdapter {
             })?;
         }
 
+        // Compute actual staged resource digest from the unpacked files on disk
+        let (staged_resource_digest, staged_byte_length, file_count) =
+            compute_directory_staged_resource_digest(&staged_dir)?;
+        if file_count == 0 {
+            return Err(ForgeError::Internal(
+                "Unpacked storage staging directory contains 0 files".into(),
+            ));
+        }
+
         // Persist durable staging record
         let durable_record_id =
             format!("{}/.participant_staging_record.json", staged_dir.display());
@@ -411,7 +468,9 @@ impl LocalStorageParticipantAdapter {
             canonical_resource_id: "api_local_vcs_storage".to_string(),
             previous_generation: prev_gen,
             target_generation: target_generation.to_string(),
-            staged_digest: staged_digest.clone(),
+            staged_digest: staged_resource_digest.clone(),
+            archive_payload_sha256: archive_payload_sha256.clone(),
+            staged_resource_digest: staged_resource_digest.clone(),
             staged_byte_length,
             prepared_at_nanos: now_nanos,
             prepared: true,
@@ -440,7 +499,9 @@ impl LocalStorageParticipantAdapter {
             restore_id: restore_id.to_string(),
             backup_id: backup_id.to_string(),
             target_generation: target_generation.to_string(),
-            staged_digest,
+            staged_digest: staged_resource_digest.clone(),
+            archive_payload_sha256,
+            staged_resource_digest,
             staged_byte_length,
             acknowledgement: ack,
         })
@@ -458,6 +519,76 @@ impl LocalStorageParticipantAdapter {
         let ack: ParticipantAcknowledgement = serde_json::from_str(&content)
             .map_err(|e| ForgeError::Internal(format!("Corrupt staging record: {}", e)))?;
         Ok(Some(ack))
+    }
+
+    pub fn revalidate_staged_contents(&self) -> Result<(), ForgeError> {
+        if !self.staged_dir.exists() {
+            return Err(ForgeError::Internal(format!(
+                "LocalStorage staged directory does not exist: {}",
+                self.staged_dir.display()
+            )));
+        }
+        let rec_path = self.staged_dir.join(".participant_staging_record.json");
+        if !rec_path.exists() {
+            return Err(ForgeError::Internal(
+                "LocalStorage durable staging record missing on disk".into(),
+            ));
+        }
+        let content = fs::read_to_string(&rec_path)
+            .map_err(|e| ForgeError::Internal(format!("Failed to read staging record: {}", e)))?;
+        let ack: ParticipantAcknowledgement = serde_json::from_str(&content)
+            .map_err(|e| ForgeError::Internal(format!("Corrupt staging record: {}", e)))?;
+
+        if ack.restore_id != self.restore_id {
+            return Err(ForgeError::Internal(format!(
+                "LocalStorage staging record restore_id mismatch: expected '{}', got '{}'",
+                self.restore_id, ack.restore_id
+            )));
+        }
+        if ack.backup_id != self.backup_id {
+            return Err(ForgeError::Internal(format!(
+                "LocalStorage staging record backup_id mismatch: expected '{}', got '{}'",
+                self.backup_id, ack.backup_id
+            )));
+        }
+        if ack.target_generation != self.target_generation {
+            return Err(ForgeError::Internal(format!(
+                "LocalStorage staging record target_generation mismatch: expected '{}', got '{}'",
+                self.target_generation, ack.target_generation
+            )));
+        }
+        if !ack.prepared {
+            return Err(ForgeError::Internal(
+                "LocalStorage staging record prepared is false".into(),
+            ));
+        }
+
+        // Recompute staged resource digest from the actual files on disk
+        let (recomputed_digest, recomputed_bytes, file_count) =
+            compute_directory_staged_resource_digest(&self.staged_dir)?;
+        if file_count == 0 {
+            return Err(ForgeError::Internal(
+                "LocalStorage staged directory contains 0 files during revalidation".into(),
+            ));
+        }
+        let expected_digest = if !ack.staged_resource_digest.is_empty() {
+            &ack.staged_resource_digest
+        } else {
+            &ack.staged_digest
+        };
+        if &recomputed_digest != expected_digest && recomputed_digest != ack.staged_digest {
+            return Err(ForgeError::Internal(format!(
+                "LocalStorage staged resource digest mismatch: record has '{}', recomputed '{}'",
+                expected_digest, recomputed_digest
+            )));
+        }
+        if recomputed_bytes != ack.staged_byte_length {
+            return Err(ForgeError::Internal(format!(
+                "LocalStorage staged byte length mismatch: record has {}, recomputed {}",
+                ack.staged_byte_length, recomputed_bytes
+            )));
+        }
+        Ok(())
     }
 
     pub fn publish(&self) -> Result<(), ForgeError> {
@@ -549,6 +680,8 @@ pub struct SshParticipantAdapter {
     pub backup_id: String,
     pub target_generation: String,
     pub staged_digest: String,
+    pub archive_payload_sha256: String,
+    pub staged_resource_digest: String,
     pub staged_byte_length: u64,
     pub acknowledgement: ParticipantAcknowledgement,
 }
@@ -578,8 +711,7 @@ impl SshParticipantAdapter {
 
         let mut hasher = Sha256::new();
         hasher.update(payload_bytes);
-        let staged_digest = hex::encode(hasher.finalize());
-        let staged_byte_length = payload_bytes.len() as u64;
+        let archive_payload_sha256 = hex::encode(hasher.finalize());
 
         // Unpack payload
         let gz = GzDecoder::new(payload_bytes);
@@ -612,6 +744,15 @@ impl SshParticipantAdapter {
             })?;
         }
 
+        // Compute actual staged resource digest from the unpacked key files on disk
+        let (staged_resource_digest, staged_byte_length, file_count) =
+            compute_directory_staged_resource_digest(&staged_dir)?;
+        if file_count == 0 {
+            return Err(ForgeError::Internal(
+                "Unpacked SSH staging directory contains 0 files".into(),
+            ));
+        }
+
         // Persist durable staging record
         let durable_record_id =
             format!("{}/.participant_staging_record.json", staged_dir.display());
@@ -626,7 +767,9 @@ impl SshParticipantAdapter {
             canonical_resource_id: "spine_ssh_host_identity".to_string(),
             previous_generation: None,
             target_generation: target_generation.to_string(),
-            staged_digest: staged_digest.clone(),
+            staged_digest: staged_resource_digest.clone(),
+            archive_payload_sha256: archive_payload_sha256.clone(),
+            staged_resource_digest: staged_resource_digest.clone(),
             staged_byte_length,
             prepared_at_nanos: now_nanos,
             prepared: true,
@@ -656,7 +799,9 @@ impl SshParticipantAdapter {
             restore_id: restore_id.to_string(),
             backup_id: backup_id.to_string(),
             target_generation: target_generation.to_string(),
-            staged_digest,
+            staged_digest: staged_resource_digest.clone(),
+            archive_payload_sha256,
+            staged_resource_digest,
             staged_byte_length,
             acknowledgement: ack,
         })
@@ -675,6 +820,105 @@ impl SshParticipantAdapter {
         let ack: ParticipantAcknowledgement = serde_json::from_str(&content)
             .map_err(|e| ForgeError::Internal(format!("Corrupt SSH staging record: {}", e)))?;
         Ok(Some(ack))
+    }
+
+    pub fn revalidate_staged_contents(&self) -> Result<(), ForgeError> {
+        if !self.staged_dir.exists() {
+            return Err(ForgeError::Internal(format!(
+                "SSH staged directory does not exist: {}",
+                self.staged_dir.display()
+            )));
+        }
+        let rec_path = self.staged_dir.join(".participant_staging_record.json");
+        if !rec_path.exists() {
+            return Err(ForgeError::Internal(
+                "SSH durable staging record missing on disk".into(),
+            ));
+        }
+        let content = fs::read_to_string(&rec_path).map_err(|e| {
+            ForgeError::Internal(format!("Failed to read SSH staging record: {}", e))
+        })?;
+        let ack: ParticipantAcknowledgement = serde_json::from_str(&content)
+            .map_err(|e| ForgeError::Internal(format!("Corrupt SSH staging record: {}", e)))?;
+
+        if ack.restore_id != self.restore_id {
+            return Err(ForgeError::Internal(format!(
+                "SSH staging record restore_id mismatch: expected '{}', got '{}'",
+                self.restore_id, ack.restore_id
+            )));
+        }
+        if ack.backup_id != self.backup_id {
+            return Err(ForgeError::Internal(format!(
+                "SSH staging record backup_id mismatch: expected '{}', got '{}'",
+                self.backup_id, ack.backup_id
+            )));
+        }
+        if ack.target_generation != self.target_generation {
+            return Err(ForgeError::Internal(format!(
+                "SSH staging record target_generation mismatch: expected '{}', got '{}'",
+                self.target_generation, ack.target_generation
+            )));
+        }
+        if !ack.prepared {
+            return Err(ForgeError::Internal(
+                "SSH staging record prepared is false".into(),
+            ));
+        }
+
+        // Recompute digest from actual staged files
+        let (recomputed_digest, recomputed_bytes, file_count) =
+            compute_directory_staged_resource_digest(&self.staged_dir)?;
+        if file_count == 0 {
+            return Err(ForgeError::Internal(
+                "SSH staged directory contains 0 files during revalidation".into(),
+            ));
+        }
+        let expected_digest = if !ack.staged_resource_digest.is_empty() {
+            &ack.staged_resource_digest
+        } else {
+            &ack.staged_digest
+        };
+        if &recomputed_digest != expected_digest && recomputed_digest != ack.staged_digest {
+            return Err(ForgeError::Internal(format!(
+                "SSH staged resource digest mismatch: record has '{}', recomputed '{}'",
+                expected_digest, recomputed_digest
+            )));
+        }
+        if recomputed_bytes != ack.staged_byte_length {
+            return Err(ForgeError::Internal(format!(
+                "SSH staged byte length mismatch: record has {}, recomputed {}",
+                ack.staged_byte_length, recomputed_bytes
+            )));
+        }
+
+        // Verify key files
+        let mut key_count = 0;
+        for entry in
+            fs::read_dir(&self.staged_dir).map_err(|e| ForgeError::Internal(e.to_string()))?
+        {
+            let entry = entry.map_err(|e| ForgeError::Internal(e.to_string()))?;
+            let path = entry.path();
+            if path.is_file() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(".key") || name.contains("host") || name.contains("id_") {
+                    key_count += 1;
+                    let bytes = fs::read(&path).map_err(|e| ForgeError::Internal(e.to_string()))?;
+                    if bytes.is_empty() {
+                        return Err(ForgeError::Internal(format!(
+                            "Staged SSH key file '{}' is empty",
+                            name
+                        )));
+                    }
+                }
+            }
+        }
+        if key_count == 0 {
+            return Err(ForgeError::Internal(
+                "No SSH key files found in staged directory".into(),
+            ));
+        }
+
+        Ok(())
     }
 
     pub fn publish(&self) -> Result<(), ForgeError> {

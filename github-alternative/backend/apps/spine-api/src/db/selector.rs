@@ -318,6 +318,16 @@ impl DatabaseSelector {
         maint_pool: &PgPool,
         record: &ActiveDatabaseRecord,
     ) -> Result<(), ForgeError> {
+        Self::save_to_db_transactional(maint_pool, record, None).await
+    }
+
+    /// Transactional monotonic compare-and-update for the active database selector.
+    /// Strictly rejects sequence rollbacks, validates decision binding, and ensures idempotency.
+    pub async fn save_to_db_transactional(
+        maint_pool: &PgPool,
+        record: &ActiveDatabaseRecord,
+        expected_previous_seq: Option<u64>,
+    ) -> Result<(), ForgeError> {
         record.verify_integrity()?;
 
         let ddl = format!(
@@ -347,7 +357,84 @@ impl DatabaseSelector {
             .await
             .map_err(|e| ForgeError::Internal(format!("Failed to create selector table: {}", e)))?;
 
-        let upsert = format!(
+        let mut tx = maint_pool.begin().await.map_err(|e| {
+            ForgeError::Internal(format!(
+                "Failed to begin transaction for selector update: {}",
+                e
+            ))
+        })?;
+
+        // 1. Lock and inspect current selector row
+        let lock_query = format!(
+            r#"
+            SELECT sequence_number, decision_id, active_db_name, target_generation
+            FROM "{}"
+            WHERE id = 1
+            FOR UPDATE
+            "#,
+            SELECTOR_TABLE_NAME
+        );
+        let current_row: Option<(i64, String, String, String)> = sqlx::query_as(&lock_query)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| {
+                ForgeError::Internal(format!("Failed to lock selector row for update: {}", e))
+            })?;
+
+        if let Some((curr_seq, curr_dec, curr_db, curr_gen)) = current_row {
+            let curr_seq_u64 = curr_seq as u64;
+
+            // Idempotent retry of exact same decision
+            if record.decision_id == curr_dec && record.sequence_number == curr_seq_u64 {
+                if record.active_db_name != curr_db || record.target_generation != curr_gen {
+                    return Err(ForgeError::Internal(format!(
+                        "Contradictory decision replay: decision '{}' previously committed active_db '{}' gen '{}', but received active_db '{}' gen '{}'",
+                        curr_dec, curr_db, curr_gen, record.active_db_name, record.target_generation
+                    )));
+                }
+                tx.commit()
+                    .await
+                    .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                return Ok(());
+            }
+
+            // Reject sequence rollback or stale decision
+            if record.sequence_number <= curr_seq_u64 {
+                return Err(ForgeError::Internal(format!(
+                    "FATAL SELECTOR ROLLBACK REJECTED: Candidate selector sequence {} is <= current authoritative sequence {}. Database sequence rollback is strictly forbidden.",
+                    record.sequence_number, curr_seq_u64
+                )));
+            }
+
+            // If expected previous sequence was specified, enforce exact CAS match
+            if let Some(exp_prev) = expected_previous_seq {
+                if curr_seq_u64 != exp_prev {
+                    return Err(ForgeError::Internal(format!(
+                        "Selector CAS sequence mismatch: expected previous sequence {}, but current authoritative sequence is {}",
+                        exp_prev, curr_seq_u64
+                    )));
+                }
+            }
+
+            // Strictly enforce monotonic step of +1
+            if record.sequence_number != curr_seq_u64 + 1 {
+                return Err(ForgeError::Internal(format!(
+                    "Selector sequence advancement must be strictly monotonic (+1): expected {}, got {}",
+                    curr_seq_u64 + 1, record.sequence_number
+                )));
+            }
+        } else {
+            // First bootstrap insertion
+            if record.sequence_number != 1 {
+                return Err(ForgeError::Internal(format!(
+                    "Initial selector record sequence number must be 1, got {}",
+                    record.sequence_number
+                )));
+            }
+        }
+
+        // 2. Perform compare-and-update or insert
+        let update_sql = format!(
             r#"
             INSERT INTO "{}" (
                 id, selector_schema_version, sequence_number, restore_id, decision_id,
@@ -370,11 +457,13 @@ impl DatabaseSelector {
                 integrity_hash = EXCLUDED.integrity_hash,
                 cutover_at_nanos = EXCLUDED.cutover_at_nanos,
                 updated_at_nanos = EXCLUDED.updated_at_nanos,
-                base_db_name = EXCLUDED.base_db_name;
+                base_db_name = EXCLUDED.base_db_name
+            WHERE "{}"."sequence_number" < EXCLUDED.sequence_number;
             "#,
-            SELECTOR_TABLE_NAME
+            SELECTOR_TABLE_NAME, SELECTOR_TABLE_NAME
         );
-        sqlx::query(&upsert)
+
+        let res = sqlx::query(&update_sql)
             .bind(record.selector_schema_version as i32)
             .bind(record.sequence_number as i64)
             .bind(&record.restore_id)
@@ -389,7 +478,7 @@ impl DatabaseSelector {
             .bind(record.cutover_at_nanos)
             .bind(record.updated_at_nanos)
             .bind(&record.base_db_name)
-            .execute(maint_pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| {
                 ForgeError::Internal(format!(
@@ -397,6 +486,36 @@ impl DatabaseSelector {
                     e
                 ))
             })?;
+
+        if res.rows_affected() == 0 {
+            return Err(ForgeError::Internal(
+                "Selector update affected 0 rows: concurrent update or sequence rollback prevented persistence".into(),
+            ));
+        }
+
+        tx.commit().await.map_err(|e| {
+            ForgeError::Internal(format!("Failed to commit selector transaction: {}", e))
+        })?;
+
+        // 3. Post-commit verification: verify database exists in pg_database catalog
+        let db_exists: Option<(bool,)> =
+            sqlx::query_as("SELECT EXISTS (SELECT FROM pg_database WHERE datname = $1)")
+                .bind(&record.active_db_name)
+                .fetch_optional(maint_pool)
+                .await
+                .map_err(|e| {
+                    ForgeError::Internal(format!(
+                        "Failed to verify database existence in pg_database catalog: {}",
+                        e
+                    ))
+                })?;
+
+        if !db_exists.map(|r| r.0).unwrap_or(false) {
+            return Err(ForgeError::Internal(format!(
+                "Post-commit selector check failed: authoritative database '{}' does not exist in PostgreSQL pg_database catalog",
+                record.active_db_name
+            )));
+        }
 
         Ok(())
     }

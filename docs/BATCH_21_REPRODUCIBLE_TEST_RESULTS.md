@@ -277,13 +277,37 @@ test test_restore_journal_durability_and_sequence_monotonicity ... ok
 test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.58s
 ```
 
-### 4.10 Quality, Linting & Release Assets
+### 4.10 Batch 21N Full-System Stabilization Suite (`batch_21n_stabilization_test.rs`)
+```text
+running 5 tests
+test test_platform_atomic_replace_and_readback_persistence ... ok
+test test_directory_staged_resource_digest_determinism ... ok
+test test_selector_diagnostic_cache_never_influences_write_authorization ... ok
+test test_ssh_participant_actual_content_revalidation ... ok
+test test_participant_actual_content_revalidation_detects_post_ack_tampering ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+```
+
+### 4.11 Consolidated Regression Test Campaigns (Batch 21N Execution)
+- `batch_21n_stabilization_test.rs`: 5 passed; 0 failed.
+- `batch_21m_remediation_test.rs`: 5 passed; 0 failed.
+- `batch_21l_remediation_test.rs`: 6 passed; 0 failed.
+- `global_restore_convergence_test.rs`: 6 passed; 0 failed.
+- `restore_failure_injection_test.rs`: 6 passed; 0 failed.
+- `production_backup_restore_roundtrip_test.rs`: 5 passed; 0 failed.
+- `spine-api` unit tests (`ssh::dispatch::tests`): 1 passed; 0 failed.
+- `git-alternative` complete suite: 100% passed across all crates, binaries, unit tests, integration tests, and doc tests.
+
+### 4.12 Quality, Linting & Release Candidate Assets
 - **Cargo Format:** `cargo fmt --all -- --check` exited with code 0 on both workspaces (`github-alternative/backend` and `git-alternative`).
 - **Cargo Clippy:** `cargo clippy --all-targets -- -D warnings` exited with code 0 on both workspaces.
-- **Release Binaries:** `spine-api.exe`, `spine.exe`, `spine-coordinator.exe`, `spine-storage-node.exe` rebuilt in release mode and checksummed in `target/release-candidate/SHA256SUMS`:
+- **Release Binaries:** `spine.exe`, `spine-coordinator.exe`, `spine-storage-node.exe`, `spine-api.exe` rebuilt in release mode and checksummed in `target/release-candidate/SHA256SUMS`:
   ```text
-  7a4266699df3ed34a4db37c18cef5edf53a81a7ebdaf808451c4a18138df68d8  spine-api.exe
-  a7741f64e9278d4c2be9ab6bf697c6e11d8aa6fc78f0462f46d48efb06268d21  spine-coordinator.exe
-  33430a7171e44ce950a99d71589132cd636218c51a6bfc5d369c2aea9b0e683b  spine-storage-node.exe
-  2bb13d680b0e2ec39ca1559f461e0a2c602a4b097d361f79c60b2a64c6a2e3f9  spine.exe
+  3f83d398ca2ed473e081b65e5c23f8d8b1b894eb8a656fc99a15f4835321f17f  spine.exe
+  3b6a3b948dd5987aebabcd370698f056e23edac1a4dc94113fef2615f9363e16  spine-coordinator.exe
+  4c27906172fb63b9fe9ef0c68feaec9ec4e673a12d7be4837dfb2f7be91835e6  spine-storage-node.exe
+  a28f828430ead4b8459b6e3ffa9fa0e84a260670430aeb5c08719da6afe0d840  spine-api.exe
   ```
+- **Provenance & SBOM:** Fully documented in `docs/RELEASE_PROVENANCE_AND_SBOM.md`.
+

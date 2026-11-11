@@ -264,6 +264,8 @@ impl StagedDatabaseRestore {
             previous_generation: None,
             target_generation: target_generation.to_string(),
             staged_digest: staged_digest.clone(),
+            archive_payload_sha256: staged_digest.clone(),
+            staged_resource_digest: staged_digest.clone(),
             staged_byte_length,
             prepared_at_nanos: now_nanos,
             prepared: true,
@@ -293,22 +295,166 @@ impl StagedDatabaseRestore {
 
     /// Re-query preparation status directly from the staged database.
     pub async fn query_preparation_status(&self) -> Result<bool, ForgeError> {
-        let pool = match PgPool::connect(&self.staged_db_url).await {
-            Ok(p) => p,
-            Err(_) => return Ok(false),
-        };
+        Ok(self.revalidate_staged_database().await.is_ok())
+    }
 
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT generation_token FROM _restore_generation WHERE id = 1")
-                .fetch_optional(&pool)
+    /// Exhaustively revalidate the staged database immediately before commit decision.
+    /// Checks catalog presence, connects to staged DB, verifies durable staging record,
+    /// verifies generation token, and confirms restored table inventory.
+    pub async fn revalidate_staged_database(&self) -> Result<(), ForgeError> {
+        // 1. Verify staged database exists in pg_database catalog
+        let maint_pool = PgPool::connect(&self.maint_db_url).await.map_err(|e| {
+            ForgeError::Internal(format!(
+                "Failed to connect to maintenance DB for staged DB verification: {}",
+                e
+            ))
+        })?;
+        let db_exists: Option<(bool,)> =
+            sqlx::query_as("SELECT EXISTS (SELECT FROM pg_database WHERE datname = $1)")
+                .bind(&self.staged_db_name)
+                .fetch_optional(&maint_pool)
                 .await
-                .ok()
-                .flatten();
+                .map_err(|e| {
+                    ForgeError::Internal(format!("Failed to query pg_database catalog: {}", e))
+                })?;
+
+        if !db_exists.map(|r| r.0).unwrap_or(false) {
+            return Err(ForgeError::Internal(format!(
+                "Staged database '{}' does not exist in PostgreSQL pg_database catalog",
+                self.staged_db_name
+            )));
+        }
+        maint_pool.close().await;
+
+        // 2. Connect directly to the staged database
+        let pool = PgPool::connect(&self.staged_db_url).await.map_err(|e| {
+            ForgeError::Internal(format!(
+                "Failed to connect to staged database '{}': {}",
+                self.staged_db_name, e
+            ))
+        })?;
+
+        // 3. Query and verify durable staging record
+        let staging_row: Option<(String, String, String, String, i64, i64, i64)> = sqlx::query_as(
+            "SELECT restore_id, backup_id, target_generation, staged_digest, staged_byte_length, tables_restored, rows_restored \
+             FROM _spine_staging_record WHERE id = 1",
+        )
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| {
+            ForgeError::Internal(format!(
+                "Failed to query _spine_staging_record in staged DB: {}",
+                e
+            ))
+        })?;
+
+        match staging_row {
+            Some((r_id, b_id, t_gen, s_dig, _s_bytes, tables, rows)) => {
+                if r_id != self.restore_id {
+                    return Err(ForgeError::Internal(format!(
+                        "Staged DB record restore_id mismatch: expected '{}', got '{}'",
+                        self.restore_id, r_id
+                    )));
+                }
+                if b_id != self.backup_id {
+                    return Err(ForgeError::Internal(format!(
+                        "Staged DB record backup_id mismatch: expected '{}', got '{}'",
+                        self.backup_id, b_id
+                    )));
+                }
+                if t_gen != self.target_generation {
+                    return Err(ForgeError::Internal(format!(
+                        "Staged DB record target_generation mismatch: expected '{}', got '{}'",
+                        self.target_generation, t_gen
+                    )));
+                }
+                if s_dig != self.staged_digest {
+                    return Err(ForgeError::Internal(format!(
+                        "Staged DB record digest mismatch: expected '{}', got '{}'",
+                        self.staged_digest, s_dig
+                    )));
+                }
+                if tables != self.tables_restored as i64 {
+                    return Err(ForgeError::Internal(format!(
+                        "Staged DB record tables_restored mismatch: expected {}, got {}",
+                        self.tables_restored, tables
+                    )));
+                }
+                if rows != self.rows_restored as i64 {
+                    return Err(ForgeError::Internal(format!(
+                        "Staged DB record rows_restored mismatch: expected {}, got {}",
+                        self.rows_restored, rows
+                    )));
+                }
+            }
+            None => {
+                return Err(ForgeError::Internal(
+                    "Staged database missing durable _spine_staging_record table/row".into(),
+                ));
+            }
+        }
+
+        // 4. Query and verify _restore_generation
+        let gen_row: Option<(String, String, String)> = sqlx::query_as(
+            "SELECT generation_token, backup_id, status FROM _restore_generation WHERE id = 1",
+        )
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| {
+            ForgeError::Internal(format!(
+                "Failed to query _restore_generation in staged DB: {}",
+                e
+            ))
+        })?;
+
+        match gen_row {
+            Some((gen, b_id, status)) => {
+                if gen != self.target_generation {
+                    return Err(ForgeError::Internal(format!(
+                        "Staged DB _restore_generation token mismatch: expected '{}', got '{}'",
+                        self.target_generation, gen
+                    )));
+                }
+                if b_id != self.backup_id {
+                    return Err(ForgeError::Internal(format!(
+                        "Staged DB _restore_generation backup_id mismatch: expected '{}', got '{}'",
+                        self.backup_id, b_id
+                    )));
+                }
+                if status != "COMMITTED" {
+                    return Err(ForgeError::Internal(format!(
+                        "Staged DB _restore_generation status mismatch: expected 'COMMITTED', got '{}'",
+                        status
+                    )));
+                }
+            }
+            None => {
+                return Err(ForgeError::Internal(
+                    "Staged database missing _restore_generation token".into(),
+                ));
+            }
+        }
+
+        // 5. Query table count in staged database
+        let count_row: (i64,) = sqlx::query_as(
+            "SELECT count(*)::bigint FROM information_schema.tables \
+             WHERE table_schema = 'public' AND table_name NOT LIKE 'pg_%' AND table_name NOT LIKE '_spine_%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| {
+            ForgeError::Internal(format!("Failed to inspect staged DB table catalog: {}", e))
+        })?;
+
+        if count_row.0 != self.tables_restored as i64 {
+            return Err(ForgeError::Internal(format!(
+                "Staged DB catalog table count mismatch: expected {} restored tables, found {}",
+                self.tables_restored, count_row.0
+            )));
+        }
 
         pool.close().await;
-        Ok(row
-            .map(|(gen,)| gen == self.target_generation)
-            .unwrap_or(false))
+        Ok(())
     }
 
     /// Atomically cut over staged database using DatabaseSelector and recoverable versioning.
@@ -382,8 +528,8 @@ impl StagedDatabaseRestore {
             self.base_db_name.clone(),
         );
 
-        DatabaseSelector::save_to_db(&maint_pool, &record).await?;
-        DatabaseSelector::save_diagnostic_cache(storage_root, &record)?;
+        DatabaseSelector::save_to_db_transactional(&maint_pool, &record, Some(prev_seq)).await?;
+        let _ = DatabaseSelector::save_diagnostic_cache(storage_root, &record);
 
         // 3. Terminate active connections to base / previous database
         let _ = sqlx::query(term_sql)

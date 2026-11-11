@@ -117,7 +117,7 @@ pub fn safe_move_path(from: &Path, to: &Path) -> Result<(), ForgeError> {
     }
 }
 
-/// Safely flush a directory handle across platforms (avoiding invalid Win32 FlushFileBuffers on directory handles).
+/// Safely flush a directory handle across platforms (propagates Unix directory flush errors and checks Windows existence).
 pub fn sync_dir(dir: &Path) -> Result<(), ForgeError> {
     #[cfg(windows)]
     {
@@ -131,89 +131,117 @@ pub fn sync_dir(dir: &Path) -> Result<(), ForgeError> {
     #[cfg(unix)]
     {
         if let Ok(f) = std::fs::File::open(dir) {
-            let _ = f.sync_all();
+            f.sync_all().map_err(|e| {
+                ForgeError::Internal(format!("Failed to sync directory {}: {}", dir.display(), e))
+            })?;
         }
     }
     Ok(())
 }
 
-/// Safely replaces a destination file atomically, preserving previous destination until replacement is confirmed.
-/// Never deletes destination file prior to verification. Accommodates Windows rename semantics.
-pub fn safe_atomic_replace(from: &Path, to: &Path) -> Result<(), ForgeError> {
-    if fs::rename(from, to).is_ok() && to.exists() && fs::metadata(to).is_ok() {
-        if let Some(parent) = to.parent() {
-            let _ = sync_dir(parent);
-        }
-        return Ok(());
+#[cfg(windows)]
+fn platform_atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide_from: Vec<u16> = from
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let wide_to: Vec<u16> = to
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    extern "system" {
+        fn MoveFileExW(
+            lpExistingFileName: *const u16,
+            lpNewFileName: *const u16,
+            dwFlags: u32,
+        ) -> i32;
+        fn ReplaceFileW(
+            lpReplacedFileName: *const u16,
+            lpReplacementFileName: *const u16,
+            lpBackupFileName: *const u16,
+            dwReplaceFlags: u32,
+            lpExclude: *mut std::ffi::c_void,
+            lpReserved: *mut std::ffi::c_void,
+        ) -> i32;
     }
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    const REPLACEFILE_WRITE_THROUGH: u32 = 0x1;
+
     if to.exists() {
-        let backup = to.with_extension(format!("bak_replace_{}", uuid::Uuid::new_v4().simple()));
-        fs::rename(to, &backup).map_err(|e| {
-            ForgeError::Internal(format!(
-                "Failed to backup {} during replace: {}",
-                to.display(),
-                e
-            ))
-        })?;
-        match fs::rename(from, to) {
-            Ok(()) => {
-                if to.exists() && fs::metadata(to).is_ok() {
-                    if let Some(parent) = to.parent() {
-                        let _ = sync_dir(parent);
-                    }
-                    let _ = fs::remove_file(&backup);
-                    Ok(())
-                } else {
-                    let _ = fs::rename(&backup, to);
-                    Err(ForgeError::Internal(format!(
-                        "Readback verification failed after replacing {}",
-                        to.display()
-                    )))
-                }
-            }
-            Err(e) => {
-                let _ = fs::rename(&backup, to);
-                Err(ForgeError::Internal(format!(
-                    "Failed to replace destination {} from {}: {}",
-                    to.display(),
-                    from.display(),
-                    e
-                )))
-            }
+        let ret = unsafe {
+            ReplaceFileW(
+                wide_to.as_ptr(),
+                wide_from.as_ptr(),
+                std::ptr::null(),
+                REPLACEFILE_WRITE_THROUGH,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ret != 0 {
+            return Ok(());
         }
+        let ret = unsafe {
+            MoveFileExW(
+                wide_from.as_ptr(),
+                wide_to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ret != 0 {
+            return Ok(());
+        }
+        Err(std::io::Error::last_os_error())
     } else {
-        match fs::rename(from, to) {
-            Ok(()) => {
-                if let Some(parent) = to.parent() {
-                    let _ = sync_dir(parent);
-                }
-                Ok(())
-            }
-            Err(_) => {
-                fs::copy(from, to).map_err(|e| {
-                    ForgeError::Internal(format!(
-                        "Failed to copy {} to {}: {}",
-                        from.display(),
-                        to.display(),
-                        e
-                    ))
-                })?;
-                if to.exists() && fs::metadata(to).is_ok() {
-                    if let Some(parent) = to.parent() {
-                        let _ = sync_dir(parent);
-                    }
-                    let _ = fs::remove_file(from);
-                    Ok(())
-                } else {
-                    let _ = fs::remove_file(to);
-                    Err(ForgeError::Internal(format!(
-                        "Readback verification failed after copying {}",
-                        to.display()
-                    )))
-                }
-            }
+        let ret = unsafe {
+            MoveFileExW(
+                wide_from.as_ptr(),
+                wide_to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ret != 0 {
+            return Ok(());
         }
+        Err(std::io::Error::last_os_error())
     }
+}
+
+#[cfg(unix)]
+fn platform_atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+/// Safely replaces a destination file atomically, preserving previous destination until replacement is confirmed.
+/// Never deletes destination file prior to verification. Accommodates platform atomic replacement semantics.
+pub fn safe_atomic_replace(from: &Path, to: &Path) -> Result<(), ForgeError> {
+    platform_atomic_replace(from, to).map_err(|e| {
+        ForgeError::Internal(format!(
+            "Failed atomic replace from {} to {}: {}",
+            from.display(),
+            to.display(),
+            e
+        ))
+    })?;
+
+    if !to.exists() || fs::metadata(to).is_err() {
+        return Err(ForgeError::Internal(format!(
+            "Readback verification failed after replacing {}",
+            to.display()
+        )));
+    }
+
+    if let Some(parent) = to.parent() {
+        sync_dir(parent)?;
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -907,17 +935,9 @@ impl BackupManager {
                 .map_err(|e| {
                     ForgeError::Internal(format!("Failed to create temp staging directory: {}", e))
                 })?;
-            let staging_dec_tar_gz = staging_dir.path().join("staging_decrypted.tar.gz");
-            let writer = File::create(&staging_dec_tar_gz).map_err(|e| {
-                ForgeError::Internal(format!("Failed to create staging decrypted file: {}", e))
-            })?;
 
-            v2::decrypt_stream(reader, writer, pass)?;
-
-            let dec_file = File::open(&staging_dec_tar_gz).map_err(|e| {
-                ForgeError::Internal(format!("Failed to open staging decrypted file: {}", e))
-            })?;
-            let dec = GzDecoder::new(dec_file);
+            let dec_reader = v2::DecryptingReader::new(reader, pass)?;
+            let dec = GzDecoder::new(dec_reader);
             Self::unpack_archive_to_session(dec, input_path, target_storage_root, staging_dir)
         } else if &magic == BACKUP_MAGIC {
             let pass = passphrase.ok_or_else(|| {

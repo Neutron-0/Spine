@@ -148,42 +148,45 @@ impl ConsistencyBarrier {
                 }
             }
 
-            if let Ok(Some(rec)) =
-                crate::db::DatabaseSelector::load_from_file(storage_root.as_ref())
-            {
-                if let Some(s_gen) = crate::backup::journal::RestoreJournal::read_storage_generation(
-                    storage_root.as_ref(),
-                ) {
-                    if rec.active_generation != s_gen {
-                        return Err(ForgeError::ServiceUnavailable(
-                            format!(
-                                "Cluster write pipeline is paused: active database selector generation '{}' does not match storage generation '{}'",
-                                rec.active_generation, s_gen
-                            ),
-                        ));
-                    }
-                }
-            }
-
             if let Some(pool) = &self.pool {
                 let db_gen_res: Result<Option<(String,)>, _> =
                     sqlx::query_as("SELECT generation_token FROM _restore_generation WHERE id = 1")
                         .fetch_optional(pool)
                         .await;
-                if let Ok(Some((db_gen,))) = db_gen_res {
-                    if let Some(s_gen) =
-                        crate::backup::journal::RestoreJournal::read_storage_generation(
-                            storage_root.as_ref(),
-                        )
-                    {
-                        if db_gen != s_gen {
-                            return Err(ForgeError::ServiceUnavailable(
-                                format!(
-                                    "Cluster write pipeline is paused: unaligned generation! Database is '{}' but storage is '{}'",
+                match db_gen_res {
+                    Ok(Some((db_gen,))) => {
+                        if let Some(s_gen) =
+                            crate::backup::journal::RestoreJournal::read_storage_generation(
+                                storage_root.as_ref(),
+                            )
+                        {
+                            if db_gen != s_gen {
+                                return Err(ForgeError::ServiceUnavailable(format!(
+                                    "Cluster write pipeline is paused: authoritative database generation '{}' does not match storage generation '{}'",
                                     db_gen, s_gen
-                                ),
-                            ));
+                                )));
+                            }
                         }
+                    }
+                    Ok(None) => {
+                        let table_count: Result<(i64,), _> = sqlx::query_as(
+                            "SELECT count(*)::bigint FROM information_schema.tables WHERE table_schema = 'public' AND table_name NOT LIKE 'pg_%'",
+                        )
+                        .fetch_one(pool)
+                        .await;
+                        if let Ok((count,)) = table_count {
+                            if count > 0 {
+                                return Err(ForgeError::ServiceUnavailable(
+                                    "Cluster write pipeline is paused: non-empty database missing generation record in _restore_generation".into(),
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        return Err(ForgeError::ServiceUnavailable(format!(
+                            "Cluster write pipeline is paused: failed to query authoritative database generation: {}",
+                            e
+                        )));
                     }
                 }
             }
@@ -295,23 +298,6 @@ impl ConsistencyBarrier {
                             e
                         ),
                     ));
-                }
-            }
-
-            if let Ok(Some(rec)) =
-                crate::db::DatabaseSelector::load_from_file(storage_root.as_ref())
-            {
-                if let Some(s_gen) = crate::backup::journal::RestoreJournal::read_storage_generation(
-                    storage_root.as_ref(),
-                ) {
-                    if rec.active_generation != s_gen {
-                        return Err(ForgeError::ServiceUnavailable(
-                            format!(
-                                "Cluster write pipeline is paused: active database selector generation '{}' does not match storage generation '{}'",
-                                rec.active_generation, s_gen
-                            ),
-                        ));
-                    }
                 }
             }
         }
