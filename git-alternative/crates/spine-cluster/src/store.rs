@@ -151,10 +151,9 @@ fn is_write_through_unsupported(err: &std::io::Error) -> bool {
 }
 
 #[cfg(windows)]
-fn win32_sync_file_handle(path: &Path) {
-    if let Ok(file) = fs::OpenOptions::new().write(true).open(path) {
-        let _ = file.sync_all();
-    }
+fn win32_sync_file_handle(path: &Path) -> std::io::Result<()> {
+    let file = fs::OpenOptions::new().write(true).open(path)?;
+    file.sync_all()
 }
 
 #[cfg(windows)]
@@ -234,14 +233,17 @@ fn platform_atomic_replace_inner(
     }
 }
 
+/// Atomically replaces `to` with `from` on Windows, propagating source/destination flush errors.
+/// Falls back to non-write-through rename + destination `FlushFileBuffers` only when the volume
+/// rejects `WRITE_THROUGH` IRPs (OS errors 650, 50, or 1).
 #[cfg(windows)]
 fn platform_atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
-    win32_sync_file_handle(from);
+    win32_sync_file_handle(from)?;
     match platform_atomic_replace_inner(from, to, true) {
         Ok(()) => Ok(()),
         Err(err) if is_write_through_unsupported(&err) => {
             platform_atomic_replace_inner(from, to, false)?;
-            win32_sync_file_handle(to);
+            win32_sync_file_handle(to)?;
             Ok(())
         }
         Err(err) => Err(err),

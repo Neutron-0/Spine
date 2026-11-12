@@ -50,6 +50,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0012_workflow_provenance",
         include_str!("../../migrations/0012_workflow_provenance.sql"),
     ),
+    (
+        "0013_cluster_barrier_fencing_generation",
+        include_str!("../../migrations/0013_cluster_barrier_fencing_generation.sql"),
+    ),
 ];
 
 // 64-bit advisory lock ID representing "SPINEMIG" (0x5350494E454D4947)

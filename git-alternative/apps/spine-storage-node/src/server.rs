@@ -2,7 +2,10 @@ use crate::backend::StorageBackend;
 use anyhow::{Context, Result};
 use spine_cluster::heartbeat::NodeHeartbeat;
 use spine_cluster::node::NodeStatus;
-use spine_cluster::protocol::{ClusterRpcRequest, ClusterRpcResponse, MAX_CLUSTER_RPC_FRAME_BYTES};
+use spine_cluster::protocol::{
+    ClusterRpcRequest, ClusterRpcResponse, MAX_CLUSTER_RPC_FRAME_BYTES,
+    MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -291,10 +294,20 @@ async fn handle_connection(
             snapshot_id,
             fencing_generation,
         } => match backend.capture_volume_snapshot(&snapshot_id, fencing_generation) {
-            Ok((manifest, payload_bytes)) => ClusterRpcResponse::VolumeSnapshotCaptured {
-                manifest,
-                payload_bytes,
-            },
+            Ok((manifest, payload_bytes)) => {
+                if payload_bytes.len() > MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES {
+                    ClusterRpcResponse::Error(format!(
+                        "Captured storage node snapshot payload ({} bytes) exceeds MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES ({} bytes)",
+                        payload_bytes.len(),
+                        MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES
+                    ))
+                } else {
+                    ClusterRpcResponse::VolumeSnapshotCaptured {
+                        manifest,
+                        payload_bytes,
+                    }
+                }
+            }
             Err(e) => ClusterRpcResponse::Error(e.to_string()),
         },
         ClusterRpcRequest::StageVolumeRestore {
@@ -302,19 +315,29 @@ async fn handle_connection(
             fencing_generation,
             manifest,
             payload_bytes,
-        } => match backend.stage_volume_restore_with_manifest(
-            &snapshot_id,
-            fencing_generation,
-            Some(&manifest),
-            &payload_bytes,
-        ) {
-            Ok(ack) => ClusterRpcResponse::VolumeRestoreStaged {
-                snapshot_id,
-                success: true,
-                acknowledgement: Some(ack),
-            },
-            Err(e) => ClusterRpcResponse::Error(e.to_string()),
-        },
+        } => {
+            if payload_bytes.len() > MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES {
+                ClusterRpcResponse::Error(format!(
+                    "Staged storage node snapshot payload ({} bytes) exceeds MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES ({} bytes)",
+                    payload_bytes.len(),
+                    MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES
+                ))
+            } else {
+                match backend.stage_volume_restore_with_manifest(
+                    &snapshot_id,
+                    fencing_generation,
+                    Some(&manifest),
+                    &payload_bytes,
+                ) {
+                    Ok(ack) => ClusterRpcResponse::VolumeRestoreStaged {
+                        snapshot_id,
+                        success: true,
+                        acknowledgement: Some(ack),
+                    },
+                    Err(e) => ClusterRpcResponse::Error(e.to_string()),
+                }
+            }
+        }
         ClusterRpcRequest::CommitVolumeRestore {
             snapshot_id,
             fencing_generation,
@@ -362,6 +385,13 @@ async fn handle_connection(
     };
 
     let resp_bytes = resp.to_bytes()?;
+    if resp_bytes.len() > MAX_CLUSTER_RPC_FRAME_BYTES {
+        anyhow::bail!(
+            "Storage node RPC response frame ({} bytes) exceeds MAX_CLUSTER_RPC_FRAME_BYTES ({} bytes)",
+            resp_bytes.len(),
+            MAX_CLUSTER_RPC_FRAME_BYTES
+        );
+    }
     let resp_len = (resp_bytes.len() as u32).to_be_bytes();
     stream.write_all(&resp_len).await?;
     stream.write_all(&resp_bytes).await?;

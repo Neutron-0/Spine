@@ -143,15 +143,15 @@ async fn test_actual_run_migrations_cancellation_and_recovery() {
         .await
         .expect("Worker B must acquire lock and complete all migrations after Worker A abort");
 
-    // 7. Verify all 12 migrations are applied and committed
+    // 7. Verify all 13 migrations are applied and committed
     let final_migrations: (i64,) = sqlx::query_as("SELECT count(*) FROM _schema_migrations")
         .fetch_one(&pool)
         .await
         .expect("count completed migrations");
 
     assert_eq!(
-        final_migrations.0, 12,
-        "Worker B must have committed all 12 migrations"
+        final_migrations.0, 13,
+        "Worker B must have committed all 13 migrations"
     );
 
     // 8. Verify idempotent re-run
@@ -270,14 +270,14 @@ async fn test_repeated_migration_cancellation_during_real_ddl_and_inserts() {
         );
         worker_b_thread.join().expect("join worker B thread");
 
-        // Verify all 12 migrations were cleanly committed
+        // Verify all 13 migrations were cleanly committed
         let final_count: (i64,) = sqlx::query_as("SELECT count(*) FROM _schema_migrations")
             .fetch_one(&pool)
             .await
             .expect("count completed migrations");
         assert_eq!(
-            final_count.0, 12,
-            "Cycle {}: All 12 migrations must be committed",
+            final_count.0, 13,
+            "Cycle {}: All 13 migrations must be committed",
             cycle
         );
 

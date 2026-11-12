@@ -1240,7 +1240,12 @@ async fn test_seven_participant_e2e_recovery_fault_injection_and_partial_restart
         run1.is_err(),
         "Run 1 must fail closed on node-2 finalize error"
     );
-    assert!(run1.unwrap_err().to_string().contains("finalize_restore"));
+    let run1_err = run1.unwrap_err().to_string();
+    assert!(
+        run1_err.contains("finalize_restore"),
+        "Expected Run 1 error to contain 'finalize_restore', got: {}",
+        run1_err
+    );
 
     // Verify journal still exists and partial durable convergence state was persisted!
     let j1 = RestoreJournal::load(&root)
@@ -1334,4 +1339,398 @@ async fn test_rpc_client_rejects_oversized_frame_without_allocation() {
         "Expected oversized frame bound rejection, got: {}",
         err
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn test_windows_fallback_sync_failures_propagate_source_and_destination() {
+    use spine_api::backup::platform_atomic_replace_with_hooks;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let tmp = tempdir().unwrap();
+    let from = tmp.path().join("src.tmp");
+    let to = tmp.path().join("dest.dat");
+    fs::write(&from, b"new-payload").unwrap();
+    fs::write(&to, b"old-payload").unwrap();
+
+    // 1. Source sync failure must fail before rename and preserve original destination
+    let replace_calls = AtomicUsize::new(0);
+    let err_src = platform_atomic_replace_with_hooks(
+        &from,
+        &to,
+        |_| Err(std::io::Error::other("injected source sync_all failure")),
+        |_, _, _| {
+            replace_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert!(err_src
+        .to_string()
+        .contains("injected source sync_all failure"));
+    assert_eq!(replace_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fs::read(&to).unwrap(), b"old-payload");
+
+    // 2. Fallback destination sync failure after Win32 OS Error 650 must propagate error
+    let sync_calls = AtomicUsize::new(0);
+    let err_dst = platform_atomic_replace_with_hooks(
+        &from,
+        &to,
+        |_| {
+            let n = sync_calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Ok(()) // source sync succeeds
+            } else {
+                Err(std::io::Error::other(
+                    "injected destination fallback sync_all failure",
+                ))
+            }
+        },
+        |_, _, write_through| {
+            if write_through {
+                Err(std::io::Error::from_raw_os_error(650))
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .unwrap_err();
+    assert!(err_dst
+        .to_string()
+        .contains("injected destination fallback sync_all failure"));
+    assert_eq!(sync_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn test_rpc_max_payload_worst_case_high_entropy_fits_frame_and_overlimit_rejected() {
+    use spine_api::coordinator::ClusterNodeClient;
+    use spine_cluster::protocol::{
+        ClusterRpcRequest, ClusterRpcResponse, VolumeSnapshotManifest, MAX_CLUSTER_RPC_FRAME_BYTES,
+        MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES,
+    };
+
+    // High-entropy worst-case JSON byte array: every byte >= 100 encodes as 4 bytes ("255,")
+    let max_payload = vec![0xFFu8; MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES];
+    let manifest = VolumeSnapshotManifest {
+        participant_id: "node-1".to_string(),
+        volume_name: "storage_1_data".to_string(),
+        snapshot_id: "snap_boundary_test".to_string(),
+        fencing_generation: 99,
+        file_count: 100,
+        total_bytes: MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES as u64,
+        sha256_checksum: "0".repeat(64),
+        created_at_nanos: 1_700_000_000_000_000_000,
+        restore_id: Some("rst_boundary_test".to_string()),
+        backup_id: Some("bak_boundary_test".to_string()),
+    };
+
+    let req = ClusterRpcRequest::StageVolumeRestore {
+        snapshot_id: "snap_boundary_test".to_string(),
+        fencing_generation: 99,
+        manifest: manifest.clone(),
+        payload_bytes: max_payload.clone(),
+    };
+    let req_bytes = req.to_bytes().unwrap();
+    assert!(
+        req_bytes.len() <= MAX_CLUSTER_RPC_FRAME_BYTES,
+        "Worst-case StageVolumeRestore ({} bytes) exceeded MAX_CLUSTER_RPC_FRAME_BYTES ({} bytes)",
+        req_bytes.len(),
+        MAX_CLUSTER_RPC_FRAME_BYTES
+    );
+    match ClusterRpcRequest::from_bytes(&req_bytes).unwrap() {
+        ClusterRpcRequest::StageVolumeRestore { payload_bytes, .. } => {
+            assert_eq!(payload_bytes.len(), MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES);
+        }
+        other => panic!("Unexpected request variant: {:?}", other),
+    }
+
+    let resp = ClusterRpcResponse::VolumeSnapshotCaptured {
+        manifest: manifest.clone(),
+        payload_bytes: max_payload,
+    };
+    let resp_bytes = resp.to_bytes().unwrap();
+    assert!(
+        resp_bytes.len() <= MAX_CLUSTER_RPC_FRAME_BYTES,
+        "Worst-case VolumeSnapshotCaptured ({} bytes) exceeded MAX_CLUSTER_RPC_FRAME_BYTES ({} bytes)",
+        resp_bytes.len(),
+        MAX_CLUSTER_RPC_FRAME_BYTES
+    );
+
+    // Over-limit payload (MAX + 1) must be rejected on client before connecting/sending
+    let client = ClusterNodeClient::new("127.0.0.1:9".to_string());
+    let over_limit = vec![0xAAu8; MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES + 1];
+    let err = client
+        .stage_restore(manifest, over_limit)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("exceeds limit"),
+        "Expected over-limit payload rejection, got: {}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn test_live_coordinator_and_storage_node_processes_restore_and_restart() {
+    use spine_api::backup::{CommitDecisionRecord, RestoreJournal, RestorePhase};
+    use spine_api::coordinator::{ClusterNodeClient, CoordinatorClient};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::process::{Child, Command, Stdio};
+
+    struct ChildGuard(Vec<Child>);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            for c in &mut self.0 {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+
+    fn find_cluster_binary(name: &str) -> PathBuf {
+        let exe_name = if cfg!(windows) {
+            format!("{}.exe", name)
+        } else {
+            name.to_string()
+        };
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .expect("repo root");
+        let candidates = [
+            repo_root
+                .join("git-alternative")
+                .join("target")
+                .join("debug")
+                .join(&exe_name),
+            repo_root
+                .join("git-alternative")
+                .join("target")
+                .join("release")
+                .join(&exe_name),
+            repo_root
+                .join("target")
+                .join("release-candidate")
+                .join(&exe_name),
+        ];
+        candidates
+            .into_iter()
+            .find(|p| p.exists())
+            .unwrap_or_else(|| {
+                panic!(
+                    "Cluster binary '{}' not found; build git-alternative first",
+                    exe_name
+                )
+            })
+    }
+
+    fn pick_free_addr() -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().to_string()
+    }
+
+    async fn wait_for_node(addr: &str) {
+        let client = ClusterNodeClient::new(addr.to_string());
+        for _ in 0..100 {
+            if client.query_node_details().await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("Timed out waiting for live cluster process at {}", addr);
+    }
+
+    let coord_bin = find_cluster_binary("spine-coordinator");
+    let node_bin = find_cluster_binary("spine-storage-node");
+
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("api_storage");
+    let staging = root.join(".staged_live");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&staging).unwrap();
+    let ssh_dir = root.join("ssh");
+    fs::create_dir_all(&ssh_dir).unwrap();
+    fs::write(ssh_dir.join("host_key_ed25519"), b"live-e2e-ssh-key").unwrap();
+    RestoreJournal::write_storage_generation(&root, "10").unwrap();
+
+    let coord_store_path = tmp.path().join("coord").join("coordinator_state.json");
+    fs::create_dir_all(coord_store_path.parent().unwrap()).unwrap();
+    let coord_addr = pick_free_addr();
+
+    let n1_dir = tmp.path().join("node-1");
+    let n2_dir = tmp.path().join("node-2");
+    let n3_dir = tmp.path().join("node-3");
+    fs::create_dir_all(&n1_dir).unwrap();
+    fs::create_dir_all(&n2_dir).unwrap();
+    fs::create_dir_all(&n3_dir).unwrap();
+    let n1_addr = pick_free_addr();
+    let n2_addr = pick_free_addr();
+    let n3_addr = pick_free_addr();
+
+    let spawn_coord = |addr: &str| {
+        Command::new(&coord_bin)
+            .env("SPINE_CLUSTER_ID", "live-e2e-cluster")
+            .env("SPINE_LISTEN", addr)
+            .env("SPINE_STORE_PATH", &coord_store_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn spine-coordinator")
+    };
+    let spawn_node = |id: &str, addr: &str, dir: &std::path::Path| {
+        Command::new(&node_bin)
+            .env("SPINE_NODE_ID", id)
+            .env("SPINE_LISTEN", addr)
+            .env("SPINE_DATA_DIR", dir)
+            .env("SPINE_COORDINATOR_ADDR", &coord_addr)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn spine-storage-node")
+    };
+
+    let mut guards = ChildGuard(vec![
+        spawn_coord(&coord_addr),
+        spawn_node("node-1", &n1_addr, &n1_dir),
+        spawn_node("node-2", &n2_addr, &n2_dir),
+        spawn_node("node-3", &n3_addr, &n3_dir),
+    ]);
+
+    wait_for_node(&coord_addr).await;
+    wait_for_node(&n1_addr).await;
+    wait_for_node(&n2_addr).await;
+    wait_for_node(&n3_addr).await;
+
+    let coord_client = CoordinatorClient::new(coord_addr.clone());
+    let n1_client = ClusterNodeClient::new(n1_addr.clone());
+    let n2_client = ClusterNodeClient::new(n2_addr.clone());
+    let n3_client = ClusterNodeClient::new(n3_addr.clone());
+
+    // Capture initial snapshots from all 4 live processes
+    let (mut cm, cp) = coord_client.capture_snapshot("cap_c", 1).await.unwrap();
+    let (mut m1, p1) = n1_client.capture_snapshot("cap_1", 1).await.unwrap();
+    let (mut m2, p2) = n2_client.capture_snapshot("cap_2", 1).await.unwrap();
+    let (mut m3, p3) = n3_client.capture_snapshot("cap_3", 1).await.unwrap();
+
+    // Enter maintenance and stage target generation 10
+    coord_client.enter_maintenance(10).await.unwrap();
+    n1_client.enter_maintenance(10).await.unwrap();
+    n2_client.enter_maintenance(10).await.unwrap();
+    n3_client.enter_maintenance(10).await.unwrap();
+
+    cm.snapshot_id = "snap_live_coord".to_string();
+    cm.fencing_generation = 10;
+    m1.snapshot_id = "snap_live_n1".to_string();
+    m1.fencing_generation = 10;
+    m2.snapshot_id = "snap_live_n2".to_string();
+    m2.fencing_generation = 10;
+    m3.snapshot_id = "snap_live_n3".to_string();
+    m3.fencing_generation = 10;
+
+    coord_client.stage_restore(cm, cp).await.unwrap();
+    n1_client.stage_restore(m1, p1).await.unwrap();
+    n2_client.stage_restore(m2, p2).await.unwrap();
+    n3_client.stage_restore(m3, p3).await.unwrap();
+
+    // Crash and restart coordinator + node-2 AFTER staging (before commit)
+    let _ = guards.0[0].kill();
+    let _ = guards.0[0].wait();
+    let _ = guards.0[2].kill();
+    let _ = guards.0[2].wait();
+    guards.0[0] = spawn_coord(&coord_addr);
+    guards.0[2] = spawn_node("node-2", &n2_addr, &n2_dir);
+    wait_for_node(&coord_addr).await;
+    wait_for_node(&n2_addr).await;
+
+    // Commit coordinator (re-entering maintenance after restart) and node-1, then crash and restart node-1 BEFORE finalize
+    coord_client.enter_maintenance(10).await.unwrap();
+    coord_client
+        .commit_restore("snap_live_coord", 10)
+        .await
+        .unwrap();
+    n1_client.commit_restore("snap_live_n1", 10).await.unwrap();
+    let _ = guards.0[1].kill();
+    let _ = guards.0[1].wait();
+    guards.0[1] = spawn_node("node-1", &n1_addr, &n1_dir);
+    wait_for_node(&n1_addr).await;
+
+    // Persist Committed restore journal and execute startup cluster recovery across live processes
+    let mut journal = RestoreJournal::new(
+        &tmp.path().join("live.spnebak"),
+        &root,
+        &staging,
+        "bak_live",
+    );
+    journal.target_generation = "10".to_string();
+    journal
+        .record_participant_snapshot("coordinator", "snap_live_coord")
+        .unwrap();
+    journal
+        .record_participant_snapshot("node-1", "snap_live_n1")
+        .unwrap();
+    journal
+        .record_participant_snapshot("node-2", "snap_live_n2")
+        .unwrap();
+    journal
+        .record_participant_snapshot("node-3", "snap_live_n3")
+        .unwrap();
+
+    let cdr = CommitDecisionRecord {
+        restore_id: journal.restore_id.clone(),
+        backup_id: "bak_live".to_string(),
+        old_generation: Some("0".to_string()),
+        new_generation: "10".to_string(),
+        required_participants: vec![
+            "postgres_data".to_string(),
+            "spine_storage".to_string(),
+            "spine_ssh".to_string(),
+            "coordinator".to_string(),
+            "node-1".to_string(),
+            "node-2".to_string(),
+            "node-3".to_string(),
+        ],
+        staged_manifest_digests: BTreeMap::new(),
+        decision_timestamp_nanos: 1_000_000,
+        schema_identity: "spine-backup-v2".to_string(),
+        decision_token: "tok_live".to_string(),
+    };
+    journal.persist(RestorePhase::CommitDecision(cdr)).unwrap();
+    journal.persist(RestorePhase::Committed).unwrap();
+
+    let nodes = vec![
+        ("node-1".to_string(), n1_addr.clone()),
+        ("node-2".to_string(), n2_addr.clone()),
+        ("node-3".to_string(), n3_addr.clone()),
+    ];
+    let db_ok = |_target: &str| Ok(Some("10".to_string()));
+    let res = RestoreJournal::handle_startup_recovery_cluster_with_db_check(
+        &root,
+        Some(db_ok),
+        None,
+        Some(&coord_client),
+        &nodes,
+    )
+    .await;
+    assert!(
+        res.is_ok(),
+        "Live multi-process recovery must converge all 7 participants: {:?}",
+        res
+    );
+    assert!(RestoreJournal::load(&root).unwrap().is_none());
+
+    for (label, client) in [
+        ("coordinator", &ClusterNodeClient::new(coord_addr)),
+        ("node-1", &n1_client),
+        ("node-2", &n2_client),
+        ("node-3", &n3_client),
+    ] {
+        let (maint, gen, _, id) = client.query_node_details().await.unwrap();
+        assert!(!maint, "{} remained in maintenance after recovery", label);
+        assert_eq!(gen, 10, "{} generation mismatch after recovery", label);
+        assert_eq!(id.as_deref(), Some(label));
+    }
 }

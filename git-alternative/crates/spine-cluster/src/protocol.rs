@@ -7,8 +7,19 @@ use serde::{Deserialize, Serialize};
 
 /// Hard wire frame bound for cluster RPC messages (64 MiB) to prevent unbounded memory allocation.
 pub const MAX_CLUSTER_RPC_FRAME_BYTES: usize = 64 * 1024 * 1024;
-/// Maximum permitted compressed snapshot payload per remote participant RPC (48 MiB).
-pub const MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES: usize = 48 * 1024 * 1024;
+/// Maximum permitted compressed snapshot payload per remote participant RPC (15 MiB).
+///
+/// `ClusterRpcRequest` and `ClusterRpcResponse` are serialized via `serde_json`, where
+/// `payload_bytes: Vec<u8>` encodes as a JSON array of decimal integers (`[255,254,...]`).
+/// High-entropy bytes (`100..=255`) expand 4x (`"255,"` per byte). At 15 MiB (`15,728,640` bytes),
+/// worst-case payload encoding is `62,914,561` bytes, leaving >4 MiB headroom for
+/// `VolumeSnapshotManifest` and protocol fields inside `MAX_CLUSTER_RPC_FRAME_BYTES` (64 MiB).
+/// Operational consequence: compressed snapshot tar.gz payloads for remote participants sent over
+/// single-frame cluster RPC cannot exceed 15 MiB.
+pub const MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES: usize = 15 * 1024 * 1024;
+
+const _: () =
+    assert!(MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES * 4 + 1024 * 1024 <= MAX_CLUSTER_RPC_FRAME_BYTES);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClusterRpcRequest {

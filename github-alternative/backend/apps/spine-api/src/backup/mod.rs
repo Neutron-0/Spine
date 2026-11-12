@@ -264,10 +264,9 @@ fn is_write_through_unsupported(err: &std::io::Error) -> bool {
 }
 
 #[cfg(windows)]
-fn win32_sync_file_handle(path: &Path) {
-    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
-        let _ = file.sync_all();
-    }
+fn win32_sync_file_handle(path: &Path) -> std::io::Result<()> {
+    let file = std::fs::OpenOptions::new().write(true).open(path)?;
+    file.sync_all()
 }
 
 #[cfg(windows)]
@@ -347,10 +346,40 @@ fn platform_atomic_replace_inner(
     }
 }
 
+/// Atomically replaces `to` with `from` on Windows.
+///
+/// Durability contract:
+/// 1. Flushes `from` (`OpenOptions::write` + `sync_all` / `FlushFileBuffers`) before renaming, propagating any error.
+/// 2. Attempts `ReplaceFileW(..., REPLACEFILE_WRITE_THROUGH)` / `MoveFileExW(..., MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`,
+///    which flushes both file data and directory/MFT metadata on standard NTFS volumes.
+/// 3. Only if the underlying volume/filter rejects write-through rename IRPs with OS error `650`, `50`, or `1`,
+///    retries atomic replacement without `WRITE_THROUGH` and immediately flushes the destination file handle (`sync_all`),
+///    propagating any open or flush failure. On such restricted/layered filesystems, file payload durability is
+///    enforced via explicit `FlushFileBuffers` before and after rename, while directory-entry metadata write-through
+///    depends on the volume filter because `SL_WRITE_THROUGH` is unsupported by that filter.
 #[cfg(windows)]
 fn platform_atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
-    win32_sync_file_handle(from);
-    match platform_atomic_replace_inner(from, to, true) {
+    platform_atomic_replace_with_hooks(
+        from,
+        to,
+        win32_sync_file_handle,
+        platform_atomic_replace_inner,
+    )
+}
+
+#[cfg(windows)]
+pub fn platform_atomic_replace_with_hooks<S, R>(
+    from: &Path,
+    to: &Path,
+    mut sync_fn: S,
+    mut replace_fn: R,
+) -> std::io::Result<()>
+where
+    S: FnMut(&Path) -> std::io::Result<()>,
+    R: FnMut(&Path, &Path, bool) -> std::io::Result<()>,
+{
+    sync_fn(from)?;
+    match replace_fn(from, to, true) {
         Ok(()) => Ok(()),
         Err(err) if is_write_through_unsupported(&err) => {
             tracing::warn!(
@@ -359,8 +388,8 @@ fn platform_atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
                 from.display(),
                 to.display()
             );
-            platform_atomic_replace_inner(from, to, false)?;
-            win32_sync_file_handle(to);
+            replace_fn(from, to, false)?;
+            sync_fn(to)?;
             Ok(())
         }
         Err(err) => Err(err),
@@ -371,7 +400,13 @@ fn platform_atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
 pub fn safe_atomic_replace_strict_writethrough(from: &Path, to: &Path) -> Result<(), ForgeError> {
     #[cfg(windows)]
     {
-        win32_sync_file_handle(from);
+        win32_sync_file_handle(from).map_err(|e| {
+            ForgeError::Internal(format!(
+                "Failed to sync source file {} before strict write-through replace: {}",
+                from.display(),
+                e
+            ))
+        })?;
         platform_atomic_replace_inner(from, to, true).map_err(|e| {
             ForgeError::Internal(format!(
                 "Strict write-through atomic replace failed from {} to {}: {}",
