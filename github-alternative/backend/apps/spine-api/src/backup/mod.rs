@@ -2154,3 +2154,133 @@ impl BackupManager {
         Ok(())
     }
 }
+
+/// Executes a coordinated cluster backup while ensuring every participant that may have received
+/// `enter_maintenance` is registered BEFORE sending the RPC, and treating any `exit_maintenance`
+/// or database `MaintenanceGuard::release` failure as a command error.
+pub async fn run_backup_with_maintenance_cleanup<Work, WorkFut, GuardRel, GuardFut>(
+    fencing_generation: u64,
+    coord_addr_opt: Option<&str>,
+    node_endpoints: &[(String, String)],
+    release_db_guard: Option<GuardRel>,
+    work: Work,
+) -> Result<(), ForgeError>
+where
+    Work: FnOnce(
+        Option<crate::CoordinatorClient>,
+        Vec<(String, crate::ClusterNodeClient)>,
+    ) -> WorkFut,
+    WorkFut: std::future::Future<Output = Result<(), ForgeError>>,
+    GuardRel: FnOnce() -> GuardFut,
+    GuardFut: std::future::Future<Output = Result<(), ForgeError>>,
+{
+    let mut coord_client: Option<crate::CoordinatorClient> = None;
+    let mut storage_clients: Vec<(String, crate::ClusterNodeClient)> = Vec::new();
+
+    let work_res: Result<(), ForgeError> = async {
+        if let Some(c_addr) = coord_addr_opt {
+            println!(
+                "Coordinating maintenance barrier with Spine Coordinator at {}...",
+                c_addr
+            );
+            let client = crate::CoordinatorClient::new(c_addr.to_string());
+            // Register BEFORE sending enter_maintenance so lost-ACK uncertain entry is cleaned up.
+            coord_client = Some(client.clone());
+            client
+                .enter_maintenance(fencing_generation)
+                .await
+                .map_err(|e| {
+                    ForgeError::Internal(format!(
+                        "Failed to coordinate maintenance barrier with coordinator at {}: {}",
+                        c_addr, e
+                    ))
+                })?;
+        }
+
+        for (node_id, addr) in node_endpoints {
+            println!(
+                "Coordinating maintenance barrier with storage node '{}' at {}...",
+                node_id, addr
+            );
+            let client = crate::ClusterNodeClient::new(addr.clone());
+            // Register BEFORE sending enter_maintenance so lost-ACK uncertain entry is cleaned up.
+            storage_clients.push((node_id.clone(), client.clone()));
+            client
+                .enter_maintenance(fencing_generation)
+                .await
+                .map_err(|e| {
+                    ForgeError::Internal(format!(
+                        "Failed to coordinate maintenance barrier with storage node '{}' at {}: {}",
+                        node_id, addr, e
+                    ))
+                })?;
+        }
+
+        work(coord_client.clone(), storage_clients.clone()).await
+    }
+    .await;
+
+    let mut cleanup_errors: Vec<String> = Vec::new();
+    let mut unresolved_participants: Vec<String> = Vec::new();
+
+    for (node_id, client) in &storage_clients {
+        let mut res = client.exit_maintenance(fencing_generation).await;
+        if res.is_err() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            res = client.exit_maintenance(fencing_generation).await;
+        }
+        if let Err(e) = res {
+            unresolved_participants.push(node_id.clone());
+            cleanup_errors.push(format!(
+                "storage node '{}' exit_maintenance({}) failed: {}",
+                node_id, fencing_generation, e
+            ));
+        }
+    }
+
+    if let Some(ref client) = coord_client {
+        let mut res = client.exit_maintenance(fencing_generation).await;
+        if res.is_err() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            res = client.exit_maintenance(fencing_generation).await;
+        }
+        if let Err(e) = res {
+            unresolved_participants.push("coordinator".to_string());
+            cleanup_errors.push(format!(
+                "coordinator exit_maintenance({}) failed: {}",
+                fencing_generation, e
+            ));
+        }
+    }
+
+    if let Some(rel_fn) = release_db_guard {
+        if let Err(e) = rel_fn().await {
+            unresolved_participants.push("postgres_maintenance_guard".to_string());
+            cleanup_errors.push(format!("database maintenance guard release failed: {}", e));
+        }
+    }
+
+    if !cleanup_errors.is_empty() {
+        let recovery_hint = format!(
+            "Unresolved participants that may remain fenced at generation {}: [{}]. Operator action: verify connectivity and re-run maintenance exit for generation {} on the listed participants.",
+            fencing_generation,
+            unresolved_participants.join(", "),
+            fencing_generation
+        );
+        return match work_res {
+            Ok(()) => Err(ForgeError::Internal(format!(
+                "Backup archive created, but maintenance cleanup failed (backup cannot succeed while maintenance state is unresolved): {}. {}",
+                cleanup_errors.join("; "),
+                recovery_hint
+            ))),
+            Err(orig) => Err(ForgeError::Internal(format!(
+                "Backup failed: [{}] AND maintenance cleanup failed: [{}]. {}",
+                orig,
+                cleanup_errors.join("; "),
+                recovery_hint
+            ))),
+        };
+    }
+
+    work_res
+}

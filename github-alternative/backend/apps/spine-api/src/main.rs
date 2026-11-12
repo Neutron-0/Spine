@@ -747,35 +747,30 @@ async fn main() -> anyhow::Result<()> {
                     .map(|g| g.fencing_generation)
                     .unwrap_or(1);
 
-                let mut stream_participants: Vec<(
+                let stream_participants: Vec<(
                     spine_api::BackupParticipantRecord,
                     spine_api::backup::ParticipantPayloadSource,
                 )> = Vec::new();
-                let mut coord_client = None;
-                let mut storage_clients = Vec::new();
-                let backup_res: anyhow::Result<()> = async {
-                if let Some(ref c_addr) = coord_addr_opt {
-                    println!(
-                        "Coordinating maintenance barrier with Spine Coordinator at {}...",
-                        c_addr
-                    );
-                    let client = spine_api::CoordinatorClient::new(c_addr.clone());
-                    client
-                        .enter_maintenance(fencing_generation)
-                        .await
-                        .map_err(|e| {
-                            anyhow::anyhow!(
-                                "Failed to coordinate maintenance barrier with coordinator: {}",
-                                e
-                            )
-                        })?;
-                    coord_client = Some(client.clone());
+                let guard_opt = _maintenance_guard;
+                let release_db_guard = guard_opt.map(|g| move || async move { g.release().await });
+                spine_api::backup::run_backup_with_maintenance_cleanup(
+                    fencing_generation,
+                    coord_addr_opt.as_deref(),
+                    &node_endpoints,
+                    release_db_guard,
+                    |coord_client, storage_clients| async move {
+                let mut stream_participants = stream_participants;
+                let captured_pg_enc = captured_pg_enc;
+                if let Some(client) = coord_client {
                     let snap_id = uuid::Uuid::new_v4().to_string();
                     let (manifest, data) = client
                         .capture_snapshot(&snap_id, fencing_generation)
                         .await
                         .map_err(|e| {
-                            anyhow::anyhow!("Failed to capture coordinator snapshot: {}", e)
+                            spine_api::core::error::ForgeError::Internal(format!(
+                                "Failed to capture coordinator snapshot: {}",
+                                e
+                            ))
                         })?;
                     let coord_enc = spine_api::backup::EphemeralEncryptedTemp::from_reader(
                         &data[..],
@@ -797,26 +792,16 @@ async fn main() -> anyhow::Result<()> {
                     println!("Coordinator volume snapshot captured successfully.");
                 }
 
-                for (node_id, addr) in &node_endpoints {
-                    println!(
-                        "Coordinating maintenance barrier with storage node '{}' at {}...",
-                        node_id, addr
-                    );
-                    let client = spine_api::ClusterNodeClient::new(addr.clone());
-                    client.enter_maintenance(fencing_generation).await.map_err(|e| {
-                        anyhow::anyhow!("Failed to coordinate maintenance barrier with storage node '{}': {}", node_id, e)
-                    })?;
-                    storage_clients.push((node_id.clone(), client.clone()));
+                for (node_id, client) in &storage_clients {
                     let snap_id = uuid::Uuid::new_v4().to_string();
                     let (manifest, data) = client
                         .capture_snapshot(&snap_id, fencing_generation)
                         .await
                         .map_err(|e| {
-                            anyhow::anyhow!(
+                            spine_api::core::error::ForgeError::Internal(format!(
                                 "Failed to capture storage node '{}' snapshot: {}",
-                                node_id,
-                                e
-                            )
+                                node_id, e
+                            ))
                         })?;
                     let node_enc = spine_api::backup::EphemeralEncryptedTemp::from_reader(
                         &data[..],
@@ -858,11 +843,11 @@ async fn main() -> anyhow::Result<()> {
                         spine_api::backup::ParticipantPayloadSource::Memory(ssh_bytes),
                     ));
                 } else if prof.requires_persistent_database() {
-                    anyhow::bail!(
+                    return Err(spine_api::core::error::ForgeError::Internal(format!(
                         "Under deployment profile '{}', SSH host identity ('spine_ssh') is required. No host key found in '{}'.",
                         prof,
                         ssh_dir.display()
-                    );
+                    )));
                 }
 
                 // Register PostgreSQL database participant record with bounded streaming AEAD payload
@@ -881,10 +866,10 @@ async fn main() -> anyhow::Result<()> {
                     ));
                     println!("PostgreSQL database snapshot participant record registered (bounded AEAD streaming, 0 plaintext disk intermediates).");
                 } else if prof.requires_persistent_database() {
-                    anyhow::bail!(
+                    return Err(spine_api::core::error::ForgeError::Internal(format!(
                         "Under deployment profile '{}', PostgreSQL database snapshot ('postgres_data') is required.",
                         prof
-                    );
+                    )));
                 }
 
                 // Register Spine API storage volume participant record with bounded streaming AEAD payload
@@ -920,7 +905,12 @@ async fn main() -> anyhow::Result<()> {
                     &participant_records,
                     fencing_generation,
                 )
-                .map_err(|e| anyhow::anyhow!("Participant validation failed: {}", e))?;
+                .map_err(|e| {
+                    spine_api::core::error::ForgeError::Internal(format!(
+                        "Participant validation failed: {}",
+                        e
+                    ))
+                })?;
 
                 println!(
                     "Creating coordinated backup from {} to {}",
@@ -948,27 +938,9 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
                     Ok(())
-                }
-                .await;
-
-                for (id, client) in storage_clients {
-                    if let Err(e) = client.exit_maintenance(fencing_generation).await {
-                        eprintln!(
-                            "Warning: Failed to exit maintenance on storage node '{}': {}",
-                            id, e
-                        );
-                    }
-                }
-                if let Some(client) = coord_client {
-                    if let Err(e) = client.exit_maintenance(fencing_generation).await {
-                        eprintln!("Warning: Failed to exit maintenance on coordinator: {}", e);
-                    }
-                }
-
-                if let Some(guard) = _maintenance_guard {
-                    let _ = guard.release().await;
-                }
-                backup_res?;
+                },
+                )
+                .await?;
                 Ok(())
             }
             BackupCommands::Restore {

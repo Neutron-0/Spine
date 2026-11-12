@@ -566,19 +566,38 @@ impl MaintenanceGuard {
     pub async fn release(mut self) -> Result<(), ForgeError> {
         self.released = true;
         self.barrier.in_maintenance.store(false, Ordering::SeqCst);
+        let mut release_errors: Vec<String> = Vec::new();
         if let Some(pool) = &self.barrier.pool {
-            let _ = sqlx::query(
+            if let Err(e) = sqlx::query(
                 "UPDATE _cluster_maintenance_barrier SET is_active = FALSE WHERE id = 1",
             )
             .execute(pool)
-            .await;
+            .await
+            {
+                release_errors.push(format!(
+                    "Failed to clear _cluster_maintenance_barrier.is_active: {}",
+                    e
+                ));
+            }
         }
         if let Some(mut conn) = self.conn.take() {
-            let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
                 .bind(SPINE_CLUSTER_MAINTENANCE_LOCK_ID)
                 .execute(&mut conn)
-                .await;
+                .await
+            {
+                release_errors.push(format!(
+                    "Failed to release PostgreSQL maintenance advisory lock: {}",
+                    e
+                ));
+            }
             let _ = conn.close().await;
+        }
+        if !release_errors.is_empty() {
+            return Err(ForgeError::Internal(format!(
+                "MaintenanceGuard release failed: {}",
+                release_errors.join("; ")
+            )));
         }
         tracing::info!("Maintenance consistency barrier explicitly released.");
         Ok(())
