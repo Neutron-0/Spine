@@ -1,10 +1,20 @@
 use spine_api::backup::consistency::ConsistencyBarrier;
 use spine_api::backup::journal::{CommitDecisionRecord, RestoreJournal, RestorePhase};
-use spine_api::backup::{safe_atomic_replace, sync_dir, BackupManager};
+use spine_api::backup::{
+    safe_atomic_replace, safe_atomic_replace_strict_writethrough, sync_dir, BackupManager,
+    BackupParticipantRecord, EphemeralEncryptedTemp, ParticipantPayloadSource,
+};
 use spine_api::db::selector::{ActiveDatabaseRecord, DatabaseSelector};
+use spine_api::CoordinatorClient;
+use spine_cluster::protocol::{ClusterRpcRequest, ClusterRpcResponse, ParticipantAcknowledgement};
+use spine_cluster::store::{CoordinatorStore, FileBackedCoordinatorStore};
 use std::collections::BTreeMap;
 use std::fs;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use tempfile::tempdir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 #[test]
 fn test_post_decision_journal_invariants_and_stale_record_protection() {
@@ -363,8 +373,24 @@ async fn test_cluster_recovery_fails_closed_when_generation_mismatches() {
     );
     DatabaseSelector::save_diagnostic_cache(&root, &record).unwrap();
 
-    // Call cluster recovery: must fail closed because DB generation is "4" while target is "5"
-    let cluster_res = RestoreJournal::handle_startup_recovery_cluster(&root, None, None, &[]).await;
+    // Call recovery without PG pool: fails closed because postgres_data is required
+    let missing_pool_res =
+        RestoreJournal::handle_startup_recovery_cluster(&root, None, None, &[]).await;
+    assert!(
+        missing_pool_res.is_err(),
+        "Cluster recovery must fail closed when required postgres_data has no DB connection"
+    );
+
+    // Call cluster recovery with DB verifier returning generation "4" != target "5": must also fail closed
+    let mismatch_check = |_target: &str| Ok(Some("4".to_string()));
+    let cluster_res = RestoreJournal::handle_startup_recovery_cluster_with_db_check(
+        &root,
+        Some(mismatch_check),
+        None,
+        None,
+        &[],
+    )
+    .await;
     assert!(
         cluster_res.is_err(),
         "Cluster recovery must fail closed when DB generation mismatches"
@@ -451,4 +477,861 @@ async fn test_missing_storage_generation_blocks_write_permits_fail_closed() {
         .await
         .unwrap();
     assert!(barrier.acquire_write_permit().await.is_err());
+}
+
+#[tokio::test]
+async fn test_committed_journal_survives_local_sync_recovery_across_all_phases() {
+    let phases = vec![
+        RestorePhase::Publishing {
+            published_participants: vec!["spine_storage".to_string()],
+        },
+        RestorePhase::DbPublished,
+        RestorePhase::StoragePublished,
+        RestorePhase::Published,
+        RestorePhase::Verified,
+        RestorePhase::Committed,
+    ];
+
+    for (idx, phase) in phases.into_iter().enumerate() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("storage");
+        let staging = root.join(format!(".staged_generation_phase_{}", idx));
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("file.txt"), b"data").unwrap();
+        let dummy_archive = tmp.path().join("bak.spnebak");
+        fs::write(&dummy_archive, b"bak").unwrap();
+
+        let mut journal = RestoreJournal::new(&dummy_archive, &root, &staging, "bak_phase");
+        journal.target_generation = "10".to_string();
+        let cdr = CommitDecisionRecord {
+            restore_id: journal.restore_id.clone(),
+            backup_id: "bak_phase".to_string(),
+            old_generation: Some("9".to_string()),
+            new_generation: "10".to_string(),
+            required_participants: vec!["spine_storage".to_string(), "coordinator".to_string()],
+            staged_manifest_digests: BTreeMap::new(),
+            decision_timestamp_nanos: 1_000_000,
+            schema_identity: "spine-backup-v2".to_string(),
+            decision_token: "tok_phase".to_string(),
+        };
+        journal.persist(RestorePhase::CommitDecision(cdr)).unwrap();
+        if !matches!(phase, RestorePhase::CommitDecision(_)) {
+            journal.persist(phase.clone()).unwrap();
+        }
+
+        // Local sync recovery must forward recover storage, yet RETAIN journal for Committed and all post-decision phases!
+        let msg = RestoreJournal::handle_startup_recovery_sync(&root).unwrap();
+        assert!(msg.is_some());
+        assert_eq!(
+            RestoreJournal::read_storage_generation(&root).as_deref(),
+            Some("10")
+        );
+        assert!(
+            RestoreJournal::load(&root).unwrap().is_some(),
+            "Journal at phase {:?} MUST survive local sync recovery",
+            phase
+        );
+
+        // Idempotent second sync recovery also retains the journal cleanly
+        let msg2 = RestoreJournal::handle_startup_recovery_sync(&root).unwrap();
+        assert!(msg2.is_some());
+        assert!(RestoreJournal::load(&root).unwrap().is_some());
+    }
+}
+
+#[tokio::test]
+async fn test_required_participant_recovery_fails_closed_when_endpoint_missing() {
+    // 1. Coordinator required, coordinator = None -> hard error
+    {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("root_coord_missing");
+        let staging = root.join(".staged");
+        fs::create_dir_all(&staging).unwrap();
+        RestoreJournal::write_storage_generation(&root, "12").unwrap();
+        let mut journal =
+            RestoreJournal::new(&tmp.path().join("b.bak"), &root, &staging, "bak_coord");
+        journal.target_generation = "12".to_string();
+        let cdr = CommitDecisionRecord {
+            restore_id: journal.restore_id.clone(),
+            backup_id: "bak_coord".to_string(),
+            old_generation: None,
+            new_generation: "12".to_string(),
+            required_participants: vec!["spine_storage".to_string(), "coordinator".to_string()],
+            staged_manifest_digests: BTreeMap::new(),
+            decision_timestamp_nanos: 1_000_000,
+            schema_identity: "spine-backup-v2".to_string(),
+            decision_token: "tok_coord_missing".to_string(),
+        };
+        journal.persist(RestorePhase::CommitDecision(cdr)).unwrap();
+
+        let err = RestoreJournal::handle_startup_recovery_cluster(&root, None, None, &[])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("coordinator"));
+        assert!(RestoreJournal::load(&root).unwrap().is_some());
+    }
+
+    // 2. node-2 required, missing from storage_nodes -> hard error
+    {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("root_node_missing");
+        let staging = root.join(".staged");
+        fs::create_dir_all(&staging).unwrap();
+        RestoreJournal::write_storage_generation(&root, "12").unwrap();
+        let mut journal =
+            RestoreJournal::new(&tmp.path().join("b.bak"), &root, &staging, "bak_node");
+        journal.target_generation = "12".to_string();
+        let cdr = CommitDecisionRecord {
+            restore_id: journal.restore_id.clone(),
+            backup_id: "bak_node".to_string(),
+            old_generation: None,
+            new_generation: "12".to_string(),
+            required_participants: vec!["spine_storage".to_string(), "node-2".to_string()],
+            staged_manifest_digests: BTreeMap::new(),
+            decision_timestamp_nanos: 1_000_000,
+            schema_identity: "spine-backup-v2".to_string(),
+            decision_token: "tok_node_missing".to_string(),
+        };
+        journal.persist(RestorePhase::CommitDecision(cdr)).unwrap();
+
+        let err = RestoreJournal::handle_startup_recovery_cluster(
+            &root,
+            None,
+            None,
+            &[("node-1".to_string(), "127.0.0.1:9".to_string())],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("node-2"));
+        assert!(RestoreJournal::load(&root).unwrap().is_some());
+    }
+}
+
+#[tokio::test]
+async fn test_recovery_rejects_malformed_and_overflowing_generations_before_rpcs() {
+    let rpc_hits = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let hits_clone = Arc::clone(&rpc_hits);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = Arc::clone(&stop);
+
+    tokio::spawn(async move {
+        while !stop_clone.load(Ordering::SeqCst) {
+            if let Ok(Ok((_stream, _))) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept()).await
+            {
+                hits_clone.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
+
+    let malformed_values = vec![
+        "",
+        "0",
+        "not_a_number",
+        "12abc",
+        "18446744073709551616",       // u64::MAX + 1
+        "99999999999999999999999999", // huge overflow
+    ];
+
+    for bad_gen in &malformed_values {
+        assert!(
+            RestoreJournal::parse_generation_u64(bad_gen).is_err(),
+            "parse_generation_u64 must reject '{}'",
+            bad_gen
+        );
+
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let staging = root.join(".staged");
+        fs::create_dir_all(&staging).unwrap();
+        RestoreJournal::write_storage_generation(&root, bad_gen).unwrap();
+        let mut journal =
+            RestoreJournal::new(&tmp.path().join("b.bak"), &root, &staging, "bak_bad");
+        journal.target_generation = bad_gen.to_string();
+        let cdr = CommitDecisionRecord {
+            restore_id: journal.restore_id.clone(),
+            backup_id: "bak_bad".to_string(),
+            old_generation: None,
+            new_generation: bad_gen.to_string(),
+            required_participants: vec!["spine_storage".to_string(), "coordinator".to_string()],
+            staged_manifest_digests: BTreeMap::new(),
+            decision_timestamp_nanos: 1_000_000,
+            schema_identity: "spine-backup-v2".to_string(),
+            decision_token: "tok_bad".to_string(),
+        };
+        journal.persist(RestorePhase::CommitDecision(cdr)).unwrap();
+
+        let coord_client = CoordinatorClient::new(addr.clone());
+        let res =
+            RestoreJournal::handle_startup_recovery_cluster(&root, None, Some(&coord_client), &[])
+                .await;
+        assert!(res.is_err(), "Malformed gen '{}' must fail closed", bad_gen);
+    }
+
+    // Also test no-journal malformed storage generation fails closed BEFORE coordinator RPC
+    {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("root_no_jnl");
+        fs::create_dir_all(&root).unwrap();
+        RestoreJournal::write_storage_generation(&root, "invalid_storage_gen").unwrap();
+        let coord_client = CoordinatorClient::new(addr.clone());
+        let res =
+            RestoreJournal::handle_startup_recovery_cluster(&root, None, Some(&coord_client), &[])
+                .await;
+        assert!(res.is_err());
+    }
+
+    stop.store(true, Ordering::SeqCst);
+    assert_eq!(
+        rpc_hits.load(Ordering::SeqCst),
+        0,
+        "Zero RPC connections may be opened for malformed/overflowing generation values"
+    );
+}
+
+#[test]
+fn test_windows_durability_local_ntfs_writethrough_dest_missing_and_exists() {
+    // Test directly inside the local NTFS workspace target directory as well as tempdir
+    let local_ntfs_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!(
+            "win_durability_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+    fs::create_dir_all(&local_ntfs_dir).unwrap();
+
+    // 1. Destination missing replacement (strict write-through)
+    let src_missing = local_ntfs_dir.join("src_missing.json");
+    let dst = local_ntfs_dir.join("target_journal.json");
+    fs::write(&src_missing, b"{\"seq\":1}").unwrap();
+    safe_atomic_replace_strict_writethrough(&src_missing, &dst)
+        .expect("Strict write-through destination-missing replace must succeed on local NTFS");
+    assert!(!src_missing.exists());
+    assert_eq!(fs::read_to_string(&dst).unwrap(), "{\"seq\":1}");
+
+    // 2. Destination exists replacement (strict write-through)
+    let src_exists = local_ntfs_dir.join("src_exists.json");
+    fs::write(&src_exists, b"{\"seq\":2}").unwrap();
+    safe_atomic_replace_strict_writethrough(&src_exists, &dst)
+        .expect("Strict write-through destination-exists replace must succeed on local NTFS");
+    assert!(!src_exists.exists());
+    assert_eq!(fs::read_to_string(&dst).unwrap(), "{\"seq\":2}");
+
+    // 3. safe_atomic_replace under tempdir()
+    let tmp = tempdir().unwrap();
+    let t_src = tmp.path().join("t_src.json");
+    let t_dst = tmp.path().join("t_dst.json");
+    fs::write(&t_src, b"temp_v1").unwrap();
+    safe_atomic_replace(&t_src, &t_dst).unwrap();
+    let t_src2 = tmp.path().join("t_src2.json");
+    fs::write(&t_src2, b"temp_v2").unwrap();
+    safe_atomic_replace(&t_src2, &t_dst).unwrap();
+    assert_eq!(fs::read_to_string(&t_dst).unwrap(), "temp_v2");
+
+    let _ = fs::remove_dir_all(&local_ntfs_dir);
+}
+
+#[test]
+fn test_bounded_memory_encrypted_streaming_backup_large_payload() {
+    #[cfg(windows)]
+    fn current_working_set_bytes() -> usize {
+        #[repr(C)]
+        struct ProcessMemoryCounters {
+            cb: u32,
+            page_fault_count: u32,
+            peak_working_set_size: usize,
+            working_set_size: usize,
+            quota_peak_paged_pool_usage: usize,
+            quota_paged_pool_usage: usize,
+            quota_peak_non_paged_pool_usage: usize,
+            quota_non_paged_pool_usage: usize,
+            pagefile_usage: usize,
+            peak_pagefile_usage: usize,
+        }
+        extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn K32GetProcessMemoryInfo(
+                process: isize,
+                ppsmem_counters: *mut ProcessMemoryCounters,
+                cb: u32,
+            ) -> i32;
+        }
+        let mut pmc = std::mem::MaybeUninit::<ProcessMemoryCounters>::zeroed();
+        unsafe {
+            let ptr = pmc.as_mut_ptr();
+            (*ptr).cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
+            if K32GetProcessMemoryInfo(GetCurrentProcess(), ptr, (*ptr).cb) != 0 {
+                return (*ptr).working_set_size;
+            }
+        }
+        0
+    }
+
+    let tmp = tempdir().unwrap();
+    let storage_root = tmp.path().join("large_storage");
+    fs::create_dir_all(storage_root.join("repos")).unwrap();
+
+    // Generate 16 MiB of incompressible high-entropy storage files using SplitMix64
+    for i in 0..4u32 {
+        let mut data = vec![0u8; 4 * 1024 * 1024];
+        let mut seed = (i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        for chunk in data.chunks_mut(8) {
+            seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            let bytes = z.to_le_bytes();
+            let n = chunk.len();
+            chunk.copy_from_slice(&bytes[..n]);
+        }
+        fs::write(
+            storage_root.join("repos").join(format!("blob_{}.bin", i)),
+            &data,
+        )
+        .unwrap();
+    }
+
+    // Stream an additional 12 MiB database JSONL payload through EphemeralEncryptedTemp with 256 KiB chunking
+    let chunk_size = 256 * 1024u32;
+    let baseline_ws = {
+        #[cfg(windows)]
+        {
+            current_working_set_bytes()
+        }
+        #[cfg(not(windows))]
+        {
+            0usize
+        }
+    };
+
+    let (pg_tmp, pg_key, mut pg_enc_writer) = EphemeralEncryptedTemp::begin(chunk_size).unwrap();
+    use std::io::Write;
+    let line = format!(
+        "{{\"table\":\"commits\",\"payload\":\"{}\"}}\n",
+        "x".repeat(1000)
+    );
+    for _ in 0..12_000 {
+        pg_enc_writer.write_all(line.as_bytes()).unwrap();
+    }
+    let pg_summary = pg_enc_writer.finish().unwrap();
+    let pg_enc = EphemeralEncryptedTemp::from_finished(pg_tmp, pg_key, pg_summary);
+
+    let storage_enc =
+        BackupManager::capture_storage_snapshot_encrypted(&storage_root, chunk_size).unwrap();
+
+    let stream_participants = vec![
+        (
+            BackupParticipantRecord {
+                participant_id: "postgres_data".to_string(),
+                volume_name: "postgres_data".to_string(),
+                snapshot_id: "pg_large_1".to_string(),
+                fencing_generation: 1,
+                byte_length: pg_enc.byte_length,
+                sha256_checksum: pg_enc.sha256_checksum.clone(),
+                archive_rel_path: "database/snapshot.jsonl".to_string(),
+            },
+            ParticipantPayloadSource::EncryptedTemp(pg_enc),
+        ),
+        (
+            BackupParticipantRecord {
+                participant_id: "spine_storage".to_string(),
+                volume_name: "spine_storage".to_string(),
+                snapshot_id: "st_large_1".to_string(),
+                fencing_generation: 1,
+                byte_length: storage_enc.byte_length,
+                sha256_checksum: storage_enc.sha256_checksum.clone(),
+                archive_rel_path: "storage/spine_storage_snapshot.tar.gz".to_string(),
+            },
+            ParticipantPayloadSource::EncryptedTemp(storage_enc),
+        ),
+    ];
+
+    let out_archive = tmp.path().join("large_backup.spnebak");
+    let manifest = BackupManager::create_cluster_backup_streaming(
+        &storage_root,
+        None,
+        stream_participants,
+        Some(1),
+        &out_archive,
+        Some("LargePayloadSecret!123"),
+        1,
+    )
+    .unwrap();
+
+    assert!(manifest.total_bytes > 20 * 1024 * 1024);
+
+    #[cfg(windows)]
+    {
+        let after_ws = current_working_set_bytes();
+        // Working set growth must remain strictly bounded well below raw ~28 MiB uncompressed payload sizes
+        if baseline_ws > 0 {
+            let delta = after_ws.saturating_sub(baseline_ws);
+            assert!(
+                delta < 16 * 1024 * 1024,
+                "Working set grew by {} bytes during >28 MiB backup (expected bounded < 16 MiB)",
+                delta
+            );
+        }
+    }
+
+    // Decrypt and verify archive roundtrip without plaintext intermediates on disk
+    let restore_target = tmp.path().join("restore_target");
+    let session = BackupManager::prepare_restore_session(
+        &out_archive,
+        &restore_target,
+        Some("LargePayloadSecret!123"),
+    )
+    .unwrap();
+    assert_eq!(session.manifest.backup_id, manifest.backup_id);
+}
+
+struct MockStorageNodeState {
+    node_id: RwLock<String>,
+    fencing_generation: AtomicU64,
+    in_maintenance: AtomicBool,
+    staged_snapshot: RwLock<Option<(String, u64)>>,
+    finalized: AtomicBool,
+    fail_finalize_once: AtomicBool,
+}
+
+async fn spawn_mock_storage_node(state: Arc<MockStorageNodeState>) -> (String, Arc<AtomicBool>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = Arc::clone(&stop);
+
+    tokio::spawn(async move {
+        while !stop_clone.load(Ordering::SeqCst) {
+            if let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept()).await
+            {
+                let st = Arc::clone(&state);
+                tokio::spawn(async move {
+                    let mut len_buf = [0u8; 4];
+                    if stream.read_exact(&mut len_buf).await.is_err() {
+                        return;
+                    }
+                    let len = u32::from_be_bytes(len_buf) as usize;
+                    let mut body = vec![0u8; len];
+                    if stream.read_exact(&mut body).await.is_err() {
+                        return;
+                    }
+                    let Ok(req) = ClusterRpcRequest::from_bytes(&body) else {
+                        return;
+                    };
+                    let resp = match req {
+                        ClusterRpcRequest::QueryMaintenanceStatus => {
+                            ClusterRpcResponse::MaintenanceStatus {
+                                in_maintenance: st.in_maintenance.load(Ordering::SeqCst),
+                                fencing_generation: st.fencing_generation.load(Ordering::SeqCst),
+                                active_writers: 0,
+                                node_id: Some(st.node_id.read().unwrap().clone()),
+                            }
+                        }
+                        ClusterRpcRequest::EnterMaintenanceBarrier { fencing_generation } => {
+                            st.in_maintenance.store(true, Ordering::SeqCst);
+                            let cur = st.fencing_generation.load(Ordering::SeqCst);
+                            if fencing_generation > cur {
+                                // Only maintain barrier generation without overwriting staged target
+                            }
+                            ClusterRpcResponse::MaintenanceBarrierAck { success: true }
+                        }
+                        ClusterRpcRequest::QueryStagedVolumeRestore { snapshot_id } => {
+                            let staged = st.staged_snapshot.read().unwrap().clone();
+                            match staged {
+                                Some((s_id, gen)) if s_id == snapshot_id => {
+                                    ClusterRpcResponse::StagedVolumeRestoreStatus {
+                                        snapshot_id,
+                                        prepared: true,
+                                        acknowledgement: Some(ParticipantAcknowledgement {
+                                            restore_id: "rst_7p".to_string(),
+                                            backup_id: "bak_7p".to_string(),
+                                            participant_id: st.node_id.read().unwrap().clone(),
+                                            volume_name: "vol".to_string(),
+                                            canonical_resource_id: "res".to_string(),
+                                            previous_generation: None,
+                                            target_generation: gen.to_string(),
+                                            staged_digest: "a".repeat(64),
+                                            archive_payload_sha256: "a".repeat(64),
+                                            staged_resource_digest: "a".repeat(64),
+                                            staged_byte_length: 128,
+                                            prepared_at_nanos: 1,
+                                            prepared: true,
+                                            durable_staging_record_id: "rec".to_string(),
+                                            current_state: "Staged".to_string(),
+                                        }),
+                                    }
+                                }
+                                _ => ClusterRpcResponse::StagedVolumeRestoreStatus {
+                                    snapshot_id,
+                                    prepared: false,
+                                    acknowledgement: None,
+                                },
+                            }
+                        }
+                        ClusterRpcRequest::CommitVolumeRestore {
+                            snapshot_id,
+                            fencing_generation,
+                        } => {
+                            let mut staged = st.staged_snapshot.write().unwrap();
+                            match staged.as_ref() {
+                                Some((s_id, gen))
+                                    if s_id == &snapshot_id && *gen == fencing_generation =>
+                                {
+                                    *staged = None;
+                                    st.fencing_generation
+                                        .store(fencing_generation, Ordering::SeqCst);
+                                    st.in_maintenance.store(false, Ordering::SeqCst);
+                                    ClusterRpcResponse::VolumeRestoreCommitted {
+                                        snapshot_id,
+                                        success: true,
+                                    }
+                                }
+                                _ => ClusterRpcResponse::Error(
+                                    "Staged restore not found for commit".to_string(),
+                                ),
+                            }
+                        }
+                        ClusterRpcRequest::FinalizeVolumeRestore { snapshot_id } => {
+                            if st.fail_finalize_once.swap(false, Ordering::SeqCst) {
+                                ClusterRpcResponse::Error(
+                                    "Injected FinalizeVolumeRestore RPC failure".to_string(),
+                                )
+                            } else {
+                                st.finalized.store(true, Ordering::SeqCst);
+                                ClusterRpcResponse::VolumeRestoreFinalized {
+                                    snapshot_id,
+                                    success: true,
+                                }
+                            }
+                        }
+                        _ => ClusterRpcResponse::Error("Unsupported mock RPC".to_string()),
+                    };
+                    if let Ok(rb) = resp.to_bytes() {
+                        let rl = (rb.len() as u32).to_be_bytes();
+                        let _ = stream.write_all(&rl).await;
+                        let _ = stream.write_all(&rb).await;
+                        let _ = stream.flush().await;
+                    }
+                });
+            }
+        }
+    });
+    (addr, stop)
+}
+
+#[tokio::test]
+async fn test_seven_participant_e2e_recovery_fault_injection_and_partial_restarts() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("api_storage");
+    let staging = root.join(".staged_7p");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&staging).unwrap();
+
+    // 1. Setup SSH identity on disk
+    let ssh_dir = root.join("ssh");
+    fs::create_dir_all(&ssh_dir).unwrap();
+    fs::write(ssh_dir.join("host_key_ed25519"), b"mock-private-key").unwrap();
+
+    // 2. Setup Local Storage generation "42" and retained .old_generation
+    RestoreJournal::write_storage_generation(&root, "42").unwrap();
+
+    // 3. Setup REAL CoordinatorStore (file-backed, tests disk staging + restart durability)
+    let coord_dir = tmp.path().join("coordinator_data");
+    fs::create_dir_all(&coord_dir).unwrap();
+    let coord_state_path = coord_dir.join("coordinator_state.json");
+    let coord_store =
+        Arc::new(FileBackedCoordinatorStore::new_file_backed(&coord_state_path).unwrap());
+    let (_, coord_payload) = coord_store.capture_snapshot("tmp_cap", 41).unwrap();
+    coord_store.enter_maintenance(41).unwrap();
+    coord_store
+        .stage_restore("snap_coord_7p", 42, &coord_payload)
+        .unwrap();
+
+    // Simulate Coordinator TCP RPC endpoint backed by FileBackedCoordinatorStore
+    let coord_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let coord_addr = coord_listener.local_addr().unwrap().to_string();
+    let coord_stop = Arc::new(AtomicBool::new(false));
+    let coord_stop_c = Arc::clone(&coord_stop);
+    let cs_clone = Arc::clone(&coord_store);
+    tokio::spawn(async move {
+        while !coord_stop_c.load(Ordering::SeqCst) {
+            if let Ok(Ok((mut stream, _))) = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                coord_listener.accept(),
+            )
+            .await
+            {
+                let store = Arc::clone(&cs_clone);
+                tokio::spawn(async move {
+                    let mut lb = [0u8; 4];
+                    if stream.read_exact(&mut lb).await.is_err() {
+                        return;
+                    }
+                    let mut body = vec![0u8; u32::from_be_bytes(lb) as usize];
+                    if stream.read_exact(&mut body).await.is_err() {
+                        return;
+                    }
+                    let Ok(req) = ClusterRpcRequest::from_bytes(&body) else {
+                        return;
+                    };
+                    let resp = match req {
+                        ClusterRpcRequest::QueryMaintenanceStatus => {
+                            let (im, fg, aw) = store.get_maintenance_status();
+                            ClusterRpcResponse::MaintenanceStatus {
+                                in_maintenance: im,
+                                fencing_generation: fg,
+                                active_writers: aw,
+                                node_id: Some("coordinator".to_string()),
+                            }
+                        }
+                        ClusterRpcRequest::EnterMaintenanceBarrier { fencing_generation } => {
+                            match store.enter_maintenance(fencing_generation) {
+                                Ok(()) => {
+                                    ClusterRpcResponse::MaintenanceBarrierAck { success: true }
+                                }
+                                Err(e) => ClusterRpcResponse::Error(e.to_string()),
+                            }
+                        }
+                        ClusterRpcRequest::QueryStagedVolumeRestore { snapshot_id } => {
+                            match store.query_staged_restore(&snapshot_id) {
+                                Ok(Some(ack)) => ClusterRpcResponse::StagedVolumeRestoreStatus {
+                                    snapshot_id,
+                                    prepared: true,
+                                    acknowledgement: Some(ack),
+                                },
+                                Ok(None) => ClusterRpcResponse::StagedVolumeRestoreStatus {
+                                    snapshot_id,
+                                    prepared: false,
+                                    acknowledgement: None,
+                                },
+                                Err(e) => ClusterRpcResponse::Error(e.to_string()),
+                            }
+                        }
+                        ClusterRpcRequest::CommitVolumeRestore {
+                            snapshot_id,
+                            fencing_generation,
+                        } => match store.commit_restore(&snapshot_id, fencing_generation) {
+                            Ok(()) => ClusterRpcResponse::VolumeRestoreCommitted {
+                                snapshot_id,
+                                success: true,
+                            },
+                            Err(e) => ClusterRpcResponse::Error(e.to_string()),
+                        },
+                        ClusterRpcRequest::FinalizeVolumeRestore { snapshot_id } => {
+                            match store.finalize_restore(&snapshot_id) {
+                                Ok(()) => ClusterRpcResponse::VolumeRestoreFinalized {
+                                    snapshot_id,
+                                    success: true,
+                                },
+                                Err(e) => ClusterRpcResponse::Error(e.to_string()),
+                            }
+                        }
+                        _ => ClusterRpcResponse::Error("Unsupported".to_string()),
+                    };
+                    if let Ok(rb) = resp.to_bytes() {
+                        let _ = stream.write_all(&(rb.len() as u32).to_be_bytes()).await;
+                        let _ = stream.write_all(&rb).await;
+                        let _ = stream.flush().await;
+                    }
+                });
+            }
+        }
+    });
+
+    // 4. Setup 3 storage nodes with fault injection:
+    // - node-1: still staged at generation 41 (needs commit + finalize during recovery)
+    // - node-2: committed at 42, finalize_restore injected to FAIL ONCE
+    // - node-3: starts with WRONG node_id ("rogue-node-9"), then fixed on retry
+    let n1 = Arc::new(MockStorageNodeState {
+        node_id: RwLock::new("node-1".to_string()),
+        fencing_generation: AtomicU64::new(41),
+        in_maintenance: AtomicBool::new(false),
+        staged_snapshot: RwLock::new(Some(("snap_n1_7p".to_string(), 42))),
+        finalized: AtomicBool::new(false),
+        fail_finalize_once: AtomicBool::new(false),
+    });
+    let n2 = Arc::new(MockStorageNodeState {
+        node_id: RwLock::new("node-2".to_string()),
+        fencing_generation: AtomicU64::new(42),
+        in_maintenance: AtomicBool::new(false),
+        staged_snapshot: RwLock::new(None),
+        finalized: AtomicBool::new(false),
+        fail_finalize_once: AtomicBool::new(true), // Fails first FinalizeVolumeRestore RPC!
+    });
+    let n3 = Arc::new(MockStorageNodeState {
+        node_id: RwLock::new("rogue-node-9".to_string()), // Wrong participant identity!
+        fencing_generation: AtomicU64::new(42),
+        in_maintenance: AtomicBool::new(false),
+        staged_snapshot: RwLock::new(None),
+        finalized: AtomicBool::new(false),
+        fail_finalize_once: AtomicBool::new(false),
+    });
+
+    let (n1_addr, n1_stop) = spawn_mock_storage_node(Arc::clone(&n1)).await;
+    let (n2_addr, n2_stop) = spawn_mock_storage_node(Arc::clone(&n2)).await;
+    let (n3_addr, n3_stop) = spawn_mock_storage_node(Arc::clone(&n3)).await;
+
+    // 5. Setup durable restore journal with all 7 participants & snapshot IDs
+    let mut journal =
+        RestoreJournal::new(&tmp.path().join("bak.spnebak"), &root, &staging, "bak_7p");
+    journal.target_generation = "42".to_string();
+    journal
+        .record_participant_snapshot("coordinator", "snap_coord_7p")
+        .unwrap();
+    journal
+        .record_participant_snapshot("node-1", "snap_n1_7p")
+        .unwrap();
+    journal
+        .record_participant_snapshot("node-2", "snap_n2_7p")
+        .unwrap();
+    journal
+        .record_participant_snapshot("node-3", "snap_n3_7p")
+        .unwrap();
+
+    let cdr = CommitDecisionRecord {
+        restore_id: journal.restore_id.clone(),
+        backup_id: "bak_7p".to_string(),
+        old_generation: Some("41".to_string()),
+        new_generation: "42".to_string(),
+        required_participants: vec![
+            "postgres_data".to_string(),
+            "spine_storage".to_string(),
+            "spine_ssh".to_string(),
+            "coordinator".to_string(),
+            "node-1".to_string(),
+            "node-2".to_string(),
+            "node-3".to_string(),
+        ],
+        staged_manifest_digests: BTreeMap::new(),
+        decision_timestamp_nanos: 1_000_000,
+        schema_identity: "spine-backup-v2".to_string(),
+        decision_token: "tok_7p".to_string(),
+    };
+    journal.persist(RestorePhase::CommitDecision(cdr)).unwrap();
+    journal.persist(RestorePhase::Committed).unwrap();
+
+    // First verify local sync recovery retains Committed journal
+    let _ = RestoreJournal::handle_startup_recovery_sync(&root).unwrap();
+    assert!(RestoreJournal::load(&root).unwrap().is_some());
+
+    let coord_client = CoordinatorClient::new(coord_addr);
+    let nodes = vec![
+        ("node-1".to_string(), n1_addr),
+        ("node-2".to_string(), n2_addr),
+        ("node-3".to_string(), n3_addr),
+    ];
+    let db_ok = |_target: &str| Ok(Some("42".to_string()));
+
+    // RECOVERY RUN 1: Fails at node-2 FinalizeVolumeRestore! Coordinator and node-1 already committed & finalized cleanly!
+    let run1 = RestoreJournal::handle_startup_recovery_cluster_with_db_check(
+        &root,
+        Some(db_ok),
+        None,
+        Some(&coord_client),
+        &nodes,
+    )
+    .await;
+    assert!(
+        run1.is_err(),
+        "Run 1 must fail closed on node-2 finalize error"
+    );
+    assert!(run1.unwrap_err().to_string().contains("finalize_restore"));
+
+    // Verify journal still exists and partial durable convergence state was persisted!
+    let j1 = RestoreJournal::load(&root)
+        .unwrap()
+        .expect("Journal must persist across partial failure");
+    assert!(j1.participant_progress["coordinator"].finalized);
+    assert!(j1.participant_progress["node-1"].finalized);
+    assert!(j1.participant_progress["node-2"].converged);
+    assert!(!j1.participant_progress["node-2"].finalized);
+
+    // RECOVERY RUN 2 (fresh restart simulation): node-2 finalize now succeeds, fails at node-3 WRONG identity!
+    let run2 = RestoreJournal::handle_startup_recovery_cluster_with_db_check(
+        &root,
+        Some(db_ok),
+        None,
+        Some(&coord_client),
+        &nodes,
+    )
+    .await;
+    assert!(
+        run2.is_err(),
+        "Run 2 must fail closed on node-3 wrong participant identity"
+    );
+    assert!(run2.unwrap_err().to_string().contains("rogue-node-9"));
+    let j2 = RestoreJournal::load(&root)
+        .unwrap()
+        .expect("Journal must persist when node-3 identity fails");
+    assert!(j2.participant_progress["node-2"].finalized);
+    assert!(!j2
+        .participant_progress
+        .get("node-3")
+        .map(|s| s.converged)
+        .unwrap_or(false));
+
+    // Fix node-3 identity and execute RECOVERY RUN 3 (fresh restart)
+    *n3.node_id.write().unwrap() = "node-3".to_string();
+    let run3 = RestoreJournal::handle_startup_recovery_cluster_with_db_check(
+        &root,
+        Some(db_ok),
+        None,
+        Some(&coord_client),
+        &nodes,
+    )
+    .await;
+    assert!(
+        run3.is_ok(),
+        "Run 3 must converge and finalize all 7 participants: {:?}",
+        run3
+    );
+
+    // Journal MUST NOW BE REMOVED and all cluster participants converged & finalized!
+    assert!(
+        RestoreJournal::load(&root).unwrap().is_none(),
+        "Journal must be cleared ONLY after all 7 participants converged and finalized"
+    );
+    assert_eq!(n1.fencing_generation.load(Ordering::SeqCst), 42);
+    assert!(n1.finalized.load(Ordering::SeqCst));
+    assert!(n2.finalized.load(Ordering::SeqCst));
+    assert!(n3.finalized.load(Ordering::SeqCst));
+    assert_eq!(coord_store.get_maintenance_status().1, 42);
+
+    coord_stop.store(true, Ordering::SeqCst);
+    n1_stop.store(true, Ordering::SeqCst);
+    n2_stop.store(true, Ordering::SeqCst);
+    n3_stop.store(true, Ordering::SeqCst);
+}
+
+#[tokio::test]
+async fn test_rpc_client_rejects_oversized_frame_without_allocation() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut lb = [0u8; 4];
+            let _ = stream.read_exact(&mut lb).await;
+            let req_len = u32::from_be_bytes(lb) as usize;
+            let mut req_body = vec![0u8; req_len];
+            let _ = stream.read_exact(&mut req_body).await;
+            // Send malicious 512 MiB length header without body
+            let bogus_len = (512u32 * 1024 * 1024).to_be_bytes();
+            let _ = stream.write_all(&bogus_len).await;
+            let _ = stream.flush().await;
+        }
+    });
+
+    let client = CoordinatorClient::new(addr);
+    let err = client.query_node_details().await.unwrap_err();
+    assert!(
+        err.to_string().contains("exceeds maximum bound"),
+        "Expected oversized frame bound rejection, got: {}",
+        err
+    );
 }

@@ -6,7 +6,7 @@ use spine_cluster::heartbeat::{
 };
 use spine_cluster::node::{FailureDomain, NodeStatus, StorageNodeInfo};
 use spine_cluster::placement::PlacementScheduler;
-use spine_cluster::protocol::{ClusterRpcRequest, ClusterRpcResponse};
+use spine_cluster::protocol::{ClusterRpcRequest, ClusterRpcResponse, MAX_CLUSTER_RPC_FRAME_BYTES};
 use spine_cluster::store::{CoordinatorStore, RepositoryMeta};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -148,6 +148,13 @@ async fn handle_coordinator_connection(
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len == 0 || len > MAX_CLUSTER_RPC_FRAME_BYTES {
+        anyhow::bail!(
+            "Cluster RPC frame size {} bytes exceeds bound {}",
+            len,
+            MAX_CLUSTER_RPC_FRAME_BYTES
+        );
+    }
 
     let mut body = vec![0u8; len];
     stream.read_exact(&mut body).await?;

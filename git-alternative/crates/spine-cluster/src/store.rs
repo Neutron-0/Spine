@@ -146,7 +146,23 @@ pub struct FileBackedCoordinatorStore {
 }
 
 #[cfg(windows)]
-fn platform_atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+fn is_write_through_unsupported(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(650) | Some(50) | Some(1))
+}
+
+#[cfg(windows)]
+fn win32_sync_file_handle(path: &Path) {
+    if let Ok(file) = fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.sync_all();
+    }
+}
+
+#[cfg(windows)]
+fn platform_atomic_replace_inner(
+    from: &Path,
+    to: &Path,
+    write_through: bool,
+) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     let wide_from: Vec<u16> = from
         .as_os_str()
@@ -179,13 +195,24 @@ fn platform_atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
     const REPLACEFILE_WRITE_THROUGH: u32 = 0x1;
 
+    let move_flags = if write_through {
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
+    } else {
+        MOVEFILE_REPLACE_EXISTING
+    };
+    let replace_flags = if write_through {
+        REPLACEFILE_WRITE_THROUGH
+    } else {
+        0
+    };
+
     if to.exists() {
         let ret = unsafe {
             ReplaceFileW(
                 wide_to.as_ptr(),
                 wide_from.as_ptr(),
                 std::ptr::null(),
-                REPLACEFILE_WRITE_THROUGH,
+                replace_flags,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
             )
@@ -193,29 +220,31 @@ fn platform_atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
         if ret != 0 {
             return Ok(());
         }
-        let ret = unsafe {
-            MoveFileExW(
-                wide_from.as_ptr(),
-                wide_to.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        };
+        let ret = unsafe { MoveFileExW(wide_from.as_ptr(), wide_to.as_ptr(), move_flags) };
         if ret != 0 {
             return Ok(());
         }
         Err(std::io::Error::last_os_error())
     } else {
-        let ret = unsafe {
-            MoveFileExW(
-                wide_from.as_ptr(),
-                wide_to.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        };
+        let ret = unsafe { MoveFileExW(wide_from.as_ptr(), wide_to.as_ptr(), move_flags) };
         if ret != 0 {
             return Ok(());
         }
         Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn platform_atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    win32_sync_file_handle(from);
+    match platform_atomic_replace_inner(from, to, true) {
+        Ok(()) => Ok(()),
+        Err(err) if is_write_through_unsupported(&err) => {
+            platform_atomic_replace_inner(from, to, false)?;
+            win32_sync_file_handle(to);
+            Ok(())
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -894,6 +923,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
             match staged.take() {
                 Some((id, gen, bytes)) => {
                     if id != snapshot_id {
+                        *staged = Some((id.clone(), gen, bytes));
                         bail!(
                             "Staged restore snapshot ID mismatch: expected {}, staged {}",
                             snapshot_id,
@@ -901,6 +931,7 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
                         );
                     }
                     if gen != fencing_generation {
+                        *staged = Some((id, gen, bytes));
                         bail!(
                             "Staged restore fencing generation mismatch: expected {}, staged {}",
                             fencing_generation,
@@ -909,7 +940,37 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
                     }
                     bytes
                 }
-                None => bail!("No staged restore found for coordinator"),
+                None => {
+                    if let Some(ref p) = self.path {
+                        let parent_dir = p.parent().unwrap_or_else(|| Path::new("."));
+                        let staged_path = parent_dir
+                            .join(format!(".staged_coordinator_restore_{}.json", snapshot_id));
+                        if staged_path.exists() {
+                            let bytes = fs::read(&staged_path)?;
+                            let (id, gen, payload): (String, u64, Vec<u8>) =
+                                serde_json::from_slice(&bytes)?;
+                            if id != snapshot_id {
+                                bail!(
+                                    "Disk staged restore snapshot ID mismatch: expected {}, staged {}",
+                                    snapshot_id,
+                                    id
+                                );
+                            }
+                            if gen != fencing_generation {
+                                bail!(
+                                    "Disk staged restore fencing generation mismatch: expected {}, staged {}",
+                                    fencing_generation,
+                                    gen
+                                );
+                            }
+                            payload
+                        } else {
+                            bail!("No staged restore found for coordinator");
+                        }
+                    } else {
+                        bail!("No staged restore found for coordinator");
+                    }
+                }
             }
         };
 

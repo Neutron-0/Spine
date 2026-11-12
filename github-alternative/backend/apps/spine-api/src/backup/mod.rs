@@ -62,12 +62,118 @@ pub struct BackupParticipantRecord {
     pub archive_rel_path: String,
 }
 
+/// Bounded-memory ephemeral AEAD-encrypted temporary payload store (AES-256-GCM).
+/// Ensures zero plaintext bytes are written to disk while bounding RAM to O(chunk_size).
+#[derive(Debug)]
+pub struct EphemeralEncryptedTemp {
+    pub file: tempfile::NamedTempFile,
+    ephemeral_key: [u8; 32],
+    pub byte_length: u64,
+    pub sha256_checksum: String,
+}
+
+impl Drop for EphemeralEncryptedTemp {
+    fn drop(&mut self) {
+        for b in &mut self.ephemeral_key {
+            unsafe {
+                std::ptr::write_volatile(b, 0);
+            }
+        }
+    }
+}
+
+impl EphemeralEncryptedTemp {
+    /// Generates an ephemeral 256-bit CSPRNG key and creates an AES-256-GCM streaming writer backed by a TempFile.
+    pub fn begin(
+        chunk_size: u32,
+    ) -> Result<
+        (
+            tempfile::NamedTempFile,
+            [u8; 32],
+            v2::EncryptingWriter<std::fs::File>,
+        ),
+        ForgeError,
+    > {
+        use ring::rand::{SecureRandom, SystemRandom};
+        let mut key = [0u8; 32];
+        SystemRandom::new()
+            .fill(&mut key)
+            .map_err(|_| ForgeError::Internal("Failed to generate ephemeral CSPRNG key".into()))?;
+        let tmp = tempfile::NamedTempFile::new().map_err(|e| {
+            ForgeError::Internal(format!(
+                "Failed to create ephemeral encrypted temp file: {}",
+                e
+            ))
+        })?;
+        let handle = tmp.reopen().map_err(|e| {
+            ForgeError::Internal(format!(
+                "Failed to reopen ephemeral encrypted temp file: {}",
+                e
+            ))
+        })?;
+        let writer = v2::EncryptingWriter::new_ephemeral(handle, &key, chunk_size)?;
+        Ok((tmp, key, writer))
+    }
+
+    pub fn from_finished(
+        file: tempfile::NamedTempFile,
+        key: [u8; 32],
+        summary: v2::StreamSummary,
+    ) -> Self {
+        Self {
+            file,
+            ephemeral_key: key,
+            byte_length: summary.total_plaintext_bytes,
+            sha256_checksum: hex::encode(summary.stream_sha256),
+        }
+    }
+
+    /// Streams raw bytes from an `io::Read` source through AES-256-GCM into an encrypted temp file.
+    pub fn from_reader<R: Read>(mut reader: R, chunk_size: u32) -> Result<Self, ForgeError> {
+        let (tmp, mut key, mut writer) = Self::begin(chunk_size)?;
+        let res = (|| {
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = reader
+                    .read(&mut buf)
+                    .map_err(|e| ForgeError::Internal(format!("Read error: {}", e)))?;
+                if n == 0 {
+                    break;
+                }
+                writer.write_all(&buf[..n]).map_err(|e| {
+                    ForgeError::Internal(format!("Encrypted staging write error: {}", e))
+                })?;
+            }
+            writer.finish()
+        })();
+        match res {
+            Ok(summary) => Ok(Self::from_finished(tmp, key, summary)),
+            Err(e) => {
+                for b in &mut key {
+                    unsafe {
+                        std::ptr::write_volatile(b, 0);
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    pub fn open_reader(&self) -> Result<v2::DecryptingReader<std::fs::File>, ForgeError> {
+        let file = self.file.reopen().map_err(|e| {
+            ForgeError::Internal(format!("Failed to reopen ephemeral encrypted file: {}", e))
+        })?;
+        v2::DecryptingReader::new_with_raw_key(file, &self.ephemeral_key)
+    }
+}
+
 /// Source of raw payload bytes for a backup participant.
-/// Supports both in-memory buffers (for small metadata/keys) and streamed disk files (for large volumes).
-#[derive(Clone, Debug)]
+/// Supports in-memory buffers (for small keys), streamed disk files, and bounded-memory ephemeral AEAD streams.
+#[derive(Debug)]
 pub enum ParticipantPayloadSource {
     Memory(Vec<u8>),
     File(PathBuf),
+    EncryptedTemp(EphemeralEncryptedTemp),
 }
 
 /// Recursively copies a directory and all its contents.
@@ -148,7 +254,28 @@ pub fn sync_dir(dir: &Path) -> Result<(), ForgeError> {
 }
 
 #[cfg(windows)]
-fn platform_atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+fn is_write_through_unsupported(err: &std::io::Error) -> bool {
+    // Win32 OS Error 650 (ERROR_DEVICE_OBJECT_PARAMETER_INVALID): returned when a
+    // layered/sandboxed/virtualized volume lacks an attached storage DeviceObject
+    // for write-through rename IRPs (SL_WRITE_THROUGH).
+    // OS Error 50 (ERROR_NOT_SUPPORTED) and OS Error 1 (ERROR_INVALID_FUNCTION)
+    // similarly indicate the underlying volume filter rejects write-through rename flags.
+    matches!(err.raw_os_error(), Some(650) | Some(50) | Some(1))
+}
+
+#[cfg(windows)]
+fn win32_sync_file_handle(path: &Path) {
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.sync_all();
+    }
+}
+
+#[cfg(windows)]
+fn platform_atomic_replace_inner(
+    from: &Path,
+    to: &Path,
+    write_through: bool,
+) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     let wide_from: Vec<u16> = from
         .as_os_str()
@@ -181,13 +308,24 @@ fn platform_atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
     const REPLACEFILE_WRITE_THROUGH: u32 = 0x1;
 
+    let move_flags = if write_through {
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
+    } else {
+        MOVEFILE_REPLACE_EXISTING
+    };
+    let replace_flags = if write_through {
+        REPLACEFILE_WRITE_THROUGH
+    } else {
+        0
+    };
+
     if to.exists() {
         let ret = unsafe {
             ReplaceFileW(
                 wide_to.as_ptr(),
                 wide_from.as_ptr(),
                 std::ptr::null(),
-                REPLACEFILE_WRITE_THROUGH,
+                replace_flags,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
             )
@@ -195,29 +333,67 @@ fn platform_atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
         if ret != 0 {
             return Ok(());
         }
-        let ret = unsafe {
-            MoveFileExW(
-                wide_from.as_ptr(),
-                wide_to.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        };
+        let ret = unsafe { MoveFileExW(wide_from.as_ptr(), wide_to.as_ptr(), move_flags) };
         if ret != 0 {
             return Ok(());
         }
         Err(std::io::Error::last_os_error())
     } else {
-        let ret = unsafe {
-            MoveFileExW(
-                wide_from.as_ptr(),
-                wide_to.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        };
+        let ret = unsafe { MoveFileExW(wide_from.as_ptr(), wide_to.as_ptr(), move_flags) };
         if ret != 0 {
             return Ok(());
         }
         Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn platform_atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    win32_sync_file_handle(from);
+    match platform_atomic_replace_inner(from, to, true) {
+        Ok(()) => Ok(()),
+        Err(err) if is_write_through_unsupported(&err) => {
+            tracing::warn!(
+                "Win32 write-through atomic replace rejected ({}) replacing {} -> {}; retrying synced atomic rename without WRITE_THROUGH",
+                err,
+                from.display(),
+                to.display()
+            );
+            platform_atomic_replace_inner(from, to, false)?;
+            win32_sync_file_handle(to);
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Executes strict write-through atomic replacement without fallback, for verifying hardware write-through support.
+pub fn safe_atomic_replace_strict_writethrough(from: &Path, to: &Path) -> Result<(), ForgeError> {
+    #[cfg(windows)]
+    {
+        win32_sync_file_handle(from);
+        platform_atomic_replace_inner(from, to, true).map_err(|e| {
+            ForgeError::Internal(format!(
+                "Strict write-through atomic replace failed from {} to {}: {}",
+                from.display(),
+                to.display(),
+                e
+            ))
+        })?;
+        if !to.exists() || fs::metadata(to).is_err() {
+            return Err(ForgeError::Internal(format!(
+                "Readback verification failed after replacing {}",
+                to.display()
+            )));
+        }
+        if let Some(parent) = to.parent() {
+            sync_dir(parent)?;
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        safe_atomic_replace(from, to)
     }
 }
 
@@ -449,7 +625,7 @@ impl StagedRestoreSession {
     /// Finalizes the restore session after all participants have been verified.
     /// Deletes the retained old generation directory and removes the restore journal.
     pub fn finalize(mut self) -> Result<RestoreReport, ForgeError> {
-        self.journal.persist(RestorePhase::Committed)?;
+        self.journal.persist(RestorePhase::Completed)?;
         let old_dir = self
             .target_storage_root
             .join(format!(".old_generation_{}", self.journal.restore_id));
@@ -585,12 +761,11 @@ impl BackupManager {
         res
     }
 
-    /// Captures the complete storage directory into an in-memory .tar.gz archive payload without touching disk.
-    /// Returns the raw compressed bytes and its SHA-256 digest, ensuring zero plaintext intermediate files on disk.
-    pub fn capture_storage_snapshot_memory(
+    fn write_storage_snapshot_tar_gz<W: Write>(
         storage_root: &Path,
-    ) -> Result<(Vec<u8>, String), ForgeError> {
-        let enc = GzEncoder::new(Vec::new(), Compression::default());
+        sink: W,
+    ) -> Result<W, ForgeError> {
+        let enc = GzEncoder::new(sink, Compression::default());
         let mut tar = tar::Builder::new(enc);
 
         let mut file_paths = Vec::new();
@@ -624,9 +799,40 @@ impl BackupManager {
         let enc = tar
             .into_inner()
             .map_err(|e| ForgeError::Internal(e.to_string()))?;
-        let bytes = enc
-            .finish()
-            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        enc.finish()
+            .map_err(|e| ForgeError::Internal(e.to_string()))
+    }
+
+    /// Streams the storage directory .tar.gz snapshot through AES-256-GCM in O(chunk_size) RAM.
+    /// Zero plaintext intermediate bytes ever hit disk.
+    pub fn capture_storage_snapshot_encrypted(
+        storage_root: &Path,
+        chunk_size: u32,
+    ) -> Result<EphemeralEncryptedTemp, ForgeError> {
+        let (tmp, mut key, enc_writer) = EphemeralEncryptedTemp::begin(chunk_size)?;
+        let res = (|| {
+            let enc_writer = Self::write_storage_snapshot_tar_gz(storage_root, enc_writer)?;
+            enc_writer.finish()
+        })();
+        match res {
+            Ok(summary) => Ok(EphemeralEncryptedTemp::from_finished(tmp, key, summary)),
+            Err(e) => {
+                for b in &mut key {
+                    unsafe {
+                        std::ptr::write_volatile(b, 0);
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Captures the complete storage directory into an in-memory .tar.gz archive payload without touching disk.
+    /// Returns the raw compressed bytes and its SHA-256 digest, ensuring zero plaintext intermediate files on disk.
+    pub fn capture_storage_snapshot_memory(
+        storage_root: &Path,
+    ) -> Result<(Vec<u8>, String), ForgeError> {
+        let bytes = Self::write_storage_snapshot_tar_gz(storage_root, Vec::new())?;
 
         use sha2::Sha256;
         let mut hasher = Sha256::new();
@@ -646,43 +852,7 @@ impl BackupManager {
         fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
 
         let file = File::create(dest_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
-        let enc = GzEncoder::new(file, Compression::default());
-        let mut tar = tar::Builder::new(enc);
-
-        let mut file_paths = Vec::new();
-        if storage_root.exists() {
-            Self::collect_files_recursive(storage_root, storage_root, &mut file_paths)?;
-        }
-        file_paths.sort_by(|a, b| a.0.cmp(&b.0));
-
-        for (rel_path, abs_path) in file_paths {
-            if rel_path.starts_with(".old_generation_")
-                || rel_path.starts_with(".old_ssh_")
-                || rel_path.starts_with(".staged_generation_")
-                || rel_path.starts_with(".tmp")
-                || rel_path.starts_with(".spine_restore_control")
-                || rel_path == RestoreJournal::JOURNAL_FILE_NAME
-            {
-                continue;
-            }
-
-            let meta = fs::metadata(&abs_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
-            let mut f =
-                fs::File::open(&abs_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
-            let mut header = tar::Header::new_gnu();
-            header.set_size(meta.len());
-            header.set_mode(0o644);
-            header.set_cksum();
-            tar.append_data(&mut header, &rel_path, &mut f)
-                .map_err(|e| ForgeError::Internal(e.to_string()))?;
-        }
-
-        let enc = tar
-            .into_inner()
-            .map_err(|e| ForgeError::Internal(e.to_string()))?;
-        let mut file = enc
-            .finish()
-            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut file = Self::write_storage_snapshot_tar_gz(storage_root, file)?;
         file.flush()
             .map_err(|e| ForgeError::Internal(e.to_string()))?;
         file.sync_all()
@@ -995,9 +1165,15 @@ impl BackupManager {
                     ForgeError::Internal(format!("Failed to create temp staging directory: {}", e))
                 })?;
 
-            let dec_reader = v2::DecryptingReader::new(reader, pass)?;
-            let dec = GzDecoder::new(dec_reader);
-            Self::unpack_archive_to_session(dec, input_path, target_storage_root, staging_dir)
+            let mut dec_reader = v2::DecryptingReader::new(reader, pass)?;
+            let dec = GzDecoder::new(&mut dec_reader);
+            let session =
+                Self::unpack_archive_to_session(dec, input_path, target_storage_root, staging_dir)?;
+            if let Err(e) = dec_reader.verify_to_eof() {
+                let _ = RestoreJournal::remove(target_storage_root);
+                return Err(e);
+            }
+            Ok(session)
         } else if &magic == BACKUP_MAGIC {
             let pass = passphrase.ok_or_else(|| {
                 ForgeError::Internal(
@@ -1637,6 +1813,15 @@ impl BackupManager {
                     p_header.set_mode(0o644);
                     p_header.set_cksum();
                     tar.append_data(&mut p_header, &record.archive_rel_path, &mut f)
+                        .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                }
+                ParticipantPayloadSource::EncryptedTemp(enc_tmp) => {
+                    let mut p_header = tar::Header::new_gnu();
+                    p_header.set_size(enc_tmp.byte_length);
+                    p_header.set_mode(0o600);
+                    p_header.set_cksum();
+                    let mut dec_reader = enc_tmp.open_reader()?;
+                    tar.append_data(&mut p_header, &record.archive_rel_path, &mut dec_reader)
                         .map_err(|e| ForgeError::Internal(e.to_string()))?;
                 }
             }

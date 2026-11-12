@@ -69,6 +69,22 @@ pub enum RestorePhase {
     Failed(String),
 }
 
+/// Durable per-participant recovery, convergence, and finalization state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ParticipantRecoveryState {
+    pub participant_id: String,
+    #[serde(default)]
+    pub snapshot_id: Option<String>,
+    #[serde(default)]
+    pub converged: bool,
+    #[serde(default)]
+    pub finalized: bool,
+    #[serde(default)]
+    pub verified_generation: Option<String>,
+    #[serde(default)]
+    pub updated_at_nanos: i64,
+}
+
 /// Durable cross-resource restoration journal persisted as `.spine_restore_control/restore_journal.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestoreJournal {
@@ -87,6 +103,8 @@ pub struct RestoreJournal {
     pub published_participants: Vec<String>,
     #[serde(default)]
     pub acknowledgements: BTreeMap<String, ParticipantAcknowledgement>,
+    #[serde(default)]
+    pub participant_progress: BTreeMap<String, ParticipantRecoveryState>,
     #[serde(default)]
     pub commit_decision: Option<CommitDecisionRecord>,
     #[serde(default)]
@@ -124,9 +142,114 @@ impl RestoreJournal {
             updated_at_nanos: now,
             published_participants: Vec::new(),
             acknowledgements: BTreeMap::new(),
+            participant_progress: BTreeMap::new(),
             commit_decision: None,
             sequence_number: 1,
         }
+    }
+
+    /// Parse numeric cluster fencing generation with checked bounds (>= 1, valid u64).
+    /// Fails closed on empty, zero, malformed, or overflowing strings.
+    pub fn parse_generation_u64(gen_str: &str) -> Result<u64, ForgeError> {
+        let trimmed = gen_str.trim();
+        if trimmed.is_empty() {
+            return Err(ForgeError::Internal(
+                "FATAL RESTORE RECOVERY FAILURE: Target generation token is empty".into(),
+            ));
+        }
+        let parsed = trimmed.parse::<u64>().map_err(|e| {
+            ForgeError::Internal(format!(
+                "FATAL RESTORE RECOVERY FAILURE: Malformed or overflowing generation token '{}': {}",
+                trimmed, e
+            ))
+        })?;
+        if parsed == 0 {
+            return Err(ForgeError::Internal(
+                "FATAL RESTORE RECOVERY FAILURE: Numeric fencing generation '0' is invalid (must be >= 1)".into(),
+            ));
+        }
+        Ok(parsed)
+    }
+
+    /// Durably record the snapshot ID bound to a participant before CommitDecision.
+    pub fn record_participant_snapshot(
+        &mut self,
+        participant_id: &str,
+        snapshot_id: &str,
+    ) -> Result<(), ForgeError> {
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let entry = self
+            .participant_progress
+            .entry(participant_id.to_string())
+            .or_insert_with(|| ParticipantRecoveryState {
+                participant_id: participant_id.to_string(),
+                snapshot_id: None,
+                converged: false,
+                finalized: false,
+                verified_generation: None,
+                updated_at_nanos: now,
+            });
+        entry.snapshot_id = Some(snapshot_id.to_string());
+        entry.updated_at_nanos = now;
+        self.persist(self.phase.clone())
+    }
+
+    /// Update and persist per-participant recovery convergence & finalization progress durably.
+    pub fn record_participant_recovery(
+        &mut self,
+        participant_id: &str,
+        converged: bool,
+        finalized: bool,
+        verified_generation: Option<&str>,
+    ) -> Result<(), ForgeError> {
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let existing_snap = self
+            .participant_progress
+            .get(participant_id)
+            .and_then(|s| s.snapshot_id.clone());
+        let state = ParticipantRecoveryState {
+            participant_id: participant_id.to_string(),
+            snapshot_id: existing_snap,
+            converged,
+            finalized,
+            verified_generation: verified_generation.map(|s| s.to_string()),
+            updated_at_nanos: now,
+        };
+        let next_phase = self.phase.clone();
+        self.participant_progress
+            .insert(participant_id.to_string(), state);
+        self.persist(next_phase)
+    }
+
+    /// Resolve exact staged/committed snapshot ID for a cluster participant across restarts.
+    pub fn snapshot_id_for_participant(&self, participant_id: &str) -> Option<String> {
+        if let Some(snap) = self
+            .participant_progress
+            .get(participant_id)
+            .and_then(|s| s.snapshot_id.clone())
+        {
+            if !snap.trim().is_empty() {
+                return Some(snap);
+            }
+        }
+        if let Some(ack) = self.acknowledgements.get(participant_id) {
+            let rec_id = &ack.durable_staging_record_id;
+            if let Some(rest) = rec_id.strip_prefix(".staged_coordinator_restore_") {
+                if let Some(snap) = rest.strip_suffix(".json") {
+                    if !snap.trim().is_empty() {
+                        return Some(snap.to_string());
+                    }
+                }
+            }
+            if let Some(rest) = rec_id.strip_prefix(".staged_volume_") {
+                if let Some((snap, _)) = rest.split_once('/') {
+                    if !snap.trim().is_empty() {
+                        return Some(snap.to_string());
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Read generation identity from live storage root.
@@ -530,7 +653,6 @@ impl RestoreJournal {
                     ));
                 }
             } else if existing.commit_decision.is_some()
-                && existing.phase != RestorePhase::Committed
                 && existing.phase != RestorePhase::Completed
             {
                 // Prevent starting or persisting a different restore over an unrecovered committed restore
@@ -598,6 +720,8 @@ impl RestoreJournal {
             || readback_journal.sequence_number != candidate.sequence_number
             || readback_journal.phase != candidate.phase
             || readback_journal.acknowledgements.len() != candidate.acknowledgements.len()
+            || readback_journal.participant_progress != candidate.participant_progress
+            || readback_journal.published_participants != candidate.published_participants
             || readback_journal.commit_decision != candidate.commit_decision
         {
             return Err(ForgeError::Internal(
@@ -636,11 +760,12 @@ impl RestoreJournal {
 
     /// Synchronous journal recovery.
     /// Cleans up uncommitted staging artifacts if interrupted before global commit decision.
-    /// Safely forward-recovers committed restores across all local storage participants; fails closed if unrecoverable.
+    /// Forward-recovers local storage & SSH while strictly RETAINING the durable journal for Committed and all post-decision phases
+    /// until full cluster convergence and finalization are confirmed.
     pub fn handle_startup_recovery_sync(storage_root: &Path) -> Result<Option<String>, ForgeError> {
-        if let Some(mut journal) = Self::load(storage_root)? {
+        if let Some(journal) = Self::load(storage_root)? {
             match journal.phase {
-                RestorePhase::Committed | RestorePhase::Completed => {
+                RestorePhase::Completed => {
                     let old_dir =
                         storage_root.join(format!(".old_generation_{}", journal.restore_id));
                     if old_dir.exists() {
@@ -676,7 +801,8 @@ impl RestoreJournal {
                 | RestorePhase::DatabaseRestored
                 | RestorePhase::StoragePublished
                 | RestorePhase::Published
-                | RestorePhase::Verified => {
+                | RestorePhase::Verified
+                | RestorePhase::Committed => {
                     // Global Commit Decision was reached! Irreversible forward recovery.
                     tracing::info!(
                         "Forward recovering committed restore '{}' in phase '{:?}' to target generation '{}'.",
@@ -735,12 +861,20 @@ impl RestoreJournal {
 
                     // 2. Resume / Complete SSH identity cutover if staged
                     let staged_ssh = journal.staging_storage_root.join("staged_ssh");
-                    let ssh_dir = storage_root.join(".ssh");
-                    if staged_ssh.exists() && ssh_dir.exists() {
+                    let ssh_dir = crate::ssh::host_key::resolve_ssh_dir(storage_root);
+                    if staged_ssh.exists() {
+                        std::fs::create_dir_all(&ssh_dir)
+                            .map_err(|e| ForgeError::Internal(e.to_string()))?;
                         if let Ok(entries) = std::fs::read_dir(&staged_ssh) {
                             for entry in entries.flatten() {
                                 let dst = ssh_dir.join(entry.file_name());
-                                let _ = std::fs::copy(entry.path(), &dst);
+                                std::fs::copy(entry.path(), &dst).map_err(|e| {
+                                    ForgeError::Internal(format!(
+                                        "Failed to forward-recover staged SSH file {}: {}",
+                                        dst.display(),
+                                        e
+                                    ))
+                                })?;
                             }
                         }
                     }
@@ -759,39 +893,14 @@ impl RestoreJournal {
                         let _ = std::fs::remove_dir_all(&journal.staging_storage_root);
                     }
 
-                    // Check if local storage is the ONLY required participant (e.g. standalone test)
-                    let is_single_storage_participant = match journal.commit_decision.as_ref() {
-                        Some(cdr) => {
-                            cdr.required_participants.len() == 1
-                                && cdr.required_participants[0] == "spine_storage"
-                        }
-                        None => false,
-                    };
-
-                    if is_single_storage_participant {
-                        let old_dir =
-                            storage_root.join(format!(".old_generation_{}", journal.restore_id));
-                        if old_dir.exists() {
-                            let _ = std::fs::remove_dir_all(&old_dir);
-                        }
-                        journal.persist(RestorePhase::Completed)?;
-                        let _ = Self::remove(storage_root);
-                        Ok(Some(format!(
-                            "Interrupted restore '{}' at '{:?}' was forward-recovered to Completed and rolled forward to target generation '{}'.",
-                            journal.restore_id,
-                            journal.phase,
-                            journal.target_generation
-                        )))
-                    } else {
-                        // DO NOT delete the journal! Multiple participants are required.
-                        // Full reconciliation across PostgreSQL, Coordinator, and Storage Nodes must complete in handle_startup_recovery_cluster.
-                        Ok(Some(format!(
-                            "Interrupted restore '{}' at '{:?}' forward-recovered local storage to target generation '{}'; awaiting full cluster participant convergence.",
-                            journal.restore_id,
-                            journal.phase,
-                            journal.target_generation
-                        )))
-                    }
+                    // Preserve journal and commit_decision across ALL post-decision phases (including Committed)
+                    // until handle_startup_recovery_cluster verifies and finalizes every required participant.
+                    Ok(Some(format!(
+                        "Interrupted restore '{}' at '{:?}' forward-recovered local storage and rolled forward to target generation '{}'; journal retained until global convergence.",
+                        journal.restore_id,
+                        journal.phase,
+                        journal.target_generation
+                    )))
                 }
                 RestorePhase::Failed(ref reason) => {
                     if journal.commit_decision.is_none() {
@@ -818,25 +927,17 @@ impl RestoreJournal {
         }
     }
 
-    /// Asynchronous crash detection, cleanup and cross-resource generation verification.
-    /// Checks both the durable journal file AND database generation identity.
-    /// FAILS CLOSED if incomplete restoration or generation mismatch is detected.
-    pub async fn handle_startup_recovery(
+    /// Database generation verifier for cluster recovery.
+    pub async fn handle_startup_recovery_cluster_with_db_check<F>(
         storage_root: &Path,
-        pool: Option<&sqlx::PgPool>,
-    ) -> Result<Option<String>, ForgeError> {
-        Self::handle_startup_recovery_cluster(storage_root, pool, None, &[]).await
-    }
-
-    /// Asynchronous crash detection, cleanup and full cluster generation verification across all 7 participants.
-    /// Checks durable journal, database generation identity, coordinator generation, and storage nodes.
-    /// FAILS CLOSED if incomplete restoration or generation mismatch is detected.
-    pub async fn handle_startup_recovery_cluster(
-        storage_root: &Path,
+        db_check: Option<F>,
         pool: Option<&sqlx::PgPool>,
         coordinator: Option<&crate::CoordinatorClient>,
         storage_nodes: &[(String, String)],
-    ) -> Result<Option<String>, ForgeError> {
+    ) -> Result<Option<String>, ForgeError>
+    where
+        F: Fn(&str) -> Result<Option<String>, ForgeError> + Send + Sync,
+    {
         let sync_msg = Self::handle_startup_recovery_sync(storage_root)?;
 
         let journal_opt = Self::load(storage_root)?;
@@ -845,197 +946,450 @@ impl RestoreJournal {
 
         if let Some(mut journal) = journal_opt {
             let target_gen = journal.target_generation.clone();
-            let decision_opt = journal.commit_decision.clone();
-            let default_parts = vec![
-                "postgres_data".to_string(),
-                "spine_storage".to_string(),
-                "spine_ssh".to_string(),
-                "coordinator".to_string(),
-                "node-1".to_string(),
-                "node-2".to_string(),
-                "node-3".to_string(),
-            ];
-            let required_participants = decision_opt
-                .as_ref()
-                .map(|d| &d.required_participants)
-                .unwrap_or(&default_parts);
+            let decision = journal.commit_decision.clone().ok_or_else(|| {
+                ForgeError::Internal(format!(
+                    "FATAL RESTORE RECOVERY FAILURE: Post-decision restore journal '{}' in phase '{:?}' is missing durable CommitDecisionRecord",
+                    journal.restore_id, journal.phase
+                ))
+            })?;
 
-            // 1. Verify / Reconcile PostgreSQL Database
-            if required_participants.iter().any(|p| p == "postgres_data") {
-                if let Some(pool) = pool {
-                    let db_gen_res: Result<Option<(String,)>, _> = sqlx::query_as(
-                        "SELECT generation_token FROM _restore_generation WHERE id = 1",
-                    )
-                    .fetch_optional(pool)
-                    .await;
+            if decision.restore_id != journal.restore_id {
+                return Err(ForgeError::Internal(format!(
+                    "FATAL RESTORE RECOVERY FAILURE: CommitDecision restore_id '{}' != journal restore_id '{}'",
+                    decision.restore_id, journal.restore_id
+                )));
+            }
+            if decision.new_generation != target_gen {
+                return Err(ForgeError::Internal(format!(
+                    "FATAL RESTORE RECOVERY FAILURE: CommitDecision new_generation '{}' != journal target_generation '{}'",
+                    decision.new_generation, target_gen
+                )));
+            }
+            if decision.required_participants.is_empty() {
+                return Err(ForgeError::Internal(
+                    "FATAL RESTORE RECOVERY FAILURE: CommitDecision has empty required_participants"
+                        .into(),
+                ));
+            }
 
-                    match db_gen_res {
-                        Ok(Some((db_gen,))) => {
-                            if db_gen != target_gen {
+            let canonical_role = |p_id: &str| -> Result<&'static str, ForgeError> {
+                match p_id {
+                    "postgres_data" => Ok("postgres_data"),
+                    "spine_storage" => Ok("spine_storage"),
+                    "spine_ssh" => Ok("spine_ssh"),
+                    "coordinator" | "coordinator_data" => Ok("coordinator"),
+                    "node-1" | "storage_1_data" => Ok("node-1"),
+                    "node-2" | "storage_2_data" => Ok("node-2"),
+                    "node-3" | "storage_3_data" => Ok("node-3"),
+                    other => Err(ForgeError::Internal(format!(
+                        "FATAL RESTORE RECOVERY FAILURE: Unknown required participant '{}' in CommitDecisionRecord",
+                        other
+                    ))),
+                }
+            };
+
+            let mut needs_numeric_gen = coordinator.is_some() || !storage_nodes.is_empty();
+            for p_id in &decision.required_participants {
+                let role = canonical_role(p_id)?;
+                if role == "coordinator" || role.starts_with("node-") {
+                    needs_numeric_gen = true;
+                }
+            }
+
+            // Requirement 3: Parse target generation ONCE using checked conversion BEFORE making RPCs or mutating state
+            let expected_num_gen = if needs_numeric_gen {
+                Some(Self::parse_generation_u64(&target_gen)?)
+            } else {
+                None
+            };
+
+            let required_participants = decision.required_participants.clone();
+
+            for raw_p_id in &required_participants {
+                let role = canonical_role(raw_p_id)?;
+                let prev_progress = journal
+                    .participant_progress
+                    .get(raw_p_id)
+                    .cloned()
+                    .unwrap_or_default();
+
+                match role {
+                    "postgres_data" => {
+                        let db_gen_opt = if let Some(ref check_fn) = db_check {
+                            check_fn(&target_gen)?
+                        } else if let Some(pool) = pool {
+                            let row: Result<Option<(String,)>, _> = sqlx::query_as(
+                                "SELECT generation_token FROM _restore_generation WHERE id = 1",
+                            )
+                            .fetch_optional(pool)
+                            .await;
+                            row.map_err(|e| {
+                                ForgeError::Internal(format!(
+                                    "FATAL RESTORE RECOVERY FAILURE: Failed to query PostgreSQL _restore_generation: {}",
+                                    e
+                                ))
+                            })?
+                            .map(|r| r.0)
+                        } else {
+                            return Err(ForgeError::Internal(
+                                "FATAL RESTORE RECOVERY FAILURE: Required participant 'postgres_data' cannot be verified because PostgreSQL pool is not connected"
+                                    .into(),
+                            ));
+                        };
+
+                        match db_gen_opt {
+                            Some(ref db_gen) if db_gen == &target_gen => {
+                                journal.record_participant_recovery(
+                                    raw_p_id,
+                                    true,
+                                    true,
+                                    Some(&target_gen),
+                                )?;
+                            }
+                            Some(db_gen) => {
                                 return Err(ForgeError::Internal(format!(
                                     "FATAL RESTORE RECOVERY FAILURE: PostgreSQL generation '{}' != target generation '{}'",
                                     db_gen, target_gen
                                 )));
                             }
-                        }
-                        Ok(None) => {
-                            return Err(ForgeError::Internal(format!(
-                                "FATAL RESTORE RECOVERY FAILURE: PostgreSQL missing _restore_generation record during recovery of restore '{}'",
-                                journal.restore_id
-                            )));
-                        }
-                        Err(e) => {
-                            return Err(ForgeError::Internal(format!(
-                                "FATAL RESTORE RECOVERY FAILURE: Failed to query PostgreSQL _restore_generation: {}",
-                                e
-                            )));
+                            None => {
+                                return Err(ForgeError::Internal(format!(
+                                    "FATAL RESTORE RECOVERY FAILURE: PostgreSQL missing _restore_generation record during recovery of restore '{}'",
+                                    journal.restore_id
+                                )));
+                            }
                         }
                     }
-                } else if let Ok(Some(cached)) =
-                    crate::db::DatabaseSelector::load_diagnostic_cache(storage_root)
-                {
-                    if cached.target_generation != target_gen {
+                    "spine_storage" => {
+                        let s_gen = Self::read_storage_generation(storage_root);
+                        if s_gen.as_deref() != Some(&target_gen) {
+                            return Err(ForgeError::Internal(format!(
+                                "FATAL RESTORE RECOVERY FAILURE: Storage generation '{:?}' != target generation '{}'",
+                                s_gen, target_gen
+                            )));
+                        }
+                        // Mark converged now; finalized happens once old_generation is cleaned up after all participants converge
+                        journal.record_participant_recovery(
+                            raw_p_id,
+                            true,
+                            prev_progress.finalized,
+                            Some(&target_gen),
+                        )?;
+                    }
+                    "spine_ssh" => {
+                        let ssh_dir = crate::ssh::host_key::resolve_ssh_dir(storage_root);
+                        let host_key = ssh_dir.join("host_key_ed25519");
+                        if !host_key.exists() {
+                            return Err(ForgeError::Internal(format!(
+                                "FATAL RESTORE RECOVERY FAILURE: Required SSH host key '{}' missing after restore",
+                                host_key.display()
+                            )));
+                        }
+                        let old_ssh = storage_root.join(format!(".old_ssh_{}", journal.restore_id));
+                        if old_ssh.exists() {
+                            std::fs::remove_dir_all(&old_ssh).map_err(|e| {
+                                ForgeError::Internal(format!(
+                                    "FATAL RESTORE RECOVERY FAILURE: Failed to finalize old SSH directory {}: {}",
+                                    old_ssh.display(),
+                                    e
+                                ))
+                            })?;
+                        }
+                        journal.record_participant_recovery(
+                            raw_p_id,
+                            true,
+                            true,
+                            Some(&target_gen),
+                        )?;
+                    }
+                    "coordinator" => {
+                        let coord = coordinator.ok_or_else(|| {
+                            ForgeError::Internal(format!(
+                                "FATAL RESTORE RECOVERY FAILURE: Required participant '{}' missing coordinator client configuration",
+                                raw_p_id
+                            ))
+                        })?;
+                        let expected_gen = expected_num_gen.expect("validated up front");
+                        let (in_maint, coord_gen, _, responding_id) =
+                            coord.query_node_details().await.map_err(|e| {
+                                ForgeError::Internal(format!(
+                                    "FATAL RESTORE RECOVERY FAILURE: Failed to query coordinator details: {}",
+                                    e
+                                ))
+                            })?;
+
+                        if responding_id.as_deref() != Some("coordinator") {
+                            return Err(ForgeError::Internal(format!(
+                                "FATAL RESTORE RECOVERY FAILURE: Coordinator endpoint at {} responded with identity {:?}, expected 'coordinator'",
+                                coord.addr(),
+                                responding_id
+                            )));
+                        }
+
+                        let snapshot_id = journal
+                            .snapshot_id_for_participant(raw_p_id)
+                            .or_else(|| journal.snapshot_id_for_participant("coordinator"))
+                            .unwrap_or_else(|| format!("rst_{}", journal.restore_id));
+
+                        if coord_gen != expected_gen || in_maint {
+                            match coord.query_staged_restore(&snapshot_id).await {
+                                Ok(Some(ack)) => {
+                                    if ack.participant_id != "coordinator" {
+                                        return Err(ForgeError::Internal(format!(
+                                            "FATAL RESTORE RECOVERY FAILURE: Staged coordinator acknowledgement identity '{}' != 'coordinator'",
+                                            ack.participant_id
+                                        )));
+                                    }
+                                    if !in_maint {
+                                        coord.enter_maintenance(expected_gen).await.map_err(|e| {
+                                            ForgeError::Internal(format!(
+                                                "FATAL RESTORE RECOVERY FAILURE: Failed to enter maintenance on coordinator before commit: {}",
+                                                e
+                                            ))
+                                        })?;
+                                    }
+                                    coord
+                                        .commit_restore(&snapshot_id, expected_gen)
+                                        .await
+                                        .map_err(|e| {
+                                            ForgeError::Internal(format!(
+                                                "FATAL RESTORE RECOVERY FAILURE: Failed to commit staged restore '{}' on coordinator: {}",
+                                                snapshot_id, e
+                                            ))
+                                        })?;
+
+                                    let (post_maint, post_gen, _, post_id) =
+                                        coord.query_node_details().await.map_err(|e| {
+                                            ForgeError::Internal(format!(
+                                                "FATAL RESTORE RECOVERY FAILURE: Failed post-commit verification query on coordinator: {}",
+                                                e
+                                            ))
+                                        })?;
+                                    if post_id.as_deref() != Some("coordinator")
+                                        || post_maint
+                                        || post_gen != expected_gen
+                                    {
+                                        return Err(ForgeError::Internal(format!(
+                                            "FATAL RESTORE RECOVERY FAILURE: Coordinator post-commit state invalid (id={:?}, maint={}, gen={}, expected={})",
+                                            post_id, post_maint, post_gen, expected_gen
+                                        )));
+                                    }
+                                }
+                                Ok(None) => {
+                                    return Err(ForgeError::Internal(format!(
+                                        "FATAL RESTORE RECOVERY FAILURE: Coordinator generation ({}) != target ({}) (in_maint={}) and no staged restore '{}'",
+                                        coord_gen, expected_gen, in_maint, snapshot_id
+                                    )));
+                                }
+                                Err(e) => {
+                                    return Err(ForgeError::Internal(format!(
+                                        "FATAL RESTORE RECOVERY FAILURE: Failed querying staged restore '{}' on coordinator: {}",
+                                        snapshot_id, e
+                                    )));
+                                }
+                            }
+                        }
+
+                        journal.record_participant_recovery(
+                            raw_p_id,
+                            true,
+                            prev_progress.finalized,
+                            Some(&target_gen),
+                        )?;
+
+                        if !prev_progress.finalized {
+                            coord.finalize_restore(&snapshot_id).await.map_err(|e| {
+                                ForgeError::Internal(format!(
+                                    "FATAL RESTORE RECOVERY FAILURE: Coordinator finalize_restore('{}') failed: {}",
+                                    snapshot_id, e
+                                ))
+                            })?;
+                            journal.record_participant_recovery(
+                                raw_p_id,
+                                true,
+                                true,
+                                Some(&target_gen),
+                            )?;
+                        }
+                    }
+                    expected_node_id if expected_node_id.starts_with("node-") => {
+                        let addr = storage_nodes
+                            .iter()
+                            .find(|(id, _)| id == expected_node_id)
+                            .map(|(_, a)| a)
+                            .ok_or_else(|| {
+                                ForgeError::Internal(format!(
+                                    "FATAL RESTORE RECOVERY FAILURE: Required storage node '{}' (participant '{}') missing from configured storage_nodes endpoints",
+                                    expected_node_id, raw_p_id
+                                ))
+                            })?;
+
+                        let expected_gen = expected_num_gen.expect("validated up front");
+                        let client = crate::ClusterNodeClient::new(addr.clone());
+                        let (in_maint, node_gen, _, responding_id) =
+                            client.query_node_details().await.map_err(|e| {
+                                ForgeError::Internal(format!(
+                                    "FATAL RESTORE RECOVERY FAILURE: Failed to query storage node '{}' at {}: {}",
+                                    expected_node_id, addr, e
+                                ))
+                            })?;
+
+                        if responding_id.as_deref() != Some(expected_node_id) {
+                            return Err(ForgeError::Internal(format!(
+                                "FATAL RESTORE RECOVERY FAILURE: Storage node at {} responded with ID {:?}, expected '{}'",
+                                addr, responding_id, expected_node_id
+                            )));
+                        }
+
+                        let snapshot_id = journal
+                            .snapshot_id_for_participant(raw_p_id)
+                            .or_else(|| journal.snapshot_id_for_participant(expected_node_id))
+                            .unwrap_or_else(|| format!("rst_{}", journal.restore_id));
+
+                        if node_gen != expected_gen || in_maint {
+                            match client.query_staged_restore(&snapshot_id).await {
+                                Ok(Some(ack)) => {
+                                    if ack.participant_id != expected_node_id
+                                        && ack.participant_id != *raw_p_id
+                                    {
+                                        return Err(ForgeError::Internal(format!(
+                                            "FATAL RESTORE RECOVERY FAILURE: Staged storage node ack identity '{}' != expected '{}'",
+                                            ack.participant_id, expected_node_id
+                                        )));
+                                    }
+                                    if !in_maint {
+                                        client.enter_maintenance(expected_gen).await.map_err(|e| {
+                                            ForgeError::Internal(format!(
+                                                "FATAL RESTORE RECOVERY FAILURE: Failed to enter maintenance on storage node '{}' before commit: {}",
+                                                expected_node_id, e
+                                            ))
+                                        })?;
+                                    }
+                                    client
+                                        .commit_restore(&snapshot_id, expected_gen)
+                                        .await
+                                        .map_err(|e| {
+                                            ForgeError::Internal(format!(
+                                                "FATAL RESTORE RECOVERY FAILURE: Failed to commit staged restore '{}' on storage node '{}': {}",
+                                                snapshot_id, expected_node_id, e
+                                            ))
+                                        })?;
+
+                                    let (post_maint, post_gen, _, post_id) =
+                                        client.query_node_details().await.map_err(|e| {
+                                            ForgeError::Internal(format!(
+                                                "FATAL RESTORE RECOVERY FAILURE: Failed post-commit query on storage node '{}': {}",
+                                                expected_node_id, e
+                                            ))
+                                        })?;
+                                    if post_id.as_deref() != Some(expected_node_id)
+                                        || post_maint
+                                        || post_gen != expected_gen
+                                    {
+                                        return Err(ForgeError::Internal(format!(
+                                            "FATAL RESTORE RECOVERY FAILURE: Storage node '{}' post-commit state invalid (id={:?}, maint={}, gen={}, expected={})",
+                                            expected_node_id, post_id, post_maint, post_gen, expected_gen
+                                        )));
+                                    }
+                                }
+                                Ok(None) => {
+                                    return Err(ForgeError::Internal(format!(
+                                        "FATAL RESTORE RECOVERY FAILURE: Storage node '{}' generation ({}) != target ({}) (in_maint={}) and no staged restore '{}'",
+                                        expected_node_id, node_gen, expected_gen, in_maint, snapshot_id
+                                    )));
+                                }
+                                Err(e) => {
+                                    return Err(ForgeError::Internal(format!(
+                                        "FATAL RESTORE RECOVERY FAILURE: Failed querying staged restore '{}' on storage node '{}': {}",
+                                        snapshot_id, expected_node_id, e
+                                    )));
+                                }
+                            }
+                        }
+
+                        journal.record_participant_recovery(
+                            raw_p_id,
+                            true,
+                            prev_progress.finalized,
+                            Some(&target_gen),
+                        )?;
+
+                        if !prev_progress.finalized {
+                            client.finalize_restore(&snapshot_id).await.map_err(|e| {
+                                ForgeError::Internal(format!(
+                                    "FATAL RESTORE RECOVERY FAILURE: Storage node '{}' finalize_restore('{}') failed: {}",
+                                    expected_node_id, snapshot_id, e
+                                ))
+                            })?;
+                            journal.record_participant_recovery(
+                                raw_p_id,
+                                true,
+                                true,
+                                Some(&target_gen),
+                            )?;
+                        }
+                    }
+                    other => {
                         return Err(ForgeError::Internal(format!(
-                            "FATAL RESTORE RECOVERY FAILURE: Cached DB generation '{}' != target generation '{}'",
-                            cached.target_generation, target_gen
+                            "FATAL RESTORE RECOVERY FAILURE: Unsupported participant role '{}'",
+                            other
                         )));
                     }
                 }
             }
 
-            // 2. Verify Local Storage Generation
-            if required_participants.iter().any(|p| p == "spine_storage") {
-                let s_gen = Self::read_storage_generation(storage_root);
-                if s_gen.as_deref() != Some(&target_gen) {
-                    return Err(ForgeError::Internal(format!(
-                        "FATAL RESTORE RECOVERY FAILURE: Storage generation '{:?}' != target generation '{}'",
-                        s_gen, target_gen
-                    )));
-                }
-            }
-
-            // 3. Verify SSH Host Key
-            if decision_opt
-                .as_ref()
-                .map(|d| d.required_participants.iter().any(|p| p == "spine_ssh"))
-                .unwrap_or(false)
-            {
-                let ssh_dir = crate::ssh::host_key::resolve_ssh_dir(storage_root);
-                let host_key = ssh_dir.join("host_key_ed25519");
-                if !host_key.exists() {
-                    return Err(ForgeError::Internal(format!(
-                        "FATAL RESTORE RECOVERY FAILURE: Required SSH host key '{}' missing after restore",
-                        host_key.display()
-                    )));
-                }
-            }
-
-            // 4. Verify / Reconcile Coordinator
-            if required_participants.iter().any(|p| p == "coordinator") {
-                if let Some(coord) = coordinator {
-                    let (_in_maint, coord_gen) =
-                        coord.query_maintenance_status().await.map_err(|e| {
-                            ForgeError::Internal(format!(
-                                "FATAL RESTORE RECOVERY FAILURE: Failed to query coordinator maintenance status: {}",
-                                e
-                            ))
-                        })?;
-
-                    let expected_num_gen = target_gen.parse::<u64>().unwrap_or(0);
-                    if coord_gen != expected_num_gen {
-                        let snapshot_id = format!("rst_{}", journal.restore_id);
-                        if let Ok(Some(_)) = coord.query_staged_restore(&snapshot_id).await {
-                            coord
-                                .commit_restore(&snapshot_id, expected_num_gen)
-                                .await
-                                .map_err(|e| {
-                                    ForgeError::Internal(format!(
-                                        "Failed to commit staged restore on coordinator: {}",
-                                        e
-                                    ))
-                                })?;
-                        } else {
-                            return Err(ForgeError::Internal(format!(
-                                "FATAL RESTORE RECOVERY FAILURE: Coordinator generation ({}) != target generation ({})",
-                                coord_gen, expected_num_gen
-                            )));
-                        }
-                    }
-
-                    let snapshot_id = format!("rst_{}", journal.restore_id);
-                    let _ = coord.finalize_restore(&snapshot_id).await;
-                }
-            }
-
-            // 5. Verify / Reconcile Storage Nodes
-            for node_id in required_participants {
-                if node_id.starts_with("node-") {
-                    let addr_opt = storage_nodes
-                        .iter()
-                        .find(|(id, _)| id == node_id)
-                        .map(|(_, addr)| addr);
-                    if let Some(addr) = addr_opt {
-                        let client = crate::ClusterNodeClient::new(addr.clone());
-                        let (_in_maint, node_gen, _, responding_id) =
-                            client.query_node_details().await.map_err(|e| {
-                                ForgeError::Internal(format!(
-                                    "FATAL RESTORE RECOVERY FAILURE: Failed to query storage node '{}' at {}: {}",
-                                    node_id, addr, e
-                                ))
-                            })?;
-
-                        if let Some(ref r_id) = responding_id {
-                            if r_id != node_id {
-                                return Err(ForgeError::Internal(format!(
-                                    "FATAL RESTORE RECOVERY FAILURE: Storage node at {} responded with '{}', expected '{}'",
-                                    addr, r_id, node_id
-                                )));
-                            }
-                        }
-
-                        let expected_num_gen = target_gen.parse::<u64>().unwrap_or(0);
-                        if node_gen != expected_num_gen {
-                            let snapshot_id = format!("rst_{}", journal.restore_id);
-                            if let Ok(Some(_)) = client.query_staged_restore(&snapshot_id).await {
-                                client
-                                    .commit_restore(&snapshot_id, expected_num_gen)
-                                    .await
-                                    .map_err(|e| {
-                                        ForgeError::Internal(format!(
-                                            "Failed to commit staged restore on storage node '{}': {}",
-                                            node_id, e
-                                        ))
-                                    })?;
-                            } else {
-                                return Err(ForgeError::Internal(format!(
-                                    "FATAL RESTORE RECOVERY FAILURE: Storage node '{}' generation ({}) != target generation ({})",
-                                    node_id, node_gen, expected_num_gen
-                                )));
-                            }
-                        }
-
-                        let snapshot_id = format!("rst_{}", journal.restore_id);
-                        let _ = client.finalize_restore(&snapshot_id).await;
-                    }
-                }
-            }
-
-            // All required participants have successfully converged!
+            // Finalize local storage old generation only after all required participants have converged
             let old_dir = storage_root.join(format!(".old_generation_{}", journal.restore_id));
             if old_dir.exists() {
-                let _ = std::fs::remove_dir_all(&old_dir);
+                std::fs::remove_dir_all(&old_dir).map_err(|e| {
+                    ForgeError::Internal(format!(
+                        "FATAL RESTORE RECOVERY FAILURE: Failed to finalize old generation directory {}: {}",
+                        old_dir.display(),
+                        e
+                    ))
+                })?;
             }
+            if required_participants.iter().any(|p| p == "spine_storage") {
+                journal.record_participant_recovery(
+                    "spine_storage",
+                    true,
+                    true,
+                    Some(&target_gen),
+                )?;
+            }
+
+            // Verify every single required participant is both converged and finalized before completing
+            for req_id in &required_participants {
+                let state = journal.participant_progress.get(req_id).ok_or_else(|| {
+                    ForgeError::Internal(format!(
+                        "FATAL RESTORE RECOVERY FAILURE: Required participant '{}' missing durable convergence state",
+                        req_id
+                    ))
+                })?;
+                if !state.converged
+                    || !state.finalized
+                    || state.verified_generation.as_deref() != Some(&target_gen)
+                {
+                    return Err(ForgeError::Internal(format!(
+                        "FATAL RESTORE RECOVERY FAILURE: Required participant '{}' did not finish convergence+finalization (converged={}, finalized={}, gen={:?})",
+                        req_id, state.converged, state.finalized, state.verified_generation
+                    )));
+                }
+            }
+
             journal.persist(RestorePhase::Completed)?;
-            let _ = Self::remove(storage_root);
+            Self::remove(storage_root)?;
             tracing::info!(
-                "Global restore '{}' successfully converged across all {} required participants. Journal removed.",
+                "Global restore '{}' successfully converged and finalized across all {} required participants. Journal removed.",
                 journal.restore_id,
                 required_participants.len()
             );
 
             return Ok(Some(format!(
-                "Global restore '{}' fully recovered, committed, and rolled forward across all required participants to target generation '{}'.",
-                journal.restore_id, target_gen
+                "Global restore '{}' fully recovered, committed, and rolled forward across all {} required participants to target generation '{}'.",
+                journal.restore_id,
+                required_participants.len(),
+                target_gen
             )));
         }
 
@@ -1099,14 +1453,25 @@ impl RestoreJournal {
             }
         }
 
+        // Parse numeric cluster fencing generation ONCE before RPCs if any cluster nodes configured
+        let expected_cluster_fencing_gen = if coordinator.is_some() || !storage_nodes.is_empty() {
+            match reconciled_storage_gen {
+                Some(ref s_gen) => Some(Self::parse_generation_u64(s_gen)?),
+                None => None,
+            }
+        } else {
+            None
+        };
+
         // Reconcile and verify coordinator generation if configured
         if let Some(coord) = coordinator {
-            let (in_maint, coord_gen) = coord.query_maintenance_status().await.map_err(|e| {
-                ForgeError::Internal(format!(
-                    "FATAL STARTUP BLOCKED: Failed to query coordinator maintenance status during recovery: {}",
-                    e
-                ))
-            })?;
+            let (in_maint, coord_gen, _, responding_id) =
+                coord.query_node_details().await.map_err(|e| {
+                    ForgeError::Internal(format!(
+                        "FATAL STARTUP BLOCKED: Failed to query coordinator details during recovery: {}",
+                        e
+                    ))
+                })?;
 
             if in_maint {
                 return Err(ForgeError::Internal(
@@ -1114,15 +1479,19 @@ impl RestoreJournal {
                         .to_string(),
                 ));
             }
+            if responding_id.as_deref() != Some("coordinator") {
+                return Err(ForgeError::Internal(format!(
+                    "FATAL STARTUP BLOCKED: Coordinator responded with identity {:?}, expected 'coordinator'",
+                    responding_id
+                )));
+            }
 
-            if let Some(ref s_gen) = reconciled_storage_gen {
-                if let Ok(expected_fencing_gen) = s_gen.parse::<u64>() {
-                    if coord_gen != expected_fencing_gen {
-                        return Err(ForgeError::Internal(format!(
-                            "FATAL STARTUP BLOCKED: Coordinator generation ({}) does not match cluster storage generation ({})",
-                            coord_gen, expected_fencing_gen
-                        )));
-                    }
+            if let Some(expected_fencing_gen) = expected_cluster_fencing_gen {
+                if coord_gen != expected_fencing_gen {
+                    return Err(ForgeError::Internal(format!(
+                        "FATAL STARTUP BLOCKED: Coordinator generation ({}) does not match cluster storage generation ({})",
+                        coord_gen, expected_fencing_gen
+                    )));
                 }
             }
         }
@@ -1155,18 +1524,47 @@ impl RestoreJournal {
                 }
             }
 
-            if let Some(ref s_gen) = reconciled_storage_gen {
-                if let Ok(expected_fencing_gen) = s_gen.parse::<u64>() {
-                    if node_gen != expected_fencing_gen {
-                        return Err(ForgeError::Internal(format!(
-                            "FATAL STARTUP BLOCKED: Storage node '{}' generation ({}) does not match cluster storage generation ({})",
-                            expected_id, node_gen, expected_fencing_gen
-                        )));
-                    }
+            if let Some(expected_fencing_gen) = expected_cluster_fencing_gen {
+                if node_gen != expected_fencing_gen {
+                    return Err(ForgeError::Internal(format!(
+                        "FATAL STARTUP BLOCKED: Storage node '{}' generation ({}) does not match cluster storage generation ({})",
+                        expected_id, node_gen, expected_fencing_gen
+                    )));
                 }
             }
         }
 
         Ok(sync_msg)
+    }
+
+    /// Asynchronous crash detection, cleanup and cross-resource generation verification.
+    /// Checks both the durable journal file AND database generation identity.
+    /// FAILS CLOSED if incomplete restoration or generation mismatch is detected.
+    pub async fn handle_startup_recovery(
+        storage_root: &Path,
+        pool: Option<&sqlx::PgPool>,
+    ) -> Result<Option<String>, ForgeError> {
+        Self::handle_startup_recovery_cluster(storage_root, pool, None, &[]).await
+    }
+
+    /// Asynchronous crash detection, cleanup and full cluster generation verification across all 7 participants.
+    /// Checks durable journal, database generation identity, coordinator generation, and storage nodes.
+    /// FAILS CLOSED if incomplete restoration or generation mismatch is detected.
+    pub async fn handle_startup_recovery_cluster(
+        storage_root: &Path,
+        pool: Option<&sqlx::PgPool>,
+        coordinator: Option<&crate::CoordinatorClient>,
+        storage_nodes: &[(String, String)],
+    ) -> Result<Option<String>, ForgeError> {
+        type DbCheckFn = fn(&str) -> Result<Option<String>, ForgeError>;
+        let no_check: Option<DbCheckFn> = None;
+        Self::handle_startup_recovery_cluster_with_db_check(
+            storage_root,
+            no_check,
+            pool,
+            coordinator,
+            storage_nodes,
+        )
+        .await
     }
 }

@@ -152,12 +152,24 @@ pub fn build_chunk_aad(
     aad
 }
 
+struct ZeroizedKey([u8; 32]);
+
+impl Drop for ZeroizedKey {
+    fn drop(&mut self) {
+        for b in &mut self.0 {
+            unsafe {
+                std::ptr::write_volatile(b, 0);
+            }
+        }
+    }
+}
+
 /// Streaming authenticated encrypting writer (SPNEBAK v2).
 /// Wraps any `Write` sink, derives keys, writes header, and seals plaintext in bounded chunks.
 /// Enables streaming TAR and GZ generation directly into AEAD ciphertext without temporary disk staging.
 pub struct EncryptingWriter<W: Write> {
     writer: W,
-    key_bytes: [u8; 32],
+    key_bytes: ZeroizedKey,
     archive_id: [u8; 16],
     nonce_prefix: [u8; NONCE_PREFIX_LEN],
     chunk_size: usize,
@@ -170,7 +182,7 @@ pub struct EncryptingWriter<W: Write> {
 
 impl<W: Write> EncryptingWriter<W> {
     pub fn new(
-        mut writer: W,
+        writer: W,
         passphrase: &str,
         key_version: u16,
         chunk_size: u32,
@@ -186,6 +198,32 @@ impl<W: Write> EncryptingWriter<W> {
         rng.fill(&mut salt)
             .map_err(|_| ForgeError::Internal("Failed to generate random salt".to_string()))?;
 
+        let key_bytes = derive_key(passphrase, &salt, DEFAULT_PBKDF2_ITERATIONS);
+        Self::new_internal(writer, key_bytes, salt, key_version, chunk_size)
+    }
+
+    /// Creates a streaming encrypting writer keyed directly with a 256-bit ephemeral CSPRNG key.
+    /// Zeroizes the key automatically when dropped.
+    pub fn new_ephemeral(
+        writer: W,
+        raw_key: &[u8; 32],
+        chunk_size: u32,
+    ) -> Result<Self, ForgeError> {
+        let rng = SystemRandom::new();
+        let mut salt = [0u8; SALT_LEN];
+        rng.fill(&mut salt)
+            .map_err(|_| ForgeError::Internal("Failed to generate random salt".to_string()))?;
+        Self::new_internal(writer, *raw_key, salt, 1, chunk_size)
+    }
+
+    fn new_internal(
+        mut writer: W,
+        key_bytes: [u8; 32],
+        salt: [u8; SALT_LEN],
+        key_version: u16,
+        chunk_size: u32,
+    ) -> Result<Self, ForgeError> {
+        let rng = SystemRandom::new();
         let mut nonce_prefix = [0u8; NONCE_PREFIX_LEN];
         rng.fill(&mut nonce_prefix).map_err(|_| {
             ForgeError::Internal("Failed to generate random nonce prefix".to_string())
@@ -207,11 +245,9 @@ impl<W: Write> EncryptingWriter<W> {
             .write_all(&header.to_bytes())
             .map_err(|e| ForgeError::Internal(format!("Failed to write header: {}", e)))?;
 
-        let key_bytes = derive_key(passphrase, &salt, DEFAULT_PBKDF2_ITERATIONS);
-
         Ok(Self {
             writer,
-            key_bytes,
+            key_bytes: ZeroizedKey(key_bytes),
             archive_id,
             nonce_prefix,
             chunk_size: chunk_size as usize,
@@ -235,7 +271,7 @@ impl<W: Write> EncryptingWriter<W> {
             data.len() as u32,
         );
 
-        let unbound_key = UnboundKey::new(&AES_256_GCM, &self.key_bytes)
+        let unbound_key = UnboundKey::new(&AES_256_GCM, &self.key_bytes.0)
             .map_err(|e| ForgeError::Internal(format!("AEAD key error: {:?}", e)))?;
         let mut sealing_key = SealingKey::new(unbound_key, OneNonce(Some(nonce)));
 
@@ -291,7 +327,7 @@ impl<W: Write> EncryptingWriter<W> {
             manifest_plain_len,
         );
 
-        let unbound_key = UnboundKey::new(&AES_256_GCM, &self.key_bytes)
+        let unbound_key = UnboundKey::new(&AES_256_GCM, &self.key_bytes.0)
             .map_err(|e| ForgeError::Internal(format!("AEAD key error: {:?}", e)))?;
         let mut sealing_key = SealingKey::new(unbound_key, OneNonce(Some(nonce)));
 
@@ -329,11 +365,18 @@ impl<W: Write> EncryptingWriter<W> {
 
 impl<W: Write> Write for EncryptingWriter<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.buffer.extend_from_slice(buf);
-        while self.buffer.len() >= self.chunk_size {
-            let chunk: Vec<u8> = self.buffer.drain(..self.chunk_size).collect();
-            self.write_chunk(&chunk)
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let mut offset = 0usize;
+        while offset < buf.len() {
+            let space = self.chunk_size.saturating_sub(self.buffer.len());
+            let take = space.min(buf.len() - offset);
+            self.buffer.extend_from_slice(&buf[offset..offset + take]);
+            offset += take;
+            if self.buffer.len() >= self.chunk_size {
+                let chunk =
+                    std::mem::replace(&mut self.buffer, Vec::with_capacity(self.chunk_size));
+                self.write_chunk(&chunk)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+            }
         }
         Ok(buf.len())
     }
@@ -535,7 +578,7 @@ pub fn decrypt_stream<R: Read, W: Write>(
 pub struct DecryptingReader<R: Read> {
     reader: R,
     header: BackupHeaderV2,
-    key_bytes: [u8; 32],
+    key_bytes: ZeroizedKey,
     expected_chunk_index: u64,
     total_bytes: u64,
     stream_hasher: Sha256,
@@ -557,7 +600,29 @@ impl<R: Read> DecryptingReader<R> {
         Ok(Self {
             reader,
             header,
-            key_bytes,
+            key_bytes: ZeroizedKey(key_bytes),
+            expected_chunk_index: 0,
+            total_bytes: 0,
+            stream_hasher: Sha256::new(),
+            buffer: Vec::new(),
+            buf_pos: 0,
+            finished: false,
+        })
+    }
+
+    /// Creates a streaming decrypting reader keyed directly with a 256-bit ephemeral CSPRNG key.
+    pub fn new_with_raw_key(mut reader: R, raw_key: &[u8; 32]) -> Result<Self, ForgeError> {
+        let mut header_buf = [0u8; HEADER_V2_LEN];
+        reader
+            .read_exact(&mut header_buf)
+            .map_err(|e| ForgeError::Internal(format!("Failed to read backup header: {}", e)))?;
+
+        let header = BackupHeaderV2::from_bytes(&header_buf)?;
+
+        Ok(Self {
+            reader,
+            header,
+            key_bytes: ZeroizedKey(*raw_key),
             expected_chunk_index: 0,
             total_bytes: 0,
             stream_hasher: Sha256::new(),
@@ -620,7 +685,7 @@ impl<R: Read> DecryptingReader<R> {
         let nonce = build_chunk_nonce(&self.header.nonce_prefix, chunk_index);
         let aad = build_chunk_aad(&self.header.archive_id, chunk_index, chunk_type, plain_len);
 
-        let unbound_key = UnboundKey::new(&AES_256_GCM, &self.key_bytes)
+        let unbound_key = UnboundKey::new(&AES_256_GCM, &self.key_bytes.0)
             .map_err(|e| ForgeError::Internal(format!("AEAD key error: {:?}", e)))?;
         let mut opening_key = OpeningKey::new(unbound_key, OneNonce(Some(nonce)));
 
@@ -699,6 +764,18 @@ impl<R: Read> DecryptingReader<R> {
                 chunk_type
             )))
         }
+    }
+
+    /// Drains all remaining authenticated chunks (including `CHUNK_TYPE_FINAL`) to EOF.
+    /// Ensures final AEAD tag, total chunk/byte counts, stream hash, and zero-trailing-bytes are verified
+    /// even when logical readers like `tar::Archive` stop early at tar EOF blocks.
+    pub fn verify_to_eof(&mut self) -> Result<(), ForgeError> {
+        while !self.finished {
+            if !self.read_next_chunk()? {
+                break;
+            }
+        }
+        Ok(())
     }
 }
 

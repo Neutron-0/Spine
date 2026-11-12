@@ -139,7 +139,23 @@ impl Drop for StorageWriterGuard {
 }
 
 #[cfg(windows)]
-fn platform_atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+fn is_write_through_unsupported(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(650) | Some(50) | Some(1))
+}
+
+#[cfg(windows)]
+fn win32_sync_file_handle(path: &Path) {
+    if let Ok(file) = fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.sync_all();
+    }
+}
+
+#[cfg(windows)]
+fn platform_atomic_replace_inner(
+    from: &Path,
+    to: &Path,
+    write_through: bool,
+) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     let wide_from: Vec<u16> = from
         .as_os_str()
@@ -172,13 +188,24 @@ fn platform_atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
     const REPLACEFILE_WRITE_THROUGH: u32 = 0x1;
 
+    let move_flags = if write_through {
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
+    } else {
+        MOVEFILE_REPLACE_EXISTING
+    };
+    let replace_flags = if write_through {
+        REPLACEFILE_WRITE_THROUGH
+    } else {
+        0
+    };
+
     if to.exists() {
         let ret = unsafe {
             ReplaceFileW(
                 wide_to.as_ptr(),
                 wide_from.as_ptr(),
                 std::ptr::null(),
-                REPLACEFILE_WRITE_THROUGH,
+                replace_flags,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
             )
@@ -186,29 +213,31 @@ fn platform_atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
         if ret != 0 {
             return Ok(());
         }
-        let ret = unsafe {
-            MoveFileExW(
-                wide_from.as_ptr(),
-                wide_to.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        };
+        let ret = unsafe { MoveFileExW(wide_from.as_ptr(), wide_to.as_ptr(), move_flags) };
         if ret != 0 {
             return Ok(());
         }
         Err(std::io::Error::last_os_error())
     } else {
-        let ret = unsafe {
-            MoveFileExW(
-                wide_from.as_ptr(),
-                wide_to.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        };
+        let ret = unsafe { MoveFileExW(wide_from.as_ptr(), wide_to.as_ptr(), move_flags) };
         if ret != 0 {
             return Ok(());
         }
         Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn platform_atomic_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    win32_sync_file_handle(from);
+    match platform_atomic_replace_inner(from, to, true) {
+        Ok(()) => Ok(()),
+        Err(err) if is_write_through_unsupported(&err) => {
+            platform_atomic_replace_inner(from, to, false)?;
+            win32_sync_file_handle(to);
+            Ok(())
+        }
+        Err(err) => Err(err),
     }
 }
 

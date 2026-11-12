@@ -259,7 +259,7 @@ async fn test_crash_matrix_point_5_to_9_post_decision_rolls_forward() {
         backup_id: "backup_post_decision".to_string(),
         old_generation: None,
         new_generation: target_gen.to_string(),
-        required_participants: vec!["postgres_data".to_string(), "spine_storage".to_string()],
+        required_participants: vec!["spine_storage".to_string()],
         staged_manifest_digests: BTreeMap::new(),
         decision_timestamp_nanos: 123456789,
         schema_identity: "3.0".to_string(),
@@ -330,9 +330,28 @@ async fn test_crash_matrix_point_14_and_15_recovery_idempotence() {
         "backup_idempotence",
     );
     journal.target_generation = target_gen.to_string();
+    let cdr = CommitDecisionRecord {
+        restore_id: journal.restore_id.clone(),
+        backup_id: "backup_idempotence".to_string(),
+        old_generation: None,
+        new_generation: target_gen.to_string(),
+        required_participants: vec!["spine_storage".to_string()],
+        staged_manifest_digests: BTreeMap::new(),
+        decision_timestamp_nanos: 123456789,
+        schema_identity: "3.0".to_string(),
+        decision_token: "token_idemp_123".to_string(),
+    };
+    journal.persist(RestorePhase::CommitDecision(cdr)).unwrap();
     journal.persist(RestorePhase::Committed).unwrap();
 
-    // Verify recovery completes without errors and purges journal
+    // Sync local recovery must RETAIN Committed journal until cluster recovery finishes
+    let _ = RestoreJournal::handle_startup_recovery_sync(&storage_root).unwrap();
+    assert!(
+        RestoreJournal::load(&storage_root).unwrap().is_some(),
+        "Committed journal must survive handle_startup_recovery_sync"
+    );
+
+    // Verify full recovery completes without errors and purges journal
     let _ = RestoreJournal::handle_startup_recovery(&storage_root, None)
         .await
         .unwrap();

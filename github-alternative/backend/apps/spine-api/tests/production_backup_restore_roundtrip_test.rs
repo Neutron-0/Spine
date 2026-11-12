@@ -373,6 +373,20 @@ async fn test_forward_recovery_from_storage_published() {
         "test_backup",
     );
     journal.restore_id = "rst_test123".to_string();
+    let target_gen = journal.target_generation.clone();
+    let cdr = spine_api::backup::CommitDecisionRecord {
+        restore_id: "rst_test123".to_string(),
+        backup_id: "test_backup".to_string(),
+        old_generation: None,
+        new_generation: target_gen.clone(),
+        required_participants: vec!["spine_storage".to_string()],
+        staged_manifest_digests: std::collections::BTreeMap::new(),
+        decision_timestamp_nanos: 1_000_000,
+        schema_identity: "spine-backup-v2".to_string(),
+        decision_token: "tok_storage_pub".to_string(),
+    };
+    journal.persist(RestorePhase::CommitDecision(cdr)).unwrap();
+    RestoreJournal::write_storage_generation(&storage_root, &target_gen).unwrap();
     journal.persist(RestorePhase::StoragePublished).unwrap();
 
     assert!(RestoreJournal::load(&storage_root).unwrap().is_some());
@@ -386,7 +400,11 @@ async fn test_forward_recovery_from_storage_published() {
         res.err()
     );
     let msg = res.unwrap().expect("recovery message");
-    assert!(msg.contains("forward-recovered to Committed"));
+    assert!(
+        msg.contains("committed") && msg.contains("rolled forward"),
+        "Unexpected recovery message: {}",
+        msg
+    );
 
     // Old generation directory must be purged
     assert!(

@@ -214,6 +214,18 @@ async fn test_startup_recovery_rolls_forward_on_interrupted_db_cutover() {
         "test_backup_456",
     );
     let target_gen = journal.target_generation.clone();
+    let cdr = spine_api::backup::CommitDecisionRecord {
+        restore_id: journal.restore_id.clone(),
+        backup_id: journal.backup_id.clone(),
+        old_generation: None,
+        new_generation: target_gen.clone(),
+        required_participants: vec!["spine_storage".to_string()],
+        staged_manifest_digests: std::collections::BTreeMap::new(),
+        decision_timestamp_nanos: 1_000_000,
+        schema_identity: "3.0".to_string(),
+        decision_token: "tok_456".to_string(),
+    };
+    journal.persist(RestorePhase::CommitDecision(cdr)).unwrap();
     journal.persist(RestorePhase::DbPublished).unwrap();
 
     let recovery_result = RestoreJournal::handle_startup_recovery(&storage_root, None).await;

@@ -2,7 +2,7 @@ use crate::backend::StorageBackend;
 use anyhow::{Context, Result};
 use spine_cluster::heartbeat::NodeHeartbeat;
 use spine_cluster::node::NodeStatus;
-use spine_cluster::protocol::{ClusterRpcRequest, ClusterRpcResponse};
+use spine_cluster::protocol::{ClusterRpcRequest, ClusterRpcResponse, MAX_CLUSTER_RPC_FRAME_BYTES};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -114,6 +114,13 @@ async fn handle_connection(
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len == 0 || len > MAX_CLUSTER_RPC_FRAME_BYTES {
+        anyhow::bail!(
+            "Storage RPC frame size {} bytes exceeds bound {}",
+            len,
+            MAX_CLUSTER_RPC_FRAME_BYTES
+        );
+    }
 
     let mut body = vec![0u8; len];
     stream.read_exact(&mut body).await?;
@@ -377,6 +384,13 @@ pub async fn send_rpc_request(addr: &str, req: &ClusterRpcRequest) -> Result<Clu
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let resp_len = u32::from_be_bytes(len_buf) as usize;
+    if resp_len == 0 || resp_len > MAX_CLUSTER_RPC_FRAME_BYTES {
+        anyhow::bail!(
+            "Storage RPC response frame size {} bytes exceeds bound {}",
+            resp_len,
+            MAX_CLUSTER_RPC_FRAME_BYTES
+        );
+    }
 
     let mut resp_body = vec![0u8; resp_len];
     stream.read_exact(&mut resp_body).await?;

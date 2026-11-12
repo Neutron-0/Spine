@@ -5,6 +5,11 @@ use crate::node::NodeStatus;
 use crate::placement::PlacementPlan;
 use serde::{Deserialize, Serialize};
 
+/// Hard wire frame bound for cluster RPC messages (64 MiB) to prevent unbounded memory allocation.
+pub const MAX_CLUSTER_RPC_FRAME_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum permitted compressed snapshot payload per remote participant RPC (48 MiB).
+pub const MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES: usize = 48 * 1024 * 1024;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClusterRpcRequest {
     Enroll(EnrollmentRequest),

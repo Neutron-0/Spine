@@ -686,7 +686,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                let (_guard_barrier, _maintenance_guard, captured_pg_bytes) = if let Some(url) =
+                let (_guard_barrier, _maintenance_guard, captured_pg_enc) = if let Some(url) =
                     db_url
                 {
                     let resolved_url = spine_api::db::DatabaseSelector::resolve_active_db_url(
@@ -715,17 +715,29 @@ async fn main() -> anyhow::Result<()> {
                             anyhow::anyhow!("Failed to enter cluster maintenance: {}", e)
                         })?;
 
-                    let mut pg_bytes: Vec<u8> = Vec::new();
-                    spine_api::dump_database_to_writer(&pool, &mut pg_bytes)
+                    let (tmp_pg, pg_key, mut pg_enc_writer) =
+                        spine_api::backup::EphemeralEncryptedTemp::begin(
+                            spine_api::backup::v2::DEFAULT_CHUNK_SIZE,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to initialize encrypted DB stream: {}", e)
+                        })?;
+                    spine_api::dump_database_to_writer(&pool, &mut pg_enc_writer)
                         .await
                         .map_err(|e| {
                             anyhow::anyhow!("Failed to stream PostgreSQL database dump: {}", e)
                         })?;
-                    println!(
-                        "PostgreSQL in-memory streaming snapshot captured successfully ({} bytes).",
-                        pg_bytes.len()
+                    let pg_summary = pg_enc_writer.finish().map_err(|e| {
+                        anyhow::anyhow!("Failed to finalize encrypted DB stream: {}", e)
+                    })?;
+                    let pg_enc = spine_api::backup::EphemeralEncryptedTemp::from_finished(
+                        tmp_pg, pg_key, pg_summary,
                     );
-                    (Some(barrier), Some(guard), Some(pg_bytes))
+                    println!(
+                        "PostgreSQL bounded-memory AEAD snapshot captured successfully ({} bytes plaintext, O(1 MiB) RAM, 0 plaintext disk intermediates).",
+                        pg_enc.byte_length
+                    );
+                    (Some(barrier), Some(guard), Some(pg_enc))
                 } else {
                     (None, None, None)
                 };
@@ -762,6 +774,11 @@ async fn main() -> anyhow::Result<()> {
                         .map_err(|e| {
                             anyhow::anyhow!("Failed to capture coordinator snapshot: {}", e)
                         })?;
+                    let coord_enc = spine_api::backup::EphemeralEncryptedTemp::from_reader(
+                        &data[..],
+                        spine_api::backup::v2::DEFAULT_CHUNK_SIZE,
+                    )?;
+                    drop(data);
                     stream_participants.push((
                         spine_api::BackupParticipantRecord {
                             participant_id: manifest.participant_id,
@@ -772,7 +789,7 @@ async fn main() -> anyhow::Result<()> {
                             sha256_checksum: manifest.sha256_checksum,
                             archive_rel_path: "coordinator/coordinator_snapshot.tar.gz".to_string(),
                         },
-                        spine_api::backup::ParticipantPayloadSource::Memory(data),
+                        spine_api::backup::ParticipantPayloadSource::EncryptedTemp(coord_enc),
                     ));
                     println!("Coordinator volume snapshot captured successfully.");
                     coord_client = Some(client);
@@ -799,6 +816,11 @@ async fn main() -> anyhow::Result<()> {
                                 e
                             )
                         })?;
+                    let node_enc = spine_api::backup::EphemeralEncryptedTemp::from_reader(
+                        &data[..],
+                        spine_api::backup::v2::DEFAULT_CHUNK_SIZE,
+                    )?;
+                    drop(data);
                     stream_participants.push((
                         spine_api::BackupParticipantRecord {
                             participant_id: manifest.participant_id,
@@ -809,7 +831,7 @@ async fn main() -> anyhow::Result<()> {
                             sha256_checksum: manifest.sha256_checksum,
                             archive_rel_path: format!("storage_nodes/{}_snapshot.tar.gz", node_id),
                         },
-                        spine_api::backup::ParticipantPayloadSource::Memory(data),
+                        spine_api::backup::ParticipantPayloadSource::EncryptedTemp(node_enc),
                     ));
                     println!(
                         "Storage node '{}' volume snapshot captured successfully.",
@@ -842,24 +864,21 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
 
-                // Register PostgreSQL database participant record with bounded in-memory payload
-                if let Some(pg_bytes) = captured_pg_bytes {
-                    use sha2::Digest;
-                    let pg_len = pg_bytes.len() as u64;
-                    let pg_hash = format!("{:x}", sha2::Sha256::digest(&pg_bytes));
+                // Register PostgreSQL database participant record with bounded streaming AEAD payload
+                if let Some(pg_enc) = captured_pg_enc {
                     stream_participants.push((
                         spine_api::BackupParticipantRecord {
                             participant_id: "postgres_data".to_string(),
                             volume_name: "postgres_data".to_string(),
                             snapshot_id: format!("pg_snap_{}", uuid::Uuid::new_v4().simple()),
                             fencing_generation,
-                            byte_length: pg_len,
-                            sha256_checksum: pg_hash,
+                            byte_length: pg_enc.byte_length,
+                            sha256_checksum: pg_enc.sha256_checksum.clone(),
                             archive_rel_path: "database/snapshot.jsonl".to_string(),
                         },
-                        spine_api::backup::ParticipantPayloadSource::Memory(pg_bytes),
+                        spine_api::backup::ParticipantPayloadSource::EncryptedTemp(pg_enc),
                     ));
-                    println!("PostgreSQL database snapshot participant record registered (in-memory streaming, 0 intermediate disk files).");
+                    println!("PostgreSQL database snapshot participant record registered (bounded AEAD streaming, 0 plaintext disk intermediates).");
                 } else if prof.requires_persistent_database() {
                     anyhow::bail!(
                         "Under deployment profile '{}', PostgreSQL database snapshot ('postgres_data') is required.",
@@ -867,28 +886,28 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
 
-                // Register Spine API storage volume participant record with streaming in-memory payload
+                // Register Spine API storage volume participant record with bounded streaming AEAD payload
                 if prof.requires_persistent_database() {
-                    println!("Capturing Spine storage volume snapshot into in-memory streaming payload (0 intermediate disk files)...");
-                    let (storage_bytes, storage_hash) =
-                        spine_api::backup::BackupManager::capture_storage_snapshot_memory(
+                    println!("Capturing Spine storage volume snapshot into bounded AEAD stream (0 plaintext disk intermediates)...");
+                    let storage_enc =
+                        spine_api::backup::BackupManager::capture_storage_snapshot_encrypted(
                             &storage_root,
+                            spine_api::backup::v2::DEFAULT_CHUNK_SIZE,
                         )?;
-                    let storage_len = storage_bytes.len() as u64;
                     stream_participants.push((
                         spine_api::BackupParticipantRecord {
                             participant_id: "spine_storage".to_string(),
                             volume_name: "spine_storage".to_string(),
                             snapshot_id: format!("storage_snap_{}", uuid::Uuid::new_v4().simple()),
                             fencing_generation,
-                            byte_length: storage_len,
-                            sha256_checksum: storage_hash,
+                            byte_length: storage_enc.byte_length,
+                            sha256_checksum: storage_enc.sha256_checksum.clone(),
                             archive_rel_path: "storage/spine_storage_snapshot.tar.gz".to_string(),
                         },
-                        spine_api::backup::ParticipantPayloadSource::Memory(storage_bytes),
+                        spine_api::backup::ParticipantPayloadSource::EncryptedTemp(storage_enc),
                     ));
                     println!(
-                        "Spine storage volume participant record registered (in-memory streaming)."
+                        "Spine storage volume participant record registered (bounded AEAD streaming)."
                     );
                 }
 
@@ -1043,6 +1062,21 @@ async fn main() -> anyhow::Result<()> {
                 println!("Archive staged and all checksums verified against manifest.");
 
                 let fencing_generation = session.manifest.fencing_generation.unwrap_or(1);
+                if fencing_generation == 0 {
+                    let _ = session.abort("Manifest contains invalid fencing_generation 0");
+                    anyhow::bail!("Manifest contains invalid fencing_generation 0 (must be >= 1)");
+                }
+                if session.manifest.fencing_generation.is_some()
+                    || session.manifest.participants.iter().any(|p| {
+                        p.participant_id == "coordinator"
+                            || p.participant_id == "coordinator_data"
+                            || p.participant_id.starts_with("node-")
+                            || p.participant_id.starts_with("storage_")
+                    })
+                {
+                    session.journal.target_generation = fencing_generation.to_string();
+                    session.journal.persist(session.journal.phase.clone())?;
+                }
 
                 // Enforce participant completeness according to deployment profile
                 spine_api::backup::participants::ParticipantRegistry::validate_participants(
@@ -1258,6 +1292,18 @@ async fn main() -> anyhow::Result<()> {
                                         );
                                     }
                                 };
+                                session
+                                    .journal
+                                    .record_participant_snapshot(
+                                        &participant.participant_id,
+                                        &participant.snapshot_id,
+                                    )
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "Failed to record coordinator snapshot ID: {}",
+                                            e
+                                        )
+                                    })?;
                                 session.journal.record_participant_ack(ack).map_err(|e| {
                                     anyhow::anyhow!(
                                         "Failed to record coordinator acknowledgement: {}",
@@ -1312,6 +1358,18 @@ async fn main() -> anyhow::Result<()> {
                                     );
                                 }
                             };
+                            session
+                                .journal
+                                .record_participant_snapshot(
+                                    &participant.participant_id,
+                                    &participant.snapshot_id,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "Failed to record storage node snapshot ID: {}",
+                                        e
+                                    )
+                                })?;
                             session.journal.record_participant_ack(ack).map_err(|e| {
                                 anyhow::anyhow!(
                                     "Failed to record storage node acknowledgement: {}",
@@ -1817,18 +1875,55 @@ async fn main() -> anyhow::Result<()> {
                 // ------------------------------------------------------------------------
                 println!("=== Phase 6: FINALIZE (Purging Retained Old Generations) ===");
                 if let Some(ref s_ssh) = staged_ssh_adapter {
-                    let _ = s_ssh.finalize();
+                    s_ssh.finalize().map_err(|e| {
+                        anyhow::anyhow!(
+                            "FATAL: Failed to finalize SSH participant after CommitDecision: {}. Writes remain fenced; restart recovery will complete finalization.",
+                            e
+                        )
+                    })?;
+                    let _ = session.journal.record_participant_recovery(
+                        "spine_ssh",
+                        true,
+                        true,
+                        Some(&session.journal.target_generation.clone()),
+                    );
                 }
                 if let Some(ref sdb) = staged_db_restore {
-                    let _ = sdb.finalize().await;
+                    sdb.finalize().await.map_err(|e| {
+                        anyhow::anyhow!(
+                            "FATAL: Failed to finalize PostgreSQL database restore after CommitDecision: {}. Writes remain fenced; restart recovery will complete finalization.",
+                            e
+                        )
+                    })?;
+                    let _ = session.journal.record_participant_recovery(
+                        "postgres_data",
+                        true,
+                        true,
+                        Some(&session.journal.target_generation.clone()),
+                    );
                 }
                 if let Some(ref s_storage) = staged_storage_adapter {
-                    let _ = s_storage.finalize();
+                    s_storage.finalize().map_err(|e| {
+                        anyhow::anyhow!(
+                            "FATAL: Failed to finalize local storage after CommitDecision: {}. Writes remain fenced; restart recovery will complete finalization.",
+                            e
+                        )
+                    })?;
+                    let _ = session.journal.record_participant_recovery(
+                        "spine_storage",
+                        true,
+                        true,
+                        Some(&session.journal.target_generation.clone()),
+                    );
                 }
                 for (snap_id, _, client) in &committed_cluster_restores {
-                    if let Err(e) = client.finalize_restore(snap_id).await {
-                        eprintln!("Warning: Failed to finalize restore on cluster participant for snapshot {}: {}", snap_id, e);
-                    }
+                    client.finalize_restore(snap_id).await.map_err(|e| {
+                        anyhow::anyhow!(
+                            "FATAL: Failed to finalize restore on cluster participant for snapshot '{}': {}. Writes remain fenced; restart recovery will complete finalization.",
+                            snap_id,
+                            e
+                        )
+                    })?;
                 }
                 let finalize_report = session
                     .finalize()

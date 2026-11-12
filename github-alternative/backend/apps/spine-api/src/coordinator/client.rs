@@ -1,7 +1,10 @@
 use crate::core::error::ForgeError;
 use spine_cluster::durability::DurabilityPolicy;
 use spine_cluster::placement::PlacementPlan;
-use spine_cluster::protocol::{ClusterRpcRequest, ClusterRpcResponse, VolumeSnapshotManifest};
+use spine_cluster::protocol::{
+    ClusterRpcRequest, ClusterRpcResponse, VolumeSnapshotManifest, MAX_CLUSTER_RPC_FRAME_BYTES,
+    MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES,
+};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -44,6 +47,13 @@ impl ClusterNodeClient {
         let req_bytes = req
             .to_bytes()
             .map_err(|e| ForgeError::Internal(format!("RPC serialization error: {}", e)))?;
+        if req_bytes.is_empty() || req_bytes.len() > MAX_CLUSTER_RPC_FRAME_BYTES {
+            return Err(ForgeError::Internal(format!(
+                "Outbound RPC frame size {} bytes exceeds maximum bound {} bytes",
+                req_bytes.len(),
+                MAX_CLUSTER_RPC_FRAME_BYTES
+            )));
+        }
         let len_buf = (req_bytes.len() as u32).to_be_bytes();
 
         stream
@@ -65,6 +75,12 @@ impl ClusterNodeClient {
             .await
             .map_err(|e| ForgeError::ServiceUnavailable(format!("RPC read length error: {}", e)))?;
         let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
+        if resp_len == 0 || resp_len > MAX_CLUSTER_RPC_FRAME_BYTES {
+            return Err(ForgeError::Internal(format!(
+                "Inbound RPC frame size {} bytes exceeds maximum bound {} bytes",
+                resp_len, MAX_CLUSTER_RPC_FRAME_BYTES
+            )));
+        }
 
         let mut resp_body = vec![0u8; resp_len];
         stream
@@ -145,7 +161,17 @@ impl ClusterNodeClient {
             ClusterRpcResponse::VolumeSnapshotCaptured {
                 manifest,
                 payload_bytes,
-            } => Ok((manifest, payload_bytes)),
+            } => {
+                if payload_bytes.len() > MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES {
+                    return Err(ForgeError::Internal(format!(
+                        "Remote participant '{}' snapshot payload {} bytes exceeds limit {} bytes",
+                        manifest.participant_id,
+                        payload_bytes.len(),
+                        MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES
+                    )));
+                }
+                Ok((manifest, payload_bytes))
+            }
             ClusterRpcResponse::Error(msg) => Err(ForgeError::Internal(format!(
                 "Capture snapshot failed: {}",
                 msg
@@ -159,6 +185,14 @@ impl ClusterNodeClient {
         manifest: VolumeSnapshotManifest,
         payload_bytes: Vec<u8>,
     ) -> Result<spine_cluster::protocol::ParticipantAcknowledgement, ForgeError> {
+        if payload_bytes.len() > MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES {
+            return Err(ForgeError::Internal(format!(
+                "Remote restore payload {} bytes for '{}' exceeds limit {} bytes",
+                payload_bytes.len(),
+                manifest.participant_id,
+                MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES
+            )));
+        }
         let req = ClusterRpcRequest::StageVolumeRestore {
             snapshot_id: manifest.snapshot_id.clone(),
             fencing_generation: manifest.fencing_generation,

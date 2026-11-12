@@ -2,10 +2,10 @@
   "$schema": "http://cyclonedx.org/schema/bom-1.5.json",
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
-  "serialNumber": "urn:uuid:64042e5a-cc4a-4890-9f78-f2cce9ea4571",
+  "serialNumber": "urn:uuid:15c7501a-176c-442a-b953-4bafe65b9968",
   "version": 1,
   "metadata": {
-    "timestamp": "2026-11-11T18:22:21.392584+00:00",
+    "timestamp": "2026-11-12T05:45:22.089277+00:00",
     "tools": [
       {
         "vendor": "Spine Release Engineering",
@@ -15,9 +15,9 @@
     ],
     "component": {
       "type": "application",
-      "bom-ref": "pkg:cargo/spine-platform@0.1.0-rc2",
+      "bom-ref": "pkg:cargo/spine-platform@0.1.0-rc3",
       "name": "spine-platform",
-      "version": "0.1.0-rc2",
+      "version": "0.1.0-rc3",
       "description": "Spine Distributed Native VCS and Forge Platform",
       "licenses": [
         {
