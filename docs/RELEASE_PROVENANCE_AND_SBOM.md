@@ -7,9 +7,9 @@
 
 - **Repository:** `D:\Vault\Spine`
 - **Branch:** `main`
-- **Built Source Commit:** `ebf4599d47df4ce26bf9d938c4b22a4774fd09c3` (source code, migrations, tests, and `docs/sbom.json` compiled into all release artifacts below; this provenance document commit is a `docs/`-only commit immediately following build verification)
-- **Built Source Tree Hash:** `51e9f9ca271113a084bef7c66d4801b76dd447f9`
-- **Build Completion Timestamp (UTC):** `2026-11-12T07:24:55Z`
+- **Built Source Commit:** `3fcded082374542b28bebff895476f6639eb29d3` (source code, migrations, tests, and `docs/sbom.json` compiled into all release artifacts below; this provenance document commit is a `docs/`-only commit immediately following build verification)
+- **Built Source Tree Hash:** `34673c35c12981ad6e96621cd19204e42dbf2c05`
+- **Build Completion Timestamp (UTC):** `2026-11-12T08:01:27Z`
 - **Host Target:** `x86_64-pc-windows-msvc`
 - **Compiler (`rustc --version`):** `rustc 1.97.1 (8bab26f4f 2026-07-14)` (commit `8bab26f4f68e0e26f0bb7960be334d5b520ea452`, LLVM `22.1.6`)
 - **Cargo (`cargo --version`):** `cargo 1.97.1 (c980f4866 2026-06-30)`
@@ -33,7 +33,7 @@ Both workspaces build with tracked `Cargo.lock` dependency graphs:
 
 ## 4. Release Candidate Artifact Inventory & SHA-256 Checksums
 
-All four production executables were built from source commit `ebf4599d47df4ce26bf9d938c4b22a4774fd09c3`, staged under `target/release-candidate/`, and recorded in `target/release-candidate/SHA256SUMS`:
+All four production executables were built from source commit `3fcded082374542b28bebff895476f6639eb29d3`, staged under `target/release-candidate/`, and recorded in `target/release-candidate/SHA256SUMS`:
 
 | Binary | Size (Bytes) | SHA-256 |
 |---|---|---|
