@@ -1,77 +1,61 @@
-# SPINE RELEASE PROVENANCE AND SOFTWARE BILL OF MATERIALS (SBOM)
-## Batch 21N Full-System Stabilization and Release Candidate Verification
+# Spine Release Provenance and SBOM
 
-This document establishes the build provenance, reproducibility manifest, and cryptographic chain-of-custody for the Spine Release Candidate binaries produced under the **Batch 21N Master Stabilization Campaign**.
+**Status:** Verified Release Candidate Provenance
+**Release Candidate:** `0.1.0-rc3`
 
----
+## 1. Source & Toolchain Provenance
 
-## 1. Build Environment and Provenance
-
-- **Operating System:** Windows 11 (NT 10.0.26200 x86_64)
-- **Rust Toolchain:** `rustc 1.97.1 (8bab26f4f 2026-07-14)`
-- **Cargo Version:** `cargo 1.97.1 (c980f4866 2026-06-30)`
-- **Host Target Triple:** `x86_64-pc-windows-msvc`
-- **LLVM Version:** `22.1.6`
-- **Base Commit Hash:** `f496e5e819f02a2e6737b1c33f325aac8338574b`
+- **Repository:** `D:\Vault\Spine`
 - **Branch:** `main`
-- **Build Timestamp (UTC):** `2026-11-11T19:34:00Z`
-- **Compilation Mode:** Full release optimization (`--release`), LTO enabled in production profile.
+- **Built Source Commit:** `90a695d940efcc3e4a2f3f4d856b416ac707d1f1` (source code, tests, and `docs/sbom.json` compiled into all release artifacts below; this provenance document commit is a `docs/`-only commit immediately following build verification)
+- **Built Source Tree Hash:** `3140d1fe19ca069226ffdbcb3472002097153bdc`
+- **Build Completion Timestamp (UTC):** `2026-11-12T05:51:16Z`
+- **Host Target:** `x86_64-pc-windows-msvc`
+- **Compiler (`rustc --version`):** `rustc 1.97.1 (8bab26f4f 2026-07-14)` (commit `8bab26f4f68e0e26f0bb7960be334d5b520ea452`, LLVM `22.1.6`)
+- **Cargo (`cargo --version`):** `cargo 1.97.1 (c980f4866 2026-06-30)`
 
----
+## 2. Build Commands & Profile
 
-## 2. Lockfile Digests
+- **Profile:** `--release` (`release` profile, optimized)
+- **Native VCS & Cluster Workspace:**
+  `cargo build --release -j 1 --manifest-path git-alternative/Cargo.toml`
+- **Backend API Server:**
+  `cargo build --release -j 2 --manifest-path github-alternative/backend/apps/spine-api/Cargo.toml`
 
-The dependency graph for all components is locked and verified with the following SHA-256 digests:
+## 3. Reproducibility & Lockfile Digests
 
-| Lockfile Path | SHA-256 Digest |
-| :--- | :--- |
-| `git-alternative/Cargo.lock` | `f0be820cc613a6359eb8fa4d68f05a44831fb4c9a4561099be6edb4c33531fdf` |
-| `github-alternative/backend/Cargo.lock` | `4f15df88dfeede2d5583d9e73b78a3035f1ac7f96a2f2caa3a3c7c8e3af8feae` |
+Both workspaces build with tracked `Cargo.lock` dependency graphs:
 
----
+- `git-alternative/Cargo.lock` (SHA-256):
+  `f0be820cc613a6359eb8fa4d68f05a44831fb4c9a4561099be6edb4c33531fdf`
+- `github-alternative/backend/Cargo.lock` (SHA-256):
+  `4f15df88dfeede2d5583d9e73b78a3035f1ac7f96a2f2caa3a3c7c8e3af8feae`
 
-## 3. Build Invocations
+## 4. Release Candidate Artifact Inventory & SHA-256 Checksums
 
-All candidate binaries were produced cleanly using the following invocations:
+All four production executables were built from source commit `90a695d940efcc3e4a2f3f4d856b416ac707d1f1`, staged under `target/release-candidate/`, and recorded in `target/release-candidate/SHA256SUMS`:
 
-```powershell
-# 1. Native Git alternative and cluster daemon binaries
-cargo build --release --manifest-path git-alternative/Cargo.toml -j1
+| Binary | Size (Bytes) | SHA-256 |
+|---|---|---|
+| `spine.exe` | `8864768` | `4c9c69b0a593e88f6c127a2e68757f23ea03a2392d8f7d6adbb7c069ca7cec34` |
+| `spine-coordinator.exe` | `2694144` | `0b8f086fd8eb6ba39e8db679bcfa2eae3abb6fdde7e341e0e7d8dc8466503b02` |
+| `spine-storage-node.exe` | `2449408` | `279f287598987e00bdea4e4e7f1fb1a34d8c6c663387209e422ebf11940c62e5` |
+| `spine-api.exe` | `22696960` | `8bc9143e9610012d48b7dad83105c91dd77c783398838abb9e48fda88e782412` |
 
-# 2. REST API / Backup Coordinator binary
-cargo build --release --manifest-path github-alternative/backend/apps/spine-api/Cargo.toml -j2
+Checksums manifest (`target/release-candidate/SHA256SUMS`):
+
+```text
+4c9c69b0a593e88f6c127a2e68757f23ea03a2392d8f7d6adbb7c069ca7cec34  spine.exe
+0b8f086fd8eb6ba39e8db679bcfa2eae3abb6fdde7e341e0e7d8dc8466503b02  spine-coordinator.exe
+279f287598987e00bdea4e4e7f1fb1a34d8c6c663387209e422ebf11940c62e5  spine-storage-node.exe
+8bc9143e9610012d48b7dad83105c91dd77c783398838abb9e48fda88e782412  spine-api.exe
 ```
 
----
+## 5. CycloneDX Software Bill of Materials (SBOM)
 
-## 4. Release Candidate Artifact Manifest (`target/release-candidate/SHA256SUMS`)
-
-All binaries were staged into `target/release-candidate/` and authenticated via SHA-256:
-
-| Binary | Size (Bytes) | SHA-256 Checksum | Description |
-| :--- | :--- | :--- | :--- |
-| `spine.exe` | 8,862,720 | `85ac6be2ae63aad5dbf2f874f628b411b252b9a3e3f42e203ad4f5f5638ce778` | Native CLI client and repository management |
-| `spine-coordinator.exe` | 2,691,584 | `9d17a03dd1d481f2e6a41162c322de5488d4ce2609316dac9c248404171a0b34` | Distributed cluster consensus and routing coordinator |
-| `spine-storage-node.exe` | 2,448,384 | `d59b35c11323c206e542f18de8e25227dd7d735af746431ae370e8d02609859a` | Storage-node volume daemon with fenced write-guards |
-| `spine-api.exe` | 22,470,144 | `9a0b5482adf248b1afdba21439099c0b4c69a1977762c00ddf36ce54d1adf0e9` | Production Web API, Auth, and Backup/Restore orchestrator |
-
----
-
-## 5. Machine-Readable CycloneDX SBOM
-
-A complete, machine-readable Software Bill of Materials conforming to the [CycloneDX v1.5 specification](http://cyclonedx.org/schema/bom-1.5.json) is published alongside this document at:
-
-- **JSON Document:** `docs/sbom.json`
-- **Component Count:** 465 verified dependencies with package URLs (purl) and SHA-256 package digests
-- **Format:** CycloneDX JSON 1.5
-
----
-
-## 6. Security & Verification Assertions
-
-1. **Selector Authority:** Single source of database selection truth (`_spine_active_database_selector` in maintenance database) via transactional row-locking (`SELECT FOR UPDATE`) CAS updates. Filesystem selector cache removed from write gates and readback validation.
-2. **Post-Decision Invariant:** Zero participant rollbacks permitted after `CommitDecision` is durably persisted. Failed post-decision transitions fail closed with write fencing preserved, and restart recovery converges forward idempotently.
-3. **Seven-Participant Binding:** Pre-decision revalidation verifies all 7 participants (`postgres_data`, `spine_storage`, `storage_1_data`, `storage_2_data`, `storage_3_data`, `coordinator_data`, `spine_ssh`) with exact field-level comparison of `restore_id`, `backup_id`, `target_generation`, and payload SHA-256 digests.
-4. **Fail-Closed Write Gating:** Database readiness, write-permit acquisition, and HTTP route pipelines reject mutations unless authoritative database generation matches storage generation and active journal state is clear.
-5. **Win32 Durability:** All journal, state, and selector atomic replacements use native Win32 `ReplaceFileW` and `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` (or POSIX `rename` + parent directory `sync_all`), completely resolving Windows error 650.
-6. **Decryption Confidentiality:** Zero unencrypted intermediate archives written to disk during backup decompression; stream decryption executes chunk-by-chunk in bounded memory via AES-256-GCM.
+- **Format:** CycloneDX `1.5` JSON (`bomFormat: CycloneDX`, `specVersion: 1.5`)
+- **Path:** `docs/sbom.json`
+- **SBOM SHA-256:** `6a86f445715d895dad11592d52fe5e3cbed5f5d34a40add256414db292c94a1f`
+- **SBOM Timestamp (UTC):** `2026-11-12T05:45:22.089277+00:00`
+- **Root Component:** `pkg:cargo/spine-platform@0.1.0-rc3` (`version: 0.1.0-rc3`)
+- **Total Unique Crate Components:** `465` (verified exact set equality against `git-alternative/Cargo.lock` + `github-alternative/backend/Cargo.lock`, with `0` missing or extra packages)
