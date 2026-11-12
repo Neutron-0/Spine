@@ -20,7 +20,29 @@ impl Drop for ChildGuard {
     }
 }
 
-fn find_cluster_binary(name: &str) -> PathBuf {
+fn compute_file_sha256_hex(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = fs::File::open(path).unwrap_or_else(|e| {
+        panic!("Failed to open release binary '{}': {}", path.display(), e);
+    });
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).expect("read release binary");
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>()
+}
+
+fn find_verified_release_binary(name: &str) -> (PathBuf, String) {
     let exe_name = if cfg!(windows) {
         format!("{}.exe", name)
     } else {
@@ -33,31 +55,60 @@ fn find_cluster_binary(name: &str) -> PathBuf {
         .and_then(|p| p.parent())
         .and_then(|p| p.parent())
         .expect("repo root");
-    let candidates = [
-        repo_root
-            .join("git-alternative")
-            .join("target")
-            .join("debug")
-            .join(&exe_name),
-        repo_root
-            .join("git-alternative")
-            .join("target")
-            .join("release")
-            .join(&exe_name),
-        repo_root
-            .join("target")
-            .join("release-candidate")
-            .join(&exe_name),
-    ];
-    candidates
-        .into_iter()
-        .find(|p| p.exists())
+    let rc_dir = repo_root.join("target").join("release-candidate");
+    let manifest_path = rc_dir.join("SHA256SUMS");
+    let manifest_text = fs::read_to_string(&manifest_path).unwrap_or_else(|e| {
+        panic!(
+            "Release checksum manifest '{}' not found or unreadable ({}); build and stage release binaries first",
+            manifest_path.display(),
+            e
+        )
+    });
+    let expected_sha256 = manifest_text
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let hash = parts.next()?;
+            let file = parts.next()?;
+            if file == exe_name {
+                Some(hash.to_ascii_lowercase())
+            } else {
+                None
+            }
+        })
+        .next()
         .unwrap_or_else(|| {
             panic!(
-                "Cluster binary '{}' not found; build git-alternative first",
-                exe_name
+                "No SHA256SUMS entry for '{}' in '{}'",
+                exe_name,
+                manifest_path.display()
             )
-        })
+        });
+
+    let bin_path = rc_dir.join(&exe_name);
+    if !bin_path.exists() {
+        panic!(
+            "Release binary '{}' not found (debug binaries are disallowed for release verification); build and stage release binaries first",
+            bin_path.display()
+        );
+    }
+
+    let actual_sha256 = compute_file_sha256_hex(&bin_path);
+    assert_eq!(
+        actual_sha256,
+        expected_sha256,
+        "Release binary '{}' SHA-256 mismatch: actual {} != manifest {} in '{}'",
+        bin_path.display(),
+        actual_sha256,
+        expected_sha256,
+        manifest_path.display()
+    );
+    println!(
+        "VERIFIED RELEASE BINARY: {} sha256={}",
+        bin_path.display(),
+        actual_sha256
+    );
+    (bin_path, actual_sha256)
 }
 
 fn pick_free_addr() -> String {
@@ -116,9 +167,9 @@ async fn test_combined_production_shaped_postgres_and_cluster_recovery() {
     fs::write(ssh_dir.join("host_key_ed25519"), b"combined-e2e-ssh-key").unwrap();
     RestoreJournal::write_storage_generation(&root, "20").unwrap();
 
-    // 3. Start real spine-coordinator + 3 real spine-storage-node processes
-    let coord_bin = find_cluster_binary("spine-coordinator");
-    let node_bin = find_cluster_binary("spine-storage-node");
+    // 3. Start verified release spine-coordinator + 3 spine-storage-node processes
+    let (coord_bin, _coord_sha256) = find_verified_release_binary("spine-coordinator");
+    let (node_bin, _node_sha256) = find_verified_release_binary("spine-storage-node");
 
     let coord_store_path = tmp.path().join("coord").join("coordinator_state.json");
     fs::create_dir_all(coord_store_path.parent().unwrap()).unwrap();

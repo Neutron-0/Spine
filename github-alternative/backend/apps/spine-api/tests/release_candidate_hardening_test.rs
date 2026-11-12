@@ -1489,6 +1489,9 @@ async fn test_live_coordinator_and_storage_node_processes_restore_and_restart() 
     }
 
     fn find_cluster_binary(name: &str) -> PathBuf {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+
         let exe_name = if cfg!(windows) {
             format!("{}.exe", name)
         } else {
@@ -1501,31 +1504,72 @@ async fn test_live_coordinator_and_storage_node_processes_restore_and_restart() 
             .and_then(|p| p.parent())
             .and_then(|p| p.parent())
             .expect("repo root");
-        let candidates = [
-            repo_root
-                .join("git-alternative")
-                .join("target")
-                .join("debug")
-                .join(&exe_name),
-            repo_root
-                .join("git-alternative")
-                .join("target")
-                .join("release")
-                .join(&exe_name),
-            repo_root
-                .join("target")
-                .join("release-candidate")
-                .join(&exe_name),
-        ];
-        candidates
-            .into_iter()
-            .find(|p| p.exists())
+        let rc_dir = repo_root.join("target").join("release-candidate");
+        let manifest_path = rc_dir.join("SHA256SUMS");
+        let manifest_text = fs::read_to_string(&manifest_path).unwrap_or_else(|e| {
+            panic!(
+                "Release checksum manifest '{}' not found or unreadable ({}); build and stage release binaries first",
+                manifest_path.display(),
+                e
+            )
+        });
+        let expected_sha256 = manifest_text
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                let hash = parts.next()?;
+                let file = parts.next()?;
+                if file == exe_name {
+                    Some(hash.to_ascii_lowercase())
+                } else {
+                    None
+                }
+            })
+            .next()
             .unwrap_or_else(|| {
                 panic!(
-                    "Cluster binary '{}' not found; build git-alternative first",
-                    exe_name
+                    "No SHA256SUMS entry for '{}' in '{}'",
+                    exe_name,
+                    manifest_path.display()
                 )
-            })
+            });
+
+        let bin_path = rc_dir.join(&exe_name);
+        if !bin_path.exists() {
+            panic!(
+                "Release binary '{}' not found (debug binaries are disallowed); build and stage release binaries first",
+                bin_path.display()
+            );
+        }
+        let mut file = fs::File::open(&bin_path).expect("open release binary");
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = file.read(&mut buf).expect("read release binary");
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        let actual_sha256: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        assert_eq!(
+            actual_sha256,
+            expected_sha256,
+            "Release binary '{}' SHA-256 mismatch: actual {} != manifest {}",
+            bin_path.display(),
+            actual_sha256,
+            expected_sha256
+        );
+        println!(
+            "VERIFIED RELEASE BINARY: {} sha256={}",
+            bin_path.display(),
+            actual_sha256
+        );
+        bin_path
     }
 
     fn pick_free_addr() -> String {
