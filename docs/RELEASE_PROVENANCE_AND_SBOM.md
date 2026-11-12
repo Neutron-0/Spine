@@ -7,9 +7,9 @@
 
 - **Repository:** `D:\Vault\Spine`
 - **Branch:** `main`
-- **Built Source Commit:** `3fcded082374542b28bebff895476f6639eb29d3` (source code, migrations, tests, and `docs/sbom.json` compiled into all release artifacts below; this provenance document commit is a `docs/`-only commit immediately following build verification)
-- **Built Source Tree Hash:** `34673c35c12981ad6e96621cd19204e42dbf2c05`
-- **Build Completion Timestamp (UTC):** `2026-11-12T08:01:27Z`
+- **Built Source Commit:** `386033664e147ddef275cd6165f1e0bf343ff136` (source code, migrations, tests, and `docs/sbom.json` compiled into all release artifacts below; this provenance document commit is a `docs/`-only commit immediately following build verification)
+- **Built Source Tree Hash:** `73f0fb54962cd061136155059fcc695bfda95a85`
+- **Build Completion Timestamp (UTC):** `2026-11-12T08:23:13Z`
 - **Host Target:** `x86_64-pc-windows-msvc`
 - **Compiler (`rustc --version`):** `rustc 1.97.1 (8bab26f4f 2026-07-14)` (commit `8bab26f4f68e0e26f0bb7960be334d5b520ea452`, LLVM `22.1.6`)
 - **Cargo (`cargo --version`):** `cargo 1.97.1 (c980f4866 2026-06-30)`
@@ -33,22 +33,22 @@ Both workspaces build with tracked `Cargo.lock` dependency graphs:
 
 ## 4. Release Candidate Artifact Inventory & SHA-256 Checksums
 
-All four production executables were built from source commit `3fcded082374542b28bebff895476f6639eb29d3`, staged under `target/release-candidate/`, and recorded in `target/release-candidate/SHA256SUMS`:
+All four production executables were built from source commit `386033664e147ddef275cd6165f1e0bf343ff136`, staged under `target/release-candidate/`, and recorded in `target/release-candidate/SHA256SUMS`:
 
 | Binary | Size (Bytes) | SHA-256 |
 |---|---|---|
-| `spine.exe` | `8864768` | `f112ee033f4cee70d900c40eb6d900010a44623d5298e55ca946b6134e3a1ec0` |
-| `spine-coordinator.exe` | `2692096` | `503be6aea55364f9fb4935d3d61e16145e1c6fc49eb47906c43391de95cb6224` |
-| `spine-storage-node.exe` | `2450944` | `bfce3912bb9b53666afbde1c61248b22a153b6a4036c098dc990ae39bbe4288c` |
-| `spine-api.exe` | `22695936` | `093291139b07cc8760705f0febd637fdfad8b64325a96d9d4be4bacdb348e353` |
+| `spine.exe` | `8892416` | `65ea4bf118113722fce876211e8ff2028b5f4273813d349c08374f03995104ab` |
+| `spine-coordinator.exe` | `3041792` | `66ccd6ac73c0154f48b84409d425801f5c314a6733def7609340f6a84696d06f` |
+| `spine-storage-node.exe` | `2766848` | `7d969321f868417483b952f36d26c68a8a4ac0b6e2a7308bf566224e02eb89cf` |
+| `spine-api.exe` | `22716928` | `972c673f65d47072e80e72a301ff1bb9b96999d918610a1f876a86de2001ca27` |
 
 Checksums manifest (`target/release-candidate/SHA256SUMS`):
 
 ```text
-f112ee033f4cee70d900c40eb6d900010a44623d5298e55ca946b6134e3a1ec0  spine.exe
-503be6aea55364f9fb4935d3d61e16145e1c6fc49eb47906c43391de95cb6224  spine-coordinator.exe
-bfce3912bb9b53666afbde1c61248b22a153b6a4036c098dc990ae39bbe4288c  spine-storage-node.exe
-093291139b07cc8760705f0febd637fdfad8b64325a96d9d4be4bacdb348e353  spine-api.exe
+65ea4bf118113722fce876211e8ff2028b5f4273813d349c08374f03995104ab  spine.exe
+66ccd6ac73c0154f48b84409d425801f5c314a6733def7609340f6a84696d06f  spine-coordinator.exe
+7d969321f868417483b952f36d26c68a8a4ac0b6e2a7308bf566224e02eb89cf  spine-storage-node.exe
+972c673f65d47072e80e72a301ff1bb9b96999d918610a1f876a86de2001ca27  spine-api.exe
 ```
 
 ## 5. CycloneDX Software Bill of Materials (SBOM)
@@ -59,3 +59,10 @@ bfce3912bb9b53666afbde1c61248b22a153b6a4036c098dc990ae39bbe4288c  spine-storage-
 - **SBOM Timestamp (UTC):** `2026-11-12T05:45:22.089277+00:00`
 - **Root Component:** `pkg:cargo/spine-platform@0.1.0-rc3` (`version: 0.1.0-rc3`)
 - **Total Unique Crate Components:** `465` (verified exact set equality against `git-alternative/Cargo.lock` + `github-alternative/backend/Cargo.lock`, with `0` missing or extra packages)
+
+## 6. Supported Operating Limits & Remote Snapshot Sizing
+
+- **Remote Participant RPC Snapshot Limit:** `15 MiB` (`15,728,640` bytes) compressed payload (`MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES`) per coordinator or storage-node participant transferred over single-frame `ClusterRpcRequest` / `ClusterRpcResponse`.
+  - **Protocol Rationale:** `ClusterRpcRequest` and `ClusterRpcResponse` serialize via `serde_json`, where `payload_bytes: Vec<u8>` encodes as a decimal integer array with `4x` worst-case expansion (`[255,...]`). A `15 MiB` payload fits within `MAX_CLUSTER_RPC_FRAME_BYTES` (`64 MiB`) with `>4 MiB` headroom for `VolumeSnapshotManifest` and protocol fields.
+  - **Bounded Capture Enforcement:** `BoundedVecWriter` aborts `capture_volume_snapshot` and coordinator `capture_snapshot` immediately when compressed/serialized bytes would exceed `15 MiB`, preventing unbounded memory allocation and cleanly releasing maintenance fencing on abort.
+  - **Pre-Restore Sizing Check:** Before scheduling a production restore window, operators must verify each remote participant's compressed snapshot (`tar -czf - repos chunks manifests | wc -c` for storage nodes; `coordinator_state.json` size for coordinator) is `<= 15,728,640` bytes, or use offline/out-of-band volume replication for larger repositories.
