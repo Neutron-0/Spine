@@ -7,9 +7,9 @@
 
 - **Repository:** `D:\Vault\Spine`
 - **Branch:** `main`
-- **Built Source Commit:** `90a695d940efcc3e4a2f3f4d856b416ac707d1f1` (source code, tests, and `docs/sbom.json` compiled into all release artifacts below; this provenance document commit is a `docs/`-only commit immediately following build verification)
-- **Built Source Tree Hash:** `3140d1fe19ca069226ffdbcb3472002097153bdc`
-- **Build Completion Timestamp (UTC):** `2026-11-12T05:51:16Z`
+- **Built Source Commit:** `054d899c9b99d92cf46d417617d16aea2a975922` (source code, migrations, tests, and `docs/sbom.json` compiled into all release artifacts below; this provenance document commit is a `docs/`-only commit immediately following build verification)
+- **Built Source Tree Hash:** `bf4c7bc9a15cadbc97146e3ee21ecdbcb6b33aa0`
+- **Build Completion Timestamp (UTC):** `2026-11-12T06:44:49Z`
 - **Host Target:** `x86_64-pc-windows-msvc`
 - **Compiler (`rustc --version`):** `rustc 1.97.1 (8bab26f4f 2026-07-14)` (commit `8bab26f4f68e0e26f0bb7960be334d5b520ea452`, LLVM `22.1.6`)
 - **Cargo (`cargo --version`):** `cargo 1.97.1 (c980f4866 2026-06-30)`
@@ -33,22 +33,22 @@ Both workspaces build with tracked `Cargo.lock` dependency graphs:
 
 ## 4. Release Candidate Artifact Inventory & SHA-256 Checksums
 
-All four production executables were built from source commit `90a695d940efcc3e4a2f3f4d856b416ac707d1f1`, staged under `target/release-candidate/`, and recorded in `target/release-candidate/SHA256SUMS`:
+All four production executables were built from source commit `054d899c9b99d92cf46d417617d16aea2a975922`, staged under `target/release-candidate/`, and recorded in `target/release-candidate/SHA256SUMS`:
 
 | Binary | Size (Bytes) | SHA-256 |
 |---|---|---|
-| `spine.exe` | `8864768` | `4c9c69b0a593e88f6c127a2e68757f23ea03a2392d8f7d6adbb7c069ca7cec34` |
-| `spine-coordinator.exe` | `2694144` | `0b8f086fd8eb6ba39e8db679bcfa2eae3abb6fdde7e341e0e7d8dc8466503b02` |
-| `spine-storage-node.exe` | `2449408` | `279f287598987e00bdea4e4e7f1fb1a34d8c6c663387209e422ebf11940c62e5` |
-| `spine-api.exe` | `22696960` | `8bc9143e9610012d48b7dad83105c91dd77c783398838abb9e48fda88e782412` |
+| `spine.exe` | `8864768` | `f112ee033f4cee70d900c40eb6d900010a44623d5298e55ca946b6134e3a1ec0` |
+| `spine-coordinator.exe` | `2692096` | `503be6aea55364f9fb4935d3d61e16145e1c6fc49eb47906c43391de95cb6224` |
+| `spine-storage-node.exe` | `2450944` | `bfce3912bb9b53666afbde1c61248b22a153b6a4036c098dc990ae39bbe4288c` |
+| `spine-api.exe` | `22695936` | `093291139b07cc8760705f0febd637fdfad8b64325a96d9d4be4bacdb348e353` |
 
 Checksums manifest (`target/release-candidate/SHA256SUMS`):
 
 ```text
-4c9c69b0a593e88f6c127a2e68757f23ea03a2392d8f7d6adbb7c069ca7cec34  spine.exe
-0b8f086fd8eb6ba39e8db679bcfa2eae3abb6fdde7e341e0e7d8dc8466503b02  spine-coordinator.exe
-279f287598987e00bdea4e4e7f1fb1a34d8c6c663387209e422ebf11940c62e5  spine-storage-node.exe
-8bc9143e9610012d48b7dad83105c91dd77c783398838abb9e48fda88e782412  spine-api.exe
+f112ee033f4cee70d900c40eb6d900010a44623d5298e55ca946b6134e3a1ec0  spine.exe
+503be6aea55364f9fb4935d3d61e16145e1c6fc49eb47906c43391de95cb6224  spine-coordinator.exe
+bfce3912bb9b53666afbde1c61248b22a153b6a4036c098dc990ae39bbe4288c  spine-storage-node.exe
+093291139b07cc8760705f0febd637fdfad8b64325a96d9d4be4bacdb348e353  spine-api.exe
 ```
 
 ## 5. CycloneDX Software Bill of Materials (SBOM)
