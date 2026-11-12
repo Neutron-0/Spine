@@ -493,3 +493,193 @@ async fn test_backup_cleanup_live_processes_and_postgres_guard_release() {
 
     disp_db.cleanup().await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires isolated SPINE_TEST_DATABASE_URL; run with -- --ignored in release gate"]
+async fn test_pre_helper_db_maintenance_entry_and_dump_failure_paths() {
+    use spine_api::backup::{capture_encrypted_pg_dump, SPINE_CLUSTER_MAINTENANCE_LOCK_ID};
+    use sqlx::postgres::PgConnectOptions;
+    use sqlx::Connection;
+
+    let db_url = std::env::var("SPINE_TEST_DATABASE_URL").unwrap_or_default();
+    assert!(
+        !db_url.trim().is_empty(),
+        "SPINE_TEST_DATABASE_URL must be set to an isolated disposable PostgreSQL instance"
+    );
+
+    let disp_db = HarnessDisposableDb::provision().await.unwrap();
+
+    // 1. Dedicated connection failure after DB barrier is activated -> rolls back DB barrier & local state
+    let bad_opts: PgConnectOptions = "postgres://postgres@127.0.0.1:1/nonexistent"
+        .parse()
+        .unwrap();
+    let bad_conn_barrier =
+        ConsistencyBarrier::with_pool_and_connect_options(disp_db.pool.clone(), bad_opts);
+    let err_conn = bad_conn_barrier
+        .enter_maintenance(Duration::from_millis(200))
+        .await
+        .err()
+        .expect("bad dedicated connect_options must fail");
+    assert!(err_conn
+        .to_string()
+        .contains("Failed to establish dedicated connection"));
+    assert!(!bad_conn_barrier.is_in_maintenance());
+    let is_active_1: (bool,) =
+        sqlx::query_as("SELECT is_active FROM _cluster_maintenance_barrier WHERE id = 1")
+            .fetch_one(&disp_db.pool)
+            .await
+            .unwrap();
+    assert!(
+        !is_active_1.0,
+        "DB barrier must be rolled back to is_active=FALSE after dedicated connection failure"
+    );
+
+    // 2. Advisory-lock query failure after DB barrier is activated -> rolls back DB barrier & closes conn
+    let normal_barrier = ConsistencyBarrier::with_pool(disp_db.pool.clone());
+    let err_lock_q = normal_barrier
+        .enter_maintenance_with_lock_sql(
+            Duration::from_millis(200),
+            "SELECT nonexistent_advisory_lock_fn($1)",
+        )
+        .await
+        .err()
+        .expect("invalid advisory lock SQL must fail");
+    assert!(err_lock_q
+        .to_string()
+        .contains("Failed to query exclusive maintenance lock"));
+    assert!(!normal_barrier.is_in_maintenance());
+    let is_active_2: (bool,) =
+        sqlx::query_as("SELECT is_active FROM _cluster_maintenance_barrier WHERE id = 1")
+            .fetch_one(&disp_db.pool)
+            .await
+            .unwrap();
+    assert!(
+        !is_active_2.0,
+        "DB barrier must be rolled back to is_active=FALSE after advisory-lock query failure"
+    );
+
+    // 3. Lock timeout with clean rollback, followed by lock timeout + barrier-clear rollback failure
+    let mut holder_conn = sqlx::PgConnection::connect(&disp_db.migrator_url)
+        .await
+        .unwrap();
+    let held: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+        .bind(SPINE_CLUSTER_MAINTENANCE_LOCK_ID)
+        .fetch_one(&mut holder_conn)
+        .await
+        .unwrap();
+    assert!(held.0);
+
+    let err_timeout = normal_barrier
+        .enter_maintenance(Duration::from_millis(150))
+        .await
+        .err()
+        .expect("lock contention must time out");
+    assert!(err_timeout.to_string().contains("Timed out"));
+    assert!(!normal_barrier.is_in_maintenance());
+    let is_active_3: (bool,) =
+        sqlx::query_as("SELECT is_active FROM _cluster_maintenance_barrier WHERE id = 1")
+            .fetch_one(&disp_db.pool)
+            .await
+            .unwrap();
+    assert!(!is_active_3.0);
+
+    // Lock timeout + barrier-clear rollback failure (drop barrier table during drain window)
+    let pool_drop = disp_db.pool.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let _ = sqlx::query("DROP TABLE _cluster_maintenance_barrier")
+            .execute(&pool_drop)
+            .await;
+    });
+    let err_timeout_rb = normal_barrier
+        .enter_maintenance(Duration::from_millis(350))
+        .await
+        .err()
+        .expect("lock timeout + rollback failure must fail");
+    let msg_rb = err_timeout_rb.to_string();
+    assert!(msg_rb.contains("Timed out"), "got: {}", msg_rb);
+    assert!(
+        msg_rb.contains("maintenance entry rollback failed"),
+        "Expected rollback failure surfaced alongside timeout, got: {}",
+        msg_rb
+    );
+
+    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(SPINE_CLUSTER_MAINTENANCE_LOCK_ID)
+        .execute(&mut holder_conn)
+        .await;
+    let _ = holder_conn.close().await;
+
+    // Recreate barrier table for dump failure & encryption-writer failure tests
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS _cluster_maintenance_barrier (id INT PRIMARY KEY DEFAULT 1, is_active BOOLEAN NOT NULL DEFAULT FALSE, activated_at_nanos BIGINT NOT NULL DEFAULT 0, activated_by VARCHAR(255) NOT NULL DEFAULT '', reason VARCHAR(255) NOT NULL DEFAULT '', fencing_generation BIGINT NOT NULL DEFAULT 1)",
+    )
+    .execute(&disp_db.pool)
+    .await
+    .unwrap();
+
+    // 4. Database dump failure after entering maintenance -> explicit cleanup clears DB barrier
+    let guard = normal_barrier
+        .enter_maintenance(Duration::from_secs(5))
+        .await
+        .unwrap();
+    let closed_pool = sqlx::PgPool::connect(&disp_db.app_url).await.unwrap();
+    closed_pool.close().await;
+    let err_dump = run_backup_with_maintenance_cleanup(
+        guard.fencing_generation,
+        None,
+        &[],
+        Some(move || async move { guard.release().await }),
+        move |_, _| async move {
+            capture_encrypted_pg_dump(&closed_pool).await?;
+            Ok(())
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err_dump
+            .to_string()
+            .contains("Failed to stream PostgreSQL database dump"),
+        "got: {}",
+        err_dump
+    );
+    let is_active_4: (bool,) =
+        sqlx::query_as("SELECT is_active FROM _cluster_maintenance_barrier WHERE id = 1")
+            .fetch_one(&disp_db.pool)
+            .await
+            .unwrap();
+    assert!(
+        !is_active_4.0,
+        "DB barrier must be cleared after dump failure under run_backup_with_maintenance_cleanup"
+    );
+
+    // 5. Encryption-writer failure + DB guard release failure -> surfaces both original and cleanup error
+    let guard2 = normal_barrier
+        .enter_maintenance(Duration::from_secs(5))
+        .await
+        .unwrap();
+    let pool_for_drop = disp_db.pool.clone();
+    let err_enc_and_guard = run_backup_with_maintenance_cleanup(
+        guard2.fencing_generation,
+        None,
+        &[],
+        Some(move || async move { guard2.release().await }),
+        move |_, _| async move {
+            sqlx::query("DROP TABLE _cluster_maintenance_barrier")
+                .execute(&pool_for_drop)
+                .await
+                .unwrap();
+            Err(ForgeError::Internal(
+                "Simulated encryption-writer failure during DB dump".to_string(),
+            ))
+        },
+    )
+    .await
+    .unwrap_err();
+    let msg_both = err_enc_and_guard.to_string();
+    assert!(msg_both.contains("Simulated encryption-writer failure"));
+    assert!(msg_both.contains("database maintenance guard release failed"));
+
+    disp_db.cleanup().await.unwrap();
+}

@@ -53,6 +53,21 @@ impl ConsistencyBarrier {
         }
     }
 
+    pub fn with_pool_and_connect_options(pool: PgPool, connect_options: PgConnectOptions) -> Self {
+        Self {
+            in_maintenance: Arc::new(AtomicBool::new(false)),
+            in_flight_writes: Arc::new(AtomicUsize::new(0)),
+            fencing_generation: Arc::new(AtomicU64::new(1)),
+            pool: Some(pool),
+            connect_options: Some(Arc::new(connect_options)),
+            storage_root: None,
+        }
+    }
+
+    pub fn is_in_maintenance(&self) -> bool {
+        self.in_maintenance.load(Ordering::SeqCst)
+    }
+
     pub fn with_pool_and_options(pool: PgPool, options: PgConnectOptions) -> Self {
         Self {
             in_maintenance: Arc::new(AtomicBool::new(false)),
@@ -326,11 +341,67 @@ impl ConsistencyBarrier {
         })
     }
 
+    async fn rollback_failed_entry(
+        &self,
+        conn_opt: Option<PgConnection>,
+        prev_fencing_gen: u64,
+        orig_err: ForgeError,
+    ) -> ForgeError {
+        self.in_maintenance.store(false, Ordering::SeqCst);
+        self.fencing_generation
+            .store(prev_fencing_gen, Ordering::SeqCst);
+
+        let mut rollback_errors: Vec<String> = Vec::new();
+        if let Some(mut conn) = conn_opt {
+            if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
+                .bind(SPINE_CLUSTER_MAINTENANCE_LOCK_ID)
+                .execute(&mut conn)
+                .await
+            {
+                rollback_errors.push(format!("advisory unlock failed: {}", e));
+            }
+            let _ = conn.close().await;
+        }
+        if let Some(pool) = &self.pool {
+            if let Err(e) = sqlx::query(
+                "UPDATE _cluster_maintenance_barrier SET is_active = FALSE WHERE id = 1",
+            )
+            .execute(pool)
+            .await
+            {
+                rollback_errors.push(format!(
+                    "failed to clear _cluster_maintenance_barrier.is_active: {}",
+                    e
+                ));
+            }
+        }
+        if rollback_errors.is_empty() {
+            orig_err
+        } else {
+            ForgeError::Internal(format!(
+                "{} AND maintenance entry rollback failed: [{}]",
+                orig_err,
+                rollback_errors.join("; ")
+            ))
+        }
+    }
+
     /// Enter maintenance mode and drain in-flight operations across all cluster processes.
     pub async fn enter_maintenance(
         &self,
         drain_timeout: Duration,
     ) -> Result<MaintenanceGuard, ForgeError> {
+        self.enter_maintenance_with_lock_sql(drain_timeout, "SELECT pg_try_advisory_lock($1)")
+            .await
+    }
+
+    /// Enter maintenance mode using a caller-specified advisory lock query (used by fault-injection tests).
+    pub async fn enter_maintenance_with_lock_sql(
+        &self,
+        drain_timeout: Duration,
+        lock_sql: &str,
+    ) -> Result<MaintenanceGuard, ForgeError> {
+        let prev_fencing_gen = self.fencing_generation.load(Ordering::SeqCst);
         self.in_maintenance.store(true, Ordering::SeqCst);
         let in_memory_gen = self.fencing_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -339,6 +410,7 @@ impl ConsistencyBarrier {
         let mut final_fencing_gen = in_memory_gen;
 
         if let Some(opts) = &self.connect_options {
+            let mut barrier_activated = false;
             if let Some(pool) = &self.pool {
                 // 1. Mark barrier active and increment monotonic fencing generation
                 let barrier_res: Result<(i64,), _> = sqlx::query_as(
@@ -363,6 +435,7 @@ impl ConsistencyBarrier {
                         final_fencing_gen = gen as u64;
                         self.fencing_generation
                             .store(final_fencing_gen, Ordering::SeqCst);
+                        barrier_activated = true;
                     }
                     Err(e) => {
                         // Fallback: If table does not exist, create it with fencing_generation
@@ -399,12 +472,27 @@ impl ConsistencyBarrier {
                             .fetch_one(pool)
                             .await;
 
-                            if let Ok((gen,)) = gen_res {
-                                final_fencing_gen = gen as u64;
-                                self.fencing_generation
-                                    .store(final_fencing_gen, Ordering::SeqCst);
+                            match gen_res {
+                                Ok((gen,)) => {
+                                    final_fencing_gen = gen as u64;
+                                    self.fencing_generation
+                                        .store(final_fencing_gen, Ordering::SeqCst);
+                                    barrier_activated = true;
+                                }
+                                Err(ins_err) => {
+                                    self.in_maintenance.store(false, Ordering::SeqCst);
+                                    self.fencing_generation
+                                        .store(prev_fencing_gen, Ordering::SeqCst);
+                                    return Err(ForgeError::Internal(format!(
+                                        "Failed to update cluster maintenance barrier: {}",
+                                        ins_err
+                                    )));
+                                }
                             }
                         } else {
+                            self.in_maintenance.store(false, Ordering::SeqCst);
+                            self.fencing_generation
+                                .store(prev_fencing_gen, Ordering::SeqCst);
                             return Err(ForgeError::Internal(format!(
                                 "Failed to update cluster maintenance barrier: {}",
                                 e
@@ -415,29 +503,45 @@ impl ConsistencyBarrier {
             }
 
             // 2. Dedicated non-pooled connection to acquire exclusive advisory lock
-            let mut conn = PgConnection::connect_with(opts.as_ref())
-                .await
-                .map_err(|e| {
-                    ForgeError::Internal(format!(
+            let mut conn = match PgConnection::connect_with(opts.as_ref()).await {
+                Ok(c) => c,
+                Err(e) => {
+                    let orig = ForgeError::Internal(format!(
                         "Failed to establish dedicated connection for maintenance lock: {}",
                         e
-                    ))
-                })?;
+                    ));
+                    return Err(if barrier_activated {
+                        self.rollback_failed_entry(None, prev_fencing_gen, orig)
+                            .await
+                    } else {
+                        self.in_maintenance.store(false, Ordering::SeqCst);
+                        self.fencing_generation
+                            .store(prev_fencing_gen, Ordering::SeqCst);
+                        orig
+                    });
+                }
+            };
 
             // 3. Acquire exclusive advisory lock, waiting for existing in-flight shared locks to drain
             let start = std::time::Instant::now();
             let mut acquired = false;
             while start.elapsed() < drain_timeout {
-                let lock_res: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+                let lock_res: (bool,) = match sqlx::query_as(lock_sql)
                     .bind(SPINE_CLUSTER_MAINTENANCE_LOCK_ID)
                     .fetch_one(&mut conn)
                     .await
-                    .map_err(|e| {
-                        ForgeError::Internal(format!(
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let orig = ForgeError::Internal(format!(
                             "Failed to query exclusive maintenance lock: {}",
                             e
-                        ))
-                    })?;
+                        ));
+                        return Err(self
+                            .rollback_failed_entry(Some(conn), prev_fencing_gen, orig)
+                            .await);
+                    }
+                };
 
                 if lock_res.0 {
                     acquired = true;
@@ -447,19 +551,13 @@ impl ConsistencyBarrier {
             }
 
             if !acquired {
-                let _ = conn.close().await;
-                if let Some(pool) = &self.pool {
-                    let _ = sqlx::query(
-                        "UPDATE _cluster_maintenance_barrier SET is_active = FALSE WHERE id = 1",
-                    )
-                    .execute(pool)
-                    .await;
-                }
-                self.in_maintenance.store(false, Ordering::SeqCst);
-                return Err(ForgeError::Internal(format!(
+                let orig = ForgeError::Internal(format!(
                     "Timed out after {:?} waiting for in-flight writers to drain across cluster",
                     drain_timeout
-                )));
+                ));
+                return Err(self
+                    .rollback_failed_entry(Some(conn), prev_fencing_gen, orig)
+                    .await);
             }
 
             guard_conn = Some(conn);
@@ -474,6 +572,16 @@ impl ConsistencyBarrier {
         let start = std::time::Instant::now();
         while self.in_flight_writes.load(Ordering::SeqCst) > 0 && start.elapsed() < drain_timeout {
             sleep(Duration::from_millis(20)).await;
+        }
+        if self.in_flight_writes.load(Ordering::SeqCst) > 0 {
+            let orig = ForgeError::Internal(format!(
+                "Timed out after {:?} waiting for {} local in-flight writers to drain",
+                drain_timeout,
+                self.in_flight_writes.load(Ordering::SeqCst)
+            ));
+            return Err(self
+                .rollback_failed_entry(guard_conn, prev_fencing_gen, orig)
+                .await);
         }
 
         Ok(MaintenanceGuard {

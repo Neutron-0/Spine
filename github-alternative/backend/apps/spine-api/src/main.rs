@@ -686,9 +686,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                let (_guard_barrier, _maintenance_guard, captured_pg_enc) = if let Some(url) =
-                    db_url
-                {
+                let (pg_pool_opt, guard_opt) = if let Some(url) = db_url {
                     let resolved_url = spine_api::db::DatabaseSelector::resolve_active_db_url(
                         &url,
                         Some(&storage_root),
@@ -715,34 +713,12 @@ async fn main() -> anyhow::Result<()> {
                             anyhow::anyhow!("Failed to enter cluster maintenance: {}", e)
                         })?;
 
-                    let (tmp_pg, pg_key, mut pg_enc_writer) =
-                        spine_api::backup::EphemeralEncryptedTemp::begin(
-                            spine_api::backup::v2::DEFAULT_CHUNK_SIZE,
-                        )
-                        .map_err(|e| {
-                            anyhow::anyhow!("Failed to initialize encrypted DB stream: {}", e)
-                        })?;
-                    spine_api::dump_database_to_writer(&pool, &mut pg_enc_writer)
-                        .await
-                        .map_err(|e| {
-                            anyhow::anyhow!("Failed to stream PostgreSQL database dump: {}", e)
-                        })?;
-                    let pg_summary = pg_enc_writer.finish().map_err(|e| {
-                        anyhow::anyhow!("Failed to finalize encrypted DB stream: {}", e)
-                    })?;
-                    let pg_enc = spine_api::backup::EphemeralEncryptedTemp::from_finished(
-                        tmp_pg, pg_key, pg_summary,
-                    );
-                    println!(
-                        "PostgreSQL bounded-memory AEAD snapshot captured successfully ({} bytes plaintext, O(1 MiB) RAM, 0 plaintext disk intermediates).",
-                        pg_enc.byte_length
-                    );
-                    (Some(barrier), Some(guard), Some(pg_enc))
+                    (Some(pool), Some(guard))
                 } else {
-                    (None, None, None)
+                    (None, None)
                 };
 
-                let fencing_generation = _maintenance_guard
+                let fencing_generation = guard_opt
                     .as_ref()
                     .map(|g| g.fencing_generation)
                     .unwrap_or(1);
@@ -751,7 +727,6 @@ async fn main() -> anyhow::Result<()> {
                     spine_api::BackupParticipantRecord,
                     spine_api::backup::ParticipantPayloadSource,
                 )> = Vec::new();
-                let guard_opt = _maintenance_guard;
                 let release_db_guard = guard_opt.map(|g| move || async move { g.release().await });
                 spine_api::backup::run_backup_with_maintenance_cleanup(
                     fencing_generation,
@@ -760,7 +735,11 @@ async fn main() -> anyhow::Result<()> {
                     release_db_guard,
                     |coord_client, storage_clients| async move {
                 let mut stream_participants = stream_participants;
-                let captured_pg_enc = captured_pg_enc;
+                let captured_pg_enc = if let Some(ref pool) = pg_pool_opt {
+                    Some(spine_api::backup::capture_encrypted_pg_dump(pool).await?)
+                } else {
+                    None
+                };
                 if let Some(client) = coord_client {
                     let snap_id = uuid::Uuid::new_v4().to_string();
                     let (manifest, data) = client

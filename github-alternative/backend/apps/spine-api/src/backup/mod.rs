@@ -2284,3 +2284,27 @@ where
 
     work_res
 }
+
+/// Streams a PostgreSQL database dump directly into an encrypted `EphemeralEncryptedTemp` file.
+pub async fn capture_encrypted_pg_dump(
+    pool: &sqlx::PgPool,
+) -> Result<EphemeralEncryptedTemp, ForgeError> {
+    let (tmp_pg, pg_key, mut pg_enc_writer) = EphemeralEncryptedTemp::begin(v2::DEFAULT_CHUNK_SIZE)
+        .map_err(|e| {
+            ForgeError::Internal(format!("Failed to initialize encrypted DB stream: {}", e))
+        })?;
+    crate::dump_database_to_writer(pool, &mut pg_enc_writer)
+        .await
+        .map_err(|e| {
+            ForgeError::Internal(format!("Failed to stream PostgreSQL database dump: {}", e))
+        })?;
+    let pg_summary = pg_enc_writer.finish().map_err(|e| {
+        ForgeError::Internal(format!("Failed to finalize encrypted DB stream: {}", e))
+    })?;
+    let pg_enc = EphemeralEncryptedTemp::from_finished(tmp_pg, pg_key, pg_summary);
+    println!(
+        "PostgreSQL bounded-memory AEAD snapshot captured successfully ({} bytes plaintext, O(1 MiB) RAM, 0 plaintext disk intermediates).",
+        pg_enc.byte_length
+    );
+    Ok(pg_enc)
+}
