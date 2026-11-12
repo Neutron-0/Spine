@@ -21,6 +21,56 @@ pub const MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES: usize = 15 * 1024 * 1024;
 const _: () =
     assert!(MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES * 4 + 1024 * 1024 <= MAX_CLUSTER_RPC_FRAME_BYTES);
 
+/// Bounded `std::io::Write` sink backed by `Vec<u8>` that fails immediately before allocating
+/// when total written bytes would exceed `max_bytes`.
+#[derive(Debug, Clone)]
+pub struct BoundedVecWriter {
+    buf: Vec<u8>,
+    max_bytes: usize,
+}
+
+impl BoundedVecWriter {
+    pub fn new(max_bytes: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            max_bytes,
+        }
+    }
+
+    pub fn into_inner(self) -> Vec<u8> {
+        self.buf
+    }
+
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+}
+
+impl std::io::Write for BoundedVecWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let next_len = self.buf.len().saturating_add(data.len());
+        if next_len > self.max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Remote participant snapshot payload exceeded MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES ({} bytes) during capture; compressed participant volume must not exceed 15 MiB over single-frame RPC",
+                    self.max_bytes
+                ),
+            ));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClusterRpcRequest {
     Enroll(EnrollmentRequest),
@@ -296,5 +346,46 @@ impl ClusterRpcResponse {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         serde_json::from_slice(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn test_bounded_vec_writer_below_at_and_above_limit() {
+        let limit = MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES;
+
+        // Just below limit
+        let mut w_below = BoundedVecWriter::new(limit);
+        w_below.write_all(&vec![0x11u8; limit - 1]).unwrap();
+        assert_eq!(w_below.len(), limit - 1);
+
+        // Exactly at limit
+        let mut w_at = BoundedVecWriter::new(limit);
+        w_at.write_all(&vec![0x22u8; limit]).unwrap();
+        assert_eq!(w_at.len(), limit);
+
+        // Above limit by 1 byte: fails immediately without growing buffer
+        let mut w_over = BoundedVecWriter::new(limit);
+        w_over.write_all(&vec![0x33u8; limit]).unwrap();
+        let err = w_over.write_all(&[0x44u8]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(w_over.len(), limit);
+
+        // Streaming 100 MiB in 32 KiB chunks stops at 15 MiB + 1 chunk
+        let mut w_stream = BoundedVecWriter::new(limit);
+        let chunk = vec![0xABu8; 32 * 1024];
+        let mut chunks_written = 0usize;
+        for _ in 0..(100 * 32) {
+            if w_stream.write_all(&chunk).is_err() {
+                break;
+            }
+            chunks_written += 1;
+        }
+        assert_eq!(chunks_written, limit / (32 * 1024));
+        assert_eq!(w_stream.len(), limit);
     }
 }

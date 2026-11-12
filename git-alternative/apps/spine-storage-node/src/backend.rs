@@ -781,10 +781,12 @@ impl StorageBackend for FileSystemStorageBackend {
         snapshot_id: &str,
         fencing_generation: u64,
     ) -> Result<(VolumeSnapshotManifest, Vec<u8>)> {
-        let mut buffer = Vec::new();
+        let bounded = spine_cluster::protocol::BoundedVecWriter::new(
+            spine_cluster::protocol::MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES,
+        );
+        let mut enc = GzEncoder::new(bounded, Compression::default());
         {
-            let enc = GzEncoder::new(&mut buffer, Compression::default());
-            let mut tar = Builder::new(enc);
+            let mut tar = Builder::new(&mut enc);
 
             let subdirs = ["repos", "chunks", "manifests"];
             for sub in &subdirs {
@@ -795,6 +797,7 @@ impl StorageBackend for FileSystemStorageBackend {
             }
             tar.finish()?;
         }
+        let buffer = enc.finish()?.into_inner();
 
         let sha256_checksum = format!("{:x}", sha2::Sha256::digest(&buffer));
         let total_bytes = buffer.len() as u64;
@@ -1184,5 +1187,46 @@ mod tests {
         // After exiting maintenance, writer succeeds
         let _guard = backend.acquire_writer(Some(15)).unwrap();
         assert_eq!(backend.get_maintenance_status(), (false, 15, 1));
+    }
+
+    #[test]
+    fn test_capture_volume_snapshot_aborts_early_above_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FileSystemStorageBackend::new(tmp.path(), 100_000_000).unwrap();
+        backend.enter_maintenance(20).unwrap();
+        assert_eq!(backend.get_maintenance_status(), (true, 20, 0));
+
+        // Write 18 MiB of incompressible pseudo-random data across chunks/ so gzip output > 15 MiB
+        let chunks_dir = tmp.path().join("chunks");
+        fs::create_dir_all(&chunks_dir).unwrap();
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut block = vec![0u8; 1024 * 1024];
+        for b in &mut block {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *b = (state >> 56) as u8;
+        }
+        for i in 0..18u8 {
+            let mut file_buf = block.clone();
+            file_buf[0] ^= i;
+            file_buf[1024] ^= i.wrapping_mul(31);
+            fs::write(chunks_dir.join(format!("chunk_{:02}.bin", i)), &file_buf).unwrap();
+        }
+
+        let err = backend
+            .capture_volume_snapshot("snap_oversized", 20)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES"),
+            "Expected bounded capture abort error, got: {}",
+            err
+        );
+
+        // Maintenance fencing recovers cleanly after aborted capture
+        backend.exit_maintenance(20).unwrap();
+        assert_eq!(backend.get_maintenance_status(), (false, 20, 0));
+        let _guard = backend.acquire_writer(Some(20)).unwrap();
     }
 }

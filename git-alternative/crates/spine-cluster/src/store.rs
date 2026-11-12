@@ -769,7 +769,11 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
         fencing_generation: u64,
     ) -> Result<(VolumeSnapshotManifest, Vec<u8>)> {
         let snap = self.state.read().unwrap();
-        let payload = serde_json::to_vec_pretty(&*snap)?;
+        let mut writer = crate::protocol::BoundedVecWriter::new(
+            crate::protocol::MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES,
+        );
+        serde_json::to_writer_pretty(&mut writer, &*snap)?;
+        let payload = writer.into_inner();
         let sha256_checksum = format!("{:x}", sha2::Sha256::digest(&payload));
         let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let manifest = VolumeSnapshotManifest {

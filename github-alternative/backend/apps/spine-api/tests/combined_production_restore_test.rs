@@ -128,16 +128,13 @@ async fn wait_for_node(addr: &str) {
 }
 
 #[tokio::test]
+#[ignore = "requires isolated SPINE_TEST_DATABASE_URL; run with -- --ignored in release gate"]
 async fn test_combined_production_shaped_postgres_and_cluster_recovery() {
-    if std::env::var("SPINE_TEST_DATABASE_URL")
-        .map(|v| v.trim().is_empty())
-        .unwrap_or(true)
-    {
-        eprintln!(
-            "Skipping combined production-shaped restore test: SPINE_TEST_DATABASE_URL not set"
-        );
-        return;
-    }
+    let db_url = std::env::var("SPINE_TEST_DATABASE_URL").unwrap_or_default();
+    assert!(
+        !db_url.trim().is_empty(),
+        "SPINE_TEST_DATABASE_URL must be set to an isolated disposable PostgreSQL instance when running combined_production_restore_test"
+    );
 
     // 1. Provision isolated disposable PostgreSQL database and set _restore_generation = "20"
     let disp_db = HarnessDisposableDb::provision()

@@ -752,6 +752,8 @@ async fn main() -> anyhow::Result<()> {
                     spine_api::backup::ParticipantPayloadSource,
                 )> = Vec::new();
                 let mut coord_client = None;
+                let mut storage_clients = Vec::new();
+                let backup_res: anyhow::Result<()> = async {
                 if let Some(ref c_addr) = coord_addr_opt {
                     println!(
                         "Coordinating maintenance barrier with Spine Coordinator at {}...",
@@ -767,6 +769,7 @@ async fn main() -> anyhow::Result<()> {
                                 e
                             )
                         })?;
+                    coord_client = Some(client.clone());
                     let snap_id = uuid::Uuid::new_v4().to_string();
                     let (manifest, data) = client
                         .capture_snapshot(&snap_id, fencing_generation)
@@ -792,10 +795,8 @@ async fn main() -> anyhow::Result<()> {
                         spine_api::backup::ParticipantPayloadSource::EncryptedTemp(coord_enc),
                     ));
                     println!("Coordinator volume snapshot captured successfully.");
-                    coord_client = Some(client);
                 }
 
-                let mut storage_clients = Vec::new();
                 for (node_id, addr) in &node_endpoints {
                     println!(
                         "Coordinating maintenance barrier with storage node '{}' at {}...",
@@ -805,6 +806,7 @@ async fn main() -> anyhow::Result<()> {
                     client.enter_maintenance(fencing_generation).await.map_err(|e| {
                         anyhow::anyhow!("Failed to coordinate maintenance barrier with storage node '{}': {}", node_id, e)
                     })?;
+                    storage_clients.push((node_id.clone(), client.clone()));
                     let snap_id = uuid::Uuid::new_v4().to_string();
                     let (manifest, data) = client
                         .capture_snapshot(&snap_id, fencing_generation)
@@ -837,7 +839,6 @@ async fn main() -> anyhow::Result<()> {
                         "Storage node '{}' volume snapshot captured successfully.",
                         node_id
                     );
-                    storage_clients.push((node_id.clone(), client));
                 }
 
                 // Capture authoritative SSH host identity snapshot
@@ -940,12 +941,15 @@ async fn main() -> anyhow::Result<()> {
                 println!("  Total files:   {}", manifest.total_files);
                 println!("  Total bytes:   {}", manifest.total_bytes);
                 println!("  Status:        {}", manifest.integrity_status);
-                if !manifest.participants.is_empty() {
-                    println!(
-                        "  Participants:  {} cluster volumes captured",
-                        manifest.participants.len()
-                    );
+                    if !manifest.participants.is_empty() {
+                        println!(
+                            "  Participants:  {} cluster volumes captured",
+                            manifest.participants.len()
+                        );
+                    }
+                    Ok(())
                 }
+                .await;
 
                 for (id, client) in storage_clients {
                     if let Err(e) = client.exit_maintenance(fencing_generation).await {
@@ -964,6 +968,7 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(guard) = _maintenance_guard {
                     let _ = guard.release().await;
                 }
+                backup_res?;
                 Ok(())
             }
             BackupCommands::Restore {
