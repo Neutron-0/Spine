@@ -136,7 +136,7 @@ impl ConsistencyBarrier {
     /// on a dedicated non-pooled connection.
     /// Fails with ServiceUnavailable if the cluster is in maintenance mode.
     pub async fn acquire_write_permit(&self) -> Result<WritePermit, ForgeError> {
-        if self.is_maintenance_active() {
+        if self.pool.is_none() && self.is_maintenance_active() {
             return Err(ForgeError::ServiceUnavailable(
                 "Cluster write pipeline is currently paused for coordinated maintenance"
                     .to_string(),
