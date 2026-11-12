@@ -10,6 +10,9 @@ use tokio::time::sleep;
 /// Represents ASCII string "SPINEBAK" (0x5350494E_4542414B).
 pub const SPINE_CLUSTER_MAINTENANCE_LOCK_ID: i64 = 0x5350_494E_4542_414B;
 
+/// Default bounded TTL for a cluster maintenance barrier lease (5 minutes).
+pub const DEFAULT_MAINTENANCE_LEASE_TTL: Duration = Duration::from_secs(300);
+
 /// Consistency barrier for coordinating live backups and draining in-flight writes.
 /// Coordinates across independent operating-system processes via PostgreSQL advisory locking
 /// and a cluster maintenance state table.
@@ -224,25 +227,56 @@ impl ConsistencyBarrier {
         let mut permit_gen = self.fencing_generation.load(Ordering::SeqCst);
 
         if let Some(opts) = &self.connect_options {
-            // 1. Check if cluster maintenance table has marked maintenance active and read fencing generation
+            // 1. Check if cluster maintenance table has marked maintenance active and read fencing generation + lease
             if let Some(pool) = &self.pool {
-                let barrier_row: Result<Option<(bool, i64)>, _> = sqlx::query_as(
-                    "SELECT is_active, fencing_generation FROM _cluster_maintenance_barrier WHERE id = 1",
+                let barrier_row: Result<Option<(bool, i64, i64)>, _> = sqlx::query_as(
+                    "SELECT is_active, fencing_generation, lease_expires_at_nanos FROM _cluster_maintenance_barrier WHERE id = 1",
                 )
                 .fetch_optional(pool)
                 .await;
 
-                if let Ok(Some((true, _))) = barrier_row {
-                    self.in_maintenance.store(true, Ordering::SeqCst);
-                    return Err(ForgeError::ServiceUnavailable(
-                        "Cluster write pipeline is currently paused for coordinated maintenance"
-                            .to_string(),
-                    ));
-                } else if let Ok(Some((false, gen))) = barrier_row {
-                    permit_gen = gen as u64;
-                    self.fencing_generation.store(permit_gen, Ordering::SeqCst);
-                    if self.in_maintenance.load(Ordering::SeqCst) {
-                        self.in_maintenance.store(false, Ordering::SeqCst);
+                match barrier_row {
+                    Ok(Some((true, _, lease_exp))) => {
+                        let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                        if lease_exp > 0
+                            && now_nanos >= lease_exp
+                            && self.clear_barrier_if_unheld().await.unwrap_or(false)
+                        {
+                            // Stale expired maintenance lease reconciled safely because exclusive lock was not held.
+                        } else {
+                            self.in_maintenance.store(true, Ordering::SeqCst);
+                            return Err(ForgeError::ServiceUnavailable(
+                                "Cluster write pipeline is currently paused for coordinated maintenance"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    Ok(Some((false, gen, _))) => {
+                        permit_gen = gen as u64;
+                        self.fencing_generation.store(permit_gen, Ordering::SeqCst);
+                        if self.in_maintenance.load(Ordering::SeqCst) {
+                            self.in_maintenance.store(false, Ordering::SeqCst);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        // Fallback if table predates lease_expires_at_nanos column
+                        let legacy_row: Result<Option<(bool, i64)>, _> = sqlx::query_as(
+                            "SELECT is_active, fencing_generation FROM _cluster_maintenance_barrier WHERE id = 1",
+                        )
+                        .fetch_optional(pool)
+                        .await;
+                        if let Ok(Some((true, _))) = legacy_row {
+                            self.in_maintenance.store(true, Ordering::SeqCst);
+                            return Err(ForgeError::ServiceUnavailable(
+                                "Cluster write pipeline is currently paused for coordinated maintenance"
+                                    .to_string(),
+                            ));
+                        } else if let Ok(Some((false, gen))) = legacy_row {
+                            permit_gen = gen as u64;
+                            self.fencing_generation.store(permit_gen, Ordering::SeqCst);
+                            self.in_maintenance.store(false, Ordering::SeqCst);
+                        }
                     }
                 }
             }
@@ -341,6 +375,54 @@ impl ConsistencyBarrier {
         })
     }
 
+    /// Clears `_cluster_maintenance_barrier.is_active` ONLY if no active backup holds the
+    /// exclusive session advisory lock (`pg_try_advisory_lock_shared` succeeds).
+    pub async fn clear_barrier_if_unheld(&self) -> Result<bool, ForgeError> {
+        let Some(opts) = &self.connect_options else {
+            return Ok(false);
+        };
+        let Some(pool) = &self.pool else {
+            return Ok(false);
+        };
+        let mut conn = PgConnection::connect_with(opts.as_ref())
+            .await
+            .map_err(|e| {
+                ForgeError::Internal(format!(
+                    "Failed to connect for maintenance lock probe: {}",
+                    e
+                ))
+            })?;
+        let shared_ok: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock_shared($1)")
+            .bind(SPINE_CLUSTER_MAINTENANCE_LOCK_ID)
+            .fetch_one(&mut conn)
+            .await
+            .map_err(|e| {
+                ForgeError::Internal(format!("Failed to probe maintenance advisory lock: {}", e))
+            })?;
+        if !shared_ok.0 {
+            let _ = conn.close().await;
+            return Ok(false);
+        }
+        let res = sqlx::query(
+            "UPDATE _cluster_maintenance_barrier SET is_active = FALSE, lease_expires_at_nanos = 0 WHERE id = 1",
+        )
+        .execute(pool)
+        .await;
+        let _ = sqlx::query("SELECT pg_advisory_unlock_shared($1)")
+            .bind(SPINE_CLUSTER_MAINTENANCE_LOCK_ID)
+            .execute(&mut conn)
+            .await;
+        let _ = conn.close().await;
+        res.map_err(|e| {
+            ForgeError::Internal(format!(
+                "Failed to clear stale maintenance barrier row: {}",
+                e
+            ))
+        })?;
+        self.in_maintenance.store(false, Ordering::SeqCst);
+        Ok(true)
+    }
+
     async fn rollback_failed_entry(
         &self,
         conn_opt: Option<PgConnection>,
@@ -348,8 +430,7 @@ impl ConsistencyBarrier {
         orig_err: ForgeError,
     ) -> ForgeError {
         self.in_maintenance.store(false, Ordering::SeqCst);
-        self.fencing_generation
-            .store(prev_fencing_gen, Ordering::SeqCst);
+        let mut synced_gen = prev_fencing_gen;
 
         let mut rollback_errors: Vec<String> = Vec::new();
         if let Some(mut conn) = conn_opt {
@@ -363,18 +444,45 @@ impl ConsistencyBarrier {
             let _ = conn.close().await;
         }
         if let Some(pool) = &self.pool {
-            if let Err(e) = sqlx::query(
-                "UPDATE _cluster_maintenance_barrier SET is_active = FALSE WHERE id = 1",
+            let clear_res = sqlx::query(
+                "UPDATE _cluster_maintenance_barrier SET is_active = FALSE, lease_expires_at_nanos = 0 WHERE id = 1",
             )
             .execute(pool)
-            .await
-            {
+            .await;
+            if let Err(e) = clear_res {
                 rollback_errors.push(format!(
                     "failed to clear _cluster_maintenance_barrier.is_active: {}",
                     e
                 ));
             }
+
+            // Reconcile and verify authoritative barrier state & monotonic fencing generation
+            let verify_res: Result<Option<(bool, i64)>, _> = sqlx::query_as(
+                "SELECT is_active, fencing_generation FROM _cluster_maintenance_barrier WHERE id = 1",
+            )
+            .fetch_optional(pool)
+            .await;
+            match verify_res {
+                Ok(Some((still_active, db_gen))) => {
+                    synced_gen = synced_gen.max(db_gen as u64);
+                    if still_active {
+                        rollback_errors.push(
+                            "verification confirmed _cluster_maintenance_barrier.is_active is still TRUE after rollback"
+                                .to_string(),
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    rollback_errors.push(format!(
+                        "failed to verify _cluster_maintenance_barrier state after rollback: {}",
+                        e
+                    ));
+                }
+            }
         }
+        self.fencing_generation.store(synced_gen, Ordering::SeqCst);
+
         if rollback_errors.is_empty() {
             orig_err
         } else {
@@ -391,8 +499,26 @@ impl ConsistencyBarrier {
         &self,
         drain_timeout: Duration,
     ) -> Result<MaintenanceGuard, ForgeError> {
-        self.enter_maintenance_with_lock_sql(drain_timeout, "SELECT pg_try_advisory_lock($1)")
-            .await
+        self.enter_maintenance_with_options(
+            drain_timeout,
+            DEFAULT_MAINTENANCE_LEASE_TTL,
+            "SELECT pg_try_advisory_lock($1)",
+        )
+        .await
+    }
+
+    /// Enter maintenance mode with an explicit bounded lease TTL.
+    pub async fn enter_maintenance_with_lease(
+        &self,
+        drain_timeout: Duration,
+        lease_ttl: Duration,
+    ) -> Result<MaintenanceGuard, ForgeError> {
+        self.enter_maintenance_with_options(
+            drain_timeout,
+            lease_ttl,
+            "SELECT pg_try_advisory_lock($1)",
+        )
+        .await
     }
 
     /// Enter maintenance mode using a caller-specified advisory lock query (used by fault-injection tests).
@@ -401,32 +527,45 @@ impl ConsistencyBarrier {
         drain_timeout: Duration,
         lock_sql: &str,
     ) -> Result<MaintenanceGuard, ForgeError> {
+        self.enter_maintenance_with_options(drain_timeout, DEFAULT_MAINTENANCE_LEASE_TTL, lock_sql)
+            .await
+    }
+
+    async fn enter_maintenance_with_options(
+        &self,
+        drain_timeout: Duration,
+        lease_ttl: Duration,
+        lock_sql: &str,
+    ) -> Result<MaintenanceGuard, ForgeError> {
         let prev_fencing_gen = self.fencing_generation.load(Ordering::SeqCst);
         self.in_maintenance.store(true, Ordering::SeqCst);
         let in_memory_gen = self.fencing_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let lease_expires_at_nanos =
+            now_nanos.saturating_add(i64::try_from(lease_ttl.as_nanos()).unwrap_or(i64::MAX));
 
         let mut guard_conn = None;
         let mut final_fencing_gen = in_memory_gen;
 
         if let Some(opts) = &self.connect_options {
-            let mut barrier_activated = false;
             if let Some(pool) = &self.pool {
-                // 1. Mark barrier active and increment monotonic fencing generation
+                // 1. Mark barrier active, set bounded lease expiry, and increment monotonic fencing generation
                 let barrier_res: Result<(i64,), _> = sqlx::query_as(
                     r#"
-                    INSERT INTO _cluster_maintenance_barrier (id, is_active, activated_at_nanos, activated_by, reason, fencing_generation)
-                    VALUES (1, TRUE, $1, 'spine-backup', 'Coordinated deployment-wide multi-volume backup', 2)
+                    INSERT INTO _cluster_maintenance_barrier (id, is_active, activated_at_nanos, activated_by, reason, fencing_generation, lease_expires_at_nanos)
+                    VALUES (1, TRUE, $1, 'spine-backup', 'Coordinated deployment-wide multi-volume backup', 2, $2)
                     ON CONFLICT (id) DO UPDATE SET 
                         is_active = TRUE,
                         activated_at_nanos = $1,
                         activated_by = 'spine-backup',
                         reason = 'Coordinated deployment-wide multi-volume backup',
-                        fencing_generation = _cluster_maintenance_barrier.fencing_generation + 1
+                        fencing_generation = _cluster_maintenance_barrier.fencing_generation + 1,
+                        lease_expires_at_nanos = $2
                     RETURNING fencing_generation
                     "#,
                 )
                 .bind(now_nanos)
+                .bind(lease_expires_at_nanos)
                 .fetch_one(pool)
                 .await;
 
@@ -435,10 +574,9 @@ impl ConsistencyBarrier {
                         final_fencing_gen = gen as u64;
                         self.fencing_generation
                             .store(final_fencing_gen, Ordering::SeqCst);
-                        barrier_activated = true;
                     }
                     Err(e) => {
-                        // Fallback: If table does not exist, create it with fencing_generation
+                        // Fallback: If table/column does not exist, ensure table & column exist, then retry
                         let create_res = sqlx::query(
                             r#"
                             CREATE TABLE IF NOT EXISTS _cluster_maintenance_barrier (
@@ -447,9 +585,15 @@ impl ConsistencyBarrier {
                                 activated_at_nanos BIGINT NOT NULL DEFAULT 0,
                                 activated_by VARCHAR(255) NOT NULL DEFAULT '',
                                 reason VARCHAR(255) NOT NULL DEFAULT '',
-                                fencing_generation BIGINT NOT NULL DEFAULT 1
+                                fencing_generation BIGINT NOT NULL DEFAULT 1,
+                                lease_expires_at_nanos BIGINT NOT NULL DEFAULT 0
                             )
                             "#,
+                        )
+                        .execute(pool)
+                        .await;
+                        let _ = sqlx::query(
+                            "ALTER TABLE _cluster_maintenance_barrier ADD COLUMN IF NOT EXISTS lease_expires_at_nanos BIGINT NOT NULL DEFAULT 0",
                         )
                         .execute(pool)
                         .await;
@@ -457,18 +601,20 @@ impl ConsistencyBarrier {
                         if create_res.is_ok() {
                             let gen_res: Result<(i64,), _> = sqlx::query_as(
                                 r#"
-                                INSERT INTO _cluster_maintenance_barrier (id, is_active, activated_at_nanos, activated_by, reason, fencing_generation)
-                                VALUES (1, TRUE, $1, 'spine-backup', 'Coordinated deployment-wide multi-volume backup', 2)
+                                INSERT INTO _cluster_maintenance_barrier (id, is_active, activated_at_nanos, activated_by, reason, fencing_generation, lease_expires_at_nanos)
+                                VALUES (1, TRUE, $1, 'spine-backup', 'Coordinated deployment-wide multi-volume backup', 2, $2)
                                 ON CONFLICT (id) DO UPDATE SET 
                                     is_active = TRUE,
                                     activated_at_nanos = $1,
                                     activated_by = 'spine-backup',
                                     reason = 'Coordinated deployment-wide multi-volume backup',
-                                    fencing_generation = _cluster_maintenance_barrier.fencing_generation + 1
+                                    fencing_generation = _cluster_maintenance_barrier.fencing_generation + 1,
+                                    lease_expires_at_nanos = $2
                                 RETURNING fencing_generation
                                 "#,
                             )
                             .bind(now_nanos)
+                            .bind(lease_expires_at_nanos)
                             .fetch_one(pool)
                             .await;
 
@@ -477,26 +623,27 @@ impl ConsistencyBarrier {
                                     final_fencing_gen = gen as u64;
                                     self.fencing_generation
                                         .store(final_fencing_gen, Ordering::SeqCst);
-                                    barrier_activated = true;
                                 }
                                 Err(ins_err) => {
-                                    self.in_maintenance.store(false, Ordering::SeqCst);
-                                    self.fencing_generation
-                                        .store(prev_fencing_gen, Ordering::SeqCst);
-                                    return Err(ForgeError::Internal(format!(
-                                        "Failed to update cluster maintenance barrier: {}",
-                                        ins_err
-                                    )));
+                                    // Uncertain DB state: original or fallback statement may have committed server-side!
+                                    let orig = ForgeError::Internal(format!(
+                                        "Failed to update cluster maintenance barrier (original: {}; fallback: {})",
+                                        e, ins_err
+                                    ));
+                                    return Err(self
+                                        .rollback_failed_entry(None, prev_fencing_gen, orig)
+                                        .await);
                                 }
                             }
                         } else {
-                            self.in_maintenance.store(false, Ordering::SeqCst);
-                            self.fencing_generation
-                                .store(prev_fencing_gen, Ordering::SeqCst);
-                            return Err(ForgeError::Internal(format!(
+                            // Uncertain DB state: original barrier_res may have committed before response was lost!
+                            let orig = ForgeError::Internal(format!(
                                 "Failed to update cluster maintenance barrier: {}",
                                 e
-                            )));
+                            ));
+                            return Err(self
+                                .rollback_failed_entry(None, prev_fencing_gen, orig)
+                                .await);
                         }
                     }
                 }
@@ -510,15 +657,9 @@ impl ConsistencyBarrier {
                         "Failed to establish dedicated connection for maintenance lock: {}",
                         e
                     ));
-                    return Err(if barrier_activated {
-                        self.rollback_failed_entry(None, prev_fencing_gen, orig)
-                            .await
-                    } else {
-                        self.in_maintenance.store(false, Ordering::SeqCst);
-                        self.fencing_generation
-                            .store(prev_fencing_gen, Ordering::SeqCst);
-                        orig
-                    });
+                    return Err(self
+                        .rollback_failed_entry(None, prev_fencing_gen, orig)
+                        .await);
                 }
             };
 
@@ -677,7 +818,7 @@ impl MaintenanceGuard {
         let mut release_errors: Vec<String> = Vec::new();
         if let Some(pool) = &self.barrier.pool {
             if let Err(e) = sqlx::query(
-                "UPDATE _cluster_maintenance_barrier SET is_active = FALSE WHERE id = 1",
+                "UPDATE _cluster_maintenance_barrier SET is_active = FALSE, lease_expires_at_nanos = 0 WHERE id = 1",
             )
             .execute(pool)
             .await

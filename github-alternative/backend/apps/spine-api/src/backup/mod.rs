@@ -2155,6 +2155,165 @@ impl BackupManager {
     }
 }
 
+/// Durable service-level recovery record persisted before entering remote maintenance during
+/// backup so cancelled or crashed backup processes can be reconciled on restart or lease expiry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupMaintenanceLeaseRecord {
+    pub backup_id: String,
+    pub fencing_generation: u64,
+    pub coordinator_addr: Option<String>,
+    pub storage_nodes: Vec<(String, String)>,
+    pub lease_expires_at_nanos: i64,
+}
+
+impl BackupMaintenanceLeaseRecord {
+    pub fn lease_path(storage_root: &Path) -> PathBuf {
+        storage_root.join(".backup_maintenance_lease.json")
+    }
+
+    pub fn persist(&self, storage_root: &Path) -> Result<(), ForgeError> {
+        let path = Self::lease_path(storage_root);
+        let tmp = storage_root.join(format!(
+            ".backup_maintenance_lease.tmp.{}",
+            uuid::Uuid::new_v4()
+        ));
+        let json = serde_json::to_vec_pretty(self).map_err(|e| {
+            ForgeError::Internal(format!(
+                "Failed to serialize backup maintenance lease: {}",
+                e
+            ))
+        })?;
+        {
+            let mut f = fs::File::create(&tmp).map_err(|e| {
+                ForgeError::Internal(format!(
+                    "Failed to create backup maintenance lease temp file: {}",
+                    e
+                ))
+            })?;
+            f.write_all(&json).map_err(|e| {
+                ForgeError::Internal(format!(
+                    "Failed to write backup maintenance lease temp file: {}",
+                    e
+                ))
+            })?;
+            f.flush().map_err(|e| {
+                ForgeError::Internal(format!("Failed to flush backup maintenance lease: {}", e))
+            })?;
+            f.sync_all().map_err(|e| {
+                ForgeError::Internal(format!("Failed to sync backup maintenance lease: {}", e))
+            })?;
+        }
+        safe_atomic_replace(&tmp, &path)
+    }
+
+    pub fn load(storage_root: &Path) -> Result<Option<Self>, ForgeError> {
+        let path = Self::lease_path(storage_root);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&path).map_err(|e| {
+            ForgeError::Internal(format!(
+                "Failed to read backup maintenance lease '{}': {}",
+                path.display(),
+                e
+            ))
+        })?;
+        let rec: Self = serde_json::from_slice(&bytes).map_err(|e| {
+            ForgeError::Internal(format!(
+                "Failed to parse backup maintenance lease '{}': {}",
+                path.display(),
+                e
+            ))
+        })?;
+        Ok(Some(rec))
+    }
+
+    pub fn remove(storage_root: &Path) -> Result<(), ForgeError> {
+        let path = Self::lease_path(storage_root);
+        if path.exists() {
+            fs::remove_file(&path).map_err(|e| {
+                ForgeError::Internal(format!(
+                    "Failed to remove backup maintenance lease '{}': {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Reconciles any stale `.backup_maintenance_lease.json` on service startup or operator recovery.
+/// Refuses to clear maintenance if a live backup still holds the PostgreSQL exclusive advisory lock.
+pub async fn reconcile_backup_maintenance_on_startup(
+    storage_root: &Path,
+    pool: Option<&sqlx::PgPool>,
+) -> Result<bool, ForgeError> {
+    let Some(rec) = BackupMaintenanceLeaseRecord::load(storage_root)? else {
+        return Ok(false);
+    };
+
+    if let Some(pg_pool) = pool {
+        let barrier = consistency::ConsistencyBarrier::with_pool(pg_pool.clone());
+        let cleared = barrier.clear_barrier_if_unheld().await?;
+        if !cleared {
+            return Ok(false);
+        }
+    }
+
+    let mut errors: Vec<String> = Vec::new();
+    for (node_id, addr) in &rec.storage_nodes {
+        let client = crate::ClusterNodeClient::new(addr.clone());
+        if let Err(e) = client.exit_maintenance(rec.fencing_generation).await {
+            errors.push(format!("storage node '{}' ({}): {}", node_id, addr, e));
+        } else {
+            match client.query_node_details().await {
+                Ok((in_maint, _, _, _)) if in_maint => {
+                    errors.push(format!(
+                        "storage node '{}' remained in maintenance after exit",
+                        node_id
+                    ));
+                }
+                Err(e) => {
+                    errors.push(format!(
+                        "storage node '{}' verification query failed: {}",
+                        node_id, e
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(ref c_addr) = rec.coordinator_addr {
+        let client = crate::CoordinatorClient::new(c_addr.clone());
+        if let Err(e) = client.exit_maintenance(rec.fencing_generation).await {
+            errors.push(format!("coordinator ({}): {}", c_addr, e));
+        } else {
+            match client.query_node_details().await {
+                Ok((in_maint, _, _, _)) if in_maint => {
+                    errors.push("coordinator remained in maintenance after exit".to_string());
+                }
+                Err(e) => {
+                    errors.push(format!("coordinator verification query failed: {}", e));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        return Err(ForgeError::Internal(format!(
+            "Failed to reconcile stale backup maintenance lease '{}' (gen {}): {}",
+            rec.backup_id,
+            rec.fencing_generation,
+            errors.join("; ")
+        )));
+    }
+
+    BackupMaintenanceLeaseRecord::remove(storage_root)?;
+    Ok(true)
+}
+
 /// Executes a coordinated cluster backup while ensuring every participant that may have received
 /// `enter_maintenance` is registered BEFORE sending the RPC, and treating any `exit_maintenance`
 /// or database `MaintenanceGuard::release` failure as a command error.
@@ -2174,6 +2333,50 @@ where
     GuardRel: FnOnce() -> GuardFut,
     GuardFut: std::future::Future<Output = Result<(), ForgeError>>,
 {
+    run_backup_with_maintenance_cleanup_at(
+        None,
+        fencing_generation,
+        coord_addr_opt,
+        node_endpoints,
+        release_db_guard,
+        work,
+    )
+    .await
+}
+
+/// Same as `run_backup_with_maintenance_cleanup`, plus durable `.backup_maintenance_lease.json`
+/// persistence under `storage_root` so abrupt process termination or cancellation can be reconciled.
+pub async fn run_backup_with_maintenance_cleanup_at<Work, WorkFut, GuardRel, GuardFut>(
+    storage_root: Option<&Path>,
+    fencing_generation: u64,
+    coord_addr_opt: Option<&str>,
+    node_endpoints: &[(String, String)],
+    release_db_guard: Option<GuardRel>,
+    work: Work,
+) -> Result<(), ForgeError>
+where
+    Work: FnOnce(
+        Option<crate::CoordinatorClient>,
+        Vec<(String, crate::ClusterNodeClient)>,
+    ) -> WorkFut,
+    WorkFut: std::future::Future<Output = Result<(), ForgeError>>,
+    GuardRel: FnOnce() -> GuardFut,
+    GuardFut: std::future::Future<Output = Result<(), ForgeError>>,
+{
+    if let Some(root) = storage_root {
+        let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let ttl_nanos = i64::try_from(consistency::DEFAULT_MAINTENANCE_LEASE_TTL.as_nanos())
+            .unwrap_or(i64::MAX);
+        let lease_rec = BackupMaintenanceLeaseRecord {
+            backup_id: format!("bak_lease_{}", uuid::Uuid::new_v4().simple()),
+            fencing_generation,
+            coordinator_addr: coord_addr_opt.map(|s| s.to_string()),
+            storage_nodes: node_endpoints.to_vec(),
+            lease_expires_at_nanos: now_nanos.saturating_add(ttl_nanos),
+        };
+        lease_rec.persist(root)?;
+    }
+
     let mut coord_client: Option<crate::CoordinatorClient> = None;
     let mut storage_clients: Vec<(String, crate::ClusterNodeClient)> = Vec::new();
 
@@ -2280,6 +2483,10 @@ where
                 recovery_hint
             ))),
         };
+    }
+
+    if let Some(root) = storage_root {
+        BackupMaintenanceLeaseRecord::remove(root)?;
     }
 
     work_res

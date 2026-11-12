@@ -728,7 +728,9 @@ async fn main() -> anyhow::Result<()> {
                     spine_api::backup::ParticipantPayloadSource,
                 )> = Vec::new();
                 let release_db_guard = guard_opt.map(|g| move || async move { g.release().await });
-                spine_api::backup::run_backup_with_maintenance_cleanup(
+                let lease_storage_root = storage_root.clone();
+                spine_api::backup::run_backup_with_maintenance_cleanup_at(
+                    Some(&lease_storage_root),
                     fencing_generation,
                     coord_addr_opt.as_deref(),
                     &node_endpoints,
@@ -2128,6 +2130,15 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("FATAL RESTORE RECOVERY FAILURE: {}", e))?
     {
         tracing::warn!("Restore state machine recovery: {}", msg);
+    }
+    if spine_api::backup::reconcile_backup_maintenance_on_startup(
+        &storage_root_canonical,
+        recovery_pool.as_ref(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("FATAL BACKUP MAINTENANCE RECOVERY FAILURE: {}", e))?
+    {
+        tracing::warn!("Startup reconciled stale backup maintenance lease");
     }
     if let Some(p) = recovery_pool {
         p.close().await;

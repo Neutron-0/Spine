@@ -683,3 +683,409 @@ async fn test_pre_helper_db_maintenance_entry_and_dump_failure_paths() {
 
     disp_db.cleanup().await.unwrap();
 }
+
+async fn spawn_pg_fault_proxy(
+    target_addr: String,
+    drop_barrier_responses: Arc<std::sync::atomic::AtomicUsize>,
+) -> (String, Arc<AtomicBool>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap().to_string();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_c = Arc::clone(&stop);
+
+    tokio::spawn(async move {
+        while !stop_c.load(Ordering::SeqCst) {
+            if let Ok(Ok((client_stream, _))) =
+                tokio::time::timeout(Duration::from_millis(50), listener.accept()).await
+            {
+                let target = target_addr.clone();
+                let drops = Arc::clone(&drop_barrier_responses);
+                tokio::spawn(async move {
+                    let Ok(server_stream) = tokio::net::TcpStream::connect(&target).await else {
+                        return;
+                    };
+                    let (mut cr, mut cw) = client_stream.into_split();
+                    let (mut sr, mut sw) = server_stream.into_split();
+                    let armed = Arc::new(AtomicBool::new(false));
+                    let armed_c = Arc::clone(&armed);
+                    let drops_c = Arc::clone(&drops);
+
+                    let c2s =
+                        tokio::spawn(async move {
+                            let mut buf = [0u8; 8192];
+                            loop {
+                                match cr.read(&mut buf).await {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => {
+                                        let chunk = &buf[..n];
+                                        let text = String::from_utf8_lossy(chunk);
+                                        if text.contains("_cluster_maintenance_barrier")
+                                            && text.contains("TRUE")
+                                            && drops_c
+                                                .fetch_update(
+                                                    Ordering::SeqCst,
+                                                    Ordering::SeqCst,
+                                                    |v| if v > 0 { Some(v - 1) } else { None },
+                                                )
+                                                .is_ok()
+                                        {
+                                            armed_c.store(true, Ordering::SeqCst);
+                                        }
+                                        if sw.write_all(chunk).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        });
+
+                    let s2c = tokio::spawn(async move {
+                        let mut buf = [0u8; 8192];
+                        loop {
+                            match sr.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    if armed.load(Ordering::SeqCst) {
+                                        // Allow server commit to finish, then drop response to client
+                                        tokio::time::sleep(Duration::from_millis(60)).await;
+                                        break;
+                                    }
+                                    if cw.write_all(&buf[..n]).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+                    tokio::select! {
+                        _ = c2s => {},
+                        _ = s2c => {},
+                    };
+                });
+            }
+        }
+    });
+
+    (proxy_addr, stop)
+}
+
+#[tokio::test]
+#[ignore = "requires isolated SPINE_TEST_DATABASE_URL; run with -- --ignored in release gate"]
+async fn test_uncertain_barrier_write_committed_server_side_then_response_lost() {
+    let db_url = std::env::var("SPINE_TEST_DATABASE_URL").unwrap_or_default();
+    assert!(
+        !db_url.trim().is_empty(),
+        "SPINE_TEST_DATABASE_URL must be set to an isolated disposable PostgreSQL instance"
+    );
+
+    let disp_db = HarnessDisposableDb::provision().await.unwrap();
+    let parsed = url::Url::parse(&disp_db.migrator_url).unwrap();
+    let host = parsed.host_str().unwrap_or("127.0.0.1");
+    let port = parsed.port().unwrap_or(5432);
+    let target_addr = format!("{}:{}", host, port);
+
+    // 1. Single response drop: server commits is_active=TRUE + fencing_generation=2,
+    //    client loses response, rollback_failed_entry clears is_active=FALSE and syncs gen.
+    let drop_once = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let (proxy_addr, proxy_stop) =
+        spawn_pg_fault_proxy(target_addr.clone(), Arc::clone(&drop_once)).await;
+    let mut proxy_url = parsed.clone();
+    let proxy_port: u16 = proxy_addr.split(':').nth(1).unwrap().parse().unwrap();
+    proxy_url.set_host(Some("127.0.0.1")).unwrap();
+    proxy_url.set_port(Some(proxy_port)).unwrap();
+
+    let proxy_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(proxy_url.as_str())
+        .await
+        .unwrap();
+    let barrier = ConsistencyBarrier::with_pool(proxy_pool.clone());
+    let err = barrier
+        .enter_maintenance(Duration::from_millis(300))
+        .await
+        .err()
+        .expect("lost response on barrier write must fail");
+    assert!(
+        err.to_string()
+            .contains("Failed to update cluster maintenance barrier"),
+        "got: {}",
+        err
+    );
+    assert!(!barrier.is_in_maintenance());
+
+    // Authoritative DB check: barrier MUST NOT be left active, and generation MUST be >= 2
+    let (is_active, db_gen): (bool, i64) = sqlx::query_as(
+        "SELECT is_active, fencing_generation FROM _cluster_maintenance_barrier WHERE id = 1",
+    )
+    .fetch_one(&disp_db.pool)
+    .await
+    .unwrap();
+    assert!(
+        !is_active,
+        "Authoritative DB barrier must be rolled back to is_active=FALSE after lost write response"
+    );
+    assert!(db_gen >= 2, "Committed DB generation must be preserved");
+
+    // 2. Double drop: both entry AND rollback fail -> unresolved state MUST be surfaced
+    let drop_many = Arc::new(std::sync::atomic::AtomicUsize::new(10));
+    let (proxy_addr2, proxy_stop2) = spawn_pg_fault_proxy(target_addr, drop_many).await;
+    let mut proxy_url2 = parsed.clone();
+    let proxy_port2: u16 = proxy_addr2.split(':').nth(1).unwrap().parse().unwrap();
+    proxy_url2.set_host(Some("127.0.0.1")).unwrap();
+    proxy_url2.set_port(Some(proxy_port2)).unwrap();
+    let proxy_pool2 = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(proxy_url2.as_str())
+        .await
+        .unwrap();
+    let barrier2 = ConsistencyBarrier::with_pool(proxy_pool2.clone());
+    // Note: proxy only arms on queries containing "TRUE", so if we also drop table or disconnect
+    // during rollback we test unresolved rollback reporting; verify here that at minimum
+    // rollback runs or surfaces error when unreachable.
+    proxy_pool2.close().await;
+    let err2 = barrier2
+        .enter_maintenance(Duration::from_millis(200))
+        .await
+        .err()
+        .expect("closed pool must fail entry and surface rollback failure");
+    assert!(err2
+        .to_string()
+        .contains("maintenance entry rollback failed"));
+
+    proxy_pool.close().await;
+    proxy_stop.store(true, Ordering::SeqCst);
+    proxy_stop2.store(true, Ordering::SeqCst);
+    disp_db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires isolated SPINE_TEST_DATABASE_URL; run with -- --ignored in release gate"]
+async fn test_backup_cancellation_and_abrupt_termination_recovery() {
+    use spine_api::backup::{
+        reconcile_backup_maintenance_on_startup, run_backup_with_maintenance_cleanup_at,
+        BackupMaintenanceLeaseRecord,
+    };
+    use std::io::{BufRead, BufReader};
+
+    if std::env::var("SPINE_BACKUP_CRASH_CHILD").as_deref() == Ok("1") {
+        let db_url = std::env::var("SPINE_CRASH_DB_URL").unwrap();
+        let storage_root = PathBuf::from(std::env::var("SPINE_CRASH_ROOT").unwrap());
+        let coord_addr = std::env::var("SPINE_CRASH_COORD").unwrap();
+        let node_addr = std::env::var("SPINE_CRASH_NODE").unwrap();
+
+        let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+        let barrier = ConsistencyBarrier::with_pool(pool);
+        let _guard = barrier
+            .enter_maintenance_with_lease(Duration::from_secs(5), Duration::from_millis(200))
+            .await
+            .unwrap();
+        let gen = _guard.fencing_generation();
+        let rec = BackupMaintenanceLeaseRecord {
+            backup_id: "bak_crash_child".to_string(),
+            fencing_generation: gen,
+            coordinator_addr: Some(coord_addr.clone()),
+            storage_nodes: vec![("node-1".to_string(), node_addr.clone())],
+            lease_expires_at_nanos: chrono::Utc::now()
+                .timestamp_nanos_opt()
+                .unwrap_or(0)
+                .saturating_add(200_000_000),
+        };
+        rec.persist(&storage_root).unwrap();
+        CoordinatorClient::new(coord_addr)
+            .enter_maintenance(gen)
+            .await
+            .unwrap();
+        ClusterNodeClient::new(node_addr)
+            .enter_maintenance(gen)
+            .await
+            .unwrap();
+
+        eprintln!("READY:IN_MAINTENANCE");
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        return;
+    }
+
+    let db_url = std::env::var("SPINE_TEST_DATABASE_URL").unwrap_or_default();
+    assert!(
+        !db_url.trim().is_empty(),
+        "SPINE_TEST_DATABASE_URL must be set to an isolated disposable PostgreSQL instance"
+    );
+
+    let disp_db = HarnessDisposableDb::provision().await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let storage_root = tmp.path().join("api_storage");
+    fs::create_dir_all(&storage_root).unwrap();
+
+    let coord_bin = find_verified_release_binary("spine-coordinator");
+    let node_bin = find_verified_release_binary("spine-storage-node");
+    let coord_store = tmp.path().join("coord").join("coordinator_state.json");
+    fs::create_dir_all(coord_store.parent().unwrap()).unwrap();
+    let node_dir = tmp.path().join("node-1");
+    fs::create_dir_all(&node_dir).unwrap();
+    let coord_addr = pick_free_addr();
+    let node_addr = pick_free_addr();
+
+    let _guards = ChildGuard(vec![
+        Command::new(&coord_bin)
+            .env("SPINE_CLUSTER_ID", "cancel-crash-e2e")
+            .env("SPINE_LISTEN", &coord_addr)
+            .env("SPINE_STORE_PATH", &coord_store)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+        Command::new(&node_bin)
+            .env("SPINE_NODE_ID", "node-1")
+            .env("SPINE_LISTEN", &node_addr)
+            .env("SPINE_DATA_DIR", &node_dir)
+            .env("SPINE_COORDINATOR_ADDR", &coord_addr)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    ]);
+    wait_for_node(&coord_addr).await;
+    wait_for_node(&node_addr).await;
+
+    // 1. Cancellation during active backup work + active backup write protection
+    let barrier = ConsistencyBarrier::with_pool(disp_db.pool.clone());
+    let guard = barrier
+        .enter_maintenance_with_lease(Duration::from_secs(5), Duration::from_secs(60))
+        .await
+        .unwrap();
+    let gen = guard.fencing_generation();
+    let root_c = storage_root.clone();
+    let coord_c = coord_addr.clone();
+    let nodes = vec![("node-1".to_string(), node_addr.clone())];
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let handle = tokio::spawn(async move {
+        let mut tx = Some(entered_tx);
+        run_backup_with_maintenance_cleanup_at(
+            Some(&root_c),
+            gen,
+            Some(&coord_c),
+            &nodes,
+            Some(move || async move { guard.release().await }),
+            move |_, _| async move {
+                if let Some(t) = tx.take() {
+                    let _ = t.send(());
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(())
+            },
+        )
+        .await
+    });
+    entered_rx.await.unwrap();
+
+    // While active backup is running: writes MUST be denied and reconcile MUST refuse to clear!
+    let app_barrier = ConsistencyBarrier::with_pool(disp_db.app_pool.clone());
+    assert!(app_barrier.acquire_write_permit().await.is_err());
+    assert!(
+        !reconcile_backup_maintenance_on_startup(&storage_root, Some(&disp_db.pool))
+            .await
+            .unwrap()
+    );
+
+    // Cancel the backup task mid-flight, then drop explicit DB lock connection by closing? Wait:
+    // guard was moved into the aborted future and dropped cleanly on abort!
+    handle.abort();
+    let _ = handle.await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Durable lease file remains on disk and reconcile_backup_maintenance_on_startup recovers all!
+    assert!(BackupMaintenanceLeaseRecord::lease_path(&storage_root).exists());
+    assert!(
+        reconcile_backup_maintenance_on_startup(&storage_root, Some(&disp_db.pool))
+            .await
+            .unwrap()
+    );
+    assert!(!BackupMaintenanceLeaseRecord::lease_path(&storage_root).exists());
+    assert!(
+        !CoordinatorClient::new(coord_addr.clone())
+            .query_node_details()
+            .await
+            .unwrap()
+            .0
+    );
+    assert!(
+        !ClusterNodeClient::new(node_addr.clone())
+            .query_node_details()
+            .await
+            .unwrap()
+            .0
+    );
+    let p_ok = app_barrier.acquire_write_permit().await.unwrap();
+    p_ok.release().await.unwrap();
+
+    // 2. Abrupt OS process termination (Child::kill) after DB, coordinator & storage-node activation
+    let current_exe = std::env::current_exe().unwrap();
+    let mut crash_child = Command::new(&current_exe)
+        .arg("test_backup_cancellation_and_abrupt_termination_recovery")
+        .arg("--exact")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env("SPINE_BACKUP_CRASH_CHILD", "1")
+        .env("SPINE_CRASH_DB_URL", &disp_db.migrator_url)
+        .env("SPINE_CRASH_ROOT", &storage_root)
+        .env("SPINE_CRASH_COORD", &coord_addr)
+        .env("SPINE_CRASH_NODE", &node_addr)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let stderr = crash_child.stderr.take().unwrap();
+    let mut reader = BufReader::new(stderr);
+    let mut line = String::new();
+    let mut ready = false;
+    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+        if line.contains("READY:IN_MAINTENANCE") {
+            ready = true;
+            break;
+        }
+        line.clear();
+    }
+    assert!(ready, "Crash child did not enter maintenance");
+
+    // While child process is alive, writes MUST be denied
+    assert!(app_barrier.acquire_write_permit().await.is_err());
+
+    // Abruptly terminate backup child process
+    let _ = crash_child.kill();
+    let _ = crash_child.wait();
+
+    // Wait past the 200ms bounded lease TTL -> acquire_write_permit reconciles expired DB lease!
+    tokio::time::sleep(Duration::from_millis(260)).await;
+    let permit_after_expiry = app_barrier
+        .acquire_write_permit()
+        .await
+        .expect("Expired lease from killed backup process must allow safe write recovery");
+    permit_after_expiry.release().await.unwrap();
+
+    // Startup reconciliation exits maintenance on coordinator and storage node and clears lease file
+    assert!(
+        reconcile_backup_maintenance_on_startup(&storage_root, Some(&disp_db.pool))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !CoordinatorClient::new(coord_addr)
+            .query_node_details()
+            .await
+            .unwrap()
+            .0
+    );
+    assert!(
+        !ClusterNodeClient::new(node_addr)
+            .query_node_details()
+            .await
+            .unwrap()
+            .0
+    );
+    assert!(!BackupMaintenanceLeaseRecord::lease_path(&storage_root).exists());
+
+    disp_db.cleanup().await.unwrap();
+}
