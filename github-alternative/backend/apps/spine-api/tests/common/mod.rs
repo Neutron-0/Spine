@@ -66,15 +66,19 @@ impl HarnessDisposableDb {
             Url::parse(&base_url).map_err(|e| format!("Invalid base test database URL: {}", e))?;
 
         // Connect to maintenance database 'postgres' to provision the ephemeral database
-        parsed_admin.set_path("postgres");
+        parsed_admin.set_path("/postgres");
         let admin_url = parsed_admin.to_string();
 
-        let admin_pool = PgPool::connect(&admin_url).await.map_err(|e| {
-            format!(
-                "Failed to connect to administrative database for provisioning: {}",
-                e
-            )
-        })?;
+        let admin_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&admin_url)
+            .await
+            .map_err(|e| {
+                format!(
+                    "Failed to connect to administrative database for provisioning: {}",
+                    e
+                )
+            })?;
 
         let creation_token = Uuid::new_v4();
         let db_name = format!("spine_disp_{}", &creation_token.simple().to_string()[..12]);
@@ -84,15 +88,14 @@ impl HarnessDisposableDb {
             "CREATE DATABASE \"{}\" WITH OWNER = spine_migrator",
             db_name
         );
-        sqlx::query(&create_sql)
-            .execute(&admin_pool)
-            .await
-            .map_err(|e| {
-                format!(
-                    "Failed to create disposable test database '{}': {}",
-                    db_name, e
-                )
-            })?;
+        let create_res = sqlx::query(&create_sql).execute(&admin_pool).await;
+        admin_pool.close().await;
+        create_res.map_err(|e| {
+            format!(
+                "Failed to create disposable test database '{}': {}",
+                db_name, e
+            )
+        })?;
 
         // 2. Build distinct connection URLs for the newly created database (no identity fallback)
         let mut parsed_migrator =
@@ -304,7 +307,9 @@ impl HarnessDisposableDb {
         self.pool.close().await;
         self.app_pool.close().await;
 
-        let admin_pool = PgPool::connect(&self.admin_url)
+        let admin_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&self.admin_url)
             .await
             .map_err(|e| format!("Failed to connect to admin database for cleanup: {}", e))?;
 
@@ -317,15 +322,14 @@ impl HarnessDisposableDb {
             .await;
 
         let drop_sql = format!("DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)", self.db_name);
-        sqlx::query(&drop_sql)
-            .execute(&admin_pool)
-            .await
-            .map_err(|e| {
-                format!(
-                    "Failed to drop disposable test database '{}': {}",
-                    self.db_name, e
-                )
-            })?;
+        let drop_res = sqlx::query(&drop_sql).execute(&admin_pool).await;
+        admin_pool.close().await;
+        drop_res.map_err(|e| {
+            format!(
+                "Failed to drop disposable test database '{}': {}",
+                self.db_name, e
+            )
+        })?;
 
         Ok(())
     }

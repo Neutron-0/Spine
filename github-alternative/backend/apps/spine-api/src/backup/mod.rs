@@ -176,6 +176,146 @@ pub enum ParticipantPayloadSource {
     EncryptedTemp(EphemeralEncryptedTemp),
 }
 
+/// Transparent writer wrapper that continuously observes an atomic cancellation token.
+/// Immediately aborts streaming writes with std::io::ErrorKind::Interrupted if the
+/// token is tripped (e.g. upon maintenance barrier advisory lock loss).
+pub struct CancellingWriter<W: std::io::Write> {
+    inner: W,
+    cancel_token: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl<W: std::io::Write> CancellingWriter<W> {
+    pub fn new(
+        inner: W,
+        cancel_token: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Self {
+        Self {
+            inner,
+            cancel_token,
+        }
+    }
+
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for CancellingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(ref ct) = self.cancel_token {
+            if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "Backup archive streaming aborted: maintenance barrier lock or connection lost",
+                ));
+            }
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(ref ct) = self.cancel_token {
+            if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "Backup archive streaming aborted: maintenance barrier lock or connection lost",
+                ));
+            }
+        }
+        self.inner.flush()
+    }
+}
+
+/// A staged, verified backup archive residing in a temporary destination.
+/// Guarantees that the temporary output is never published to the final requested path
+/// until final lock-ownership verification succeeds. If dropped without successful publication,
+/// the temporary file is automatically cleaned up and no artifact remains.
+pub struct StagedBackupArchive {
+    tmp_path: PathBuf,
+    final_path: PathBuf,
+    manifest: BackupManifest,
+    cancel_token: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    published: bool,
+}
+
+impl StagedBackupArchive {
+    pub fn manifest(&self) -> &BackupManifest {
+        &self.manifest
+    }
+
+    pub fn tmp_path(&self) -> &Path {
+        &self.tmp_path
+    }
+
+    pub fn final_path(&self) -> &Path {
+        &self.final_path
+    }
+
+    /// Publishes the staged archive immediately without asynchronous verifier.
+    /// Checks cancellation before atomic rename.
+    pub fn publish_immediate(mut self) -> Result<BackupManifest, ForgeError> {
+        if let Some(ref ct) = self.cancel_token {
+            if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = fs::remove_file(&self.tmp_path);
+                return Err(ForgeError::ServiceUnavailable(
+                    "Backup publication aborted: maintenance barrier lock or connection lost"
+                        .into(),
+                ));
+            }
+        }
+        safe_atomic_replace(&self.tmp_path, &self.final_path)?;
+        self.published = true;
+        Ok(self.manifest.clone())
+    }
+
+    /// Publishes the staged archive after executing an asynchronous lock-ownership verifier.
+    /// If lock ownership verification fails or cancellation occurs before/after verification,
+    /// aborts publication, removes the temporary output, and leaves the final destination untouched.
+    pub async fn publish_with_verifier<F, Fut>(
+        mut self,
+        verifier: F,
+    ) -> Result<BackupManifest, ForgeError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), ForgeError>>,
+    {
+        if let Some(ref ct) = self.cancel_token {
+            if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = fs::remove_file(&self.tmp_path);
+                return Err(ForgeError::ServiceUnavailable(
+                    "Backup publication aborted: maintenance barrier lock or connection lost before verification".into(),
+                ));
+            }
+        }
+
+        if let Err(e) = verifier().await {
+            let _ = fs::remove_file(&self.tmp_path);
+            return Err(e);
+        }
+
+        if let Some(ref ct) = self.cancel_token {
+            if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = fs::remove_file(&self.tmp_path);
+                return Err(ForgeError::ServiceUnavailable(
+                    "Backup publication aborted: maintenance barrier lock or connection lost after verification".into(),
+                ));
+            }
+        }
+
+        safe_atomic_replace(&self.tmp_path, &self.final_path)?;
+        self.published = true;
+        Ok(self.manifest.clone())
+    }
+}
+
+impl Drop for StagedBackupArchive {
+    fn drop(&mut self) {
+        if !self.published && self.tmp_path.exists() {
+            let _ = fs::remove_file(&self.tmp_path);
+        }
+    }
+}
+
 /// Recursively copies a directory and all its contents.
 pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), ForgeError> {
     fs::create_dir_all(dst).map_err(|e| ForgeError::Internal(e.to_string()))?;
@@ -753,6 +893,7 @@ impl BackupManager {
                 &[],
                 None,
                 enc,
+                None,
             )?;
             safe_atomic_replace(&tmp_output, output_tar_gz)?;
             Ok(manifest)
@@ -785,6 +926,7 @@ impl BackupManager {
                 &[],
                 None,
                 enc,
+                None,
             )?;
             safe_atomic_replace(&tmp_output, output_tar_gz)?;
             Ok(manifest)
@@ -935,8 +1077,10 @@ impl BackupManager {
         )
     }
 
-    /// Creates a complete cluster backup archive with bounded-memory streaming participant payloads.
-    pub fn create_cluster_backup_streaming(
+    /// Creates a staged cluster backup archive in a temporary destination, observing cancellation
+    /// during streaming and deferring final publication until explicit lock-ownership verification succeeds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_cluster_backup_staged(
         storage_root: &Path,
         db_snapshot_file: Option<&Path>,
         participants: Vec<(BackupParticipantRecord, ParticipantPayloadSource)>,
@@ -944,7 +1088,16 @@ impl BackupManager {
         output_path: &Path,
         passphrase: Option<&str>,
         key_version: u16,
-    ) -> Result<BackupManifest, ForgeError> {
+        cancel_token: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<StagedBackupArchive, ForgeError> {
+        if let Some(ref ct) = cancel_token {
+            if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ForgeError::ServiceUnavailable(
+                    "Backup aborted: maintenance barrier lock or connection lost before archive creation".into(),
+                ));
+            }
+        }
+
         let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
 
@@ -955,12 +1108,17 @@ impl BackupManager {
                 ));
             }
             let tmp_output = parent.join(format!(".tmp_bak_{}.spnebak", Uuid::new_v4()));
-            let res = (|| {
+            let res = (|| -> Result<BackupManifest, ForgeError> {
                 let file = File::create(&tmp_output).map_err(|e| {
                     ForgeError::Internal(format!("Failed to create output archive: {}", e))
                 })?;
-                let enc_writer =
-                    v2::EncryptingWriter::new(file, pass, key_version, v2::DEFAULT_CHUNK_SIZE)?;
+                let cancelling_file = CancellingWriter::new(file, cancel_token.clone());
+                let enc_writer = v2::EncryptingWriter::new(
+                    cancelling_file,
+                    pass,
+                    key_version,
+                    v2::DEFAULT_CHUNK_SIZE,
+                )?;
                 let enc = GzEncoder::new(enc_writer, Compression::default());
                 let (manifest, enc) = Self::create_archive_internal(
                     storage_root,
@@ -969,11 +1127,29 @@ impl BackupManager {
                     &participants,
                     fencing_generation,
                     enc,
+                    cancel_token.as_ref(),
                 )?;
                 let enc_writer = enc
                     .finish()
-                    .map_err(|e| ForgeError::Internal(format!("Failed to finalize gzip: {}", e)))?;
+                    .map_err(|e| {
+                        if let Some(ref ct) = cancel_token {
+                            if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                                return ForgeError::ServiceUnavailable(
+                                    "Backup archive streaming aborted: maintenance barrier lock or connection lost".into(),
+                                );
+                            }
+                        }
+                        ForgeError::Internal(format!("Failed to finalize gzip: {}", e))
+                    })?;
                 let _ = enc_writer.finish()?;
+
+                if let Some(ref ct) = cancel_token {
+                    if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(ForgeError::ServiceUnavailable(
+                            "Backup aborted: maintenance barrier lock or connection lost during streaming".into(),
+                        ));
+                    }
+                }
 
                 let verify_file = File::open(&tmp_output).map_err(|e| {
                     ForgeError::Internal(format!(
@@ -982,35 +1158,104 @@ impl BackupManager {
                     ))
                 })?;
                 v2::decrypt_stream(verify_file, std::io::sink(), pass)?;
-                safe_atomic_replace(&tmp_output, output_path)?;
                 Ok(manifest)
             })();
-            if res.is_err() && tmp_output.exists() {
-                let _ = fs::remove_file(&tmp_output);
+
+            match res {
+                Ok(manifest) => Ok(StagedBackupArchive {
+                    tmp_path: tmp_output,
+                    final_path: output_path.to_path_buf(),
+                    manifest,
+                    cancel_token,
+                    published: false,
+                }),
+                Err(e) => {
+                    if tmp_output.exists() {
+                        let _ = fs::remove_file(&tmp_output);
+                    }
+                    Err(e)
+                }
             }
-            res
         } else {
             let tmp_output = parent.join(format!(".tmp_bak_{}.tar.gz", Uuid::new_v4()));
-            let res = (|| {
+            let res = (|| -> Result<BackupManifest, ForgeError> {
                 let file =
                     File::create(&tmp_output).map_err(|e| ForgeError::Internal(e.to_string()))?;
-                let enc = GzEncoder::new(file, Compression::default());
-                let (manifest, _) = Self::create_archive_internal(
+                let cancelling_file = CancellingWriter::new(file, cancel_token.clone());
+                let enc = GzEncoder::new(cancelling_file, Compression::default());
+                let (manifest, enc) = Self::create_archive_internal(
                     storage_root,
                     None,
                     db_snapshot_file,
                     &participants,
                     fencing_generation,
                     enc,
+                    cancel_token.as_ref(),
                 )?;
-                safe_atomic_replace(&tmp_output, output_path)?;
+                let cancelling_file = enc
+                    .finish()
+                    .map_err(|e| {
+                        if let Some(ref ct) = cancel_token {
+                            if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                                return ForgeError::ServiceUnavailable(
+                                    "Backup archive streaming aborted: maintenance barrier lock or connection lost".into(),
+                                );
+                            }
+                        }
+                        ForgeError::Internal(format!("Failed to finalize gzip: {}", e))
+                    })?;
+                let _ = cancelling_file.into_inner();
+
+                if let Some(ref ct) = cancel_token {
+                    if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(ForgeError::ServiceUnavailable(
+                            "Backup aborted: maintenance barrier lock or connection lost during streaming".into(),
+                        ));
+                    }
+                }
+
                 Ok(manifest)
             })();
-            if res.is_err() && tmp_output.exists() {
-                let _ = fs::remove_file(&tmp_output);
+
+            match res {
+                Ok(manifest) => Ok(StagedBackupArchive {
+                    tmp_path: tmp_output,
+                    final_path: output_path.to_path_buf(),
+                    manifest,
+                    cancel_token,
+                    published: false,
+                }),
+                Err(e) => {
+                    if tmp_output.exists() {
+                        let _ = fs::remove_file(&tmp_output);
+                    }
+                    Err(e)
+                }
             }
-            res
         }
+    }
+
+    /// Creates a complete cluster backup archive with bounded-memory streaming participant payloads.
+    pub fn create_cluster_backup_streaming(
+        storage_root: &Path,
+        db_snapshot_file: Option<&Path>,
+        participants: Vec<(BackupParticipantRecord, ParticipantPayloadSource)>,
+        fencing_generation: Option<u64>,
+        output_path: &Path,
+        passphrase: Option<&str>,
+        key_version: u16,
+    ) -> Result<BackupManifest, ForgeError> {
+        let staged = Self::create_cluster_backup_staged(
+            storage_root,
+            db_snapshot_file,
+            participants,
+            fencing_generation,
+            output_path,
+            passphrase,
+            key_version,
+            None,
+        )?;
+        staged.publish_immediate()
     }
 
     /// Creates an authenticated, streaming chunked AEAD-encrypted backup archive (SPNEBAK v2)
@@ -1085,6 +1330,7 @@ impl BackupManager {
                 &[],
                 None,
                 enc,
+                None,
             )?;
             let enc_writer = enc
                 .finish()
@@ -1655,7 +1901,16 @@ impl BackupManager {
         participants: &[(BackupParticipantRecord, ParticipantPayloadSource)],
         fencing_generation: Option<u64>,
         writer: W,
+        cancel_token: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<(BackupManifest, W), ForgeError> {
+        if let Some(ct) = cancel_token {
+            if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ForgeError::ServiceUnavailable(
+                    "Backup archive creation aborted: maintenance barrier lock or connection lost"
+                        .into(),
+                ));
+            }
+        }
         let backup_id = Uuid::new_v4().to_string();
         let timestamp_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
@@ -1682,12 +1937,26 @@ impl BackupManager {
         }
 
         for (rel_path, abs_path) in &file_paths {
+            if let Some(ct) = cancel_token {
+                if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(ForgeError::ServiceUnavailable(
+                        "Backup archive creation aborted: maintenance barrier lock or connection lost during streaming".into(),
+                    ));
+                }
+            }
             let mut f =
                 fs::File::open(abs_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
             let mut hasher = Sha256::new();
             let mut buf = [0u8; 64 * 1024];
             let mut f_len = 0u64;
             loop {
+                if let Some(ct) = cancel_token {
+                    if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(ForgeError::ServiceUnavailable(
+                            "Backup archive creation aborted: maintenance barrier lock or connection lost during streaming".into(),
+                        ));
+                    }
+                }
                 let n = f
                     .read(&mut buf)
                     .map_err(|e| ForgeError::Internal(e.to_string()))?;
@@ -1710,6 +1979,13 @@ impl BackupManager {
                 let mut buf = [0u8; 64 * 1024];
                 let mut f_len = 0u64;
                 loop {
+                    if let Some(ct) = cancel_token {
+                        if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                            return Err(ForgeError::ServiceUnavailable(
+                                "Backup archive creation aborted: maintenance barrier lock or connection lost during streaming".into(),
+                            ));
+                        }
+                    }
                     let n = f
                         .read(&mut buf)
                         .map_err(|e| ForgeError::Internal(e.to_string()))?;
@@ -1816,6 +2092,13 @@ impl BackupManager {
         }
 
         for (rel_path, abs_path) in file_paths {
+            if let Some(ct) = cancel_token {
+                if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(ForgeError::ServiceUnavailable(
+                        "Backup archive creation aborted: maintenance barrier lock or connection lost during streaming".into(),
+                    ));
+                }
+            }
             let metadata =
                 fs::metadata(&abs_path).map_err(|e| ForgeError::Internal(e.to_string()))?;
             let mut f =
@@ -1825,10 +2108,26 @@ impl BackupManager {
             f_header.set_mode(0o644);
             f_header.set_cksum();
             tar.append_data(&mut f_header, &rel_path, &mut f)
-                .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                .map_err(|e| {
+                    if let Some(ct) = cancel_token {
+                        if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                            return ForgeError::ServiceUnavailable(
+                                "Backup archive streaming aborted: maintenance barrier lock or connection lost".into(),
+                            );
+                        }
+                    }
+                    ForgeError::Internal(e.to_string())
+                })?;
         }
 
         for (record, source) in participants {
+            if let Some(ct) = cancel_token {
+                if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(ForgeError::ServiceUnavailable(
+                        "Backup archive creation aborted: maintenance barrier lock or connection lost during streaming".into(),
+                    ));
+                }
+            }
             match source {
                 ParticipantPayloadSource::Memory(data) => {
                     let mut p_header = tar::Header::new_gnu();
@@ -1836,7 +2135,16 @@ impl BackupManager {
                     p_header.set_mode(0o644);
                     p_header.set_cksum();
                     tar.append_data(&mut p_header, &record.archive_rel_path, &data[..])
-                        .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                        .map_err(|e| {
+                            if let Some(ct) = cancel_token {
+                                if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                                    return ForgeError::ServiceUnavailable(
+                                        "Backup archive streaming aborted: maintenance barrier lock or connection lost".into(),
+                                    );
+                                }
+                            }
+                            ForgeError::Internal(e.to_string())
+                        })?;
                 }
                 ParticipantPayloadSource::File(path) => {
                     let mut f =
@@ -1848,7 +2156,16 @@ impl BackupManager {
                     p_header.set_mode(0o644);
                     p_header.set_cksum();
                     tar.append_data(&mut p_header, &record.archive_rel_path, &mut f)
-                        .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                        .map_err(|e| {
+                            if let Some(ct) = cancel_token {
+                                if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                                    return ForgeError::ServiceUnavailable(
+                                        "Backup archive streaming aborted: maintenance barrier lock or connection lost".into(),
+                                    );
+                                }
+                            }
+                            ForgeError::Internal(e.to_string())
+                        })?;
                 }
                 ParticipantPayloadSource::EncryptedTemp(enc_tmp) => {
                     let mut p_header = tar::Header::new_gnu();
@@ -1857,14 +2174,32 @@ impl BackupManager {
                     p_header.set_cksum();
                     let mut dec_reader = enc_tmp.open_reader()?;
                     tar.append_data(&mut p_header, &record.archive_rel_path, &mut dec_reader)
-                        .map_err(|e| ForgeError::Internal(e.to_string()))?;
+                        .map_err(|e| {
+                            if let Some(ct) = cancel_token {
+                                if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                                    return ForgeError::ServiceUnavailable(
+                                        "Backup archive streaming aborted: maintenance barrier lock or connection lost".into(),
+                                    );
+                                }
+                            }
+                            ForgeError::Internal(e.to_string())
+                        })?;
                 }
             }
         }
 
         let writer = tar
             .into_inner()
-            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+            .map_err(|e| {
+                if let Some(ct) = cancel_token {
+                    if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                        return ForgeError::ServiceUnavailable(
+                            "Backup archive streaming aborted: maintenance barrier lock or connection lost".into(),
+                        );
+                    }
+                }
+                ForgeError::Internal(e.to_string())
+            })?;
         Ok((manifest, writer))
     }
 
@@ -2155,6 +2490,56 @@ impl BackupManager {
     }
 }
 
+#[cfg(windows)]
+pub fn is_process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    if pid == std::process::id() {
+        return true;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(
+            dwDesiredAccess: u32,
+            bInheritHandle: i32,
+            dwProcessId: u32,
+        ) -> *mut std::ffi::c_void;
+        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+        fn GetExitCodeProcess(hProcess: *mut std::ffi::c_void, lpExitCode: *mut u32) -> i32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut exit_code);
+        CloseHandle(handle);
+        ok != 0 && exit_code == STILL_ACTIVE
+    }
+}
+
+#[cfg(not(windows))]
+pub fn is_process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    if pid == std::process::id() {
+        return true;
+    }
+    if std::path::Path::new(&format!("/proc/{}", pid)).exists() {
+        return true;
+    }
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Durable service-level recovery record persisted before entering remote maintenance during
 /// backup so cancelled or crashed backup processes can be reconciled on restart or lease expiry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2164,6 +2549,10 @@ pub struct BackupMaintenanceLeaseRecord {
     pub coordinator_addr: Option<String>,
     pub storage_nodes: Vec<(String, String)>,
     pub lease_expires_at_nanos: i64,
+    #[serde(default)]
+    pub owner_token: String,
+    #[serde(default)]
+    pub process_id: u32,
 }
 
 impl BackupMaintenanceLeaseRecord {
@@ -2244,7 +2633,12 @@ impl BackupMaintenanceLeaseRecord {
 }
 
 /// Reconciles any stale `.backup_maintenance_lease.json` on service startup or operator recovery.
-/// Refuses to clear maintenance if a live backup still holds the PostgreSQL exclusive advisory lock.
+/// Reconciles ONLY an expired, unchanged lease:
+/// - Verifies that the recorded lease has actually expired before clearing.
+/// - Performs compare-and-swap (CAS) matching owner_token, fencing_generation, and lease_expires_at_nanos.
+/// - Re-read and verifies the database barrier row after update.
+/// - For non-PostgreSQL configurations, ensures participants are not released if the backup process is alive.
+#[allow(clippy::type_complexity)]
 pub async fn reconcile_backup_maintenance_on_startup(
     storage_root: &Path,
     pool: Option<&sqlx::PgPool>,
@@ -2255,8 +2649,114 @@ pub async fn reconcile_backup_maintenance_on_startup(
 
     if let Some(pg_pool) = pool {
         let barrier = consistency::ConsistencyBarrier::with_pool(pg_pool.clone());
-        let cleared = barrier.clear_barrier_if_unheld().await?;
-        if !cleared {
+
+        // Make PostgreSQL's current owner, generation, expiry, and clock the authoritative recovery state.
+        let barrier_row: Result<Option<(bool, i64, String, i64, i64)>, _> = sqlx::query_as(
+            r#"
+            SELECT is_active, fencing_generation, owner_token, lease_expires_at_nanos,
+                   (EXTRACT(EPOCH FROM clock_timestamp()) * 1000000000)::bigint AS db_now
+            FROM _cluster_maintenance_barrier
+            WHERE id = 1
+            "#,
+        )
+        .fetch_optional(pg_pool)
+        .await;
+
+        match barrier_row {
+            Ok(Some((true, gen, owner, lease_exp, db_now))) => {
+                // Verify that the owner and generation still match the recorded lease
+                if owner != rec.owner_token || gen as u64 != rec.fencing_generation {
+                    tracing::warn!(
+                        "Startup recovery: barrier owned by newer backup (db owner: '{}', gen: {}, lease owner: '{}', gen: {}); refusing to exit participants",
+                        owner, gen, rec.owner_token, rec.fencing_generation
+                    );
+                    return Ok(false);
+                }
+
+                // Verify that the database lease is expired according to the authoritative database clock
+                if lease_exp > 0 && db_now < lease_exp {
+                    let remaining_nanos = lease_exp - db_now;
+                    let remaining_dur = std::time::Duration::from_nanos(remaining_nanos as u64);
+                    tracing::warn!(
+                        "Startup recovery: lease '{}' (gen {}, owner '{}') has {:?} remaining in database; refusing to clear unexpired lease",
+                        rec.backup_id,
+                        rec.fencing_generation,
+                        rec.owner_token,
+                        remaining_dur
+                    );
+                    return Ok(false);
+                }
+
+                // Make clear operation conditional on exact current database lease values and probe lock
+                let cleared = barrier
+                    .clear_barrier_with_cas(&owner, gen as u64, lease_exp)
+                    .await?;
+
+                if !cleared {
+                    tracing::warn!(
+                        "Startup recovery: CAS update failed for lease '{}' (gen {}, owner '{}'); active backup or newer owner owns barrier",
+                        rec.backup_id,
+                        rec.fencing_generation,
+                        rec.owner_token
+                    );
+                    return Ok(false);
+                }
+            }
+            Ok(Some((false, _, _, _, _))) => {
+                // Barrier is already inactive; proceed to verify participants
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Err(ForgeError::Internal(format!(
+                    "Failed to query barrier row during startup recovery: {}",
+                    e
+                )));
+            }
+        }
+
+        // Re-read and verify that barrier row is confirmed inactive before touching participants
+        let verify_row: Result<Option<(bool, String)>, _> = sqlx::query_as(
+            "SELECT is_active, owner_token FROM _cluster_maintenance_barrier WHERE id = 1",
+        )
+        .fetch_optional(pg_pool)
+        .await;
+
+        match verify_row {
+            Ok(Some((is_active, owner))) => {
+                if is_active || !owner.is_empty() {
+                    tracing::warn!(
+                        "Startup recovery: barrier verification failed: is_active={}, owner='{}'; refusing to exit participants",
+                        is_active, owner
+                    );
+                    return Ok(false);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Err(ForgeError::Internal(format!(
+                    "Failed to verify barrier row during startup recovery: {}",
+                    e
+                )));
+            }
+        }
+    } else {
+        // Configuration without PostgreSQL: verify backup process is not alive and lease is expired
+        if rec.process_id > 0 && is_process_alive(rec.process_id) {
+            tracing::warn!(
+                "Startup recovery: backup process {} for lease '{}' is still active; refusing to clear lease",
+                rec.process_id,
+                rec.backup_id
+            );
+            return Ok(false);
+        }
+        let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        if rec.lease_expires_at_nanos > 0 && now_nanos < rec.lease_expires_at_nanos {
+            let remaining_nanos = rec.lease_expires_at_nanos - now_nanos;
+            let remaining_dur = std::time::Duration::from_nanos(remaining_nanos as u64);
+            tracing::warn!(
+                "Startup recovery (no DB): lease '{}' has {:?} remaining; refusing to clear unexpired lease",
+                rec.backup_id, remaining_dur
+            );
             return Ok(false);
         }
     }
@@ -2363,18 +2863,107 @@ where
     GuardRel: FnOnce() -> GuardFut,
     GuardFut: std::future::Future<Output = Result<(), ForgeError>>,
 {
-    if let Some(root) = storage_root {
-        let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let ttl_nanos = i64::try_from(consistency::DEFAULT_MAINTENANCE_LEASE_TTL.as_nanos())
-            .unwrap_or(i64::MAX);
+    run_backup_with_maintenance_cleanup_with_lease(
+        storage_root,
+        fencing_generation,
+        coord_addr_opt,
+        node_endpoints,
+        None,
+        None,
+        None,
+        None,
+        release_db_guard,
+        work,
+    )
+    .await
+}
+
+/// Coordinated cluster backup with explicit lease ownership, cancellation monitoring, and heartbeat.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_backup_with_maintenance_cleanup_with_lease<Work, WorkFut, GuardRel, GuardFut>(
+    storage_root: Option<&Path>,
+    fencing_generation: u64,
+    coord_addr_opt: Option<&str>,
+    node_endpoints: &[(String, String)],
+    owner_token: Option<&str>,
+    lease_expires_at_nanos: Option<i64>,
+    lease_expires_atomic: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
+    cancel_token: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    release_db_guard: Option<GuardRel>,
+    work: Work,
+) -> Result<(), ForgeError>
+where
+    Work: FnOnce(
+        Option<crate::CoordinatorClient>,
+        Vec<(String, crate::ClusterNodeClient)>,
+    ) -> WorkFut,
+    WorkFut: std::future::Future<Output = Result<(), ForgeError>>,
+    GuardRel: FnOnce() -> GuardFut,
+    GuardFut: std::future::Future<Output = Result<(), ForgeError>>,
+{
+    let lease_rec_opt = if let Some(root) = storage_root {
+        let expiry = match (lease_expires_at_nanos, lease_expires_atomic.as_ref()) {
+            (Some(exp), _) => exp,
+            (None, Some(atomic)) => atomic.load(std::sync::atomic::Ordering::SeqCst),
+            (None, None) => {
+                let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                let ttl_nanos =
+                    i64::try_from(consistency::DEFAULT_MAINTENANCE_LEASE_TTL.as_nanos())
+                        .unwrap_or(i64::MAX);
+                now_nanos.saturating_add(ttl_nanos)
+            }
+        };
         let lease_rec = BackupMaintenanceLeaseRecord {
             backup_id: format!("bak_lease_{}", uuid::Uuid::new_v4().simple()),
             fencing_generation,
             coordinator_addr: coord_addr_opt.map(|s| s.to_string()),
             storage_nodes: node_endpoints.to_vec(),
-            lease_expires_at_nanos: now_nanos.saturating_add(ttl_nanos),
+            lease_expires_at_nanos: expiry,
+            owner_token: owner_token.unwrap_or("").to_string(),
+            process_id: std::process::id(),
         };
         lease_rec.persist(root)?;
+        Some(lease_rec)
+    } else {
+        None
+    };
+
+    let (sync_tx, sync_handle) = if let (Some(root), Some(lease_atomic), Some(rec)) = (
+        storage_root,
+        lease_expires_atomic.as_ref(),
+        lease_rec_opt.as_ref(),
+    ) {
+        let root_buf = root.to_path_buf();
+        let mut lease_rec_sync = rec.clone();
+        let lease_atomic_clone = std::sync::Arc::clone(lease_atomic);
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let mut last_saved = lease_rec_sync.lease_expires_at_nanos;
+            loop {
+                tokio::select! {
+                    _ = &mut rx => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                        let cur = lease_atomic_clone.load(std::sync::atomic::Ordering::SeqCst);
+                        if cur > last_saved {
+                            lease_rec_sync.lease_expires_at_nanos = cur;
+                            let _ = lease_rec_sync.persist(&root_buf);
+                            last_saved = cur;
+                        }
+                    }
+                }
+            }
+        });
+        (Some(tx), Some(handle))
+    } else {
+        (None, None)
+    };
+
+    if let Some(ref ct) = cancel_token {
+        if ct.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ForgeError::ServiceUnavailable(
+                "Backup aborted: maintenance barrier lock or connection was compromised before participant entry".into(),
+            ));
+        }
     }
 
     let mut coord_client: Option<crate::CoordinatorClient> = None;
@@ -2382,6 +2971,13 @@ where
 
     let work_res: Result<(), ForgeError> = async {
         if let Some(c_addr) = coord_addr_opt {
+            if let Some(ref ct) = cancel_token {
+                if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(ForgeError::ServiceUnavailable(
+                        "Backup aborted: maintenance barrier lock or connection lost".into(),
+                    ));
+                }
+            }
             println!(
                 "Coordinating maintenance barrier with Spine Coordinator at {}...",
                 c_addr
@@ -2401,6 +2997,13 @@ where
         }
 
         for (node_id, addr) in node_endpoints {
+            if let Some(ref ct) = cancel_token {
+                if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(ForgeError::ServiceUnavailable(
+                        "Backup aborted: maintenance barrier lock or connection lost".into(),
+                    ));
+                }
+            }
             println!(
                 "Coordinating maintenance barrier with storage node '{}' at {}...",
                 node_id, addr
@@ -2419,9 +3022,34 @@ where
                 })?;
         }
 
-        work(coord_client.clone(), storage_clients.clone()).await
+        if let Some(ref ct) = cancel_token {
+            if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ForgeError::ServiceUnavailable(
+                    "Backup aborted: maintenance barrier lock or connection lost".into(),
+                ));
+            }
+        }
+
+        let res = work(coord_client.clone(), storage_clients.clone()).await;
+
+        if let Some(ref ct) = cancel_token {
+            if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ForgeError::ServiceUnavailable(
+                    "Backup aborted: maintenance barrier lock or connection lost during work execution".into(),
+                ));
+            }
+        }
+
+        res
     }
     .await;
+
+    if let Some(tx) = sync_tx {
+        let _ = tx.send(());
+    }
+    if let Some(handle) = sync_handle {
+        let _ = handle.await;
+    }
 
     let mut cleanup_errors: Vec<String> = Vec::new();
     let mut unresolved_participants: Vec<String> = Vec::new();

@@ -722,26 +722,64 @@ async fn main() -> anyhow::Result<()> {
                     .as_ref()
                     .map(|g| g.fencing_generation)
                     .unwrap_or(1);
+                let owner_token = guard_opt.as_ref().map(|g| g.owner_token.clone());
+                let cancel_token = guard_opt.as_ref().map(|g| g.cancel_token());
+                let lease_expires_at_nanos = guard_opt.as_ref().map(|g| g.current_lease_expiry());
+                let lease_expires_atomic = guard_opt.as_ref().map(|g| g.lease_expires_atomic());
+
+                let guard_shared: Option<
+                    std::sync::Arc<tokio::sync::Mutex<Option<spine_api::backup::MaintenanceGuard>>>,
+                > = guard_opt.map(|g| std::sync::Arc::new(tokio::sync::Mutex::new(Some(g))));
 
                 let stream_participants: Vec<(
                     spine_api::BackupParticipantRecord,
                     spine_api::backup::ParticipantPayloadSource,
                 )> = Vec::new();
-                let release_db_guard = guard_opt.map(|g| move || async move { g.release().await });
+                let guard_shared_for_release = guard_shared.clone();
+                let release_db_guard = guard_shared_for_release.map(|shared| {
+                    move || async move {
+                        let mut g_opt = shared.lock().await;
+                        if let Some(guard) = g_opt.take() {
+                            guard.release().await
+                        } else {
+                            Ok(())
+                        }
+                    }
+                });
                 let lease_storage_root = storage_root.clone();
-                spine_api::backup::run_backup_with_maintenance_cleanup_at(
+                let cancel_token_work = cancel_token.clone();
+                let guard_shared_for_publish = guard_shared.clone();
+                spine_api::backup::run_backup_with_maintenance_cleanup_with_lease(
                     Some(&lease_storage_root),
                     fencing_generation,
                     coord_addr_opt.as_deref(),
                     &node_endpoints,
+                    owner_token.as_deref(),
+                    lease_expires_at_nanos,
+                    lease_expires_atomic,
+                    cancel_token.clone(),
                     release_db_guard,
                     |coord_client, storage_clients| async move {
+                if let Some(ref ct) = cancel_token_work {
+                    if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(spine_api::core::error::ForgeError::ServiceUnavailable(
+                            "Backup aborted: database maintenance barrier lock or connection lost".into(),
+                        ));
+                    }
+                }
                 let mut stream_participants = stream_participants;
                 let captured_pg_enc = if let Some(ref pool) = pg_pool_opt {
                     Some(spine_api::backup::capture_encrypted_pg_dump(pool).await?)
                 } else {
                     None
                 };
+                if let Some(ref ct) = cancel_token_work {
+                    if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(spine_api::core::error::ForgeError::ServiceUnavailable(
+                            "Backup aborted: database maintenance barrier lock or connection lost".into(),
+                        ));
+                    }
+                }
                 if let Some(client) = coord_client {
                     let snap_id = uuid::Uuid::new_v4().to_string();
                     let (manifest, data) = client
@@ -773,6 +811,13 @@ async fn main() -> anyhow::Result<()> {
                     println!("Coordinator volume snapshot captured successfully.");
                 }
 
+                if let Some(ref ct) = cancel_token_work {
+                    if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(spine_api::core::error::ForgeError::ServiceUnavailable(
+                            "Backup aborted: database maintenance barrier lock or connection lost".into(),
+                        ));
+                    }
+                }
                 for (node_id, client) in &storage_clients {
                     let snap_id = uuid::Uuid::new_v4().to_string();
                     let (manifest, data) = client
@@ -878,6 +923,14 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
 
+                if let Some(ref ct) = cancel_token_work {
+                    if ct.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(spine_api::core::error::ForgeError::ServiceUnavailable(
+                            "Backup aborted: database maintenance barrier lock or connection lost before archive assembly".into(),
+                        ));
+                    }
+                }
+
                 // Enforce participant registry validation before archive assembly
                 let participant_records: Vec<_> =
                     stream_participants.iter().map(|(r, _)| r.clone()).collect();
@@ -898,7 +951,7 @@ async fn main() -> anyhow::Result<()> {
                     storage_root.display(),
                     output.display()
                 );
-                let manifest = spine_api::backup::BackupManager::create_cluster_backup_streaming(
+                let staged = spine_api::backup::BackupManager::create_cluster_backup_staged(
                     &storage_root,
                     None,
                     stream_participants,
@@ -906,7 +959,21 @@ async fn main() -> anyhow::Result<()> {
                     &output,
                     pass.as_deref(),
                     key_version,
+                    cancel_token_work.clone(),
                 )?;
+
+                let guard_shared_verify = guard_shared_for_publish.clone();
+                let manifest = staged
+                    .publish_with_verifier(move || async move {
+                        if let Some(ref shared) = guard_shared_verify {
+                            let guard_lock = shared.lock().await;
+                            if let Some(ref guard) = *guard_lock {
+                                guard.verify_lock_held().await?;
+                            }
+                        }
+                        Ok(())
+                    })
+                    .await?;
                 println!("Backup archive created successfully:");
                 println!("  Backup ID:     {}", manifest.backup_id);
                 println!("  Total files:   {}", manifest.total_files);

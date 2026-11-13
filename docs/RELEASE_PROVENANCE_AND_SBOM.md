@@ -40,7 +40,7 @@ All four production executables were built from source commit `0dd1abe4e90d1cadc
 | `spine.exe` | `8892416` | `65ea4bf118113722fce876211e8ff2028b5f4273813d349c08374f03995104ab` |
 | `spine-coordinator.exe` | `3041792` | `66ccd6ac73c0154f48b84409d425801f5c314a6733def7609340f6a84696d06f` |
 | `spine-storage-node.exe` | `2766848` | `7d969321f868417483b952f36d26c68a8a4ac0b6e2a7308bf566224e02eb89cf` |
-| `spine-api.exe` | `22727680` | `e5331db97717097d98287ac5187525bc474fc7d62492951ec83084911086b6d3` |
+| `spine-api.exe` | `23265280` | `b2a23d729736f63e996caf0511c0875f28bd7467889dead749c6226a6d7984b5` |
 
 Checksums manifest (`target/release-candidate/SHA256SUMS`):
 
@@ -48,7 +48,7 @@ Checksums manifest (`target/release-candidate/SHA256SUMS`):
 65ea4bf118113722fce876211e8ff2028b5f4273813d349c08374f03995104ab  spine.exe
 66ccd6ac73c0154f48b84409d425801f5c314a6733def7609340f6a84696d06f  spine-coordinator.exe
 7d969321f868417483b952f36d26c68a8a4ac0b6e2a7308bf566224e02eb89cf  spine-storage-node.exe
-e5331db97717097d98287ac5187525bc474fc7d62492951ec83084911086b6d3  spine-api.exe
+b2a23d729736f63e996caf0511c0875f28bd7467889dead749c6226a6d7984b5  spine-api.exe
 ```
 
 ## 5. CycloneDX Software Bill of Materials (SBOM)

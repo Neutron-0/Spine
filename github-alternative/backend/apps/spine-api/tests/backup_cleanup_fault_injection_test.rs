@@ -2,10 +2,14 @@ mod common;
 
 use common::HarnessDisposableDb;
 use sha2::{Digest, Sha256};
-use spine_api::backup::{run_backup_with_maintenance_cleanup, ConsistencyBarrier};
+use spine_api::backup::{
+    run_backup_with_maintenance_cleanup, BackupMaintenanceLeaseRecord, BackupManager,
+    ConsistencyBarrier,
+};
 use spine_api::coordinator::{ClusterNodeClient, CoordinatorClient};
 use spine_api::core::error::ForgeError;
 use spine_cluster::protocol::{ClusterRpcRequest, ClusterRpcResponse};
+use sqlx::Connection;
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
@@ -81,6 +85,14 @@ async fn spawn_mock_barrier_server(state: Arc<MockBarrierNode>) -> (String, Arc<
                                     .store(fencing_generation, Ordering::SeqCst);
                                 st.in_maintenance.store(false, Ordering::SeqCst);
                                 ClusterRpcResponse::MaintenanceBarrierAck { success: true }
+                            }
+                        }
+                        ClusterRpcRequest::QueryMaintenanceStatus => {
+                            ClusterRpcResponse::MaintenanceStatus {
+                                in_maintenance: st.in_maintenance.load(Ordering::SeqCst),
+                                fencing_generation: st.fencing_generation.load(Ordering::SeqCst),
+                                active_writers: 0,
+                                node_id: Some("mock-node".to_string()),
                             }
                         }
                         _ => ClusterRpcResponse::Error("Unsupported".to_string()),
@@ -878,7 +890,7 @@ async fn test_uncertain_barrier_write_committed_server_side_then_response_lost()
 #[ignore = "requires isolated SPINE_TEST_DATABASE_URL; run with -- --ignored in release gate"]
 async fn test_backup_cancellation_and_abrupt_termination_recovery() {
     use spine_api::backup::{
-        reconcile_backup_maintenance_on_startup, run_backup_with_maintenance_cleanup_at,
+        reconcile_backup_maintenance_on_startup, run_backup_with_maintenance_cleanup_with_lease,
         BackupMaintenanceLeaseRecord,
     };
     use std::io::{BufRead, BufReader};
@@ -905,6 +917,8 @@ async fn test_backup_cancellation_and_abrupt_termination_recovery() {
                 .timestamp_nanos_opt()
                 .unwrap_or(0)
                 .saturating_add(200_000_000),
+            owner_token: _guard.owner_token().to_string(),
+            process_id: std::process::id(),
         };
         rec.persist(&storage_root).unwrap();
         CoordinatorClient::new(coord_addr)
@@ -966,10 +980,13 @@ async fn test_backup_cancellation_and_abrupt_termination_recovery() {
     // 1. Cancellation during active backup work + active backup write protection
     let barrier = ConsistencyBarrier::with_pool(disp_db.pool.clone());
     let guard = barrier
-        .enter_maintenance_with_lease(Duration::from_secs(5), Duration::from_secs(60))
+        .enter_maintenance_with_lease(Duration::from_secs(5), Duration::from_millis(300))
         .await
         .unwrap();
     let gen = guard.fencing_generation();
+    let owner_tok = guard.owner_token().to_string();
+    let lease_exp = guard.current_lease_expiry();
+    let lease_atomic = guard.lease_expires_atomic();
     let root_c = storage_root.clone();
     let coord_c = coord_addr.clone();
     let nodes = vec![("node-1".to_string(), node_addr.clone())];
@@ -977,11 +994,15 @@ async fn test_backup_cancellation_and_abrupt_termination_recovery() {
 
     let handle = tokio::spawn(async move {
         let mut tx = Some(entered_tx);
-        run_backup_with_maintenance_cleanup_at(
+        run_backup_with_maintenance_cleanup_with_lease(
             Some(&root_c),
             gen,
             Some(&coord_c),
             &nodes,
+            Some(&owner_tok),
+            Some(lease_exp),
+            Some(lease_atomic),
+            None,
             Some(move || async move { guard.release().await }),
             move |_, _| async move {
                 if let Some(t) = tx.take() {
@@ -1008,7 +1029,7 @@ async fn test_backup_cancellation_and_abrupt_termination_recovery() {
     // guard was moved into the aborted future and dropped cleanly on abort!
     handle.abort();
     let _ = handle.await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(350)).await;
 
     // Durable lease file remains on disk and reconcile_backup_maintenance_on_startup recovers all!
     assert!(BackupMaintenanceLeaseRecord::lease_path(&storage_root).exists());
@@ -1108,4 +1129,677 @@ async fn test_backup_cancellation_and_abrupt_termination_recovery() {
     assert!(!BackupMaintenanceLeaseRecord::lease_path(&storage_root).exists());
 
     disp_db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_non_postgres_startup_recovery_refuses_active_process() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage_root = tmp.path().to_path_buf();
+
+    let node_state = MockBarrierNode::new();
+    let (node_addr, stop_node) = spawn_mock_barrier_server(Arc::clone(&node_state)).await;
+    let node_client = ClusterNodeClient::new(node_addr.clone());
+    node_client.enter_maintenance(10).await.unwrap();
+    assert!(node_state.in_maintenance.load(Ordering::SeqCst));
+
+    // 1. Write lease with CURRENT process PID (still alive)
+    let active_lease = spine_api::backup::BackupMaintenanceLeaseRecord {
+        backup_id: "active_lease_proc".to_string(),
+        fencing_generation: 10,
+        coordinator_addr: None,
+        storage_nodes: vec![("node1".to_string(), node_addr.clone())],
+        lease_expires_at_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            + 1_000_000_000,
+        owner_token: "active_owner".to_string(),
+        process_id: std::process::id(),
+    };
+    active_lease.persist(&storage_root).unwrap();
+
+    // Recovery must refuse to clear participants because process is still running
+    let recovered = spine_api::backup::reconcile_backup_maintenance_on_startup(&storage_root, None)
+        .await
+        .unwrap();
+    assert!(
+        !recovered,
+        "Startup recovery without PostgreSQL must refuse to clear lease belonging to active process"
+    );
+    assert!(
+        node_state.in_maintenance.load(Ordering::SeqCst),
+        "Participant must not be exited while process is active"
+    );
+    assert!(
+        spine_api::backup::BackupMaintenanceLeaseRecord::lease_path(&storage_root).exists(),
+        "Lease file must be preserved"
+    );
+
+    // 2. Write lease with non-existent dead PID and expired lease timestamp
+    let dead_lease = spine_api::backup::BackupMaintenanceLeaseRecord {
+        backup_id: "dead_lease_proc".to_string(),
+        fencing_generation: 10,
+        coordinator_addr: None,
+        storage_nodes: vec![("node1".to_string(), node_addr.clone())],
+        lease_expires_at_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            - 1_000_000_000,
+        owner_token: "dead_owner".to_string(),
+        process_id: 999_999, // Non-existent process
+    };
+    dead_lease.persist(&storage_root).unwrap();
+
+    let recovered_dead =
+        spine_api::backup::reconcile_backup_maintenance_on_startup(&storage_root, None)
+            .await
+            .unwrap();
+    assert!(
+        recovered_dead,
+        "Startup recovery must clean up expired lease from non-existent process"
+    );
+    assert!(
+        !node_state.in_maintenance.load(Ordering::SeqCst),
+        "Participant must be exited cleanly after dead process recovery"
+    );
+    assert!(
+        !spine_api::backup::BackupMaintenanceLeaseRecord::lease_path(&storage_root).exists(),
+        "Lease file must be removed after successful recovery"
+    );
+
+    stop_node.store(true, Ordering::SeqCst);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_concurrent_startup_reconciliation_racing_with_new_backup_entry() {
+    let disp_db = HarnessDisposableDb::provision().await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let storage_root = tmp.path().to_path_buf();
+
+    let node_state = MockBarrierNode::new();
+    let (node_addr, stop_node) = spawn_mock_barrier_server(Arc::clone(&node_state)).await;
+
+    // Simulate an old expired lease on disk from a previous crashed run
+    let old_lease = spine_api::backup::BackupMaintenanceLeaseRecord {
+        backup_id: "old_crashed_backup".to_string(),
+        fencing_generation: 5,
+        coordinator_addr: None,
+        storage_nodes: vec![("node1".to_string(), node_addr.clone())],
+        lease_expires_at_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            - 1_000_000_000,
+        owner_token: "old_crashed_owner".to_string(),
+        process_id: 999_999,
+    };
+    old_lease.persist(&storage_root).unwrap();
+
+    // A new backup begins and acquires exclusive database maintenance guard
+    let barrier = ConsistencyBarrier::with_pool(disp_db.pool.clone());
+    let guard = barrier
+        .enter_maintenance(Duration::from_secs(10))
+        .await
+        .expect("New backup must enter maintenance");
+
+    let new_gen = guard.fencing_generation();
+    let new_owner = guard.owner_token().to_string();
+
+    // Verify DB barrier has new owner
+    let db_row: (bool, i64, String) = sqlx::query_as(
+        "SELECT is_active, fencing_generation, owner_token FROM _cluster_maintenance_barrier WHERE id = 1",
+    )
+    .fetch_one(&disp_db.pool)
+    .await
+    .unwrap();
+    assert!(db_row.0, "DB barrier must be active");
+    assert_eq!(db_row.1, new_gen as i64);
+    assert_eq!(db_row.2, new_owner);
+
+    // Concurrently, startup recovery runs with the old lease record
+    let recovered = spine_api::backup::reconcile_backup_maintenance_on_startup(
+        &storage_root,
+        Some(&disp_db.pool),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !recovered,
+        "Startup recovery must REFUSE to clear maintenance while new backup owns barrier"
+    );
+
+    // Verify database barrier state was NOT cleared by the old recovery
+    let db_row_after: (bool, i64, String) = sqlx::query_as(
+        "SELECT is_active, fencing_generation, owner_token FROM _cluster_maintenance_barrier WHERE id = 1",
+    )
+    .fetch_one(&disp_db.pool)
+    .await
+    .unwrap();
+    assert!(
+        db_row_after.0,
+        "DB barrier must remain active for the new backup"
+    );
+    assert_eq!(
+        db_row_after.2, new_owner,
+        "DB barrier owner must remain the new backup owner"
+    );
+
+    // Verify advisory lock is still exclusively held by new backup
+    let lock_probe = barrier.clear_barrier_if_unheld().await.unwrap();
+    assert!(
+        !lock_probe,
+        "Exclusive lock must be held by new backup; probe must fail"
+    );
+
+    // New backup is allowed to complete its work and release cleanly
+    guard
+        .release()
+        .await
+        .expect("New backup must release cleanly");
+
+    // After release, DB barrier is inactive
+    let is_active_final = barrier.is_maintenance_active_in_db().await.unwrap();
+    assert!(
+        !is_active_final,
+        "DB barrier must be cleared after new backup release"
+    );
+
+    stop_node.store(true, Ordering::SeqCst);
+    disp_db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_acquire_write_permit_attempting_to_clear_expired_lease_while_new_backup_beginning() {
+    let disp_db = HarnessDisposableDb::provision().await.unwrap();
+
+    // Insert an expired barrier row into DB
+    let expired_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) - 5_000_000_000;
+    sqlx::query(
+        r#"
+        INSERT INTO _cluster_maintenance_barrier (id, is_active, activated_at_nanos, activated_by, reason, fencing_generation, lease_expires_at_nanos, owner_token)
+        VALUES (1, TRUE, $1, 'spine-backup', 'old backup', 5, $1, 'stale_owner_token')
+        ON CONFLICT (id) DO UPDATE SET
+            is_active = TRUE,
+            lease_expires_at_nanos = $1,
+            owner_token = 'stale_owner_token'
+        "#,
+    )
+    .bind(expired_nanos)
+    .execute(&disp_db.pool)
+    .await
+    .unwrap();
+
+    // A new backup begins and acquires exclusive session advisory lock on dedicated connection
+    let mut backup_conn = sqlx::PgConnection::connect(&disp_db.migrator_url)
+        .await
+        .unwrap();
+    let lock_ok: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+        .bind(spine_api::backup::SPINE_CLUSTER_MAINTENANCE_LOCK_ID)
+        .fetch_one(&mut backup_conn)
+        .await
+        .unwrap();
+    assert!(lock_ok.0, "New backup must acquire exclusive advisory lock");
+
+    // A writer attempts acquire_write_permit:
+    // It sees is_active = TRUE and lease expired, so it attempts clear_barrier_with_cas.
+    // However, because the new backup holds the exclusive advisory lock, probe fails!
+    let barrier = ConsistencyBarrier::with_pool(disp_db.pool.clone());
+    let permit_res = barrier.acquire_write_permit().await;
+
+    assert!(
+        permit_res.is_err(),
+        "acquire_write_permit must be rejected because exclusive lock is held by beginning backup"
+    );
+
+    // Release new backup's advisory lock
+    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(spine_api::backup::SPINE_CLUSTER_MAINTENANCE_LOCK_ID)
+        .execute(&mut backup_conn)
+        .await;
+    let _ = backup_conn.close().await;
+
+    // Now with exclusive lock unheld, writer permit can clear the expired lease
+    let permit = barrier
+        .acquire_write_permit()
+        .await
+        .expect("Writer permit must succeed once lock is unheld and lease is expired");
+    permit.release().await.unwrap();
+
+    disp_db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_stale_lease_record_alongside_fresh_database_barrier_owner() {
+    let disp_db = HarnessDisposableDb::provision().await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let storage_root = tmp.path().to_path_buf();
+
+    let node_state = MockBarrierNode::new();
+    let (node_addr, stop_node) = spawn_mock_barrier_server(Arc::clone(&node_state)).await;
+    let client = ClusterNodeClient::new(node_addr.clone());
+    client.enter_maintenance(20).await.unwrap();
+
+    // Local stale lease record on disk
+    let stale_lease = spine_api::backup::BackupMaintenanceLeaseRecord {
+        backup_id: "crashed_backup_old".to_string(),
+        fencing_generation: 19,
+        coordinator_addr: None,
+        storage_nodes: vec![("node1".to_string(), node_addr.clone())],
+        lease_expires_at_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            - 10_000_000_000,
+        owner_token: "crashed_backup_old_token".to_string(),
+        process_id: 999_999,
+    };
+    stale_lease.persist(&storage_root).unwrap();
+
+    // Database barrier is actively held by a fresh owner
+    let fresh_barrier = ConsistencyBarrier::with_pool(disp_db.pool.clone());
+    let fresh_guard = fresh_barrier
+        .enter_maintenance(Duration::from_secs(10))
+        .await
+        .unwrap();
+
+    assert_ne!(
+        fresh_guard.owner_token(),
+        "crashed_backup_old_token",
+        "Fresh guard must have distinct owner token"
+    );
+
+    // Startup recovery runs for the stale lease
+    let recovered = spine_api::backup::reconcile_backup_maintenance_on_startup(
+        &storage_root,
+        Some(&disp_db.pool),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !recovered,
+        "Startup recovery must REFUSE to clear fresh barrier belonging to another owner"
+    );
+
+    // Verify participants were NOT exited
+    assert!(
+        node_state.in_maintenance.load(Ordering::SeqCst),
+        "Participant must not be exited by stale lease recovery"
+    );
+
+    // Verify local stale lease was NOT deleted while fresh barrier was active
+    assert!(
+        spine_api::backup::BackupMaintenanceLeaseRecord::lease_path(&storage_root).exists(),
+        "Stale lease file must not be removed when fresh owner owns barrier"
+    );
+
+    fresh_guard.release().await.unwrap();
+    stop_node.store(true, Ordering::SeqCst);
+    disp_db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_lease_expiry_while_backup_alive_but_db_connection_lost() {
+    let disp_db = HarnessDisposableDb::provision().await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let storage_root = tmp.path().to_path_buf();
+
+    let barrier = ConsistencyBarrier::with_pool(disp_db.pool.clone());
+    // Enter maintenance with a short lease TTL (600ms)
+    let guard = barrier
+        .enter_maintenance_with_lease(Duration::from_secs(10), Duration::from_millis(600))
+        .await
+        .expect("Enter maintenance");
+
+    let cancel_token = guard.cancel_token();
+    let owner_token = guard.owner_token().to_string();
+    let fencing_gen = guard.fencing_generation();
+
+    assert!(!cancel_token.load(Ordering::SeqCst));
+    assert!(guard.check_healthy().await.is_ok());
+
+    // Injected fault: Database connection is severed mid-backup
+    guard.simulate_connection_loss().await;
+
+    // Heartbeat loop runs every 200ms; it must detect connection loss and trip cancel_token
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !cancel_token.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("Heartbeat must trip cancel_token when database connection is severed");
+
+    assert!(
+        guard.check_healthy().await.is_err(),
+        "check_healthy must report compromised barrier after connection loss"
+    );
+
+    // Verify backup work execution is prevented and fails command
+    let dummy_node = Vec::new();
+    let backup_res = spine_api::backup::run_backup_with_maintenance_cleanup_with_lease(
+        Some(&storage_root),
+        fencing_gen,
+        None,
+        &dummy_node,
+        Some(&owner_token),
+        Some(guard.current_lease_expiry()),
+        Some(guard.lease_expires_atomic()),
+        Some(cancel_token.clone()),
+        Some(|| async move { guard.release().await }),
+        |_coord, _nodes| async move {
+            panic!("Backup work closure must NOT execute when cancel_token is tripped");
+        },
+    )
+    .await;
+
+    assert!(
+        backup_res.is_err(),
+        "Backup must fail when cancel_token is tripped by lost DB connection"
+    );
+    let err_msg = format!("{}", backup_res.err().unwrap());
+    assert!(
+        err_msg.contains("compromised") || err_msg.contains("lost") || err_msg.contains("aborted"),
+        "Error message must indicate maintenance lock/connection was lost: {}",
+        err_msg
+    );
+
+    disp_db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_recovery_attempting_to_exit_participants_while_current_backup_owns_lease() {
+    let disp_db = HarnessDisposableDb::provision().await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let storage_root = tmp.path().to_path_buf();
+
+    let node_state = MockBarrierNode::new();
+    let (node_addr, stop_node) = spawn_mock_barrier_server(Arc::clone(&node_state)).await;
+
+    let barrier = ConsistencyBarrier::with_pool(disp_db.pool.clone());
+    let guard = barrier
+        .enter_maintenance(Duration::from_secs(10))
+        .await
+        .unwrap();
+
+    let fencing_gen = guard.fencing_generation();
+    let owner_token = guard.owner_token().to_string();
+
+    // Active backup enters participant maintenance
+    let node_client = ClusterNodeClient::new(node_addr.clone());
+    node_client.enter_maintenance(fencing_gen).await.unwrap();
+    assert!(node_state.in_maintenance.load(Ordering::SeqCst));
+
+    // Active backup writes its lease file
+    let active_lease = spine_api::backup::BackupMaintenanceLeaseRecord {
+        backup_id: "active_running_backup".to_string(),
+        fencing_generation: fencing_gen,
+        coordinator_addr: None,
+        storage_nodes: vec![("node1".to_string(), node_addr.clone())],
+        lease_expires_at_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            + 300_000_000_000,
+        owner_token: owner_token.clone(),
+        process_id: std::process::id(),
+    };
+    active_lease.persist(&storage_root).unwrap();
+
+    // Recovery runs while active backup is running and holding advisory lock
+    let recovered = spine_api::backup::reconcile_backup_maintenance_on_startup(
+        &storage_root,
+        Some(&disp_db.pool),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !recovered,
+        "Recovery must refuse to clear lease or exit participants while active backup owns lease"
+    );
+
+    // Verify participant is STILL in maintenance
+    assert!(
+        node_state.in_maintenance.load(Ordering::SeqCst),
+        "Participant must remain in maintenance for the active backup"
+    );
+
+    // Active backup releases cleanly at end
+    node_client.exit_maintenance(fencing_gen).await.unwrap();
+    guard.release().await.unwrap();
+
+    assert!(!node_state.in_maintenance.load(Ordering::SeqCst));
+    stop_node.store(true, Ordering::SeqCst);
+    disp_db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_multi_heartbeat_lease_renewal_and_startup_recovery() {
+    let disp_db = HarnessDisposableDb::provision().await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let storage_root = tmp.path().to_path_buf();
+
+    let node_state = MockBarrierNode::new();
+    let (node_addr, stop_node) = spawn_mock_barrier_server(Arc::clone(&node_state)).await;
+
+    // Use a short lease TTL (e.g. 1 second) so heartbeats renew it every 200ms
+    let barrier = ConsistencyBarrier::with_pool(disp_db.pool.clone());
+    let guard = barrier
+        .enter_maintenance(Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    let fencing_gen = guard.fencing_generation();
+    let owner_token = guard.owner_token().to_string();
+
+    // Participant enters maintenance
+    let node_client = ClusterNodeClient::new(node_addr.clone());
+    node_client.enter_maintenance(fencing_gen).await.unwrap();
+    assert!(node_state.in_maintenance.load(Ordering::SeqCst));
+
+    // Initial lease record written at backup startup
+    let initial_lease_exp = guard.lease_expires_atomic().load(Ordering::SeqCst);
+    let lease = BackupMaintenanceLeaseRecord {
+        backup_id: "multi_heartbeat_backup".to_string(),
+        fencing_generation: fencing_gen,
+        coordinator_addr: None,
+        storage_nodes: vec![("node1".to_string(), node_addr.clone())],
+        lease_expires_at_nanos: initial_lease_exp,
+        owner_token: owner_token.clone(),
+        process_id: std::process::id(),
+    };
+    lease.persist(&storage_root).unwrap();
+
+    // Let the background heartbeat run for at least 3 ticks (>600ms)
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    // Verify PostgreSQL database row has been renewed beyond initial lease expiry
+    let row: (i64, i64) = sqlx::query_as(
+        "SELECT lease_expires_at_nanos, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000000000)::bigint FROM _cluster_maintenance_barrier WHERE id = 1"
+    )
+    .fetch_one(&disp_db.pool)
+    .await
+    .unwrap();
+    let renewed_db_exp = row.0;
+    assert!(
+        renewed_db_exp > initial_lease_exp,
+        "Heartbeat must renew lease_expires_at_nanos in PostgreSQL (initial: {}, db: {})",
+        initial_lease_exp,
+        renewed_db_exp
+    );
+
+    // Simulate process termination / crash without clean guard.release():
+    // Sever the dedicated database connection (dropping the advisory lock in PostgreSQL)
+    // and forget the guard so the DB row remains active as it would after an abrupt crash.
+    guard.simulate_connection_loss().await;
+    std::mem::forget(guard);
+
+    // Wait until the renewed lease expires in the database
+    let db_now = row.1;
+    if renewed_db_exp > db_now {
+        let remaining_nanos = (renewed_db_exp - db_now) as u64;
+        tokio::time::sleep(Duration::from_nanos(remaining_nanos) + Duration::from_millis(200))
+            .await;
+    }
+
+    // Run startup recovery
+    let recovered = spine_api::backup::reconcile_backup_maintenance_on_startup(
+        &storage_root,
+        Some(&disp_db.pool),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        recovered,
+        "Startup recovery must successfully clear barrier and exit participants after heartbeat-renewed lease expired"
+    );
+
+    // Verify PostgreSQL barrier row is now inactive
+    let active_row: (bool,) =
+        sqlx::query_as("SELECT is_active FROM _cluster_maintenance_barrier WHERE id = 1")
+            .fetch_one(&disp_db.pool)
+            .await
+            .unwrap();
+    assert!(
+        !active_row.0,
+        "Database barrier must be marked inactive after recovery"
+    );
+
+    // Verify participant has been exited
+    assert!(
+        !node_state.in_maintenance.load(Ordering::SeqCst),
+        "Participant node must be out of maintenance after recovery"
+    );
+
+    // Verify local lease record was removed
+    assert!(
+        !BackupMaintenanceLeaseRecord::lease_path(&storage_root).exists(),
+        "Lease record file must be removed after successful recovery"
+    );
+
+    stop_node.store(true, Ordering::SeqCst);
+    disp_db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_archive_publication_aborted_on_lock_loss() {
+    let disp_db = HarnessDisposableDb::provision().await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let storage_root = tmp.path().join("storage");
+    fs::create_dir_all(&storage_root).unwrap();
+    fs::write(storage_root.join("data.txt"), b"test-payload-data").unwrap();
+
+    let output_path = tmp.path().join("archive.tar.gz");
+
+    let barrier = ConsistencyBarrier::with_pool(disp_db.pool.clone());
+    let guard = barrier
+        .enter_maintenance(Duration::from_secs(10))
+        .await
+        .unwrap();
+
+    // Verify lock is held initially
+    guard.verify_lock_held().await.unwrap();
+
+    // Create staged backup archive
+    let staged = BackupManager::create_cluster_backup_staged(
+        &storage_root,
+        None,
+        vec![],
+        Some(guard.fencing_generation()),
+        &output_path,
+        None,
+        2,
+        Some(guard.cancel_token()),
+    )
+    .unwrap();
+
+    let staged_tmp_path = staged.tmp_path().to_path_buf();
+    assert!(
+        staged_tmp_path.exists(),
+        "Staged temporary archive file must exist before publication"
+    );
+    assert!(
+        !output_path.exists(),
+        "Final archive path must not exist before publication"
+    );
+
+    // Simulate advisory lock loss by cutting the connection
+    guard.simulate_connection_loss().await;
+
+    // Now attempt publication with verifier checking lock held
+    let pub_res = staged
+        .publish_with_verifier(|| async {
+            // Guard lock is severed, so verify_lock_held will fail
+            guard.verify_lock_held().await
+        })
+        .await;
+
+    assert!(
+        pub_res.is_err(),
+        "Publication must fail when lock ownership cannot be verified"
+    );
+
+    // Verify final destination remains untouched
+    assert!(
+        !output_path.exists(),
+        "Final archive path must NOT exist after aborted publication"
+    );
+
+    // Verify temporary file was cleaned up
+    assert!(
+        !staged_tmp_path.exists(),
+        "Temporary staged file must be removed on abort"
+    );
+
+    disp_db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_archive_streaming_aborted_on_lock_loss() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage_root = tmp.path().join("storage");
+    fs::create_dir_all(&storage_root).unwrap();
+    fs::write(storage_root.join("payload.bin"), vec![0x42; 64 * 1024]).unwrap();
+
+    let output_path = tmp.path().join("output_archive.tar.gz");
+    let cancel_token = Arc::new(AtomicBool::new(false));
+
+    // Trigger cancel token before / during streaming
+    cancel_token.store(true, Ordering::SeqCst);
+
+    let res = BackupManager::create_cluster_backup_staged(
+        &storage_root,
+        None,
+        vec![],
+        Some(1),
+        &output_path,
+        None,
+        2,
+        Some(cancel_token),
+    );
+
+    assert!(
+        res.is_err(),
+        "Streaming must abort when cancellation token is set"
+    );
+    let err_str = format!("{}", res.err().unwrap());
+    assert!(
+        err_str.contains("aborted") || err_str.contains("lost"),
+        "Error message must indicate streaming aborted: {}",
+        err_str
+    );
+
+    // Ensure final output path was not created
+    assert!(
+        !output_path.exists(),
+        "Output archive must not exist after aborted streaming"
+    );
+
+    // Ensure no orphan temporary files exist in the output directory
+    let parent = output_path.parent().unwrap();
+    for entry in fs::read_dir(parent).unwrap().flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        assert!(
+            !name.starts_with(".tmp_bak_"),
+            "Orphan temp file found: {}",
+            name
+        );
+    }
 }

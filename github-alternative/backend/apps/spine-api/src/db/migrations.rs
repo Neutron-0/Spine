@@ -58,6 +58,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0014_maintenance_lease_recovery",
         include_str!("../../migrations/0014_maintenance_lease_recovery.sql"),
     ),
+    (
+        "0015_maintenance_lease_owner_token",
+        include_str!("../../migrations/0015_maintenance_lease_owner_token.sql"),
+    ),
 ];
 
 // 64-bit advisory lock ID representing "SPINEMIG" (0x5350494E454D4947)
