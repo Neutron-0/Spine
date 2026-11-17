@@ -3563,7 +3563,8 @@ impl Database for PgDatabase {
         limit: i64,
         now_nanos: i64,
     ) -> Result<Vec<WebhookOutboxItem>, ForgeError> {
-        let lease_expiry_nanos = now_nanos + 60 * 1_000_000_000;
+        let batch_buffer_secs = (limit as i64 - 1).max(0) * 30;
+        let lease_expiry_nanos = now_nanos + (60 + batch_buffer_secs) * 1_000_000_000;
         let query = "UPDATE webhook_outbox SET status = 'PROCESSING', attempts = attempts + 1, next_attempt_at_nanos = $3 WHERE id IN (SELECT id FROM webhook_outbox WHERE (status = 'PENDING' AND next_attempt_at_nanos <= $1) OR (status = 'PROCESSING' AND next_attempt_at_nanos <= $1) ORDER BY next_attempt_at_nanos ASC LIMIT $2 FOR UPDATE SKIP LOCKED) RETURNING id, event_type, owner_type, owner_id, payload, attempts, max_attempts, status, last_error, created_at_nanos, next_attempt_at_nanos";
         let rows = sqlx::query(query)
             .bind(now_nanos)
@@ -3590,6 +3591,21 @@ impl Database for PgDatabase {
             })
             .collect();
         Ok(list)
+    }
+
+    async fn extend_webhook_outbox_lease(
+        &self,
+        id: &str,
+        lease_until_nanos: i64,
+    ) -> Result<bool, ForgeError> {
+        let query = "UPDATE webhook_outbox SET next_attempt_at_nanos = $1 WHERE id = $2 AND status = 'PROCESSING'";
+        let res = sqlx::query(query)
+            .bind(lease_until_nanos)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(res.rows_affected() > 0)
     }
 
     async fn update_webhook_outbox_status(

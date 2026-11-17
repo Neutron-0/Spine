@@ -542,6 +542,11 @@ pub trait Database: Send + Sync {
         error: Option<&str>,
         next_attempt_nanos: i64,
     ) -> Result<(), ForgeError>;
+    async fn extend_webhook_outbox_lease(
+        &self,
+        id: &str,
+        lease_until_nanos: i64,
+    ) -> Result<bool, ForgeError>;
 
     // -------------------------------------------------------------------------
     // Workflows, Runs, Jobs, Steps, Logs (Batch 12)

@@ -1229,4 +1229,70 @@ mod tests {
         assert_eq!(backend.get_maintenance_status(), (false, 20, 0));
         let _guard = backend.acquire_writer(Some(20)).unwrap();
     }
+
+    #[test]
+    fn test_capture_and_restore_production_volume_within_15mib_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FileSystemStorageBackend::new(tmp.path(), 100_000_000).unwrap();
+        backend.enter_maintenance(25).unwrap();
+
+        // Write representative multi-megabyte production dataset (repos, chunks, manifests)
+        let repos_dir = tmp.path().join("repos");
+        let chunks_dir = tmp.path().join("chunks");
+        let manifests_dir = tmp.path().join("manifests");
+        fs::create_dir_all(&repos_dir).unwrap();
+        fs::create_dir_all(&chunks_dir).unwrap();
+        fs::create_dir_all(&manifests_dir).unwrap();
+
+        // 4 MiB of chunks + repos
+        let chunk_data = vec![0x42u8; 1024 * 1024]; // 1 MiB per file
+        for i in 0..4 {
+            fs::write(chunks_dir.join(format!("chunk_{}.pack", i)), &chunk_data).unwrap();
+            fs::write(repos_dir.join(format!("repo_{}.idx", i)), &chunk_data).unwrap();
+        }
+        fs::write(manifests_dir.join("root.manifest"), b"manifest_metadata_v1").unwrap();
+
+        let (manifest, buffer) = backend
+            .capture_volume_snapshot("snap_prod_valid", 25)
+            .expect("Capture of valid production volume within 15 MiB must succeed");
+
+        assert!(
+            buffer.len() <= spine_cluster::protocol::MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES,
+            "Compressed snapshot must be within 15 MiB limit"
+        );
+        assert_eq!(manifest.total_bytes, buffer.len() as u64);
+        assert_eq!(manifest.fencing_generation, 25);
+        assert_eq!(manifest.file_count, 9);
+
+        // Verify SHA-256 checksum matches
+        let computed_sha256 = format!("{:x}", sha2::Sha256::digest(&buffer));
+        assert_eq!(manifest.sha256_checksum, computed_sha256);
+
+        // Stage restore in a separate backend to verify full roundtrip
+        let restore_tmp = tempfile::tempdir().unwrap();
+        let restore_backend =
+            FileSystemStorageBackend::new(restore_tmp.path(), 100_000_000).unwrap();
+        restore_backend.enter_maintenance(25).unwrap();
+
+        let ack = restore_backend
+            .stage_volume_restore("restore_prod_1", 25, &buffer)
+            .expect("Staging restore of valid production volume must succeed");
+        assert_eq!(ack.target_generation, "25");
+        assert_eq!(ack.archive_payload_sha256, computed_sha256);
+
+        restore_backend
+            .commit_volume_restore("restore_prod_1", 25)
+            .unwrap();
+        restore_backend
+            .finalize_volume_restore("restore_prod_1")
+            .unwrap();
+        restore_backend.exit_maintenance(25).unwrap();
+
+        // Verify restored contents exist and are bit-for-bit identical
+        for i in 0..4 {
+            let restored_chunk =
+                fs::read(restore_tmp.path().join("chunks").join(format!("chunk_{}.pack", i))).unwrap();
+            assert_eq!(restored_chunk, chunk_data);
+        }
+    }
 }

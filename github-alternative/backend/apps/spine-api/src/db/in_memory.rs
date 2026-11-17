@@ -2416,22 +2416,52 @@ impl Database for InMemoryDatabase {
             .state
             .write()
             .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut eligible_items: Vec<WebhookOutboxItem> = state
+            .webhook_outbox
+            .values()
+            .filter(|item| {
+                (item.status == "PENDING" && item.next_attempt_at_nanos <= now_nanos)
+                    || (item.status == "PROCESSING" && item.next_attempt_at_nanos <= now_nanos)
+            })
+            .cloned()
+            .collect();
+        // Deterministic FIFO order matching PostgreSQL's ORDER BY next_attempt_at_nanos ASC, id ASC
+        eligible_items.sort_by(|a, b| {
+            (a.next_attempt_at_nanos, a.created_at_nanos, &a.id)
+                .cmp(&(b.next_attempt_at_nanos, b.created_at_nanos, &b.id))
+        });
+        eligible_items.truncate(limit as usize);
+
         let mut claimed = Vec::new();
-        let lease_expiry_nanos = now_nanos + 60 * 1_000_000_000;
-        for item in state.webhook_outbox.values_mut() {
-            let eligible = (item.status == "PENDING" && item.next_attempt_at_nanos <= now_nanos)
-                || (item.status == "PROCESSING" && item.next_attempt_at_nanos <= now_nanos);
-            if eligible {
+        for (idx, eligible) in eligible_items.into_iter().enumerate() {
+            if let Some(item) = state.webhook_outbox.get_mut(&eligible.id) {
                 item.status = "PROCESSING".into();
                 item.attempts += 1;
-                item.next_attempt_at_nanos = lease_expiry_nanos;
+                // Base 60s lease plus 30s per position in batch to prevent premature reclaim
+                let item_lease_secs = 60 + (idx as i64) * 30;
+                item.next_attempt_at_nanos = now_nanos + item_lease_secs * 1_000_000_000;
                 claimed.push(item.clone());
-                if claimed.len() >= limit as usize {
-                    break;
-                }
             }
         }
         Ok(claimed)
+    }
+
+    async fn extend_webhook_outbox_lease(
+        &self,
+        id: &str,
+        lease_until_nanos: i64,
+    ) -> Result<bool, ForgeError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(item) = state.webhook_outbox.get_mut(id) {
+            if item.status == "PROCESSING" {
+                item.next_attempt_at_nanos = lease_until_nanos;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     async fn update_webhook_outbox_status(
