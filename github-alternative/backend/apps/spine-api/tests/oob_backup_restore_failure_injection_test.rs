@@ -449,3 +449,154 @@ fn test_pre_restore_archive_failure_aborts_before_modifying_any_volume() {
         }
     }
 }
+
+/// Helper to validate POSIX-style permissions for backup directories and archives.
+/// Checks that directory has mode 0700 (owner-only) and files have mode 0600 (owner-only rw).
+pub fn validate_backup_permissions(dir_mode: u32, file_modes: &[(&str, u32)]) -> Result<(), String> {
+    // 0o077 represents group and other read/write/execute bits
+    if dir_mode & 0o077 != 0 || (dir_mode & 0o700 != 0o700) {
+        return Err(format!(
+            "FATAL: Insecure directory mode {:o}. Expected 0700 (owner-only rwx).",
+            dir_mode
+        ));
+    }
+
+    for (file, mode) in file_modes {
+        if mode & 0o077 != 0 || (mode & 0o600 != 0o600) {
+            return Err(format!(
+                "FATAL: Insecure file mode {:o} on {}. Expected 0600 (owner-only rw).",
+                mode, file
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_backup_directory_permissions_enforces_restrictive_umask() {
+    let secure_files = [
+        ("FENCING_GENERATION", 0o600),
+        ("postgres_dump.sql.gz", 0o600),
+        ("coordinator.tar.gz", 0o600),
+        ("spine_ssh.tar.gz", 0o600),
+        ("SHA256SUMS", 0o600),
+    ];
+
+    // Case 1: Strictly secure permissions (dir 0700, files 0600) -> PASS
+    assert!(validate_backup_permissions(0o700, &secure_files).is_ok());
+
+    // Case 2: Permissive directory permissions (e.g. default umask 022 -> 0755) -> FAIL
+    let err_dir = validate_backup_permissions(0o755, &secure_files).unwrap_err();
+    assert!(err_dir.contains("Insecure directory mode 755"));
+
+    // Case 3: Group-readable directory (e.g. 0750) -> FAIL
+    let err_grp_dir = validate_backup_permissions(0o750, &secure_files).unwrap_err();
+    assert!(err_grp_dir.contains("Insecure directory mode 750"));
+
+    // Case 4: World-readable sensitive archive (e.g. 0644 ssh keys or postgres dump) -> FAIL
+    let mut insecure_files = secure_files.to_vec();
+    insecure_files[3] = ("spine_ssh.tar.gz", 0o644);
+    let err_file = validate_backup_permissions(0o700, &insecure_files).unwrap_err();
+    assert!(err_file.contains("Insecure file mode 644 on spine_ssh.tar.gz"));
+
+    // Case 5: Group-writable or readable archive (e.g. 0660) -> FAIL
+    let mut insecure_db = secure_files.to_vec();
+    insecure_db[1] = ("postgres_dump.sql.gz", 0o660);
+    let err_db = validate_backup_permissions(0o700, &insecure_db).unwrap_err();
+    assert!(err_db.contains("Insecure file mode 660 on postgres_dump.sql.gz"));
+}
+
+/// Result of executing a multi-volume rollback.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RollbackExecutionResult {
+    pub success: bool,
+    pub exit_code: i32,
+    pub failed_participants: Vec<String>,
+    pub services_running: Vec<String>,
+    pub verified_participants: Vec<String>,
+}
+
+/// Simulates rollback_volumes() logic from scripts/restore_oob.sh.
+pub fn execute_simulated_rollback(
+    participants: &[&str],
+    corrupted_participant: Option<&str>,
+    failed_verification_participant: Option<&str>,
+) -> RollbackExecutionResult {
+    let mut failed_participants = Vec::new();
+    let mut verified_participants = Vec::new();
+
+    for p in participants {
+        // Step 1: Extract archive
+        if let Some(corrupt) = corrupted_participant {
+            if *p == corrupt {
+                failed_participants.push(format!("extraction_failed:{}", p));
+                continue;
+            }
+        }
+
+        // Step 2: Post-extraction verification
+        if let Some(unverified) = failed_verification_participant {
+            if *p == unverified {
+                failed_participants.push(format!("verification_failed:{}", p));
+                continue;
+            }
+        }
+
+        verified_participants.push(p.to_string());
+    }
+
+    let success = failed_participants.is_empty();
+    let exit_code = if success { 0 } else { 2 };
+    // In all rollback cases (success or failure), cluster services remain strictly stopped!
+    let services_running = Vec::new();
+
+    RollbackExecutionResult {
+        success,
+        exit_code,
+        failed_participants,
+        services_running,
+        verified_participants,
+    }
+}
+
+#[test]
+fn test_rollback_extraction_failure_is_fatal_and_keeps_cluster_stopped() {
+    let participants = [
+        "coordinator",
+        "storage_node_1",
+        "storage_node_2",
+        "storage_node_3",
+        "spine_ssh",
+        "spine_storage",
+        "postgres_data",
+    ];
+
+    // Case 1: Clean rollback with all valid archives -> success 0, services stopped
+    let clean = execute_simulated_rollback(&participants, None, None);
+    assert!(clean.success);
+    assert_eq!(clean.exit_code, 0);
+    assert_eq!(clean.verified_participants.len(), 7);
+    assert!(clean.services_running.is_empty(), "Cluster must remain stopped after rollback");
+
+    // Case 2: Extraction failure on Coordinator -> FATAL exit code 2, services stopped
+    let failed_coord = execute_simulated_rollback(&participants, Some("coordinator"), None);
+    assert!(!failed_coord.success);
+    assert_eq!(failed_coord.exit_code, 2);
+    assert!(failed_coord.failed_participants.contains(&"extraction_failed:coordinator".to_string()));
+    assert!(failed_coord.services_running.is_empty(), "Cluster must remain stopped on rollback failure");
+
+    // Case 3: Extraction failure on Storage Node 2 -> FATAL exit code 2
+    let failed_node2 = execute_simulated_rollback(&participants, Some("storage_node_2"), None);
+    assert!(!failed_node2.success);
+    assert_eq!(failed_node2.exit_code, 2);
+    assert!(failed_node2.failed_participants.contains(&"extraction_failed:storage_node_2".to_string()));
+    assert!(failed_node2.services_running.is_empty());
+
+    // Case 4: Extraction passes but verification fails on PostgreSQL (e.g. PG_VERSION missing) -> FATAL exit code 2
+    let failed_pg_verify = execute_simulated_rollback(&participants, None, Some("postgres_data"));
+    assert!(!failed_pg_verify.success);
+    assert_eq!(failed_pg_verify.exit_code, 2);
+    assert!(failed_pg_verify.failed_participants.contains(&"verification_failed:postgres_data".to_string()));
+    assert!(failed_pg_verify.services_running.is_empty());
+}

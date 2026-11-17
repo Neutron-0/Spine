@@ -110,6 +110,14 @@ With active mutations drained and write permits rejected with HTTP 503, capture 
 > This procedure is the authoritative, cloud-agnostic disaster recovery standard for Spine Forge clusters when storage exceeds 15 MiB. It operates uniformly across Docker Compose, Kubernetes, and bare-metal environments, and is backed by the turnkey script `scripts/backup_oob.sh` and automated regression test `test_out_of_band_storage_backup_and_restore_above_15mib`.
 > *(For optional cloud hypervisor volume snapshots such as AWS EBS / GCP PD, see Appendix A).*
 
+> [!SECURITY]
+> **POSIX File Permissions & At-Rest Encryption:**
+> All backup artifacts contain sensitive production data (PostgreSQL relational tables, SSH Ed25519 host private keys, and repository chunk stores).
+> - `scripts/backup_oob.sh` sets `umask 077` at initialization.
+> - The backup root and backup directory are created with mode `0700` (`rwx------`, owner-only).
+> - All generated archives and checksum manifests are enforced to mode `0600` (`rw-------`, owner-only).
+> - For off-host replication or remote archival, operators must encrypt backup archives with standard asymmetric encryption (e.g., `age -r <recipient-key>` or `gpg --encrypt`) before transit.
+
 Execute the automated backup script:
 ```bash
 # Set environment variables and execute canonical backup
@@ -122,8 +130,10 @@ export BACKUP_ROOT="/mnt/backups/spine"
 
 Or execute the canonical snapshot steps manually:
 ```bash
+umask 077
 BACKUP_DIR="/mnt/backups/spine/$(date +%Y%m%d_%H%M%S)_gen_${GENERATION_TOKEN}"
 mkdir -p "${BACKUP_DIR}"
+chmod 700 "${BACKUP_DIR}"
 
 # 0. Record target fencing generation token
 echo "${GENERATION_TOKEN}" > "${BACKUP_DIR}/FENCING_GENERATION"
@@ -143,8 +153,10 @@ done
 docker compose -f docker-compose.prod.yml exec -T spine-api tar -czf - -C /var/lib/spine/ssh . > "${BACKUP_DIR}/spine_ssh.tar.gz"
 docker compose -f docker-compose.prod.yml exec -T spine-api tar -czf - -C /var/lib/spine/storage . > "${BACKUP_DIR}/spine_storage.tar.gz"
 
-# 5. Checksum manifest
+# 5. Checksum manifest & permission enforcement
 cd "${BACKUP_DIR}" && sha256sum * > SHA256SUMS
+chmod 600 "${BACKUP_DIR}"/*
+chmod 700 "${BACKUP_DIR}"
 ```
 
 ### Phase 3: Release Maintenance Mode & Resume Service
@@ -190,6 +202,15 @@ To prevent old deleted files from persisting after restore, target volumes are n
 
 > [!IMPORTANT]
 > **Zero Modifications Gate:** All 7 participant rollback archives (`coordinator`, `storage_node_1/2/3`, `spine_ssh`, `spine_storage`, `postgres_data`) MUST be generated without error suppression and verified readable (`tar -tzf`) BEFORE any volume directory is emptied or modified. If any rollback archive creation fails, restore aborts immediately leaving all live volumes completely untouched.
+
+> [!CAUTION]
+> **Automatic Fail-Closed Rollback Handler (`scripts/restore_oob.sh`):**
+> If an unrecoverable failure occurs during volume extraction, post-restore verification, or service startup:
+> 1. `scripts/restore_oob.sh` executes `rollback_volumes()` automatically via bash trap (`EXIT ERR INT TERM`).
+> 2. Rollback extraction commands run **without error suppression** and stream visible output.
+> 3. Following extraction, every volume is checked for critical marker files (`.coordinator_fencing_generation`, `.fencing_generation`, `PG_VERSION`).
+> 4. If any rollback step fails, `restore_oob.sh` logs a `CRITICAL FATAL` alert identifying the failed volume, **strictly leaves all cluster services stopped**, and exits with code 2. It will NEVER report rollback success unless all 7 volumes are confirmed restored and verified.
+> 5. Staged rollback archives in `${ROLLBACK_DIR}` are retained intact for operator emergency triage.
 
 1. **Phase 2a: Mandatory Pre-Restore Archiving & Integrity Verification (Volumes Untouched):**
    ```bash
