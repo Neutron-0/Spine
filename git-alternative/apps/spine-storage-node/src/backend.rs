@@ -126,6 +126,7 @@ pub trait StorageBackend: Send + Sync {
         &self,
         snapshot_id: &str,
     ) -> Result<Option<ParticipantAcknowledgement>>;
+    fn verify_volume_integrity(&self) -> Result<(usize, usize, usize)>;
 }
 
 pub struct StorageWriterGuard {
@@ -1127,6 +1128,109 @@ impl StorageBackend for FileSystemStorageBackend {
             current_state: "Staged".to_string(),
         };
         Ok(Some(ack))
+    }
+
+    fn verify_volume_integrity(&self) -> Result<(usize, usize, usize)> {
+        let mut repos_checked = 0;
+        let mut chunks_checked = 0;
+        let mut manifests_checked = 0;
+
+        // 1. Verify fencing generation
+        let fencing_path = self.storage_root.join(".fencing_generation");
+        if !fencing_path.exists() {
+            bail!(
+                "Integrity check failed: missing .fencing_generation file in {}",
+                self.storage_root.display()
+            );
+        }
+        let gen_str = fs::read_to_string(&fencing_path)?;
+        let gen = gen_str.trim().parse::<u64>().map_err(|e| {
+            anyhow::anyhow!("Corrupt fencing generation record: {}", e)
+        })?;
+        if gen == 0 {
+            bail!("Integrity check failed: invalid fencing generation 0");
+        }
+
+        // 2. Verify all repositories in repos/
+        let repos_dir = self.storage_root.join("repos");
+        if repos_dir.exists() {
+            for entry in fs::read_dir(&repos_dir)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    let repo_name = entry.file_name().to_string_lossy().to_string();
+                    if !self.verify_repository(&repo_name)? {
+                        bail!(
+                            "Integrity check failed: repository '{}' verification failed",
+                            repo_name
+                        );
+                    }
+                    repos_checked += 1;
+                }
+            }
+        }
+
+        // 3. Verify all chunks in chunks/
+        let chunks_dir = self.storage_root.join("chunks");
+        if chunks_dir.exists() {
+            for prefix_entry in fs::read_dir(&chunks_dir)? {
+                let prefix_entry = prefix_entry?;
+                if prefix_entry.file_type()?.is_dir() {
+                    for chunk_entry in fs::read_dir(prefix_entry.path())? {
+                        let chunk_entry = chunk_entry?;
+                        if chunk_entry.file_type()?.is_file() {
+                            let expected_hash =
+                                chunk_entry.file_name().to_string_lossy().to_string();
+                            if !expected_hash.ends_with(".tmp") {
+                                let bytes = fs::read(chunk_entry.path())?;
+                                let actual_hash = blake3::hash(&bytes).to_hex().to_string();
+                                if actual_hash != expected_hash {
+                                    bail!(
+                                        "Integrity check failed: chunk hash mismatch for {}. Expected {}, got {}",
+                                        chunk_entry.path().display(),
+                                        expected_hash,
+                                        actual_hash
+                                    );
+                                }
+                                chunks_checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Verify all manifests in manifests/
+        let manifests_dir = self.storage_root.join("manifests");
+        if manifests_dir.exists() {
+            for prefix_entry in fs::read_dir(&manifests_dir)? {
+                let prefix_entry = prefix_entry?;
+                if prefix_entry.file_type()?.is_dir() {
+                    for manifest_entry in fs::read_dir(prefix_entry.path())? {
+                        let manifest_entry = manifest_entry?;
+                        if manifest_entry.file_type()?.is_file() {
+                            let fname =
+                                manifest_entry.file_name().to_string_lossy().to_string();
+                            if fname.ends_with(".json") {
+                                let expected_id = fname.trim_end_matches(".json");
+                                let bytes = fs::read(manifest_entry.path())?;
+                                let actual_id = blake3::hash(&bytes).to_hex().to_string();
+                                if actual_id != expected_id {
+                                    bail!(
+                                        "Integrity check failed: manifest hash mismatch for {}. Expected {}, got {}",
+                                        manifest_entry.path().display(),
+                                        expected_id,
+                                        actual_id
+                                    );
+                                }
+                                manifests_checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok((repos_checked, chunks_checked, manifests_checked))
     }
 }
 
