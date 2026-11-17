@@ -1295,4 +1295,128 @@ mod tests {
             assert_eq!(restored_chunk, chunk_data);
         }
     }
+
+    #[test]
+    fn test_out_of_band_storage_backup_and_restore_above_15mib() {
+        use flate2::read::GzDecoder;
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use tar::{Archive, Builder};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FileSystemStorageBackend::new(tmp.path(), 100_000_000).unwrap();
+        backend.enter_maintenance(50).unwrap();
+        assert_eq!(backend.get_maintenance_status(), (true, 50, 0));
+
+        // 1. Generate 18 MiB of incompressible data across chunks to exceed 15 MiB limit
+        let chunks_dir = tmp.path().join("chunks");
+        let repos_dir = tmp.path().join("repos");
+        let manifests_dir = tmp.path().join("manifests");
+        fs::create_dir_all(&chunks_dir).unwrap();
+        fs::create_dir_all(&repos_dir).unwrap();
+        fs::create_dir_all(&manifests_dir).unwrap();
+
+        let mut state: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        let mut block = vec![0u8; 1024 * 1024]; // 1 MiB block
+        for b in &mut block {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *b = (state >> 56) as u8;
+        }
+
+        let mut expected_chunk_hashes = Vec::new();
+        for i in 0..18u8 {
+            let mut file_buf = block.clone();
+            file_buf[0] ^= i;
+            file_buf[1024] ^= i.wrapping_mul(43);
+            let file_name = format!("chunk_{:02}.bin", i);
+            let hash = format!("{:x}", sha2::Sha256::digest(&file_buf));
+            expected_chunk_hashes.push((file_name.clone(), hash));
+            fs::write(chunks_dir.join(&file_name), &file_buf).unwrap();
+        }
+        fs::write(manifests_dir.join("root.manifest"), b"oob_manifest_generation_50").unwrap();
+
+        // 2. Verify in-band single-frame RPC backup aborts immediately to protect memory
+        let err = backend
+            .capture_volume_snapshot("snap_oversized", 50)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES"),
+            "In-band capture must abort above 15 MiB: {}",
+            err
+        );
+
+        // 3. Execute Out-of-Band (OOB) atomic volume backup procedure while quiesced
+        let oob_archive_path = tmp.path().join("oob_backup_node_volume.tar.gz");
+        {
+            let tar_gz_file = fs::File::create(&oob_archive_path).unwrap();
+            let encoder = GzEncoder::new(tar_gz_file, Compression::fast());
+            let mut tar_builder = Builder::new(encoder);
+
+            // Archive chunks, repos, manifests, and .fencing_generation
+            tar_builder
+                .append_dir_all("chunks", &chunks_dir)
+                .unwrap();
+            tar_builder
+                .append_dir_all("repos", &repos_dir)
+                .unwrap();
+            tar_builder
+                .append_dir_all("manifests", &manifests_dir)
+                .unwrap();
+            let fence_file = tmp.path().join(".fencing_generation");
+            if fence_file.exists() {
+                tar_builder
+                    .append_path_with_name(&fence_file, ".fencing_generation")
+                    .unwrap();
+            }
+            tar_builder.finish().unwrap();
+        }
+
+        let oob_archive_size = fs::metadata(&oob_archive_path).unwrap().len();
+        assert!(
+            oob_archive_size > spine_cluster::protocol::MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES as u64,
+            "OOB archive must exceed 15 MiB limit to validate large-volume recovery: {} bytes",
+            oob_archive_size
+        );
+
+        // 4. Perform Out-of-Band Restore onto a fresh storage volume
+        let restore_tmp = tempfile::tempdir().unwrap();
+        {
+            let tar_gz_file = fs::File::open(&oob_archive_path).unwrap();
+            let decoder = GzDecoder::new(tar_gz_file);
+            let mut archive = Archive::new(decoder);
+            archive.unpack(restore_tmp.path()).unwrap();
+        }
+
+        // 5. Initialize storage backend on restored volume and verify seamless resumption
+        let restored_backend =
+            FileSystemStorageBackend::new(restore_tmp.path(), 100_000_000).unwrap();
+
+        // Verify fencing generation restored to 50
+        assert_eq!(
+            restored_backend.get_maintenance_status().1,
+            50,
+            "Fencing generation 50 must be preserved by OOB restore"
+        );
+
+        // Verify all 18 MiB chunks match expected SHA-256 digests bit-for-bit
+        for (file_name, expected_sha256) in &expected_chunk_hashes {
+            let restored_data = fs::read(restore_tmp.path().join("chunks").join(file_name)).unwrap();
+            let actual_sha256 = format!("{:x}", sha2::Sha256::digest(&restored_data));
+            assert_eq!(
+                &actual_sha256, expected_sha256,
+                "Restored chunk {} must match SHA256 exactly",
+                file_name
+            );
+        }
+
+        // Verify manifests
+        let restored_manifest = fs::read(restore_tmp.path().join("manifests").join("root.manifest")).unwrap();
+        assert_eq!(restored_manifest, b"oob_manifest_generation_50");
+
+        // Verify writer permits can be acquired and writes resume cleanly on restored volume
+        let _guard = restored_backend.acquire_writer(Some(50)).unwrap();
+    }
 }
