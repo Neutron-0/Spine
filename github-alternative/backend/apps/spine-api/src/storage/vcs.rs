@@ -527,8 +527,8 @@ impl NativeVcsService {
         prefix: &str,
         out: &mut BTreeMap<String, (FileMode, ObjectId)>,
     ) -> Result<(), ForgeError> {
-        let mut visited = std::collections::HashSet::new();
-        self.flatten_tree_inner(store, tree_oid, prefix, out, &mut visited, 0)
+        let mut active_ancestors = std::collections::HashSet::new();
+        self.flatten_tree_inner(store, tree_oid, prefix, out, &mut active_ancestors, 0)
     }
 
     fn flatten_tree_inner<S: ObjectStore>(
@@ -537,7 +537,7 @@ impl NativeVcsService {
         tree_oid: &ObjectId,
         prefix: &str,
         out: &mut BTreeMap<String, (FileMode, ObjectId)>,
-        visited: &mut std::collections::HashSet<ObjectId>,
+        active_ancestors: &mut std::collections::HashSet<ObjectId>,
         depth: usize,
     ) -> Result<(), ForgeError> {
         const MAX_TREE_DEPTH: usize = 128;
@@ -547,34 +547,39 @@ impl NativeVcsService {
                 MAX_TREE_DEPTH
             )));
         }
-        if !visited.insert(*tree_oid) {
+        if !active_ancestors.insert(*tree_oid) {
             return Err(ForgeError::Internal(format!(
                 "Cyclic tree reference detected at object {}",
                 tree_oid
             )));
         }
 
-        let (obj_type, payload) = store
-            .read_object(tree_oid)
-            .map_err(|e| ForgeError::Internal(format!("Tree read failed: {}", e)))?;
-        if obj_type != ObjectType::Tree {
-            return Ok(());
-        }
-        let entries = deserialize_tree(&payload)
-            .map_err(|e| ForgeError::Internal(format!("Tree deserialize error: {}", e)))?;
-        for entry in entries {
-            let path = if prefix.is_empty() {
-                entry.name.clone()
-            } else {
-                format!("{}/{}", prefix, entry.name)
-            };
-            if entry.mode == FileMode::Directory {
-                self.flatten_tree_inner(store, &entry.object_id, &path, out, visited, depth + 1)?;
-            } else {
-                out.insert(path, (entry.mode, entry.object_id));
+        let res = (|| -> Result<(), ForgeError> {
+            let (obj_type, payload) = store
+                .read_object(tree_oid)
+                .map_err(|e| ForgeError::Internal(format!("Tree read failed: {}", e)))?;
+            if obj_type != ObjectType::Tree {
+                return Ok(());
             }
-        }
-        Ok(())
+            let entries = deserialize_tree(&payload)
+                .map_err(|e| ForgeError::Internal(format!("Tree deserialize error: {}", e)))?;
+            for entry in entries {
+                let path = if prefix.is_empty() {
+                    entry.name.clone()
+                } else {
+                    format!("{}/{}", prefix, entry.name)
+                };
+                if entry.mode == FileMode::Directory {
+                    self.flatten_tree_inner(store, &entry.object_id, &path, out, active_ancestors, depth + 1)?;
+                } else {
+                    out.insert(path, (entry.mode, entry.object_id));
+                }
+            }
+            Ok(())
+        })();
+
+        active_ancestors.remove(tree_oid);
+        res
     }
 
     /// Recursively converts a flattened path map into nested Tree objects written to the store.
