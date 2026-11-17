@@ -184,9 +184,9 @@ Follow these steps to restore a Spine Forge cluster from an out-of-band snapshot
    fi
    ```
 
-### Step 2: Prepare Clean Target Volumes & Restore Archive Data
+### Step 2: Preserve Pre-Restore Rollback Archives & Clean Target Volumes
 
-To prevent old deleted files from persisting after restore, target volumes are not overlaid. Existing files are preserved in `.rollback_snapshot` inside the volume until verification succeeds.
+To prevent old deleted files from persisting after restore, target volumes are not overlaid. Existing files across all volumes are archived to an external rollback directory (`${BACKUP_DIR}/.pre_restore_rollback`) outside the volume mount paths, and the volume directories are cleared completely before archive extraction.
 
 1. **Remove Ephemeral Staging Directories:**
    ```bash
@@ -196,36 +196,43 @@ To prevent old deleted files from persisting after restore, target volumes are n
    done
    ```
 
-2. **Restore Archive Volumes into Clean Docker Volumes:**
+2. **Archive Existing Volumes to External Rollback Dir & Extract Clean Volumes:**
    ```bash
-   # Coordinator state into clean coordinator_data volume
-   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh coordinator -c '
-     mkdir -p /var/lib/spine/.rollback_snapshot
-     find /var/lib/spine -mindepth 1 -maxdepth 1 ! -name ".rollback_snapshot" -exec mv -t /var/lib/spine/.rollback_snapshot {} + 2>/dev/null || true
-     tar -xzf - -C /var/lib/spine
-   ' < "${BACKUP_DIR}/coordinator.tar.gz"
+   ROLLBACK_DIR="${BACKUP_DIR}/.pre_restore_rollback_$(date +%s)"
+   mkdir -p "${ROLLBACK_DIR}"
 
-   # Storage nodes into clean storage volumes
+   # Coordinator volume
+   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint tar coordinator \
+     -czf - -C /var/lib/spine . > "${ROLLBACK_DIR}/coordinator.tar.gz" || true
+   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh coordinator \
+     -c "rm -rf /var/lib/spine/* /var/lib/spine/.[!.]* 2>/dev/null || true"
+   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh coordinator \
+     -c "tar -xzf - -C /var/lib/spine" < "${BACKUP_DIR}/coordinator.tar.gz"
+
+   # Storage node volumes
    for NODE in 1 2 3; do
-     docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh "storage-node-${NODE}" -c '
-       mkdir -p /var/lib/spine/node-'"${NODE}"'/.rollback_snapshot
-       find /var/lib/spine/node-'"${NODE}"' -mindepth 1 -maxdepth 1 ! -name ".rollback_snapshot" -exec mv -t /var/lib/spine/node-'"${NODE}"'/.rollback_snapshot {} + 2>/dev/null || true
-       tar -xzf - -C /var/lib/spine/node-'"${NODE}"'
-     ' < "${BACKUP_DIR}/storage_node_${NODE}.tar.gz"
+     docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint tar "storage-node-${NODE}" \
+       -czf - -C "/var/lib/spine/node-${NODE}" . > "${ROLLBACK_DIR}/storage_node_${NODE}.tar.gz" || true
+     docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
+       -c "rm -rf /var/lib/spine/node-${NODE}/* /var/lib/spine/node-${NODE}/.[!.]* 2>/dev/null || true"
+     docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
+       -c "tar -xzf - -C /var/lib/spine/node-${NODE}" < "${BACKUP_DIR}/storage_node_${NODE}.tar.gz"
    done
 
    # API SSH host keys and storage cache
-   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh spine-api -c '
-     mkdir -p /var/lib/spine/ssh/.rollback_snapshot
-     find /var/lib/spine/ssh -mindepth 1 -maxdepth 1 ! -name ".rollback_snapshot" -exec mv -t /var/lib/spine/ssh/.rollback_snapshot {} + 2>/dev/null || true
-     tar -xzf - -C /var/lib/spine/ssh
-   ' < "${BACKUP_DIR}/spine_ssh.tar.gz"
+   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint tar spine-api \
+     -czf - -C /var/lib/spine/ssh . > "${ROLLBACK_DIR}/spine_ssh.tar.gz" || true
+   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh spine-api \
+     -c "rm -rf /var/lib/spine/ssh/* /var/lib/spine/ssh/.[!.]* 2>/dev/null || true"
+   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh spine-api \
+     -c "tar -xzf - -C /var/lib/spine/ssh" < "${BACKUP_DIR}/spine_ssh.tar.gz"
 
-   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh spine-api -c '
-     mkdir -p /var/lib/spine/storage/.rollback_snapshot
-     find /var/lib/spine/storage -mindepth 1 -maxdepth 1 ! -name ".rollback_snapshot" -exec mv -t /var/lib/spine/storage/.rollback_snapshot {} + 2>/dev/null || true
-     tar -xzf - -C /var/lib/spine/storage
-   ' < "${BACKUP_DIR}/spine_storage.tar.gz"
+   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint tar spine-api \
+     -czf - -C /var/lib/spine/storage . > "${ROLLBACK_DIR}/spine_storage.tar.gz" || true
+   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh spine-api \
+     -c "rm -rf /var/lib/spine/storage/* /var/lib/spine/storage/.[!.]* 2>/dev/null || true"
+   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh spine-api \
+     -c "tar -xzf - -C /var/lib/spine/storage" < "${BACKUP_DIR}/spine_storage.tar.gz"
    ```
 
 ### Step 3: Automated Fail-Closed Fencing Generation Verification
@@ -295,27 +302,35 @@ done
 
 ### Step 5: Clean PostgreSQL Restoration & Verification
 
-1. **Prepare Fresh Database Cluster (Rollback Preservation):**
+1. **Preserve Existing PostgreSQL Data to External Rollback Dir & Clear PGDATA:**
    ```bash
-   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh postgres -c '
-     mkdir -p /var/lib/postgresql/data/.rollback_snapshot
-     find /var/lib/postgresql/data -mindepth 1 -maxdepth 1 ! -name ".rollback_snapshot" -exec mv -t /var/lib/postgresql/data/.rollback_snapshot {} + 2>/dev/null || true
-   '
+   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint tar postgres \
+     -czf - -C /var/lib/postgresql/data . > "${ROLLBACK_DIR}/postgres_data.tar.gz" || true
+   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh postgres \
+     -c "rm -rf /var/lib/postgresql/data/* /var/lib/postgresql/data/.[!.]* 2>/dev/null || true"
    ```
-2. **Start PostgreSQL Container & Wait for Readiness:**
+2. **Start Fresh PostgreSQL Container & Wait for Readiness:**
    ```bash
    docker compose -f docker-compose.prod.yml up -d postgres
    until docker compose -f docker-compose.prod.yml exec -T postgres pg_isready -U spine_admin >/dev/null 2>&1; do
      sleep 1
    done
    ```
-3. **Restore Database SQL Dump (Fail Closed on Error with ON_ERROR_STOP=1):**
+3. **Drop Empty Database Created by Container Init:**
+   ```bash
+   docker compose -f docker-compose.prod.yml exec -T postgres psql -U spine_admin -d postgres -v ON_ERROR_STOP=1 -c "
+     SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'spine_forge' AND pid <> pg_backend_pid();
+     DROP DATABASE IF EXISTS spine_forge;
+   "
+   ```
+4. **Restore Database SQL Dump (with ON_ERROR_STOP=1 & Idempotent Role Adaptation):**
    ```bash
    gzip -dc "${BACKUP_DIR}/postgres_dump.sql.gz" | \
+     sed -E 's/^CREATE ROLE ([^;]+);/DO \$\$ BEGIN CREATE ROLE \1; EXCEPTION WHEN duplicate_object THEN NULL; END \$\$;/' | \
      docker compose -f docker-compose.prod.yml exec -T postgres \
      psql -v ON_ERROR_STOP=1 -U spine_admin -d postgres
    ```
-4. **Verify Restored Schema and Tables:**
+5. **Verify Restored Schema and Tables:**
    ```bash
    TABLE_COUNT=$(docker compose -f docker-compose.prod.yml exec -T postgres \
      psql -U spine_admin -d spine_forge -t -A -c \
@@ -325,16 +340,16 @@ done
      exit 1
    fi
    ```
-5. **Start Core Cluster Infrastructure:**
+6. **Start Core Cluster Infrastructure:**
    ```bash
    docker compose -f docker-compose.prod.yml up -d coordinator storage-node-1 storage-node-2 storage-node-3
    ```
-6. **Wait for Health Checks to Pass:**
+7. **Wait for Health Checks to Pass:**
    ```bash
    docker compose -f docker-compose.prod.yml ps
    # Verify that postgres, coordinator, storage-node-1, storage-node-2, storage-node-3 are (healthy)
    ```
-7. **Start Application Control Plane & Ingress:**
+8. **Start Application Control Plane & Ingress:**
    ```bash
    docker compose -f docker-compose.prod.yml up -d spine-api spine-frontend ingress
    ```
@@ -348,14 +363,9 @@ curl -i http://127.0.0.1:3000/health/ready
 **Required Response:**
 - HTTP Status Code: `200 OK`
 
-After `/health/ready` returns 200 OK, purge preserved rollback directories across volumes:
+After `/health/ready` returns 200 OK, purge preserved rollback artifacts:
 ```bash
-docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh coordinator -c "rm -rf /var/lib/spine/.rollback_snapshot 2>/dev/null || true"
-for NODE in 1 2 3; do
-  docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh "storage-node-${NODE}" -c "rm -rf /var/lib/spine/node-${NODE}/.rollback_snapshot 2>/dev/null || true"
-done
-docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh spine-api -c "rm -rf /var/lib/spine/ssh/.rollback_snapshot /var/lib/spine/storage/.rollback_snapshot 2>/dev/null || true"
-docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh postgres -c "rm -rf /var/lib/postgresql/data/.rollback_snapshot 2>/dev/null || true"
+rm -rf "${ROLLBACK_DIR}"
 ```
 - Body:
   ```json

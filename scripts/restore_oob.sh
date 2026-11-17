@@ -42,16 +42,63 @@ if [ -n "${RUNNING}" ]; then
 fi
 echo "All cluster services confirmed stopped."
 
-echo "=== Step 2: Preparing Clean Target Volumes & Restoring Archive Data ==="
+# Set up external rollback directory outside container volume paths
+ROLLBACK_DIR="${BACKUP_DIR}/.pre_restore_rollback_$(date +%s)"
+mkdir -p "${ROLLBACK_DIR}"
 
-# Define rollback helper in case of failure before commit
 RESTORE_SUCCESS=0
 rollback_volumes() {
-  if [ "${RESTORE_SUCCESS}" -eq 0 ]; then
-    echo "NOTICE: Restore encountered an error or was aborted. Preserved rollback state is intact." >&2
+  if [ "${RESTORE_SUCCESS}" -eq 0 ] && [ -d "${ROLLBACK_DIR:-}" ]; then
+    echo "================================================================================" >&2
+    echo "CRITICAL: Restore failed or was aborted before commit. EXECUTING AUTOMATIC ROLLBACK." >&2
+    echo "Reverting all cluster volumes to pre-restore state..." >&2
+
+    # Stop any partially started services
+    docker compose -f "${COMPOSE_FILE}" stop ingress spine-api storage-node-1 storage-node-2 storage-node-3 coordinator postgres spine-frontend >/dev/null 2>&1 || true
+
+    # Roll back Coordinator
+    if [ -f "${ROLLBACK_DIR}/coordinator.tar.gz" ]; then
+      echo "Rolling back Coordinator volume..." >&2
+      docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh coordinator \
+        -c "rm -rf /var/lib/spine/* /var/lib/spine/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine" < "${ROLLBACK_DIR}/coordinator.tar.gz" >/dev/null 2>&1 || true
+    fi
+
+    # Roll back Storage Nodes
+    for NODE in 1 2 3; do
+      if [ -f "${ROLLBACK_DIR}/storage_node_${NODE}.tar.gz" ]; then
+        echo "Rolling back Storage Node ${NODE} volume..." >&2
+        docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
+          -c "rm -rf /var/lib/spine/node-${NODE}/* /var/lib/spine/node-${NODE}/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine/node-${NODE}" < "${ROLLBACK_DIR}/storage_node_${NODE}.tar.gz" >/dev/null 2>&1 || true
+      fi
+    done
+
+    # Roll back API storage and SSH
+    if [ -f "${ROLLBACK_DIR}/spine_ssh.tar.gz" ]; then
+      echo "Rolling back API SSH volume..." >&2
+      docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh spine-api \
+        -c "rm -rf /var/lib/spine/ssh/* /var/lib/spine/ssh/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine/ssh" < "${ROLLBACK_DIR}/spine_ssh.tar.gz" >/dev/null 2>&1 || true
+    fi
+    if [ -f "${ROLLBACK_DIR}/spine_storage.tar.gz" ]; then
+      echo "Rolling back API storage volume..." >&2
+      docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh spine-api \
+        -c "rm -rf /var/lib/spine/storage/* /var/lib/spine/storage/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine/storage" < "${ROLLBACK_DIR}/spine_storage.tar.gz" >/dev/null 2>&1 || true
+    fi
+
+    # Roll back PostgreSQL
+    if [ -f "${ROLLBACK_DIR}/postgres_data.tar.gz" ]; then
+      echo "Rolling back PostgreSQL volume..." >&2
+      docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh postgres \
+        -c "rm -rf /var/lib/postgresql/data/* /var/lib/postgresql/data/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/postgresql/data" < "${ROLLBACK_DIR}/postgres_data.tar.gz" >/dev/null 2>&1 || true
+    fi
+
+    echo "Rollback complete. Volumes restored to pre-restore state." >&2
+    echo "Rollback artifacts retained for manual inspection at: ${ROLLBACK_DIR}" >&2
+    echo "================================================================================" >&2
   fi
 }
 trap rollback_volumes EXIT ERR INT TERM
+
+echo "=== Step 2: Preserving Rollback Archives & Restoring Clean Target Volumes ==="
 
 # 1. Clean ephemeral staging in storage nodes (unquoted wildcards inside container shell)
 for NODE in 1 2 3; do
@@ -60,37 +107,40 @@ for NODE in 1 2 3; do
     -c "rm -rf /var/lib/spine/node-${NODE}/.staged_restore_* /var/lib/spine/node-${NODE}/.old_restore_* 2>/dev/null || true"
 done
 
-# 2. Extract into clean volume targets (NOT overlaying existing files)
-# For each participant, existing live data is archived to .rollback_snapshot so no stale files remain
-echo "Restoring Coordinator state into clean coordinator_data volume..."
-docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh coordinator -c '
-  mkdir -p /var/lib/spine/.rollback_snapshot
-  find /var/lib/spine -mindepth 1 -maxdepth 1 ! -name ".rollback_snapshot" -exec mv -t /var/lib/spine/.rollback_snapshot {} + 2>/dev/null || true
-  tar -xzf - -C /var/lib/spine
-' < "${BACKUP_DIR}/coordinator.tar.gz"
+# 2. Archive current volume states to ROLLBACK_DIR, completely empty volumes, then extract backup
+echo "Preserving and restoring Coordinator volume..."
+docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint tar coordinator \
+  -czf - -C /var/lib/spine . > "${ROLLBACK_DIR}/coordinator.tar.gz" || true
+docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh coordinator \
+  -c "rm -rf /var/lib/spine/* /var/lib/spine/.[!.]* 2>/dev/null || true"
+docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh coordinator \
+  -c "tar -xzf - -C /var/lib/spine" < "${BACKUP_DIR}/coordinator.tar.gz"
 
 for NODE in 1 2 3; do
-  echo "Restoring Storage Node ${NODE} into clean storage_${NODE}_data volume..."
-  docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh "storage-node-${NODE}" -c '
-    mkdir -p /var/lib/spine/node-'"${NODE}"'/.rollback_snapshot
-    find /var/lib/spine/node-'"${NODE}"' -mindepth 1 -maxdepth 1 ! -name ".rollback_snapshot" -exec mv -t /var/lib/spine/node-'"${NODE}"'/.rollback_snapshot {} + 2>/dev/null || true
-    tar -xzf - -C /var/lib/spine/node-'"${NODE}"'
-  ' < "${BACKUP_DIR}/storage_node_${NODE}.tar.gz"
+  echo "Preserving and restoring Storage Node ${NODE} volume..."
+  docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint tar "storage-node-${NODE}" \
+    -czf - -C "/var/lib/spine/node-${NODE}" . > "${ROLLBACK_DIR}/storage_node_${NODE}.tar.gz" || true
+  docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
+    -c "rm -rf /var/lib/spine/node-${NODE}/* /var/lib/spine/node-${NODE}/.[!.]* 2>/dev/null || true"
+  docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
+    -c "tar -xzf - -C /var/lib/spine/node-${NODE}" < "${BACKUP_DIR}/storage_node_${NODE}.tar.gz"
 done
 
-echo "Restoring API SSH identities into clean spine_ssh volume..."
-docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh spine-api -c '
-  mkdir -p /var/lib/spine/ssh/.rollback_snapshot
-  find /var/lib/spine/ssh -mindepth 1 -maxdepth 1 ! -name ".rollback_snapshot" -exec mv -t /var/lib/spine/ssh/.rollback_snapshot {} + 2>/dev/null || true
-  tar -xzf - -C /var/lib/spine/ssh
-' < "${BACKUP_DIR}/spine_ssh.tar.gz"
+echo "Preserving and restoring API SSH identities..."
+docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint tar spine-api \
+  -czf - -C /var/lib/spine/ssh . > "${ROLLBACK_DIR}/spine_ssh.tar.gz" || true
+docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh spine-api \
+  -c "rm -rf /var/lib/spine/ssh/* /var/lib/spine/ssh/.[!.]* 2>/dev/null || true"
+docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh spine-api \
+  -c "tar -xzf - -C /var/lib/spine/ssh" < "${BACKUP_DIR}/spine_ssh.tar.gz"
 
-echo "Restoring API storage cache into clean spine_storage volume..."
-docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh spine-api -c '
-  mkdir -p /var/lib/spine/storage/.rollback_snapshot
-  find /var/lib/spine/storage -mindepth 1 -maxdepth 1 ! -name ".rollback_snapshot" -exec mv -t /var/lib/spine/storage/.rollback_snapshot {} + 2>/dev/null || true
-  tar -xzf - -C /var/lib/spine/storage
-' < "${BACKUP_DIR}/spine_storage.tar.gz"
+echo "Preserving and restoring API storage cache..."
+docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint tar spine-api \
+  -czf - -C /var/lib/spine/storage . > "${ROLLBACK_DIR}/spine_storage.tar.gz" || true
+docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh spine-api \
+  -c "rm -rf /var/lib/spine/storage/* /var/lib/spine/storage/.[!.]* 2>/dev/null || true"
+docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh spine-api \
+  -c "tar -xzf - -C /var/lib/spine/storage" < "${BACKUP_DIR}/spine_storage.tar.gz"
 
 echo "=== Step 3: Automated Fail-Closed Fencing Generation Verification ==="
 FAILED=0
@@ -119,7 +169,7 @@ done
 if [ ${FAILED} -ne 0 ]; then
   echo "================================================================================" >&2
   echo "CRITICAL: Fencing generation divergence detected across restored volumes." >&2
-  echo "HALTING DISASTER RECOVERY IMMEDIATELY." >&2
+  echo "HALTING DISASTER RECOVERY IMMEDIATELY. Rolling back volumes." >&2
   echo "" >&2
   echo "DO NOT manually edit or overwrite .fencing_generation or .coordinator_fencing_generation." >&2
   echo "Manual editing undermines consensus fencing invariants and leads to silent split-brain writes." >&2
@@ -146,12 +196,12 @@ for NODE in 1 2 3; do
 done
 
 echo "=== Step 5: Clean PostgreSQL Restoration & Verification ==="
-# Preserve old postgres data and clear directory so PostgreSQL starts clean for import
-echo "Preparing fresh PostgreSQL database cluster..."
-docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh postgres -c '
-  mkdir -p /var/lib/postgresql/data/.rollback_snapshot
-  find /var/lib/postgresql/data -mindepth 1 -maxdepth 1 ! -name ".rollback_snapshot" -exec mv -t /var/lib/postgresql/data/.rollback_snapshot {} + 2>/dev/null || true
-'
+# 1. Preserve existing PostgreSQL data into rollback dir, then make /var/lib/postgresql/data 100% EMPTY
+echo "Preserving PostgreSQL volume and preparing completely empty PGDATA..."
+docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint tar postgres \
+  -czf - -C /var/lib/postgresql/data . > "${ROLLBACK_DIR}/postgres_data.tar.gz" || true
+docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh postgres \
+  -c "rm -rf /var/lib/postgresql/data/* /var/lib/postgresql/data/.[!.]* 2>/dev/null || true"
 
 echo "Starting fresh PostgreSQL container..."
 docker compose -f "${COMPOSE_FILE}" up -d postgres
@@ -171,14 +221,25 @@ if [ ${READY_PG} -ne 1 ]; then
   exit 1
 fi
 
+# 2. Terminate connections and drop empty compose-initialized spine_forge database
+echo "Preparing database cluster for dump import..."
+docker compose -f "${COMPOSE_FILE}" exec -T postgres psql -U "${POSTGRES_ADMIN_USER}" -d postgres -v ON_ERROR_STOP=1 -c "
+  SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'spine_forge' AND pid <> pg_backend_pid();
+  DROP DATABASE IF EXISTS spine_forge;
+"
+
+# 3. Import dump with ON_ERROR_STOP=1, adapting CREATE ROLE statements to handle existing bootstrap roles idempotently
 echo "Importing PostgreSQL database from ${BACKUP_DIR}/postgres_dump.sql.gz (with ON_ERROR_STOP=1)..."
-# Must enforce ON_ERROR_STOP=1: any SQL error fails closed immediately
+# Stream through sed: converts 'CREATE ROLE <name> ...;' into idempotent PL/pgSQL block
+# Catching duplicate_object prevents collision with bootstrap roles while failing closed on any real error
 if [ -n "${POSTGRES_ADMIN_PASSWORD}" ]; then
   gzip -dc "${BACKUP_DIR}/postgres_dump.sql.gz" | \
+    sed -E 's/^CREATE ROLE ([^;]+);/DO \$\$ BEGIN CREATE ROLE \1; EXCEPTION WHEN duplicate_object THEN NULL; END \$\$;/' | \
     docker compose -f "${COMPOSE_FILE}" exec -T -e PGPASSWORD="${POSTGRES_ADMIN_PASSWORD}" postgres \
     psql -v ON_ERROR_STOP=1 -U "${POSTGRES_ADMIN_USER}" -d postgres
 else
   gzip -dc "${BACKUP_DIR}/postgres_dump.sql.gz" | \
+    sed -E 's/^CREATE ROLE ([^;]+);/DO \$\$ BEGIN CREATE ROLE \1; EXCEPTION WHEN duplicate_object THEN NULL; END \$\$;/' | \
     docker compose -f "${COMPOSE_FILE}" exec -T postgres \
     psql -v ON_ERROR_STOP=1 -U "${POSTGRES_ADMIN_USER}" -d postgres
 fi
@@ -222,21 +283,8 @@ if [ ${READY_APP} -ne 1 ]; then
   exit 1
 fi
 
-echo "Readiness gate passed. Purging pre-restore rollback snapshots..."
-# Safely purge .rollback_snapshot directories across participants now that restore is verified
-docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh coordinator \
-  -c "rm -rf /var/lib/spine/.rollback_snapshot 2>/dev/null || true"
-
-for NODE in 1 2 3; do
-  docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
-    -c "rm -rf /var/lib/spine/node-${NODE}/.rollback_snapshot 2>/dev/null || true"
-done
-
-docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh spine-api \
-  -c "rm -rf /var/lib/spine/ssh/.rollback_snapshot /var/lib/spine/storage/.rollback_snapshot 2>/dev/null || true"
-
-docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh postgres \
-  -c "rm -rf /var/lib/postgresql/data/.rollback_snapshot 2>/dev/null || true"
-
 RESTORE_SUCCESS=1
+echo "Readiness gate passed. Purging pre-restore rollback artifacts..."
+rm -rf "${ROLLBACK_DIR}"
+
 echo "SUCCESS: Spine Forge cluster restored, verified, and fully ready at generation ${TARGET_GEN}."
