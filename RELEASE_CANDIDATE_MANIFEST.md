@@ -3,7 +3,7 @@
 
 **Target Milestone:** Batch 21J Distributed Restore Convergence & Batch 21K Production Hardening  
 **Target Profile:** `core-forge-v1` (Mandatory PostgreSQL, TLS Ingress, Strict Role Separation)  
-**Source Commit Revision:** `76e2343dc370120eaa9ba58a7a9266057d03872e`  
+**Source Commit Revision:** `2ef6bd40800f26b3a45e6982e315ca005f251b63`  
 
 ---
 
@@ -12,9 +12,9 @@ Artifacts compiled and verified in `target/release-candidate/`:
 
 ```
 c6159534e9b4fa218121cd4f89a3c5d1ab51199e751023403276b07fded70f87  spine-api.exe
-3365beee12afac10cbfef3a5619977fd5e18b0e8be9e4949b0c5942409caa1b7  spine-coordinator.exe
-30fa249c48aca72008f522295e223e0bac63ac4aee97374e6a648faa7accc72b  spine-storage-node.exe
-92b1bbde6fc96a99a0bf44dff2f70930c9301431e095fb403c50ead6325f73e3  spine.exe
+a4ad1827c9a0c967268bebaccf1ba5342ce633c355816dbc754e96b62091e4c2  spine-coordinator.exe
+a7c82c192dcc8af83413a7bc8458cea6d8191cb06b59bbada21abae2587e36b5  spine-storage-node.exe
+f8743f24eb42c49d316b23e35b1a952e781a12beee52416ff4c137b57fa8cf3d  spine.exe
 ```
 
 ---
