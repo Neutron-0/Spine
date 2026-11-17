@@ -144,4 +144,46 @@ fn test_fencing_generation_persistence_and_restore_finalization() {
             "Fencing generation must survive process restart"
         );
     }
+
+    // CLI invocation: verify --check-generation reports the correct generation
+    {
+        let storage_node_bin = env!("CARGO_BIN_EXE_spine-storage-node");
+        let output = std::process::Command::new(storage_node_bin)
+            .arg("--node-id")
+            .arg("node-test")
+            .arg("--storage-root")
+            .arg(&node_dir)
+            .arg("--check-generation")
+            .output()
+            .expect("failed to execute spine-storage-node binary");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!("Storage node 'node-test' fencing generation: {}", fencing_gen)),
+            "stdout was: {}",
+            stdout
+        );
+    }
+
+    // CLI invocation: verify --verify-integrity with --data-dir alias succeeds
+    {
+        let storage_node_bin = env!("CARGO_BIN_EXE_spine-storage-node");
+        let output = std::process::Command::new(storage_node_bin)
+            .arg("--node-id")
+            .arg("node-test")
+            .arg("--data-dir")
+            .arg(&node_dir)
+            .arg("--verify-integrity")
+            .output()
+            .expect("failed to execute spine-storage-node binary");
+
+        assert!(output.status.success(), "Exit status: {:?}", output.status);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("volume integrity verified successfully"),
+            "stdout was: {}",
+            stdout
+        );
+    }
 }

@@ -22,6 +22,14 @@ pub struct Cli {
     #[arg(long, default_value = ".spine-coordinator-state.json")]
     pub store_file: PathBuf,
 
+    /// Reconcile coordinator fencing generation with cluster snapshot token
+    #[arg(long)]
+    pub repair_generation: bool,
+
+    /// Target expected generation token for repair
+    #[arg(long)]
+    pub expected_gen: Option<u64>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -32,6 +40,11 @@ pub enum Commands {
     GenerateToken {
         #[arg(short, long, default_value_t = 3600)] // 1 hour
         duration_secs: i64,
+    },
+    /// Reconcile coordinator fencing generation with cluster snapshot token
+    RepairGeneration {
+        #[arg(long)]
+        expected_gen: u64,
     },
 }
 
@@ -117,6 +130,40 @@ async fn main() -> Result<()> {
         &config.store_file,
     )?);
 
+    let target_repair_gen = if cli.repair_generation {
+        Some(cli.expected_gen)
+    } else if let Some(Commands::RepairGeneration { expected_gen }) = cli.command {
+        Some(Some(expected_gen))
+    } else {
+        None
+    };
+
+    if let Some(target_opt) = target_repair_gen {
+        let current_gen = store.get_fencing_generation();
+        println!("Current coordinator fencing generation: {}", current_gen);
+        if let Some(target) = target_opt {
+            if current_gen == target {
+                println!(
+                    "Coordinator fencing generation already aligned with expected generation {}.",
+                    target
+                );
+            } else if target > current_gen {
+                store.persist_fencing_generation(target)?;
+                println!(
+                    "Successfully reconciled coordinator fencing generation from {} to {}.",
+                    current_gen, target
+                );
+            } else {
+                anyhow::bail!(
+                    "Monotonicity violation: coordinator fencing generation ({}) is already higher than expected generation ({}). Cannot rollback.",
+                    current_gen,
+                    target
+                );
+            }
+        }
+        return Ok(());
+    }
+
     if let Some(cmd) = cli.command {
         match cmd {
             Commands::GenerateToken { duration_secs } => {
@@ -128,6 +175,7 @@ async fn main() -> Result<()> {
                 println!("Cluster ID: {}", token.cluster_id);
                 println!("Expires In: {} seconds", duration_secs);
             }
+            Commands::RepairGeneration { .. } => unreachable!(),
         }
         return Ok(());
     }
@@ -164,6 +212,8 @@ mod tests {
             cluster_id: "test-cluster".to_string(),
             listen: "127.0.0.1:9000".to_string(),
             store_file: PathBuf::from("test-state.json"),
+            repair_generation: false,
+            expected_gen: None,
             command: None,
         };
         let cfg = CoordinatorConfig::resolve(&cli).unwrap();
@@ -184,6 +234,8 @@ mod tests {
             cluster_id: "dev-cluster".to_string(),
             listen: "127.0.0.1:9000".to_string(),
             store_file: PathBuf::from(".dev-state.json"),
+            repair_generation: false,
+            expected_gen: None,
             command: None,
         };
         let cfg = CoordinatorConfig::resolve(&cli).unwrap();
@@ -198,5 +250,35 @@ mod tests {
         std::env::remove_var("SPINE_BIND");
         std::env::remove_var("SPINE_STORE_PATH");
         std::env::remove_var("SPINE_CLUSTER_ID");
+    }
+
+    #[test]
+    fn test_repair_generation_advances_and_protects_monotonicity() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state_path = temp_dir.path().join("coordinator.state");
+
+        let store = FileBackedCoordinatorStore::new_file_backed(&state_path).unwrap();
+        assert_eq!(store.get_fencing_generation(), 1);
+
+        // Advance to generation 50
+        store.persist_fencing_generation(50).unwrap();
+        assert_eq!(store.get_fencing_generation(), 50);
+
+        // Advancing to 50 again is idempotent
+        store.persist_fencing_generation(50).unwrap();
+        assert_eq!(store.get_fencing_generation(), 50);
+
+        // Regressing to 49 fails with monotonicity violation
+        let err = store.persist_fencing_generation(49).unwrap_err();
+        assert!(err.to_string().contains("Monotonicity violation"));
+        assert_eq!(store.get_fencing_generation(), 50);
+
+        // Advancing to 60 succeeds
+        store.persist_fencing_generation(60).unwrap();
+        assert_eq!(store.get_fencing_generation(), 60);
+
+        // Reload store from disk and verify persistence
+        let reloaded_store = FileBackedCoordinatorStore::new_file_backed(&state_path).unwrap();
+        assert_eq!(reloaded_store.get_fencing_generation(), 60);
     }
 }

@@ -2,6 +2,7 @@ pub mod backend;
 pub mod server;
 
 use anyhow::{Context, Result};
+use backend::StorageBackend;
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,7 +19,7 @@ pub struct Args {
     #[arg(short, long, default_value = "127.0.0.1:9001")]
     pub listen: String,
 
-    #[arg(long, default_value = ".spine-node-data")]
+    #[arg(long, visible_alias = "data-dir", default_value = ".spine-node-data")]
     pub storage_root: PathBuf,
 
     #[arg(short, long)]
@@ -35,6 +36,14 @@ pub struct Args {
 
     #[arg(long, default_value = "localhost")]
     pub host: String,
+
+    /// Print node fencing generation and exit
+    #[arg(long)]
+    pub check_generation: bool,
+
+    /// Run offline volume integrity check across all chunks, manifests, and repositories
+    #[arg(long)]
+    pub verify_integrity: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,6 +183,25 @@ async fn main() -> Result<()> {
             .with_node_id(config.node_id.clone()),
     );
 
+    if args.check_generation {
+        let (_, gen, _) = backend.get_maintenance_status();
+        println!(
+            "Storage node '{}' fencing generation: {}",
+            config.node_id, gen
+        );
+        return Ok(());
+    }
+
+    if args.verify_integrity {
+        let (repos, chunks, manifests) = backend.verify_volume_integrity()?;
+        let (_, gen, _) = backend.get_maintenance_status();
+        println!(
+            "Storage node '{}' volume integrity verified successfully: {} repositories, {} chunks, {} manifests. Fencing generation: {}.",
+            config.node_id, repos, chunks, manifests, gen
+        );
+        return Ok(());
+    }
+
     let server = server::StorageNodeServer::new(
         config.node_id,
         config.listen_addr,
@@ -212,6 +240,8 @@ mod tests {
             region: "local".to_string(),
             zone: "zone-1".to_string(),
             host: "localhost".to_string(),
+            check_generation: false,
+            verify_integrity: false,
         };
         let cfg = StorageNodeConfig::resolve(&args).unwrap();
         assert_eq!(cfg.node_id, "test-node");
@@ -241,6 +271,8 @@ mod tests {
             region: "local".to_string(),
             zone: "zone-1".to_string(),
             host: "localhost".to_string(),
+            check_generation: false,
+            verify_integrity: false,
         };
         let cfg = StorageNodeConfig::resolve(&args).unwrap();
         assert_eq!(cfg.node_id, "node-3");

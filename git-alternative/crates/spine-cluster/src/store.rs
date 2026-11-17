@@ -431,6 +431,10 @@ impl FileBackedCoordinatorStore {
         Ok(())
     }
 
+    pub fn get_fencing_generation(&self) -> u64 {
+        self.fencing_generation.load(Ordering::SeqCst)
+    }
+
     pub fn acquire_writer(&self) -> Result<CoordinatorWriterGuard> {
         let _barrier = self
             .mutation_barrier
