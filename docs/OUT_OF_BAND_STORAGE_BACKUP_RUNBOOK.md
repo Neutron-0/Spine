@@ -184,55 +184,66 @@ Follow these steps to restore a Spine Forge cluster from an out-of-band snapshot
    fi
    ```
 
-### Step 2: Preserve Pre-Restore Rollback Archives & Clean Target Volumes
+### Step 2: Mandatory Pre-Restore Archiving & Clean Target Volume Extraction
 
-To prevent old deleted files from persisting after restore, target volumes are not overlaid. Existing files across all volumes are archived to an external rollback directory (`${BACKUP_DIR}/.pre_restore_rollback`) outside the volume mount paths, and the volume directories are cleared completely before archive extraction.
+To prevent old deleted files from persisting after restore, target volumes are not overlaid. Existing files across all volumes are archived to an external rollback directory (`${BACKUP_DIR}/.pre_restore_rollback`) outside the volume mount paths.
 
-1. **Remove Ephemeral Staging Directories:**
-   ```bash
-   for NODE in 1 2 3; do
-     docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
-       -c "rm -rf /var/lib/spine/node-${NODE}/.staged_restore_* /var/lib/spine/node-${NODE}/.old_restore_* 2>/dev/null || true"
-   done
-   ```
+> [!IMPORTANT]
+> **Zero Modifications Gate:** All 7 participant rollback archives (`coordinator`, `storage_node_1/2/3`, `spine_ssh`, `spine_storage`, `postgres_data`) MUST be generated without error suppression and verified readable (`tar -tzf`) BEFORE any volume directory is emptied or modified. If any rollback archive creation fails, restore aborts immediately leaving all live volumes completely untouched.
 
-2. **Archive Existing Volumes to External Rollback Dir & Extract Clean Volumes:**
+1. **Phase 2a: Mandatory Pre-Restore Archiving & Integrity Verification (Volumes Untouched):**
    ```bash
    ROLLBACK_DIR="${BACKUP_DIR}/.pre_restore_rollback_$(date +%s)"
    mkdir -p "${ROLLBACK_DIR}"
 
-   # Coordinator volume
+   # Archive all 7 participants without error suppression
    docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint tar coordinator \
-     -czf - -C /var/lib/spine . > "${ROLLBACK_DIR}/coordinator.tar.gz" || true
-   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh coordinator \
-     -c "rm -rf /var/lib/spine/* /var/lib/spine/.[!.]* 2>/dev/null || true"
-   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh coordinator \
-     -c "tar -xzf - -C /var/lib/spine" < "${BACKUP_DIR}/coordinator.tar.gz"
+     -czf - -C /var/lib/spine . > "${ROLLBACK_DIR}/coordinator.tar.gz"
 
-   # Storage node volumes
    for NODE in 1 2 3; do
      docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint tar "storage-node-${NODE}" \
-       -czf - -C "/var/lib/spine/node-${NODE}" . > "${ROLLBACK_DIR}/storage_node_${NODE}.tar.gz" || true
-     docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
-       -c "rm -rf /var/lib/spine/node-${NODE}/* /var/lib/spine/node-${NODE}/.[!.]* 2>/dev/null || true"
-     docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
-       -c "tar -xzf - -C /var/lib/spine/node-${NODE}" < "${BACKUP_DIR}/storage_node_${NODE}.tar.gz"
+       -czf - -C "/var/lib/spine/node-${NODE}" . > "${ROLLBACK_DIR}/storage_node_${NODE}.tar.gz"
    done
 
-   # API SSH host keys and storage cache
    docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint tar spine-api \
-     -czf - -C /var/lib/spine/ssh . > "${ROLLBACK_DIR}/spine_ssh.tar.gz" || true
-   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh spine-api \
-     -c "rm -rf /var/lib/spine/ssh/* /var/lib/spine/ssh/.[!.]* 2>/dev/null || true"
-   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh spine-api \
-     -c "tar -xzf - -C /var/lib/spine/ssh" < "${BACKUP_DIR}/spine_ssh.tar.gz"
+     -czf - -C /var/lib/spine/ssh . > "${ROLLBACK_DIR}/spine_ssh.tar.gz"
+   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint tar spine-api \
+     -czf - -C /var/lib/spine/storage . > "${ROLLBACK_DIR}/spine_storage.tar.gz"
+   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint tar postgres \
+     -czf - -C /var/lib/postgresql/data . > "${ROLLBACK_DIR}/postgres_data.tar.gz"
 
-   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint tar spine-api \
-     -czf - -C /var/lib/spine/storage . > "${ROLLBACK_DIR}/spine_storage.tar.gz" || true
+   # Verify all 7 rollback archives are non-empty and readable
+   for ARCHIVE in coordinator storage_node_1 storage_node_2 storage_node_3 spine_ssh spine_storage postgres_data; do
+     FILE="${ROLLBACK_DIR}/${ARCHIVE}.tar.gz"
+     if [ ! -s "${FILE}" ] || ! tar -tzf "${FILE}" >/dev/null 2>&1; then
+       echo "FATAL: Pre-restore rollback archive ${FILE} is missing or corrupted. Aborting restore with zero volumes modified."
+       exit 1
+     fi
+   done
+   echo "All 7 pre-restore rollback archives verified valid. Safe to proceed with volume modification."
+   ```
+
+2. **Phase 2b: Clean Target Volumes & Extract Incoming Backup:**
+   ```bash
+   # Clean ephemeral staging in storage nodes
+   for NODE in 1 2 3; do
+     docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
+       -c "rm -rf /var/lib/spine/node-${NODE}/.staged_restore_* /var/lib/spine/node-${NODE}/.old_restore_* 2>/dev/null || true"
+   done
+
+   # Empty target volumes and extract incoming backup cleanly
+   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh coordinator \
+     -c "rm -rf /var/lib/spine/* /var/lib/spine/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine" < "${BACKUP_DIR}/coordinator.tar.gz"
+
+   for NODE in 1 2 3; do
+     docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
+       -c "rm -rf /var/lib/spine/node-${NODE}/* /var/lib/spine/node-${NODE}/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine/node-${NODE}" < "${BACKUP_DIR}/storage_node_${NODE}.tar.gz"
+   done
+
    docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh spine-api \
-     -c "rm -rf /var/lib/spine/storage/* /var/lib/spine/storage/.[!.]* 2>/dev/null || true"
+     -c "rm -rf /var/lib/spine/ssh/* /var/lib/spine/ssh/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine/ssh" < "${BACKUP_DIR}/spine_ssh.tar.gz"
    docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh spine-api \
-     -c "tar -xzf - -C /var/lib/spine/storage" < "${BACKUP_DIR}/spine_storage.tar.gz"
+     -c "rm -rf /var/lib/spine/storage/* /var/lib/spine/storage/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine/storage" < "${BACKUP_DIR}/spine_storage.tar.gz"
    ```
 
 ### Step 3: Automated Fail-Closed Fencing Generation Verification
