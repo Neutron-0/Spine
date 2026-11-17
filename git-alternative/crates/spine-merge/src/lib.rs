@@ -156,6 +156,76 @@ pub enum TextMergeResult {
     Conflict(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiffHunk {
+    base_start: usize,
+    base_end: usize,
+    replacement: Vec<String>,
+}
+
+fn diff_ops_to_hunks(ops: &[spine_diff::DiffOp]) -> Vec<DiffHunk> {
+    let mut hunks = Vec::new();
+    let mut base_idx = 0;
+    let mut i = 0;
+
+    while i < ops.len() {
+        match &ops[i] {
+            spine_diff::DiffOp::Context(_) => {
+                base_idx += 1;
+                i += 1;
+            }
+            spine_diff::DiffOp::Addition(_) | spine_diff::DiffOp::Deletion(_) => {
+                let hunk_start = base_idx;
+                let mut replacement = Vec::new();
+
+                while i < ops.len() {
+                    match &ops[i] {
+                        spine_diff::DiffOp::Context(_) => break,
+                        spine_diff::DiffOp::Addition(line) => {
+                            replacement.push(line.clone());
+                            i += 1;
+                        }
+                        spine_diff::DiffOp::Deletion(_) => {
+                            base_idx += 1;
+                            i += 1;
+                        }
+                    }
+                }
+                hunks.push(DiffHunk {
+                    base_start: hunk_start,
+                    base_end: base_idx,
+                    replacement,
+                });
+            }
+        }
+    }
+
+    hunks
+}
+
+fn reconstruct_side(
+    base_lines: &[&str],
+    range_start: usize,
+    range_end: usize,
+    hunks: &[DiffHunk],
+) -> Vec<String> {
+    let mut res = Vec::new();
+    let mut cur = range_start;
+    for h in hunks {
+        while cur < h.base_start {
+            res.push(base_lines[cur].to_string());
+            cur += 1;
+        }
+        res.extend(h.replacement.clone());
+        cur = h.base_end;
+    }
+    while cur < range_end {
+        res.push(base_lines[cur].to_string());
+        cur += 1;
+    }
+    res
+}
+
 /// Performs a 3-way line merge between base, ours, and theirs text buffers.
 pub fn merge_3way_text(base: &str, ours: &str, theirs: &str) -> TextMergeResult {
     if ours == theirs {
@@ -168,87 +238,134 @@ pub fn merge_3way_text(base: &str, ours: &str, theirs: &str) -> TextMergeResult 
         return TextMergeResult::Clean(ours.to_string());
     }
 
-    let _diff_ours = compute_line_diff(base, ours);
-    let _diff_theirs = compute_line_diff(base, theirs);
+    let diff_ours = compute_line_diff(base, ours);
+    let diff_theirs = compute_line_diff(base, theirs);
+
+    let hunks_o = diff_ops_to_hunks(&diff_ours);
+    let hunks_t = diff_ops_to_hunks(&diff_theirs);
 
     let base_lines: Vec<&str> = base.lines().collect();
-    let ours_lines: Vec<&str> = ours.lines().collect();
-    let theirs_lines: Vec<&str> = theirs.lines().collect();
 
-    // Line-by-line 3-way merge
     let mut out = String::new();
     let mut has_conflict = false;
 
-    let mut i_b = 0;
-    let mut i_o = 0;
-    let mut i_t = 0;
+    let mut idx_o = 0;
+    let mut idx_t = 0;
+    let mut cursor = 0;
 
-    while i_b < base_lines.len() || i_o < ours_lines.len() || i_t < theirs_lines.len() {
-        let b_line = base_lines.get(i_b).copied();
-        let o_line = ours_lines.get(i_o).copied();
-        let t_line = theirs_lines.get(i_t).copied();
+    while cursor < base_lines.len() || idx_o < hunks_o.len() || idx_t < hunks_t.len() {
+        let next_o = hunks_o.get(idx_o).map(|h| h.base_start);
+        let next_t = hunks_t.get(idx_t).map(|h| h.base_start);
 
-        if o_line == t_line {
-            if let Some(line) = o_line {
-                out.push_str(line);
+        if next_o.is_none() && next_t.is_none() {
+            while cursor < base_lines.len() {
+                out.push_str(base_lines[cursor]);
+                out.push('\n');
+                cursor += 1;
+            }
+            break;
+        }
+
+        let next_start = match (next_o, next_t) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => unreachable!(),
+        };
+
+        if next_start > cursor {
+            while cursor < next_start && cursor < base_lines.len() {
+                out.push_str(base_lines[cursor]);
+                out.push('\n');
+                cursor += 1;
+            }
+            cursor = next_start;
+        }
+
+        // Group all overlapping hunks at this location
+        let group_start = cursor;
+        let mut group_end = cursor;
+        let mut group_o: Vec<DiffHunk> = Vec::new();
+        let mut group_t: Vec<DiffHunk> = Vec::new();
+
+        loop {
+            let mut added = false;
+            let group_empty = group_o.is_empty() && group_t.is_empty();
+
+            if let Some(ho) = hunks_o.get(idx_o) {
+                let overlaps = if group_empty {
+                    ho.base_start == cursor
+                } else if group_start == group_end {
+                    ho.base_start == group_start
+                } else {
+                    ho.base_start < group_end
+                };
+
+                if overlaps {
+                    group_end = group_end.max(ho.base_end);
+                    group_o.push(ho.clone());
+                    idx_o += 1;
+                    added = true;
+                }
+            }
+
+            let group_empty = group_o.is_empty() && group_t.is_empty();
+            if let Some(ht) = hunks_t.get(idx_t) {
+                let overlaps = if group_empty {
+                    ht.base_start == cursor
+                } else if group_start == group_end {
+                    ht.base_start == group_start
+                } else {
+                    ht.base_start < group_end
+                };
+
+                if overlaps {
+                    group_end = group_end.max(ht.base_end);
+                    group_t.push(ht.clone());
+                    idx_t += 1;
+                    added = true;
+                }
+            }
+
+            if !added {
+                break;
+            }
+        }
+
+        let ours_slice = reconstruct_side(&base_lines, group_start, group_end, &group_o);
+        let theirs_slice = reconstruct_side(&base_lines, group_start, group_end, &group_t);
+
+        if group_o.is_empty() && !group_t.is_empty() {
+            for l in &theirs_slice {
+                out.push_str(l);
                 out.push('\n');
             }
-            if b_line.is_some() {
-                i_b += 1;
-            }
-            i_o += 1;
-            i_t += 1;
-        } else if o_line == b_line {
-            // Ours matches base; take theirs
-            if let Some(line) = t_line {
-                out.push_str(line);
+        } else if !group_o.is_empty() && group_t.is_empty() {
+            for l in &ours_slice {
+                out.push_str(l);
                 out.push('\n');
             }
-            if b_line.is_some() {
-                i_b += 1;
-            }
-            if o_line.is_some() {
-                i_o += 1;
-            }
-            i_t += 1;
-        } else if t_line == b_line {
-            // Theirs matches base; take ours
-            if let Some(line) = o_line {
-                out.push_str(line);
+        } else if ours_slice == theirs_slice {
+            for l in &ours_slice {
+                out.push_str(l);
                 out.push('\n');
-            }
-            if b_line.is_some() {
-                i_b += 1;
-            }
-            i_o += 1;
-            if t_line.is_some() {
-                i_t += 1;
             }
         } else {
-            // Both sides differ from base and from each other -> Conflict region!
             has_conflict = true;
             out.push_str("<<<<<<< OURS\n");
-            if let Some(line) = o_line {
-                out.push_str(line);
+            for l in &ours_slice {
+                out.push_str(l);
                 out.push('\n');
             }
             out.push_str("=======\n");
-            if let Some(line) = t_line {
-                out.push_str(line);
+            for l in &theirs_slice {
+                out.push_str(l);
                 out.push('\n');
             }
             out.push_str(">>>>>>> THEIRS\n");
-
-            if b_line.is_some() {
-                i_b += 1;
-            }
-            if o_line.is_some() {
-                i_o += 1;
-            }
-            if t_line.is_some() {
-                i_t += 1;
-            }
         }
+
+        cursor = group_end;
     }
 
     if has_conflict {

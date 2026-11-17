@@ -18,7 +18,27 @@ use std::io::Cursor;
 use subtle::ConstantTimeEq;
 
 type HmacSha256 = Hmac<Sha256>;
-pub const LFS_SECRET_SALT: &[u8] = b"spine-lfs-transfer-token-salt-v1";
+
+static EPHEMERAL_SALT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+/// Resolves LFS secret salt from environment, falling back to a cryptographically secure
+/// random ephemeral salt generated at process startup if unset (preventing offline token forgery).
+pub fn resolve_lfs_secret_salt() -> Vec<u8> {
+    if let Ok(val) = std::env::var("SPINE_LFS_SECRET").or_else(|_| std::env::var("SPINE_AUTH_SECRET_KEY")) {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            return trimmed.as_bytes().to_vec();
+        }
+    }
+    EPHEMERAL_SALT
+        .get_or_init(|| {
+            use rand::RngCore;
+            let mut buf = vec![0u8; 32];
+            rand::thread_rng().fill_bytes(&mut buf);
+            buf
+        })
+        .clone()
+}
 
 pub const LFS_MEDIA_TYPE: &str = "application/vnd.git-lfs+json";
 
@@ -116,7 +136,8 @@ pub fn generate_scoped_token(
     let json_bytes = serde_json::to_vec(&token).unwrap_or_default();
     let payload_hex = hex::encode(&json_bytes);
 
-    let mut mac = HmacSha256::new_from_slice(LFS_SECRET_SALT).expect("HMAC slice valid");
+    let salt = resolve_lfs_secret_salt();
+    let mut mac = HmacSha256::new_from_slice(&salt).expect("HMAC slice valid");
     mac.update(payload_hex.as_bytes());
     let sig_hex = hex::encode(mac.finalize().into_bytes());
 
@@ -132,7 +153,8 @@ pub fn verify_scoped_token(
 ) -> Result<u64, StatusCode> {
     let (payload_hex, sig_hex) = token_str.split_once('.').ok_or(StatusCode::UNAUTHORIZED)?;
     let expected_sig = {
-        let mut mac = HmacSha256::new_from_slice(LFS_SECRET_SALT).expect("HMAC slice valid");
+        let salt = resolve_lfs_secret_salt();
+        let mut mac = HmacSha256::new_from_slice(&salt).expect("HMAC slice valid");
         mac.update(payload_hex.as_bytes());
         hex::encode(mac.finalize().into_bytes())
     };

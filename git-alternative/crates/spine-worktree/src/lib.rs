@@ -237,11 +237,13 @@ pub fn flatten_tree<S: ObjectStore>(
     let entries = deserialize_tree(&payload)?;
 
     for entry in entries {
+        normalize_rel_path(&entry.name)?;
         let full_path = if prefix.is_empty() {
             entry.name.clone()
         } else {
             format!("{}/{}", prefix, entry.name)
         };
+        normalize_rel_path(&full_path)?;
 
         if entry.mode == FileMode::Directory {
             flatten_tree(store, &entry.object_id, &full_path, out)?;
@@ -580,8 +582,9 @@ pub fn execute_switch<P: AsRef<Path>, S: ObjectStore>(
 
     // 1. Remove files in current that are not in target
     for path in current_files.keys() {
+        let safe_path = normalize_rel_path(path)?;
         if !target_files.contains_key(path) {
-            let file_path = root_path.join(path);
+            let file_path = root_path.join(safe_path);
             if file_path.exists() {
                 fs::remove_file(&file_path)?;
                 let _ = remove_empty_parent_dirs(root_path, path);
@@ -592,12 +595,13 @@ pub fn execute_switch<P: AsRef<Path>, S: ObjectStore>(
 
     // 2. Add or update files from target
     for (path, (mode, oid)) in &target_files {
+        let safe_path = normalize_rel_path(path)?;
         let needs_update = match current_files.get(path) {
             Some((c_mode, c_oid)) => c_mode != mode || c_oid != oid,
             None => true,
         };
 
-        let file_path = root_path.join(path);
+        let file_path = root_path.join(safe_path);
         if needs_update || !file_path.exists() {
             if let Some(parent) = file_path.parent() {
                 fs::create_dir_all(parent)?;
@@ -814,5 +818,24 @@ mod tests {
         let list_after = list_worktrees(&spine_dir).unwrap();
         assert_eq!(list_after.len(), 1);
         assert!(!wt_path.exists());
+    }
+
+    #[test]
+    fn test_tree_traversal_rejection() {
+        let store = MemoryObjectStore::new(HashAlgorithm::Blake3);
+        let blob_oid = store.write_object(ObjectType::Blob, b"malicious").unwrap();
+
+        // Craft a tree with a path traversal entry "../escape.txt"
+        let entry = spine_core::TreeEntry {
+            mode: FileMode::Regular,
+            name: "../escape.txt".to_string(),
+            object_id: blob_oid,
+        };
+        let tree_bytes = spine_format::serialize_tree(&[entry]);
+        let tree_oid = store.write_object(ObjectType::Tree, &tree_bytes).unwrap();
+
+        let mut out = BTreeMap::new();
+        let res = flatten_tree(&store, &tree_oid, "", &mut out);
+        assert!(matches!(res, Err(WorktreeError::UnsafePath(_))));
     }
 }

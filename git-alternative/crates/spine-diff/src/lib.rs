@@ -136,47 +136,175 @@ pub fn format_diff_stat(summary: &DiffSummary) -> String {
     out
 }
 
-/// Computes line-by-line diff between two text documents using LCS algorithm.
-pub fn compute_line_diff(old_text: &str, new_text: &str) -> Vec<DiffOp> {
-    let old_lines: Vec<&str> = old_text.lines().collect();
-    let new_lines: Vec<&str> = new_text.lines().collect();
+/// Computes line-by-line diff between two text documents using Myers linear-space algorithm.
+fn myers_diff_slice(a: &[&str], b: &[&str], out: &mut Vec<DiffOp>) {
+    let n = a.len();
+    let m = b.len();
 
-    let n = old_lines.len();
-    let m = new_lines.len();
+    if n == 0 {
+        for line in b {
+            out.push(DiffOp::Addition((*line).to_string()));
+        }
+        return;
+    }
+    if m == 0 {
+        for line in a {
+            out.push(DiffOp::Deletion((*line).to_string()));
+        }
+        return;
+    }
 
-    // Standard LCS table
-    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+    // Common prefix
+    let mut p = 0;
+    while p < n && p < m && a[p] == b[p] {
+        out.push(DiffOp::Context(a[p].to_string()));
+        p += 1;
+    }
 
-    for i in 0..n {
-        for j in 0..m {
-            if old_lines[i] == new_lines[j] {
-                dp[i + 1][j + 1] = dp[i][j] + 1;
+    // Common suffix
+    let mut s = 0;
+    while s < (n - p) && s < (m - p) && a[n - 1 - s] == b[m - 1 - s] {
+        s += 1;
+    }
+
+    let a_mid = &a[p..n - s];
+    let b_mid = &b[p..m - s];
+
+    if a_mid.is_empty() {
+        for line in b_mid {
+            out.push(DiffOp::Addition((*line).to_string()));
+        }
+    } else if b_mid.is_empty() {
+        for line in a_mid {
+            out.push(DiffOp::Deletion((*line).to_string()));
+        }
+    } else if a_mid.len() * b_mid.len() <= 64 * 64 {
+        let an = a_mid.len();
+        let bm = b_mid.len();
+        let mut dp = vec![0usize; (an + 1) * (bm + 1)];
+        let idx = |i: usize, j: usize| i * (bm + 1) + j;
+
+        for i in 0..an {
+            for j in 0..bm {
+                if a_mid[i] == b_mid[j] {
+                    dp[idx(i + 1, j + 1)] = dp[idx(i, j)] + 1;
+                } else {
+                    dp[idx(i + 1, j + 1)] = dp[idx(i, j)].max(dp[idx(i, j + 1)]);
+                }
+            }
+        }
+
+        let mut i = an;
+        let mut j = bm;
+        let mut local_ops = Vec::new();
+        while i > 0 || j > 0 {
+            if i > 0 && j > 0 && a_mid[i - 1] == b_mid[j - 1] {
+                local_ops.push(DiffOp::Context(a_mid[i - 1].to_string()));
+                i -= 1;
+                j -= 1;
+            } else if j > 0 && (i == 0 || dp[idx(i, j - 1)] >= dp[idx(i - 1, j)]) {
+                local_ops.push(DiffOp::Addition(b_mid[j - 1].to_string()));
+                j -= 1;
+            } else if i > 0 && (j == 0 || dp[idx(i, j - 1)] < dp[idx(i - 1, j)]) {
+                local_ops.push(DiffOp::Deletion(a_mid[i - 1].to_string()));
+                i -= 1;
+            }
+        }
+        local_ops.reverse();
+        out.extend(local_ops);
+    } else {
+        let (split_a, split_b) = find_middle_snake(a_mid, b_mid);
+        myers_diff_slice(&a_mid[..split_a], &b_mid[..split_b], out);
+        myers_diff_slice(&a_mid[split_a..], &b_mid[split_b..], out);
+    }
+
+    // Emit suffix
+    for i in (n - s)..n {
+        out.push(DiffOp::Context(a[i].to_string()));
+    }
+}
+
+fn find_middle_snake(a: &[&str], b: &[&str]) -> (usize, usize) {
+    let n = a.len() as isize;
+    let m = b.len() as isize;
+    let max = n + m;
+    let delta = n - m;
+    let odd = (delta & 1) != 0;
+
+    let size = (2 * max + 1) as usize;
+    let mut vf = vec![0isize; size];
+    let mut vr = vec![0isize; size];
+
+    let offset = max as usize;
+
+    vf[offset + 1] = 0;
+    vr[offset + (delta as usize) - 1] = n;
+
+    let max_d = (max + 1) / 2;
+
+    for d in 0..=max_d {
+        for k in (-d..=d).step_by(2) {
+            let mut x = if k == -d || (k != d && vf[offset + (k - 1) as usize] < vf[offset + (k + 1) as usize]) {
+                vf[offset + (k + 1) as usize]
             } else {
-                dp[i + 1][j + 1] = dp[i + 1][j].max(dp[i][j + 1]);
+                vf[offset + (k - 1) as usize] + 1
+            };
+            let mut y = x - k;
+
+            while x < n && y < m && a[x as usize] == b[y as usize] {
+                x += 1;
+                y += 1;
+            }
+
+            vf[offset + k as usize] = x;
+
+            if odd && (k - delta).abs() <= (d - 1) {
+                if vf[offset + k as usize] >= vr[offset + k as usize] {
+                    return (x as usize, y as usize);
+                }
+            }
+        }
+
+        for k in (-d..=d).step_by(2) {
+            let kr = k + delta;
+            let mut x = if k == -d || (k != d && vr[offset + (kr + 1) as usize] <= vr[offset + (kr - 1) as usize]) {
+                vr[offset + (kr - 1) as usize]
+            } else {
+                vr[offset + (kr + 1) as usize] - 1
+            };
+            let mut y = x - kr;
+
+            while x > 0 && y > 0 && a[(x - 1) as usize] == b[(y - 1) as usize] {
+                x -= 1;
+                y -= 1;
+            }
+
+            vr[offset + kr as usize] = x;
+
+            if !odd && k.abs() <= d {
+                if vf[offset + kr as usize] >= vr[offset + kr as usize] {
+                    return (x as usize, y as usize);
+                }
             }
         }
     }
 
-    // Backtrack to build diff ops
-    let mut i = n;
-    let mut j = m;
-    let mut ops = Vec::new();
+    ((n as usize) / 2, (m as usize) / 2)
+}
 
-    while i > 0 || j > 0 {
-        if i > 0 && j > 0 && old_lines[i - 1] == new_lines[j - 1] {
-            ops.push(DiffOp::Context(old_lines[i - 1].to_string()));
-            i -= 1;
-            j -= 1;
-        } else if j > 0 && (i == 0 || dp[i][j - 1] >= dp[i - 1][j]) {
-            ops.push(DiffOp::Addition(new_lines[j - 1].to_string()));
-            j -= 1;
-        } else if i > 0 && (j == 0 || dp[i][j - 1] < dp[i - 1][j]) {
-            ops.push(DiffOp::Deletion(old_lines[i - 1].to_string()));
-            i -= 1;
-        }
+pub fn compute_line_diff(old_text: &str, new_text: &str) -> Vec<DiffOp> {
+    if old_text == new_text {
+        return old_text
+            .lines()
+            .map(|l| DiffOp::Context(l.to_string()))
+            .collect();
     }
 
-    ops.reverse();
+    let old_lines: Vec<&str> = old_text.lines().collect();
+    let new_lines: Vec<&str> = new_text.lines().collect();
+
+    let mut ops = Vec::new();
+    myers_diff_slice(&old_lines, &new_lines, &mut ops);
     ops
 }
 

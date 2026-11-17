@@ -275,9 +275,9 @@ pub async fn health_diagnostics(State(state): State<AppState>) -> impl IntoRespo
         .list_queued_workflow_jobs(now)
         .await
         .unwrap_or_default();
-    let outbox = state
+    let pending_outbox_count = state
         .db
-        .claim_pending_webhook_outbox(100, now)
+        .count_pending_webhook_outbox(now)
         .await
         .unwrap_or_default();
     let public_repos = state
@@ -299,7 +299,7 @@ pub async fn health_diagnostics(State(state): State<AppState>) -> impl IntoRespo
         database_connected: db_ok,
         coordinator_connected: coord_ok,
         active_runners_count: active_runners,
-        pending_webhook_outbox_depth: outbox.len(),
+        pending_webhook_outbox_depth: pending_outbox_count,
         queued_workflow_jobs_count: queued_jobs.len(),
         total_public_repositories: public_repos.len(),
         timestamp_nanos: now,

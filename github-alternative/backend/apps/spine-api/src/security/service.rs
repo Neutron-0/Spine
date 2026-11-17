@@ -10,6 +10,17 @@ type HmacSha256 = Hmac<Sha256>;
 pub const DEFAULT_FINGERPRINT_KEY_ID: &str = "hmac-sha256:v1";
 pub const DEFAULT_FINGERPRINT_SECRET: &[u8] = b"spine_forge_protected_fingerprint_salt_2026";
 
+/// Resolves secret scanning fingerprint salt from environment or defaults to baseline.
+pub fn resolve_fingerprint_secret() -> Vec<u8> {
+    if let Ok(val) = std::env::var("SPINE_FINGERPRINT_SECRET") {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            return trimmed.as_bytes().to_vec();
+        }
+    }
+    DEFAULT_FINGERPRINT_SECRET.to_vec()
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AdvisoryFeedProvenance {
     pub source_name: String,
@@ -668,10 +679,11 @@ pub fn compute_keyed_safe_fingerprint(raw_secret: &str, key_id: &str, key_bytes:
 }
 
 pub fn compute_safe_fingerprint(raw_secret: &str) -> String {
+    let secret = resolve_fingerprint_secret();
     compute_keyed_safe_fingerprint(
         raw_secret,
         DEFAULT_FINGERPRINT_KEY_ID,
-        DEFAULT_FINGERPRINT_SECRET,
+        &secret,
     )
 }
 

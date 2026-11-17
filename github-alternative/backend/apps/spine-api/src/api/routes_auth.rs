@@ -143,9 +143,16 @@ pub async fn register(
         .await;
 
     // Cookie
+    let secure_flag = if state.public_origin.starts_with("https://")
+        || state.profile == crate::core::profile::DeploymentProfile::CoreForge
+    {
+        "; Secure"
+    } else {
+        ""
+    };
     let cookie = format!(
-        "spine_session={}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800",
-        token
+        "spine_session={}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800{}",
+        token, secure_flag
     );
     let mut headers = HeaderMap::new();
     headers.insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
@@ -221,9 +228,16 @@ pub async fn login(
     };
     state.db.create_session(session).await?;
 
+    let secure_flag = if state.public_origin.starts_with("https://")
+        || state.profile == crate::core::profile::DeploymentProfile::CoreForge
+    {
+        "; Secure"
+    } else {
+        ""
+    };
     let cookie = format!(
-        "spine_session={}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800",
-        token
+        "spine_session={}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800{}",
+        token, secure_flag
     );
     let mut headers = HeaderMap::new();
     headers.insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
@@ -245,9 +259,19 @@ pub async fn logout(
         state.db.revoke_session(&sess.id).await?;
     }
 
-    let cookie = "spine_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0";
+    let secure_flag = if state.public_origin.starts_with("https://")
+        || state.profile == crate::core::profile::DeploymentProfile::CoreForge
+    {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cookie = format!(
+        "spine_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{}",
+        secure_flag
+    );
     let mut headers = HeaderMap::new();
-    headers.insert(header::SET_COOKIE, HeaderValue::from_str(cookie).unwrap());
+    headers.insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
 
     Ok((
         StatusCode::OK,

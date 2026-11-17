@@ -2178,7 +2178,7 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
 
     // 2.1 Restore state machine crash recovery & generation validation BEFORE running schema migrations
     let recovery_pool = match database_url.as_ref() {
-        Some(url) => Some(sqlx::PgPool::connect(url).await.map_err(|e| {
+        Some(url) => Some(PgDatabase::build_pool(url).await.map_err(|e| {
             anyhow::anyhow!(
                 "Failed to connect to active database for recovery verification: {}",
                 e
@@ -2220,7 +2220,7 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
                     sanitize_db_url(&mig_url),
                     profile
                 );
-                let migrator_pool = sqlx::PgPool::connect(&mig_url).await.map_err(|e| {
+                let migrator_pool = PgDatabase::build_pool(&mig_url).await.map_err(|e| {
                     anyhow::anyhow!(
                         "Failed to connect to PostgreSQL with migration credentials: {}",
                         e
@@ -2368,6 +2368,7 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
         });
 
     validate_public_origin(&public_origin, profile)?;
+    spine_api::auth::validate_production_secrets(profile)?;
 
     let state = AppState {
         profile,
@@ -2383,9 +2384,9 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
         packages,
         cargo,
         webhooks,
-        webhook_worker,
+        webhook_worker: Arc::clone(&webhook_worker),
         workflows,
-        scheduler,
+        scheduler: Arc::clone(&scheduler),
         runners,
         runner_executor,
         search,
@@ -2397,7 +2398,7 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
         storage_nodes,
     };
 
-    // 4. Spawn background provisioning worker
+    // 4. Spawn background workers
     let worker = Arc::new(
         ProvisioningWorker::new(Arc::clone(&db), coordinator, &storage_root_canonical)
             .with_barrier(Arc::clone(&consistency_barrier)),
@@ -2406,6 +2407,18 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
     let worker_handle = tokio::spawn(async move {
         tracing::info!("Starting background repository provisioning worker");
         worker_clone.run().await;
+    });
+
+    let webhook_worker_clone = Arc::clone(&webhook_worker);
+    let webhook_worker_handle = tokio::spawn(async move {
+        tracing::info!("Starting background webhook outbox delivery worker");
+        webhook_worker_clone.run().await;
+    });
+
+    let scheduler_clone = Arc::clone(&scheduler);
+    let scheduler_handle = tokio::spawn(async move {
+        tracing::info!("Starting background workflow scheduler worker");
+        scheduler_clone.run().await;
     });
 
     // 5. Start HTTP and SSH servers
@@ -2432,7 +2445,9 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
     }
 
     worker.shutdown();
-    let _ = worker_handle.await;
+    webhook_worker.shutdown();
+    scheduler.shutdown();
+    let _ = tokio::join!(worker_handle, webhook_worker_handle, scheduler_handle);
     tracing::info!("Spine Forge shutdown complete.");
     Ok(())
 }

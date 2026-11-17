@@ -8,15 +8,72 @@ pub struct PgDatabase {
     pool: PgPool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbPoolSettings {
+    pub max_connections: u32,
+    pub min_connections: u32,
+    pub acquire_timeout_secs: u64,
+    pub idle_timeout_secs: u64,
+    pub max_lifetime_secs: u64,
+}
+
 impl PgDatabase {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
 
+    pub fn pool_settings_from_env() -> DbPoolSettings {
+        DbPoolSettings {
+            max_connections: std::env::var("SPINE_DB_MAX_CONNECTIONS")
+                .or_else(|_| std::env::var("DATABASE_MAX_CONNECTIONS"))
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(50),
+            min_connections: std::env::var("SPINE_DB_MIN_CONNECTIONS")
+                .or_else(|_| std::env::var("DATABASE_MIN_CONNECTIONS"))
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(5),
+            acquire_timeout_secs: std::env::var("SPINE_DB_TIMEOUT_SECONDS")
+                .or_else(|_| std::env::var("DATABASE_ACQUIRE_TIMEOUT_SECS"))
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(10),
+            idle_timeout_secs: std::env::var("SPINE_DB_IDLE_TIMEOUT_SECS")
+                .or_else(|_| std::env::var("DATABASE_IDLE_TIMEOUT_SECS"))
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(300),
+            max_lifetime_secs: std::env::var("SPINE_DB_MAX_LIFETIME_SECS")
+                .or_else(|_| std::env::var("DATABASE_MAX_LIFETIME_SECS"))
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(1800),
+        }
+    }
+
+    pub fn pool_options_from_env() -> sqlx::postgres::PgPoolOptions {
+        let settings = Self::pool_settings_from_env();
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(settings.max_connections)
+            .min_connections(settings.min_connections)
+            .acquire_timeout(std::time::Duration::from_secs(settings.acquire_timeout_secs))
+            .idle_timeout(std::time::Duration::from_secs(settings.idle_timeout_secs))
+            .max_lifetime(std::time::Duration::from_secs(settings.max_lifetime_secs))
+    }
+
+    pub async fn build_pool(url: &str) -> Result<PgPool, ForgeError> {
+        Self::pool_options_from_env()
+            .connect(url)
+            .await
+            .map_err(|e| ForgeError::ServiceUnavailable(format!("PostgreSQL connect failed: {}", e)))
+    }
+
     pub async fn connect(url: &str) -> Result<Self, ForgeError> {
-        let pool = PgPool::connect(url).await.map_err(|e| {
-            ForgeError::ServiceUnavailable(format!("PostgreSQL connect failed: {}", e))
-        })?;
+        let pool = Self::pool_options_from_env()
+            .connect(url)
+            .await
+            .map_err(|e| ForgeError::ServiceUnavailable(format!("PostgreSQL connect failed: {}", e)))?;
         Ok(Self { pool })
     }
 
@@ -3491,15 +3548,27 @@ impl Database for PgDatabase {
         Ok(item)
     }
 
+    async fn count_pending_webhook_outbox(&self, now_nanos: i64) -> Result<usize, ForgeError> {
+        let query = "SELECT COUNT(*) FROM webhook_outbox WHERE (status = 'PENDING' AND next_attempt_at_nanos <= $1) OR (status = 'PROCESSING' AND next_attempt_at_nanos <= $1)";
+        let row: (i64,) = sqlx::query_as(query)
+            .bind(now_nanos)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(row.0 as usize)
+    }
+
     async fn claim_pending_webhook_outbox(
         &self,
         limit: i64,
         now_nanos: i64,
     ) -> Result<Vec<WebhookOutboxItem>, ForgeError> {
-        let query = "UPDATE webhook_outbox SET status = 'PROCESSING', attempts = attempts + 1 WHERE id IN (SELECT id FROM webhook_outbox WHERE status = 'PENDING' AND next_attempt_at_nanos <= $1 ORDER BY next_attempt_at_nanos ASC LIMIT $2 FOR UPDATE SKIP LOCKED) RETURNING id, event_type, owner_type, owner_id, payload, attempts, max_attempts, status, last_error, created_at_nanos, next_attempt_at_nanos";
+        let lease_expiry_nanos = now_nanos + 60 * 1_000_000_000;
+        let query = "UPDATE webhook_outbox SET status = 'PROCESSING', attempts = attempts + 1, next_attempt_at_nanos = $3 WHERE id IN (SELECT id FROM webhook_outbox WHERE (status = 'PENDING' AND next_attempt_at_nanos <= $1) OR (status = 'PROCESSING' AND next_attempt_at_nanos <= $1) ORDER BY next_attempt_at_nanos ASC LIMIT $2 FOR UPDATE SKIP LOCKED) RETURNING id, event_type, owner_type, owner_id, payload, attempts, max_attempts, status, last_error, created_at_nanos, next_attempt_at_nanos";
         let rows = sqlx::query(query)
             .bind(now_nanos)
             .bind(limit)
+            .bind(lease_expiry_nanos)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| ForgeError::Internal(e.to_string()))?;
@@ -3713,6 +3782,58 @@ impl Database for PgDatabase {
                 started_at_nanos: r.get(17),
                 completed_at_nanos: r.get(18),
             })
+            .collect();
+        Ok(list)
+    }
+
+    async fn list_active_workflow_runs_for_repo(
+        &self,
+        repo_id: &str,
+    ) -> Result<Vec<WorkflowRun>, ForgeError> {
+        let query = "SELECT id, repo_id, workflow_id, workflow_name, commit_oid, ref_name, trigger_event, actor_id, status, conclusion, definition_yaml, definition_digest, source_repo_id, is_fork, trust_classification, provenance_reason, created_at_nanos, started_at_nanos, completed_at_nanos FROM workflow_runs WHERE repo_id = $1 AND status NOT IN ('COMPLETED', 'CANCELLED') ORDER BY created_at_nanos ASC";
+        let rows = sqlx::query(query)
+            .bind(repo_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows
+            .into_iter()
+            .map(|r| WorkflowRun {
+                id: r.get(0),
+                repo_id: r.get(1),
+                workflow_id: r.get(2),
+                workflow_name: r.get(3),
+                commit_oid: r.get(4),
+                ref_name: r.get(5),
+                trigger_event: r.get(6),
+                actor_id: r.get(7),
+                status: r.get(8),
+                conclusion: r.get(9),
+                definition_yaml: r.get(10),
+                definition_digest: r.get(11),
+                source_repo_id: r.get(12),
+                is_fork: r.get(13),
+                trust_classification: TrustClassification::from_str_lossy(&r.get::<String, _>(14)),
+                provenance_reason: r.get(15),
+                created_at_nanos: r.get(16),
+                started_at_nanos: r.get(17),
+                completed_at_nanos: r.get(18),
+            })
+            .collect();
+        Ok(list)
+    }
+
+    async fn list_active_workflow_repo_ids(&self) -> Result<Vec<String>, ForgeError> {
+        let query = "SELECT DISTINCT repo_id FROM workflow_runs WHERE status NOT IN ('COMPLETED', 'CANCELLED')";
+        let rows = sqlx::query(query)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        let list = rows
+            .into_iter()
+            .map(|r| r.get(0))
             .collect();
         Ok(list)
     }
