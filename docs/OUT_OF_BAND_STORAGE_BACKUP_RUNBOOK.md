@@ -86,6 +86,11 @@ To prevent tearing across distributed chunk stores and PostgreSQL, in-flight wri
 
 With active mutations drained and write permits rejected with HTTP 503, snapshot all volumes consistently.
 
+> [!NOTE]
+> **Strategy Selection & Deployment Validation Matrix:**
+> - **Strategy C (Quiesced Archive Streaming):** The **baseline cross-platform standard** validated in code by automated integration regression `test_out_of_band_storage_backup_and_restore_above_15mib`. It operates independently of underlying cloud infrastructure across any Docker Compose, Kubernetes PersistentVolume, or bare-metal environment.
+> - **Strategy A (Cloud Block Storage EBS/PD) & Strategy B (ZFS/LVM):** Requires platform engineering validation on the target deployment host. Before adopting Strategy A or B in production, operators must perform a validation dry run using the checklist in Section 4.1 to verify that multi-volume snapshot groups freeze all disks at the exact same instant without tearing.
+
 #### Strategy A: Cloud Block Storage (AWS EBS / GCP Persistent Disk)
 Create a multi-volume crash-consistent snapshot group containing all underlying block volumes:
 ```bash
@@ -168,7 +173,7 @@ Follow these steps to restore a Spine Forge cluster from an out-of-band snapshot
    done
    ```
 
-### Step 3: Fencing Generation Verification
+### Step 3: Fencing Generation Verification & Strict Divergence Prohibition
 
 Verify that `.fencing_generation` on all storage nodes and `.coordinator_fencing_generation` on the coordinator match the target recovery generation token:
 ```bash
@@ -181,7 +186,23 @@ echo -n "Coordinator generation: "
 cat /var/lib/spine/.coordinator_fencing_generation
 echo ""
 ```
-All nodes **MUST** report the identical integer generation. If any node has diverged, set the generation file to the target generation.
+
+> [!CAUTION]
+> **STRICT FAIL-CLOSED POLICY — DO NOT MANUALLY OVERWRITE FENCING GENERATIONS:**
+> All storage nodes and the coordinator **MUST** report the identical integer generation matching the recorded `${GENERATION_TOKEN}` from Phase 1. 
+> 
+> Under no circumstances should an operator manually overwrite, edit, or force a node's `.fencing_generation` file. Overriding fencing tokens manually bypasses distributed consensus safeguards, allows stale nodes to accept conflicting writes, and masks split-brain volume tearing.
+> 
+> **Defined Fencing Recovery Procedure (If Divergence Occurs):**
+> 1. **Halt the Restore Immediately:** Do not proceed to Step 4 or start the cluster services.
+> 2. **Audit Volume Provenance:** Inspect the snapshot metadata and creation timestamps of all restored volumes. Confirm that all volumes originated from the exact same atomic snapshot group (`SpineFencingGen=${GENERATION_TOKEN}`).
+> 3. **Re-restore Out-of-Sync Participant:** If one node was accidentally restored from a different snapshot point, wipe that node's volume mount and re-restore strictly from the correct snapshot group.
+> 4. **Quorum Reconciliation:** If the coordinator generation matches the snapshot token and at least a quorum (2 of 3) of storage nodes match, start only the matching nodes and run the coordinator anti-entropy repair command:
+>    ```bash
+>    docker compose -f docker-compose.prod.yml run --rm coordinator \
+>      /usr/local/bin/spine-coordinator --repair-generation --expected-gen "${GENERATION_TOKEN}"
+>    ```
+> 5. **Unresolvable Divergence:** If generation consensus cannot be established, abort the restore and fall back to the previous known consistent snapshot set.
 
 ### Step 4: Storage Node Integrity Check
 
