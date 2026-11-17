@@ -58,7 +58,7 @@ impl WebhookOutboxWorker {
     /// Background worker loop.
     pub async fn run(&self) {
         while self.running.load(Ordering::SeqCst) {
-            match self.process_batch(50).await {
+            match self.process_batch(10).await {
                 Ok(count) if count > 0 => {
                     // Items processed; check again immediately
                     continue;
@@ -123,10 +123,33 @@ impl WebhookOutboxWorker {
                 continue;
             }
 
+            // Actively refresh/extend the lease for this specific event before and during delivery
+            let per_sub_timeout = self.timeout_duration.as_secs().max(5);
+            let needed_secs = (per_sub_timeout * (matching_subs.len() as u64) + 60) as i64;
+            let current_now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+            let extended = self
+                .db
+                .extend_webhook_outbox_lease(&event.id, current_now + needed_secs * 1_000_000_000)
+                .await?;
+            if !extended {
+                // Lost lease or item completed elsewhere; skip to prevent duplicate delivery!
+                tracing::warn!("Webhook outbox item {} lost lease; skipping delivery", event.id);
+                continue;
+            }
+
             let mut any_failed = false;
             let mut last_error = None;
 
             for sub in matching_subs {
+                let current_now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                let _ = self
+                    .db
+                    .extend_webhook_outbox_lease(
+                        &event.id,
+                        current_now + (self.timeout_duration.as_secs().max(5) + 30) as i64 * 1_000_000_000,
+                    )
+                    .await;
+
                 let start = Instant::now();
                 let delivery_res = self.deliver_to_subscription(&sub, &event).await;
                 let duration_ms = start.elapsed().as_millis() as i64;
