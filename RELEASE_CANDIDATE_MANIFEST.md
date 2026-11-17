@@ -3,7 +3,7 @@
 
 **Target Milestone:** Batch 21J Distributed Restore Convergence & Batch 21K Production Hardening  
 **Target Profile:** `core-forge-v1` (Mandatory PostgreSQL, TLS Ingress, Strict Role Separation)  
-**Source Commit Revision:** `2ef6bd40800f26b3a45e6982e315ca005f251b63`  
+**Source Commit Revision:** `74f72a6c3156780ec97f1a8fd25494abc2fa0378`  
 
 ---
 
@@ -11,10 +11,10 @@
 Artifacts compiled and verified in `target/release-candidate/`:
 
 ```
-c6159534e9b4fa218121cd4f89a3c5d1ab51199e751023403276b07fded70f87  spine-api.exe
-a4ad1827c9a0c967268bebaccf1ba5342ce633c355816dbc754e96b62091e4c2  spine-coordinator.exe
-a7c82c192dcc8af83413a7bc8458cea6d8191cb06b59bbada21abae2587e36b5  spine-storage-node.exe
-f8743f24eb42c49d316b23e35b1a952e781a12beee52416ff4c137b57fa8cf3d  spine.exe
+af2ade12b1cae0080a0f29e5b29c83ef43af2a9aff2f47d25328d5e9e9ba60f6  spine-api.exe
+8f7ed491e1b04d62e801cd7bb09c8b083bd6eebe911685304e836994a96994b1  spine-coordinator.exe
+1ed8049200a6a2b306ca9d2cffcf2df6b7b0558c9dcd5f4d07d45d18192edd74  spine-storage-node.exe
+5a987eb7a1a1c3f6bc017be82560b191ea69bf21dde9751a8c9db43c91faef5f  spine.exe
 ```
 
 ---
@@ -61,3 +61,14 @@ f8743f24eb42c49d316b23e35b1a952e781a12beee52416ff4c137b57fa8cf3d  spine.exe
   - `Phase 6: GLOBAL FINALIZE` — Retained old generation directories are purged and journal removed only after global verification succeeds across all participants.
 - **Deterministic Startup Recovery:** Pre-decision crashes safely abort staging leaving live storage and database untouched. Post-decision crashes roll forward across all participants, ensuring that database, storage, cluster volumes, and SSH converge on the committed target generation without split-brain risk.
 - **Out-of-Band Volume Backup Runbook ($> 15\text{ MiB}$):** For clusters where individual storage nodes exceed the 15 MiB compressed payload ceiling, documented operational runbook [`docs/OUT_OF_BAND_STORAGE_BACKUP_RUNBOOK.md`](docs/OUT_OF_BAND_STORAGE_BACKUP_RUNBOOK.md) specifies atomic block/filesystem snapshotting, writer draining, and generation alignment procedures.
+
+---
+
+### 5. Reviewer & Operator Environment Verification
+When verifying working tree status from containerized sandboxes, external auditor harnesses (e.g. Codex), or non-default user accounts, Git 2.35.2+ requires directory ownership alignment:
+```bash
+# Add directory exception to avoid 'fatal: detected dubious ownership' in sandbox runners
+git config --global --add safe.directory D:/Vault/Spine
+# Or execute inline
+git -c safe.directory=* status
+```
