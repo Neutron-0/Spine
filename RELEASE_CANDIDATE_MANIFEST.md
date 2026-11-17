@@ -3,7 +3,7 @@
 
 **Target Milestone:** Batch 21J Distributed Restore Convergence & Batch 21K Production Hardening  
 **Target Profile:** `core-forge-v1` (Mandatory PostgreSQL, TLS Ingress, Strict Role Separation)  
-**Source Commit Revision:** `39fa9566b157de3fb8b6c93b709bf57301248c14`  
+**Source Commit Revision:** `5ed12d2ce9da082d4314207865c6978189e47fe2`  
 
 ---
 
@@ -11,7 +11,7 @@
 Artifacts compiled and verified in `target/release-candidate/`:
 
 ```
-8b9b367e257044056a4697873b36aaf46bacaa1d70c30ebe3d4e06d17b27da0c  spine-api.exe
+c6f49680fc168e3d962a96ff161692ba09f82955eff1f2f12239a1b8fa4dbdd2  spine-api.exe
 3365beee12afac10cbfef3a5619977fd5e18b0e8be9e4949b0c5942409caa1b7  spine-coordinator.exe
 30fa249c48aca72008f522295e223e0bac63ac4aee97374e6a648faa7accc72b  spine-storage-node.exe
 92b1bbde6fc96a99a0bf44dff2f70930c9301431e095fb403c50ead6325f73e3  spine.exe
@@ -26,7 +26,7 @@ Artifacts compiled and verified in `target/release-candidate/`:
 - **Database Engine (`postgres`):** Bound to internal private network `spine-internal`. No host port publication. Configurable role setup supporting `POSTGRES_MIGRATOR_USER` and `POSTGRES_APP_USER` via `upgrade_postgres_roles.sh` with stdin SQL piping and parameterized psql identifiers (no credentials on process command lines).
 - **Consensus Coordinator (`spine-coordinator`):** Raft consensus node on `spine-internal` (port `8400`). Guarded by RAII `CoordinatorWriterGuard`, atomic writer tracking, mutation barrier, draining maintenance barrier, persisted monotonic fencing generation (`.coordinator_fencing_generation` with `safe_atomic_replace`), and crash-resilient rollback state.
 - **Storage Nodes (`spine-storage-node-1/2/3`):** Chunked BLAKE3 storage nodes on `spine-internal` (port `8401`). Responding with explicit logical node IDs (`node-1`, `node-2`, `node-3`). Guarded by RAII `StorageWriterGuard`, atomic writer tracking, mutation barrier, draining maintenance barrier, persisted monotonic fencing generation (`.fencing_generation` with error propagation and atomic replacement), and distributed volume restore verification.
-- **Readiness Probes (`/api/v1/health/ready`):** Validates database connectivity, storage root availability, distinct storage node identities (`node-1`, `node-2`, `node-3`), rejection of duplicate endpoints/identities, uniform generation convergence across all participants and coordinator, and verifies that no active restore journal is in progress.
+- **Readiness Probes (`/health/ready` and `/api/v1/health/ready`):** Validates database connectivity, storage root availability, distinct storage node identities (`node-1`, `node-2`, `node-3`), rejection of duplicate endpoints/identities, uniform generation convergence across all participants and coordinator, and verifies that no active restore journal is in progress.
 
 ---
 
@@ -60,3 +60,4 @@ Artifacts compiled and verified in `target/release-candidate/`:
   - `Phase 5: VERIFY` — Distributed health check, generation check, and integrity validation across all 7 participants.
   - `Phase 6: GLOBAL FINALIZE` — Retained old generation directories are purged and journal removed only after global verification succeeds across all participants.
 - **Deterministic Startup Recovery:** Pre-decision crashes safely abort staging leaving live storage and database untouched. Post-decision crashes roll forward across all participants, ensuring that database, storage, cluster volumes, and SSH converge on the committed target generation without split-brain risk.
+- **Out-of-Band Volume Backup Runbook ($> 15\text{ MiB}$):** For clusters where individual storage nodes exceed the 15 MiB compressed payload ceiling, documented operational runbook [`docs/OUT_OF_BAND_STORAGE_BACKUP_RUNBOOK.md`](docs/OUT_OF_BAND_STORAGE_BACKUP_RUNBOOK.md) specifies atomic block/filesystem snapshotting, writer draining, and generation alignment procedures.

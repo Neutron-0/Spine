@@ -320,6 +320,14 @@ async fn test_observability_liveness_readiness_and_diagnostics_discrimination() 
     let live_res = app.clone().oneshot(live_req).await.unwrap();
     assert_eq!(live_res.status(), StatusCode::OK);
 
+    // 1b. Liveness alias check: /api/v1/health/live
+    let api_live_req = Request::builder()
+        .uri("/api/v1/health/live")
+        .body(Body::empty())
+        .unwrap();
+    let api_live_res = app.clone().oneshot(api_live_req).await.unwrap();
+    assert_eq!(api_live_res.status(), StatusCode::OK);
+
     // 2. Readiness check: 200 OK with connected DB
     let ready_req = Request::builder()
         .uri("/health/ready")
@@ -327,6 +335,14 @@ async fn test_observability_liveness_readiness_and_diagnostics_discrimination() 
         .unwrap();
     let ready_res = app.clone().oneshot(ready_req).await.unwrap();
     assert_eq!(ready_res.status(), StatusCode::OK);
+
+    // 2b. Readiness alias check: /api/v1/health/ready
+    let api_ready_req = Request::builder()
+        .uri("/api/v1/health/ready")
+        .body(Body::empty())
+        .unwrap();
+    let api_ready_res = app.clone().oneshot(api_ready_req).await.unwrap();
+    assert_eq!(api_ready_res.status(), StatusCode::OK);
 
     // 3. Structured Diagnostics check
     let diag_req = Request::builder()

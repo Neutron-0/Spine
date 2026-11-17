@@ -63,6 +63,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health/live", get(routes_health::health_liveness))
         .route("/health/ready", get(routes_health::health_readiness))
         .route("/readyz", get(routes_health::health_readiness))
+        .route("/api/v1/health/live", get(routes_health::health_liveness))
+        .route("/api/v1/health/ready", get(routes_health::health_readiness))
         .route(
             "/health/diagnostics",
             get(routes_health::health_diagnostics),

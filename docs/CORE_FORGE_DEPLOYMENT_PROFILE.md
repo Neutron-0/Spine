@@ -101,3 +101,10 @@ Core Forge services run under unprivileged user `spine:spine` with OS sandboxing
 - Blocked elevation (`NoNewPrivileges=true`).
 - Blocked device node creation (`PrivateDevices=true`).
 - Confined write permissions: strictly restricted to `/var/lib/spine`.
+
+---
+
+## 5. Disaster Recovery & Storage Backup Procedures
+
+- **In-Band Cluster RPC Backups (`SPNEBAK v2`):** Supported for participant volumes up to `15 MiB` (`15,728,640` bytes) compressed payload per node (`MAX_REMOTE_PARTICIPANT_PAYLOAD_BYTES`), protected by authenticated AES-256-GCM encryption and RAII writer-draining barriers.
+- **Out-of-Band Volume Snapshots ($> 15\text{ MiB}$):** For production clusters exceeding the 15 MiB single-frame cluster RPC limit, operators must follow the documented, validated out-of-band operational runbook at [OUT_OF_BAND_STORAGE_BACKUP_RUNBOOK.md](OUT_OF_BAND_STORAGE_BACKUP_RUNBOOK.md) to perform atomic cloud block storage or filesystem snapshots and fail-closed post-restore verification.
