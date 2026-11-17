@@ -111,7 +111,7 @@ pub fn deserialize_tree(payload: &[u8]) -> Result<Vec<TreeEntry>, FormatError> {
 
     let count = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
     let mut cursor = 4;
-    let mut entries = Vec::with_capacity(count);
+    let mut entries = Vec::with_capacity(count.min(payload.len() / 38));
 
     for _ in 0..count {
         if cursor + 4 + 2 > payload.len() {
@@ -247,7 +247,7 @@ fn deserialize_commit_v2(payload: &[u8]) -> Result<Commit, FormatError> {
     let parent_count = u16::from_le_bytes(payload[cursor..cursor + 2].try_into().unwrap()) as usize;
     cursor += 2;
 
-    let mut parents = Vec::with_capacity(parent_count);
+    let mut parents = Vec::with_capacity(parent_count.min(payload.len() / 32));
     for _ in 0..parent_count {
         if cursor + 32 > payload.len() {
             return Err(FormatError::BufferTooShort {
@@ -384,7 +384,7 @@ fn deserialize_commit_v1(payload: &[u8]) -> Result<Commit, FormatError> {
     let parent_count = payload[cursor] as usize;
     cursor += 1;
 
-    let mut parents = Vec::with_capacity(parent_count);
+    let mut parents = Vec::with_capacity(parent_count.min(payload.len() / 32));
     for _ in 0..parent_count {
         if cursor + 32 > payload.len() {
             return Err(FormatError::BufferTooShort {

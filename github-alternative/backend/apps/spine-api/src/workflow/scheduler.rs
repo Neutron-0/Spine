@@ -1,5 +1,6 @@
 use chrono::Utc;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::core::error::ForgeError;
@@ -15,6 +16,7 @@ pub struct WorkflowScheduler {
     webhook_service: Option<WebhookService>,
     pub profile: DeploymentProfile,
     consistency_barrier: Option<Arc<crate::backup::ConsistencyBarrier>>,
+    running: Arc<AtomicBool>,
 }
 
 impl WorkflowScheduler {
@@ -24,6 +26,7 @@ impl WorkflowScheduler {
             webhook_service,
             profile: DeploymentProfile::CoreForge,
             consistency_barrier: None,
+            running: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -35,6 +38,31 @@ impl WorkflowScheduler {
     pub fn with_barrier(mut self, barrier: Arc<crate::backup::ConsistencyBarrier>) -> Self {
         self.consistency_barrier = Some(barrier);
         self
+    }
+
+    pub fn shutdown(&self) {
+        self.running.store(false, Ordering::SeqCst);
+    }
+
+    /// Advance active workflow runs across all repositories with pending/running workflows.
+    pub async fn tick_active(&self) -> Result<(), ForgeError> {
+        let repo_ids = self.db.list_active_workflow_repo_ids().await?;
+        for repo_id in repo_ids {
+            if let Err(e) = self.tick(&repo_id).await {
+                tracing::warn!("Scheduler tick failed for repo {}: {}", repo_id, e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Background scheduler loop.
+    pub async fn run(&self) {
+        while self.running.load(Ordering::SeqCst) {
+            if let Err(e) = self.tick_active().await {
+                tracing::warn!("WorkflowScheduler tick error: {}", e);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
     }
 
     /// Advance active workflow runs, resolve job dependencies, detect timed out leases,
@@ -53,7 +81,7 @@ impl WorkflowScheduler {
         };
 
         let now_nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let runs = self.db.list_workflow_runs(repo_id, 100).await?;
+        let runs = self.db.list_active_workflow_runs_for_repo(repo_id).await?;
 
         for run in runs {
             if run.status == "COMPLETED" || run.status == "CANCELLED" {

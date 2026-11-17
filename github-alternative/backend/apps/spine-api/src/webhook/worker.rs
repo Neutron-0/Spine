@@ -1,10 +1,13 @@
 use chrono::Utc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use uuid::Uuid;
+
+use spine_net::tls::SpineStream;
 
 use super::service::WebhookService;
 use super::ssrf::SsrfValidator;
@@ -17,6 +20,8 @@ pub struct WebhookOutboxWorker {
     ssrf: SsrfValidator,
     timeout_duration: std::time::Duration,
     consistency_barrier: Option<Arc<crate::backup::ConsistencyBarrier>>,
+    running: Arc<AtomicBool>,
+    root_certs: Option<Vec<Vec<u8>>>,
 }
 
 impl WebhookOutboxWorker {
@@ -26,12 +31,47 @@ impl WebhookOutboxWorker {
             ssrf,
             timeout_duration: std::time::Duration::from_secs(10),
             consistency_barrier: None,
+            running: Arc::new(AtomicBool::new(true)),
+            root_certs: None,
         }
     }
 
     pub fn with_barrier(mut self, barrier: Arc<crate::backup::ConsistencyBarrier>) -> Self {
         self.consistency_barrier = Some(barrier);
         self
+    }
+
+    pub fn with_root_certs(mut self, certs: Vec<Vec<u8>>) -> Self {
+        self.root_certs = Some(certs);
+        self
+    }
+
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout_duration = timeout;
+        self
+    }
+
+    pub fn shutdown(&self) {
+        self.running.store(false, Ordering::SeqCst);
+    }
+
+    /// Background worker loop.
+    pub async fn run(&self) {
+        while self.running.load(Ordering::SeqCst) {
+            match self.process_batch(50).await {
+                Ok(count) if count > 0 => {
+                    // Items processed; check again immediately
+                    continue;
+                }
+                Ok(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                Err(e) => {
+                    tracing::warn!("Webhook outbox worker error: {}", e);
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
     }
 
     /// Process a batch of scheduled outbox webhook events.
@@ -190,89 +230,102 @@ impl WebhookOutboxWorker {
     ) -> Result<(i32, String), anyhow::Error> {
         let (url, socket_addr) = self.ssrf.validate_and_resolve(&sub.target_url).await?;
 
-        let host = url.host_str().unwrap_or("localhost");
-        let path = if url.path().is_empty() {
-            "/"
-        } else {
-            url.path()
-        };
-        let query = url.query().map(|q| format!("?{}", q)).unwrap_or_default();
-        let target_resource = format!("{}{}", path, query);
-
-        let payload_str = serde_json::to_string(&event.payload)?;
-        let signature =
-            WebhookService::sign_payload(&sub.secret_ciphertext, payload_str.as_bytes());
-
-        // Connect with timeout
-        let connect_fut = TcpStream::connect(socket_addr);
-        let mut stream = timeout(self.timeout_duration, connect_fut).await??;
-
-        // Build HTTP/1.1 POST request
-        let req_str = format!(
-            "POST {} HTTP/1.1\r\n\
-             Host: {}\r\n\
-             User-Agent: Spine-Hookshot/1.0\r\n\
-             Content-Type: application/json\r\n\
-             X-Spine-Event: {}\r\n\
-             X-Spine-Delivery: {}\r\n\
-             X-Spine-Signature-256: {}\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\r\n{}",
-            target_resource,
-            host,
-            event.event_type,
-            event.id,
-            signature,
-            payload_str.len(),
-            payload_str
-        );
-
-        stream.write_all(req_str.as_bytes()).await?;
-        stream.flush().await?;
-
-        // Read response (up to 64 KiB)
-        let mut response_buf = Vec::new();
-        let mut chunk = [0u8; 4096];
-        loop {
-            let read_fut = stream.read(&mut chunk);
-            let n = match timeout(self.timeout_duration, read_fut).await {
-                Ok(Ok(n)) => n,
-                _ => break,
+        timeout(self.timeout_duration, async {
+            let host = url.host_str().unwrap_or("localhost");
+            let path = if url.path().is_empty() {
+                "/"
+            } else {
+                url.path()
             };
-            if n == 0 {
-                break;
+            let query = url.query().map(|q| format!("?{}", q)).unwrap_or_default();
+            let target_resource = format!("{}{}", path, query);
+
+            let payload_str = serde_json::to_string(&event.payload)?;
+            let signature =
+                WebhookService::sign_payload(&sub.secret_ciphertext, payload_str.as_bytes());
+
+            // Connect
+            let tcp_stream = TcpStream::connect(socket_addr).await?;
+            let mut stream = if url.scheme() == "https" {
+                let tls_config = Arc::new(
+                    spine_net::tls::build_client_tls_config(self.root_certs.clone())
+                        .map_err(|e| anyhow::anyhow!("TLS config error: {}", e))?,
+                );
+                SpineStream::upgrade_client(tcp_stream, host, tls_config)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("TLS handshake error: {}", e))?
+            } else {
+                SpineStream::Plain(tcp_stream)
+            };
+
+            // Build HTTP/1.1 POST request
+            let req_str = format!(
+                "POST {} HTTP/1.1\r\n\
+                 Host: {}\r\n\
+                 User-Agent: Spine-Hookshot/1.0\r\n\
+                 Content-Type: application/json\r\n\
+                 X-Spine-Event: {}\r\n\
+                 X-Spine-Delivery: {}\r\n\
+                 X-Spine-Signature-256: {}\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\r\n{}",
+                target_resource,
+                host,
+                event.event_type,
+                event.id,
+                signature,
+                payload_str.len(),
+                payload_str
+            );
+
+            stream.write_all(req_str.as_bytes()).await?;
+            stream.flush().await?;
+
+            // Read response (up to 64 KiB)
+            let mut response_buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = match stream.read(&mut chunk).await {
+                    Ok(n) => n,
+                    _ => break,
+                };
+                if n == 0 {
+                    break;
+                }
+                response_buf.extend_from_slice(&chunk[..n]);
+                if response_buf.len() > 65536 {
+                    break;
+                }
             }
-            response_buf.extend_from_slice(&chunk[..n]);
-            if response_buf.len() > 65536 {
-                break;
+
+            let resp_str = String::from_utf8_lossy(&response_buf);
+            let mut lines = resp_str.lines();
+            let status_line = lines
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("Empty HTTP response"))?;
+
+            let parts: Vec<&str> = status_line.split_whitespace().collect();
+            if parts.len() < 2 {
+                return Err(anyhow::anyhow!(
+                    "Malformed HTTP status line: {}",
+                    status_line
+                ));
             }
-        }
+            let status_code: i32 = parts[1]
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Invalid status code"))?;
 
-        let resp_str = String::from_utf8_lossy(&response_buf);
-        let mut lines = resp_str.lines();
-        let status_line = lines
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("Empty HTTP response"))?;
+            let body = if let Some(idx) = resp_str.find("\r\n\r\n") {
+                resp_str[idx + 4..].to_string()
+            } else if let Some(idx) = resp_str.find("\n\n") {
+                resp_str[idx + 2..].to_string()
+            } else {
+                String::new()
+            };
 
-        let parts: Vec<&str> = status_line.split_whitespace().collect();
-        if parts.len() < 2 {
-            return Err(anyhow::anyhow!(
-                "Malformed HTTP status line: {}",
-                status_line
-            ));
-        }
-        let status_code: i32 = parts[1]
-            .parse()
-            .map_err(|_| anyhow::anyhow!("Invalid status code"))?;
-
-        let body = if let Some(idx) = resp_str.find("\r\n\r\n") {
-            resp_str[idx + 4..].to_string()
-        } else if let Some(idx) = resp_str.find("\n\n") {
-            resp_str[idx + 2..].to_string()
-        } else {
-            String::new()
-        };
-
-        Ok((status_code, body))
+            Ok((status_code, body))
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Webhook delivery timed out after {:?}", self.timeout_duration))?
     }
 }

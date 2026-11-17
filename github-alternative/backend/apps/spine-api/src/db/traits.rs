@@ -529,6 +529,7 @@ pub trait Database: Send + Sync {
         &self,
         item: WebhookOutboxItem,
     ) -> Result<WebhookOutboxItem, ForgeError>;
+    async fn count_pending_webhook_outbox(&self, now_nanos: i64) -> Result<usize, ForgeError>;
     async fn claim_pending_webhook_outbox(
         &self,
         limit: i64,
@@ -566,6 +567,11 @@ pub trait Database: Send + Sync {
         repo_id: &str,
         limit: i64,
     ) -> Result<Vec<WorkflowRun>, ForgeError>;
+    async fn list_active_workflow_runs_for_repo(
+        &self,
+        repo_id: &str,
+    ) -> Result<Vec<WorkflowRun>, ForgeError>;
+    async fn list_active_workflow_repo_ids(&self) -> Result<Vec<String>, ForgeError>;
     async fn update_workflow_run_status(
         &self,
         id: &str,

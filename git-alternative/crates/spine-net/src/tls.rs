@@ -11,9 +11,10 @@ use std::task::{Context, Poll};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+pub use tokio_rustls;
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
-use tokio_rustls::{TlsAcceptor, TlsConnector};
+pub use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 #[derive(Error, Debug)]
 pub enum TlsError {
@@ -74,8 +75,7 @@ pub fn build_client_tls_config(
                 .map_err(|e| TlsError::Certificate(e.to_string()))?;
         }
     } else {
-        // In local development or testing without webpki-roots, add self-signed loopback root if available
-        // For production, roots can be provided via config
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
 
     let config = ClientConfig::builder()

@@ -141,8 +141,9 @@ pub async fn authenticate_git_user(
                 }
             }
         } else if let Some(remote_token) = auth_str.strip_prefix("RemoteAuth ") {
+            let salt = crate::api::routes_lfs::resolve_lfs_secret_salt();
             if let Some(tok) = crate::api::routes_lfs::verify_remote_auth_token(
-                crate::api::routes_lfs::LFS_SECRET_SALT,
+                &salt,
                 remote_token.trim(),
             ) {
                 if let Ok(Some(u)) = state.db.get_user_by_id(&tok.user_id).await {

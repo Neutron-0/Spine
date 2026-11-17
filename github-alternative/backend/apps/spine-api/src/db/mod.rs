@@ -13,7 +13,7 @@ pub use dump::{
 };
 pub use in_memory::InMemoryDatabase;
 pub use migrations::run_migrations;
-pub use postgres::PgDatabase;
+pub use postgres::{DbPoolSettings, PgDatabase};
 pub use selector::{ActiveDatabaseRecord, DatabaseSelector};
 pub use staging::StagedDatabaseRestore;
 pub use traits::Database;

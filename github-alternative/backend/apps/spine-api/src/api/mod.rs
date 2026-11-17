@@ -38,10 +38,23 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 pub fn build_router(state: AppState) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let cors = if state.profile == crate::core::profile::DeploymentProfile::CoreForge {
+        if let Ok(origin_val) = state.public_origin.parse::<axum::http::HeaderValue>() {
+            CorsLayer::new()
+                .allow_origin(origin_val)
+                .allow_methods(Any)
+                .allow_headers(Any)
+        } else {
+            CorsLayer::new()
+                .allow_methods(Any)
+                .allow_headers(Any)
+        }
+    } else {
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any)
+    };
 
     Router::new()
         // Health endpoints

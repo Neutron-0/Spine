@@ -4,6 +4,11 @@ COPY git-alternative ./git-alternative
 RUN cargo build --release --manifest-path git-alternative/Cargo.toml -p spine-storage-node
 
 FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
 RUN groupadd -g 10001 spine && useradd -u 10001 -g spine -s /bin/false -m spine
 RUN mkdir -p /var/lib/spine && chown -R spine:spine /var/lib/spine
 COPY --from=builder /usr/src/spine/git-alternative/target/release/spine-storage-node /usr/local/bin/spine-storage-node

@@ -194,10 +194,13 @@ fn is_prohibited_port(port: u16) -> bool {
         | 139 // NetBIOS
         | 445 // SMB
         | 2049 // NFS
+        | 2222 // Spine SSH Listener
         | 2379 | 2380 // etcd
         | 3306 // MySQL
         | 5432 // PostgreSQL
         | 6379 // Redis
+        | 8400 // Spine Coordinator RPC
+        | 8401 // Spine Storage Node RPC
         | 9200 | 9300 // Elasticsearch
         | 11211 // Memcached
         | 27017 // MongoDB

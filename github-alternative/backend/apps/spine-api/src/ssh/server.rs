@@ -2,7 +2,7 @@ use super::dispatch::GitSshCommand;
 use super::host_key::load_or_generate_host_key;
 use crate::api::middleware::AppState;
 use crate::api::routes_git_http::{ensure_repo_spine_dir, process_git_receive_pack};
-use crate::api::routes_lfs::{generate_remote_auth_token, LFS_SECRET_SALT};
+use crate::api::routes_lfs::{generate_remote_auth_token, resolve_lfs_secret_salt};
 use crate::core::types::{DeployKey, ForgeRepository, User};
 use anyhow::{Context, Result};
 use axum::body::Bytes;
@@ -340,8 +340,9 @@ impl Handler for SshHandler {
                 }
 
                 let exp_sec = chrono::Utc::now().timestamp() + 3600;
+                let salt = resolve_lfs_secret_salt();
                 let token = generate_remote_auth_token(
-                    LFS_SECRET_SALT,
+                    &salt,
                     &identity.actor_id(),
                     &repo_obj.id,
                     &operation,

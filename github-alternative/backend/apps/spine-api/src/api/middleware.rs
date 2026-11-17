@@ -96,7 +96,7 @@ impl AppState {
         let packages = Arc::new(PackageService::new(Arc::clone(&db), Arc::clone(&artifacts)));
         let cargo = Arc::new(CargoRegistryAdapter::new(Arc::clone(&packages)));
 
-        let ssrf = crate::webhook::SsrfValidator::new(true);
+        let ssrf = crate::webhook::SsrfValidator::new(profile != DeploymentProfile::CoreForge);
         let webhooks = Arc::new(crate::webhook::WebhookService::new(
             Arc::clone(&db),
             ssrf.clone(),

@@ -16,3 +16,4 @@ references/sources/
 .env
 .env.local
 *.log
+.superpowers/

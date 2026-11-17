@@ -2391,6 +2391,22 @@ impl Database for InMemoryDatabase {
         Ok(item)
     }
 
+    async fn count_pending_webhook_outbox(&self, now_nanos: i64) -> Result<usize, ForgeError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let count = state
+            .webhook_outbox
+            .values()
+            .filter(|item| {
+                (item.status == "PENDING" && item.next_attempt_at_nanos <= now_nanos)
+                    || (item.status == "PROCESSING" && item.next_attempt_at_nanos <= now_nanos)
+            })
+            .count();
+        Ok(count)
+    }
+
     async fn claim_pending_webhook_outbox(
         &self,
         limit: i64,
@@ -2401,10 +2417,14 @@ impl Database for InMemoryDatabase {
             .write()
             .map_err(|e| ForgeError::Internal(e.to_string()))?;
         let mut claimed = Vec::new();
+        let lease_expiry_nanos = now_nanos + 60 * 1_000_000_000;
         for item in state.webhook_outbox.values_mut() {
-            if item.status == "PENDING" && item.next_attempt_at_nanos <= now_nanos {
+            let eligible = (item.status == "PENDING" && item.next_attempt_at_nanos <= now_nanos)
+                || (item.status == "PROCESSING" && item.next_attempt_at_nanos <= now_nanos);
+            if eligible {
                 item.status = "PROCESSING".into();
                 item.attempts += 1;
+                item.next_attempt_at_nanos = lease_expiry_nanos;
                 claimed.push(item.clone());
                 if claimed.len() >= limit as usize {
                     break;
@@ -2518,6 +2538,41 @@ impl Database for InMemoryDatabase {
         list.sort_by_key(|r| std::cmp::Reverse(r.created_at_nanos));
         list.truncate(limit as usize);
         Ok(list)
+    }
+
+    async fn list_active_workflow_runs_for_repo(
+        &self,
+        repo_id: &str,
+    ) -> Result<Vec<WorkflowRun>, ForgeError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut list: Vec<WorkflowRun> = state
+            .workflow_runs
+            .values()
+            .filter(|r| r.repo_id == repo_id && r.status != "COMPLETED" && r.status != "CANCELLED")
+            .cloned()
+            .collect();
+        // FIFO order ensures older runs are scheduled first without starvation
+        list.sort_by_key(|r| r.created_at_nanos);
+        Ok(list)
+    }
+
+    async fn list_active_workflow_repo_ids(&self) -> Result<Vec<String>, ForgeError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let mut repos: Vec<String> = state
+            .workflow_runs
+            .values()
+            .filter(|r| r.status != "COMPLETED" && r.status != "CANCELLED")
+            .map(|r| r.repo_id.clone())
+            .collect();
+        repos.sort();
+        repos.dedup();
+        Ok(repos)
     }
 
     async fn update_workflow_run_status(

@@ -24,6 +24,7 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pki-types.workspace = true
 rcgen.workspace = true
+webpki-roots.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
