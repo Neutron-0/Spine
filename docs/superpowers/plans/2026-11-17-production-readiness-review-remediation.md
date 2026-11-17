@@ -50,11 +50,11 @@
 - Consumes: `SPINE_AUTH_SECRET_KEY`, `SPINE_LFS_SECRET`, `DeploymentProfile::CoreForge`
 - Produces: `validate_production_secrets()`, secure dynamic salt with random ephemeral fallback.
 
-- [ ] **Step 1: Write failing test verifying default salt cannot forge tokens and production rejects missing secret**
-- [ ] **Step 2: Run test to verify it fails**
-- [ ] **Step 3: Implement `validate_production_secrets` in `main.rs` and replace static salt with `OnceLock` random ephemeral salt in `routes_lfs.rs`**
-- [ ] **Step 4: Run test to verify it passes**
-- [ ] **Step 5: Verify all auth tests pass**
+- [x] **Step 1: Write failing test verifying default salt cannot forge tokens and production rejects missing secret**
+- [x] **Step 2: Run test to verify it fails**
+- [x] **Step 3: Implement `validate_production_secrets` in `main.rs` and replace static salt with `OnceLock` random ephemeral salt in `routes_lfs.rs`**
+- [x] **Step 4: Run test to verify it passes**
+- [x] **Step 5: Verify all auth tests pass**
 
 ---
 
@@ -68,11 +68,11 @@
 - Consumes: Myers diff hunks `DiffHunk { base_start, base_end, replacement }`
 - Produces: Correct range intersection test preventing adjacent non-overlapping edits from grouping into false conflicts.
 
-- [ ] **Step 1: Write test in `three_way_merge_alignment_test.rs` for adjacent line changes**
-- [ ] **Step 2: Run test to verify it fails**
-- [ ] **Step 3: Update hunk grouping logic in `merge_3way_text` so adjacent ranges do not overlap**
-- [ ] **Step 4: Run test to verify it passes**
-- [ ] **Step 5: Verify all `spine-merge` tests pass**
+- [x] **Step 1: Write test in `three_way_merge_alignment_test.rs` for adjacent line changes**
+- [x] **Step 2: Run test to verify it fails**
+- [x] **Step 3: Update hunk grouping logic in `merge_3way_text` so adjacent ranges do not overlap**
+- [x] **Step 4: Run test to verify it passes**
+- [x] **Step 5: Verify all `spine-merge` tests pass**
 
 ---
 
@@ -87,11 +87,11 @@
 - Consumes: `webpki_roots::TLS_SERVER_ROOTS`, `timeout_duration`
 - Produces: Default trusted Mozilla roots for client TLS and full-delivery timeout.
 
-- [ ] **Step 1: Write unit test verifying default TLS config loads WebPKI roots and delivery times out completely on hanging handshake**
-- [ ] **Step 2: Run test to verify it fails**
-- [ ] **Step 3: Update `build_client_tls_config` in `tls.rs` to load `TLS_SERVER_ROOTS` when roots are None, and wrap entire delivery in timeout in `worker.rs`**
-- [ ] **Step 4: Run test to verify it passes**
-- [ ] **Step 5: Verify all webhook tests pass**
+- [x] **Step 1: Write unit test verifying default TLS config loads WebPKI roots and delivery times out completely on hanging handshake**
+- [x] **Step 2: Run test to verify it fails**
+- [x] **Step 3: Update `build_client_tls_config` in `tls.rs` to load `TLS_SERVER_ROOTS` when roots are None, and wrap entire delivery in timeout in `worker.rs`**
+- [x] **Step 4: Run test to verify it passes**
+- [x] **Step 5: Verify all webhook tests pass**
 
 ---
 
@@ -107,11 +107,11 @@
 - Consumes: `claim_pending_webhook_outbox(limit, now_nanos)`
 - Produces: 60-second lease timestamp on claimed items and automatic reclamation of expired `PROCESSING` items.
 
-- [ ] **Step 1: Write test reproducing stranded `PROCESSING` item not being reclaimed**
-- [ ] **Step 2: Run test to verify it fails**
-- [ ] **Step 3: Update `claim_pending_webhook_outbox` in `in_memory.rs` and `postgres.rs` to set lease expiry and reclaim expired processing items**
-- [ ] **Step 4: Run test to verify it passes**
-- [ ] **Step 5: Verify all outbox tests pass**
+- [x] **Step 1: Write test reproducing stranded `PROCESSING` item not being reclaimed**
+- [x] **Step 2: Run test to verify it fails**
+- [x] **Step 3: Update `claim_pending_webhook_outbox` in `in_memory.rs` and `postgres.rs` to set lease expiry and reclaim expired processing items**
+- [x] **Step 4: Run test to verify it passes**
+- [x] **Step 5: Verify all outbox tests pass**
 
 ---
 
@@ -129,11 +129,11 @@
 - Consumes: `list_active_workflow_runs_for_repo(repo_id)`
 - Produces: FIFO active run ordering without starvation; dual `SPINE_DB_*` / `DATABASE_*` configuration support.
 
-- [ ] **Step 1: Write test reproducing starvation when > 100 newer runs exist**
-- [ ] **Step 2: Run test to verify it fails**
-- [ ] **Step 3: Implement `list_active_workflow_runs_for_repo` and update scheduler to use it; update `postgres.rs` to read `SPINE_DB_*` variables**
-- [ ] **Step 4: Run test to verify it passes**
-- [ ] **Step 5: Verify all scheduler and pool tests pass**
+- [x] **Step 1: Write test reproducing starvation when > 100 newer runs exist**
+- [x] **Step 2: Run test to verify it fails**
+- [x] **Step 3: Implement `list_active_workflow_runs_for_repo` and update scheduler to use it; update `postgres.rs` to read `SPINE_DB_*` variables**
+- [x] **Step 4: Run test to verify it passes**
+- [x] **Step 5: Verify all scheduler and pool tests pass**
 
 ---
 
@@ -144,8 +144,8 @@
 - Create Git commit for all remediation changes
 - Build release candidate binaries (`spine-api`, `spine-coordinator`, `spine-storage-node`, `spine`)
 
-- [ ] **Step 1: Run full workspace test suites (`cargo test`)**
-- [ ] **Step 2: Commit all changes with clean commit message**
-- [ ] **Step 3: Build release binaries and compute SHA-256 checksums**
-- [ ] **Step 4: Update `RELEASE_CANDIDATE_MANIFEST.md` to reflect `v0.1.0-rc3` with new checksums and commit hash**
-- [ ] **Step 5: Verify all artifacts and records match**
+- [x] **Step 1: Run full workspace test suites (`cargo test`)**
+- [x] **Step 2: Commit all changes with clean commit message**
+- [x] **Step 3: Build release binaries and compute SHA-256 checksums**
+- [x] **Step 4: Update `RELEASE_CANDIDATE_MANIFEST.md` to reflect `v0.1.0-rc3` with new checksums and commit hash**
+- [x] **Step 5: Verify all artifacts and records match**
