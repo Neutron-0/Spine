@@ -60,15 +60,20 @@ af2ade12b1cae0080a0f29e5b29c83ef43af2a9aff2f47d25328d5e9e9ba60f6  spine-api.exe
   - `Phase 5: VERIFY` — Distributed health check, generation check, and integrity validation across all 7 participants.
   - `Phase 6: GLOBAL FINALIZE` — Retained old generation directories are purged and journal removed only after global verification succeeds across all participants.
 - **Deterministic Startup Recovery:** Pre-decision crashes safely abort staging leaving live storage and database untouched. Post-decision crashes roll forward across all participants, ensuring that database, storage, cluster volumes, and SSH converge on the committed target generation without split-brain risk.
-- **Out-of-Band Volume Backup Runbook ($> 15\text{ MiB}$):** For clusters where individual storage nodes exceed the 15 MiB compressed payload ceiling, documented operational runbook [`docs/OUT_OF_BAND_STORAGE_BACKUP_RUNBOOK.md`](docs/OUT_OF_BAND_STORAGE_BACKUP_RUNBOOK.md) specifies atomic block/filesystem snapshotting, writer draining, and generation alignment procedures.
+- **Out-of-Band Volume Backup Runbook ($> 15\text{ MiB}$):** For clusters where individual storage nodes exceed the 15 MiB compressed payload ceiling, documented operational runbook [`docs/OUT_OF_BAND_STORAGE_BACKUP_RUNBOOK.md`](docs/OUT_OF_BAND_STORAGE_BACKUP_RUNBOOK.md) specifies writer draining, multi-volume archive streaming, and strict automated generation verification. Backed by turnkey operational scripts `scripts/backup_oob.sh` and `scripts/restore_oob.sh`.
 
 ---
 
 ### 5. Reviewer & Operator Environment Verification
 When verifying working tree status from containerized sandboxes, external auditor harnesses (e.g. Codex), or non-default user accounts, Git 2.35.2+ requires directory ownership alignment:
 ```bash
-# Add directory exception to avoid 'fatal: detected dubious ownership' in sandbox runners
-git config --global --add safe.directory D:/Vault/Spine
-# Or execute inline
+# Automated cross-platform verifiers:
+./scripts/verify_workspace_clean.sh      # Linux / WSL / macOS
+.\scripts\verify_workspace_clean.ps1    # Windows PowerShell
+
+# Or direct Git inline command bypassing dubious ownership:
 git -c safe.directory=* status
+
+# Or configure persistent exception:
+git config --global --add safe.directory D:/Vault/Spine
 ```

@@ -82,36 +82,32 @@ To prevent tearing across distributed chunk stores and PostgreSQL, in-flight wri
    ```
    Record the current fencing generation (`GENERATION_TOKEN=42`).
 
-### Phase 2: Capture Storage Snapshots
+### Phase 2: Capture Multi-Volume Backup (Canonical Production Procedure)
 
-With active mutations drained and write permits rejected with HTTP 503, snapshot all volumes consistently.
+With active mutations drained and write permits rejected with HTTP 503, capture all volumes consistently.
 
-> [!NOTE]
-> **Strategy Selection & Deployment Validation Matrix:**
-> - **Strategy C (Quiesced Archive Streaming):** The **baseline cross-platform standard** validated in code by automated integration regression `test_out_of_band_storage_backup_and_restore_above_15mib`. It operates independently of underlying cloud infrastructure across any Docker Compose, Kubernetes PersistentVolume, or bare-metal environment.
-> - **Strategy A (Cloud Block Storage EBS/PD) & Strategy B (ZFS/LVM):** Requires platform engineering validation on the target deployment host. Before adopting Strategy A or B in production, operators must perform a validation dry run using the checklist in Section 4.1 to verify that multi-volume snapshot groups freeze all disks at the exact same instant without tearing.
+> [!IMPORTANT]
+> **Canonical Certified Production Procedure (Quiesced Multi-Volume Archive Streaming):**
+> This procedure is the authoritative, cloud-agnostic disaster recovery standard for Spine Forge clusters when storage exceeds 15 MiB. It operates uniformly across Docker Compose, Kubernetes, and bare-metal environments, and is backed by the turnkey script `scripts/backup_oob.sh` and automated regression test `test_out_of_band_storage_backup_and_restore_above_15mib`.
+> *(For optional cloud hypervisor volume snapshots such as AWS EBS / GCP PD, see Appendix A).*
 
-#### Strategy A: Cloud Block Storage (AWS EBS / GCP Persistent Disk)
-Create a multi-volume crash-consistent snapshot group containing all underlying block volumes:
+Execute the automated backup script:
 ```bash
-# Example AWS CLI volume snapshot group
-aws ec2 create-snapshots \
-  --instance-specification InstanceId=i-0123456789abcdef0 \
-  --description "spine-forge-oob-backup-gen-${GENERATION_TOKEN}-$(date +%Y%m%d%H%M%S)" \
-  --tag-specifications "ResourceType=snapshot,Tags=[{Key=SpineFencingGen,Value=${GENERATION_TOKEN}}]"
+# Set environment variables and execute canonical backup
+export SPINE_API_URL="http://127.0.0.1:3000"
+export SPINE_ADMIN_TOKEN="<administrative-token>"
+export BACKUP_ROOT="/mnt/backups/spine"
+
+./scripts/backup_oob.sh
 ```
 
-#### Strategy B: Enterprise Filesystem Snapshots (OpenZFS)
-```bash
-SNAPSHOT_NAME="oob-backup-gen-${GENERATION_TOKEN}-$(date +%s)"
-zfs snapshot -r zpool-spine/volumes@${SNAPSHOT_NAME}
-```
-
-#### Strategy C: Quiesced Archive Streaming (Host Filesystem / Object Storage)
-If snapshot-capable block storage is not present, stream compressed tarballs directly to an external backup destination:
+Or execute the canonical snapshot steps manually:
 ```bash
 BACKUP_DIR="/mnt/backups/spine/$(date +%Y%m%d_%H%M%S)_gen_${GENERATION_TOKEN}"
 mkdir -p "${BACKUP_DIR}"
+
+# 0. Record target fencing generation token
+echo "${GENERATION_TOKEN}" > "${BACKUP_DIR}/FENCING_GENERATION"
 
 # 1. Database snapshot
 docker exec spine-forge-postgres pg_dumpall -U spine_admin | gzip > "${BACKUP_DIR}/postgres_dump.sql.gz"
@@ -121,7 +117,7 @@ docker exec spine-coordinator tar -czf - -C /var/lib/spine . > "${BACKUP_DIR}/co
 
 # 3. Storage node volumes
 for NODE in 1 2 3; do
-  docker exec spine-storage-node-${NODE} tar -czf - -C /var/lib/spine/node-${NODE} . > "${BACKUP_DIR}/storage_node_${NODE}.tar.gz"
+  docker exec "spine-storage-node-${NODE}" tar -czf - -C "/var/lib/spine/node-${NODE}" . > "${BACKUP_DIR}/storage_node_${NODE}.tar.gz"
 done
 
 # 4. Host SSH keys & API storage
@@ -148,7 +144,7 @@ curl -s -f http://127.0.0.1:3000/health/ready || echo "Cluster not ready!"
 
 ## 5. Point-in-Time Out-of-Band Disaster Recovery Procedure
 
-Follow these steps to restore a Spine Forge cluster from an out-of-band snapshot.
+Follow these steps to restore a Spine Forge cluster from an out-of-band snapshot archive (or execute `./scripts/restore_oob.sh <path-to-backup-dir>`).
 
 ### Step 1: Quiesce Traffic & Stop Running Containers
 
@@ -163,7 +159,15 @@ Follow these steps to restore a Spine Forge cluster from an out-of-band snapshot
 
 ### Step 2: Restore Volumes & Clean Leftover Staging Files
 
-1. **Restore Volumes:** Attach/restore the block volume snapshots or untar the backup archive into the corresponding volume directories.
+1. **Restore Volumes:** Extract the verified backup archive into the corresponding volume directories:
+   ```bash
+   tar -xzf "${BACKUP_DIR}/coordinator.tar.gz" -C /var/lib/spine
+   for NODE in 1 2 3; do
+     tar -xzf "${BACKUP_DIR}/storage_node_${NODE}.tar.gz" -C "/var/lib/spine/node-${NODE}"
+   done
+   tar -xzf "${BACKUP_DIR}/spine_ssh.tar.gz" -C /var/lib/spine/ssh
+   tar -xzf "${BACKUP_DIR}/spine_storage.tar.gz" -C /var/lib/spine/storage
+   ```
 2. **Remove Ephemeral Staging Directories:**
    Ensure no leftover partial staging directories exist:
    ```bash
@@ -173,25 +177,46 @@ Follow these steps to restore a Spine Forge cluster from an out-of-band snapshot
    done
    ```
 
-### Step 3: Fencing Generation Verification & Strict Divergence Prohibition
+### Step 3: Automated Fail-Closed Fencing Generation Verification
 
-Verify that `.fencing_generation` on all storage nodes and `.coordinator_fencing_generation` on the coordinator match the target recovery generation token:
+Run the automated verification script to confirm that all nodes match the target generation token. **Execution will abort immediately with exit code 1 if any node diverges.**
+
 ```bash
+TARGET_GEN=$(cat "${BACKUP_DIR}/FENCING_GENERATION" | tr -d '[:space:]')
+FAILED=0
+
+COORD_GEN=$(cat /var/lib/spine/.coordinator_fencing_generation 2>/dev/null || echo "MISSING")
+if [ "${COORD_GEN}" != "${TARGET_GEN}" ]; then
+  echo "FATAL: Coordinator generation (${COORD_GEN}) does not match target generation (${TARGET_GEN})."
+  FAILED=1
+else
+  echo "Coordinator generation: ${COORD_GEN} [OK]"
+fi
+
 for NODE in 1 2 3; do
-  echo -n "Node ${NODE} generation: "
-  cat /var/lib/spine/node-${NODE}/.fencing_generation
-  echo ""
+  NODE_GEN=$(cat "/var/lib/spine/node-${NODE}/.fencing_generation" 2>/dev/null || echo "MISSING")
+  if [ "${NODE_GEN}" != "${TARGET_GEN}" ]; then
+    echo "FATAL: Storage node ${NODE} generation (${NODE_GEN}) diverged from target generation (${TARGET_GEN})."
+    FAILED=1
+  else
+    echo "Storage node ${NODE} generation: ${NODE_GEN} [OK]"
+  fi
 done
-echo -n "Coordinator generation: "
-cat /var/lib/spine/.coordinator_fencing_generation
-echo ""
+
+if [ ${FAILED} -ne 0 ]; then
+  echo "CRITICAL: Generation divergence detected across restored participants."
+  echo "RESTORE HALTED. DO NOT MANUALLY OVERWRITE OR EDIT .fencing_generation FILES."
+  echo "Proceed to the Defined Fencing Recovery Procedure below."
+  exit 1
+fi
+echo "All nodes verified at fencing generation ${TARGET_GEN}. Safe to proceed."
 ```
 
 > [!CAUTION]
 > **STRICT FAIL-CLOSED POLICY — DO NOT MANUALLY OVERWRITE FENCING GENERATIONS:**
-> All storage nodes and the coordinator **MUST** report the identical integer generation matching the recorded `${GENERATION_TOKEN}` from Phase 1. 
+> All storage nodes and the coordinator **MUST** report the identical integer generation matching the recorded `${GENERATION_TOKEN}` from Phase 1.
 > 
-> Under no circumstances should an operator manually overwrite, edit, or force a node's `.fencing_generation` file. Overriding fencing tokens manually bypasses distributed consensus safeguards, allows stale nodes to accept conflicting writes, and masks split-brain volume tearing.
+> **NEVER MANUALLY EDIT, OVERWRITE, OR FORCE A NODE'S `.fencing_generation` OR `.coordinator_fencing_generation` FILE.** Overriding fencing tokens manually bypasses distributed consensus safeguards, allows stale nodes to accept conflicting writes, and masks split-brain volume tearing.
 > 
 > **Defined Fencing Recovery Procedure (If Divergence Occurs):**
 > 1. **Halt the Restore Immediately:** Do not proceed to Step 4 or start the cluster services.
@@ -273,3 +298,29 @@ Every Out-of-Band backup and restore operation must be recorded in the site oper
 3. Storage node volume SHA-256 digests
 4. Verification test output
 5. Operator signature
+
+---
+
+## Appendix A: Infrastructure-Level Volume Snapshotting (Optional Cloud / SAN Offload)
+
+> [!NOTE]
+> **Qualification Requirement for Infrastructure Snapshots:**
+> Cloud block storage (AWS EBS, GCP Persistent Disk) and enterprise filesystems (OpenZFS, NetApp) can optionally be used by platform teams to snapshot volumes at the hypervisor level during Phase 1 maintenance mode. Because these mechanisms depend on cloud provider control planes and virtualization hypervisors outside the software control plane, platform engineering teams MUST qualify the multi-volume snapshot consistency of their infrastructure before deploying it in production:
+> 1. Execute a pre-production dry run using `scripts/backup_oob.sh` as the baseline.
+> 2. Create the cloud volume snapshot group while the cluster is in Phase 1 maintenance mode (`active_writers == 0`).
+> 3. Restore the cloud snapshot to a test cluster and execute `scripts/restore_oob.sh` or Step 3 automated verification.
+> 4. Ensure `spine-storage-node --verify-integrity` passes 100% on all restored volumes before approving the infrastructure snapshot mechanism.
+
+### AWS EBS Multi-Volume Crash-Consistent Snapshot Group
+```bash
+aws ec2 create-snapshots \
+  --instance-specification InstanceId="${INSTANCE_ID}" \
+  --description "spine-forge-oob-backup-gen-${GENERATION_TOKEN}-$(date +%Y%m%d%H%M%S)" \
+  --tag-specifications "ResourceType=snapshot,Tags=[{Key=SpineFencingGen,Value=${GENERATION_TOKEN}}]"
+```
+
+### OpenZFS Recursive Dataset Snapshot
+```bash
+SNAPSHOT_NAME="oob-backup-gen-${GENERATION_TOKEN}-$(date +%s)"
+zfs snapshot -r zpool-spine/volumes@${SNAPSHOT_NAME}
+```
