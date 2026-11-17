@@ -141,7 +141,7 @@ pub async fn list_runs(
 
 pub async fn get_run(
     State(state): State<AppState>,
-    _user: Option<Extension<User>>,
+    user: Option<Extension<User>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let run = state
@@ -149,6 +149,8 @@ pub async fn get_run(
         .get_run(&id)
         .await?
         .ok_or_else(|| ForgeError::NotFound("Workflow run not found".into()))?;
+    let caller_id = user.as_ref().map(|Extension(u)| u.id.as_str());
+    state.permissions.require_repo_read(caller_id, &run.repo_id).await?;
     Ok(Json(run))
 }
 
@@ -181,16 +183,23 @@ pub async fn cancel_run(
 
 pub async fn list_jobs(
     State(state): State<AppState>,
-    _user: Option<Extension<User>>,
+    user: Option<Extension<User>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let run = state
+        .workflows
+        .get_run(&id)
+        .await?
+        .ok_or_else(|| ForgeError::NotFound("Workflow run not found".into()))?;
+    let caller_id = user.as_ref().map(|Extension(u)| u.id.as_str());
+    state.permissions.require_repo_read(caller_id, &run.repo_id).await?;
     let jobs = state.workflows.list_jobs(&id).await?;
     Ok(Json(jobs))
 }
 
 pub async fn get_job(
     State(state): State<AppState>,
-    _user: Option<Extension<User>>,
+    user: Option<Extension<User>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let job = state
@@ -198,23 +207,39 @@ pub async fn get_job(
         .get_job(&id)
         .await?
         .ok_or_else(|| ForgeError::NotFound("Job not found".into()))?;
+    let caller_id = user.as_ref().map(|Extension(u)| u.id.as_str());
+    state.permissions.require_repo_read(caller_id, &job.repo_id).await?;
     Ok(Json(job))
 }
 
 pub async fn list_steps(
     State(state): State<AppState>,
-    _user: Option<Extension<User>>,
+    user: Option<Extension<User>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let job = state
+        .workflows
+        .get_job(&id)
+        .await?
+        .ok_or_else(|| ForgeError::NotFound("Job not found".into()))?;
+    let caller_id = user.as_ref().map(|Extension(u)| u.id.as_str());
+    state.permissions.require_repo_read(caller_id, &job.repo_id).await?;
     let steps = state.workflows.list_steps(&id).await?;
     Ok(Json(steps))
 }
 
 pub async fn list_logs(
     State(state): State<AppState>,
-    _user: Option<Extension<User>>,
+    user: Option<Extension<User>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let job = state
+        .workflows
+        .get_job(&id)
+        .await?
+        .ok_or_else(|| ForgeError::NotFound("Job not found".into()))?;
+    let caller_id = user.as_ref().map(|Extension(u)| u.id.as_str());
+    state.permissions.require_repo_read(caller_id, &job.repo_id).await?;
     let logs = state.workflows.list_logs(&id).await?;
     Ok(Json(logs))
 }

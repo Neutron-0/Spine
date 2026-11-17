@@ -340,12 +340,7 @@ pub fn merge_3way_text(base: &str, ours: &str, theirs: &str) -> TextMergeResult 
                 out.push_str(l);
                 out.push('\n');
             }
-        } else if !group_o.is_empty() && group_t.is_empty() {
-            for l in &ours_slice {
-                out.push_str(l);
-                out.push('\n');
-            }
-        } else if ours_slice == theirs_slice {
+        } else if (!group_o.is_empty() && group_t.is_empty()) || ours_slice == theirs_slice {
             for l in &ours_slice {
                 out.push_str(l);
                 out.push('\n');

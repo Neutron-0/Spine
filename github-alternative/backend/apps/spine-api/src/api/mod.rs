@@ -476,6 +476,25 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/actions/jobs/:id/logs",
             get(routes_workflows::list_logs),
         )
+        // Aliases for /api/v1/workflows
+        .route("/api/v1/workflows/runs/:id", get(routes_workflows::get_run))
+        .route(
+            "/api/v1/workflows/runs/:id/cancel",
+            post(routes_workflows::cancel_run),
+        )
+        .route(
+            "/api/v1/workflows/runs/:id/jobs",
+            get(routes_workflows::list_jobs),
+        )
+        .route("/api/v1/workflows/jobs/:id", get(routes_workflows::get_job))
+        .route(
+            "/api/v1/workflows/jobs/:id/steps",
+            get(routes_workflows::list_steps),
+        )
+        .route(
+            "/api/v1/workflows/jobs/:id/logs",
+            get(routes_workflows::list_logs),
+        )
         // Runners (Batch 12)
         .route("/api/v1/runners", get(routes_runners::list_runners))
         .route(

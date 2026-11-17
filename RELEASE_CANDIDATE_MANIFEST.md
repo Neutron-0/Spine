@@ -11,7 +11,7 @@
 Artifacts compiled and verified in `target/release-candidate/`:
 
 ```
-c6f49680fc168e3d962a96ff161692ba09f82955eff1f2f12239a1b8fa4dbdd2  spine-api.exe
+8c06ba6fa63e9dd7cbc58f728ee4b692f7a1d2c8d71885c3d56d3d0fe4c22fc8  spine-api.exe
 3365beee12afac10cbfef3a5619977fd5e18b0e8be9e4949b0c5942409caa1b7  spine-coordinator.exe
 30fa249c48aca72008f522295e223e0bac63ac4aee97374e6a648faa7accc72b  spine-storage-node.exe
 92b1bbde6fc96a99a0bf44dff2f70930c9301431e095fb403c50ead6325f73e3  spine.exe
