@@ -4,6 +4,7 @@
 # Canonical Certified Procedure for Clusters > 15 MiB
 # ==============================================================================
 set -euo pipefail
+umask 077
 
 BACKUP_DIR="${1:-}"
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
@@ -45,6 +46,7 @@ echo "All cluster services confirmed stopped."
 # Set up external rollback directory outside container volume paths
 ROLLBACK_DIR="${BACKUP_DIR}/.pre_restore_rollback_$(date +%s)"
 mkdir -p "${ROLLBACK_DIR}"
+chmod 700 "${ROLLBACK_DIR}"
 
 RESTORE_SUCCESS=0
 VOLUMES_MODIFIED=0
@@ -59,45 +61,109 @@ rollback_volumes() {
       echo "CRITICAL: Restore failed after volume modification. EXECUTING AUTOMATIC ROLLBACK." >&2
       echo "Reverting all cluster volumes to pre-restore state..." >&2
 
-      # Stop any partially started services
+      # Stop any partially started services (ensure cluster is completely stopped)
       docker compose -f "${COMPOSE_FILE}" stop ingress spine-api storage-node-1 storage-node-2 storage-node-3 coordinator postgres spine-frontend >/dev/null 2>&1 || true
+
+      ROLLBACK_FAILED=0
 
       # Roll back Coordinator
       if [ -f "${ROLLBACK_DIR}/coordinator.tar.gz" ]; then
         echo "Rolling back Coordinator volume..." >&2
-        docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh coordinator \
-          -c "rm -rf /var/lib/spine/* /var/lib/spine/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine" < "${ROLLBACK_DIR}/coordinator.tar.gz" >/dev/null 2>&1 || true
+        if ! docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh coordinator \
+          -c "rm -rf /var/lib/spine/* /var/lib/spine/.[!.]* && tar -xzf - -C /var/lib/spine" < "${ROLLBACK_DIR}/coordinator.tar.gz"; then
+          echo "ERROR: Failed to extract rollback archive for Coordinator!" >&2
+          ROLLBACK_FAILED=1
+        elif ! docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint test coordinator -f /var/lib/spine/.coordinator_fencing_generation; then
+          echo "ERROR: Coordinator volume verification failed after rollback (.coordinator_fencing_generation missing)!" >&2
+          ROLLBACK_FAILED=1
+        else
+          echo "Coordinator volume rolled back and verified [OK]" >&2
+        fi
+      else
+        echo "ERROR: Missing rollback archive for Coordinator (${ROLLBACK_DIR}/coordinator.tar.gz)!" >&2
+        ROLLBACK_FAILED=1
       fi
 
       # Roll back Storage Nodes
       for NODE in 1 2 3; do
         if [ -f "${ROLLBACK_DIR}/storage_node_${NODE}.tar.gz" ]; then
           echo "Rolling back Storage Node ${NODE} volume..." >&2
-          docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
-            -c "rm -rf /var/lib/spine/node-${NODE}/* /var/lib/spine/node-${NODE}/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine/node-${NODE}" < "${ROLLBACK_DIR}/storage_node_${NODE}.tar.gz" >/dev/null 2>&1 || true
+          if ! docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
+            -c "rm -rf /var/lib/spine/node-${NODE}/* /var/lib/spine/node-${NODE}/.[!.]* && tar -xzf - -C /var/lib/spine/node-${NODE}" < "${ROLLBACK_DIR}/storage_node_${NODE}.tar.gz"; then
+            echo "ERROR: Failed to extract rollback archive for Storage Node ${NODE}!" >&2
+            ROLLBACK_FAILED=1
+          elif ! docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint test "storage-node-${NODE}" -f "/var/lib/spine/node-${NODE}/.fencing_generation"; then
+            echo "ERROR: Storage Node ${NODE} volume verification failed after rollback (.fencing_generation missing)!" >&2
+            ROLLBACK_FAILED=1
+          else
+            echo "Storage Node ${NODE} volume rolled back and verified [OK]" >&2
+          fi
+        else
+          echo "ERROR: Missing rollback archive for Storage Node ${NODE} (${ROLLBACK_DIR}/storage_node_${NODE}.tar.gz)!" >&2
+          ROLLBACK_FAILED=1
         fi
       done
 
-      # Roll back API storage and SSH
+      # Roll back API SSH
       if [ -f "${ROLLBACK_DIR}/spine_ssh.tar.gz" ]; then
         echo "Rolling back API SSH volume..." >&2
-        docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh spine-api \
-          -c "rm -rf /var/lib/spine/ssh/* /var/lib/spine/ssh/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine/ssh" < "${ROLLBACK_DIR}/spine_ssh.tar.gz" >/dev/null 2>&1 || true
+        if ! docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh spine-api \
+          -c "rm -rf /var/lib/spine/ssh/* /var/lib/spine/ssh/.[!.]* && tar -xzf - -C /var/lib/spine/ssh" < "${ROLLBACK_DIR}/spine_ssh.tar.gz"; then
+          echo "ERROR: Failed to extract rollback archive for API SSH!" >&2
+          ROLLBACK_FAILED=1
+        else
+          echo "API SSH volume rolled back [OK]" >&2
+        fi
+      else
+        echo "ERROR: Missing rollback archive for API SSH (${ROLLBACK_DIR}/spine_ssh.tar.gz)!" >&2
+        ROLLBACK_FAILED=1
       fi
+
+      # Roll back API storage
       if [ -f "${ROLLBACK_DIR}/spine_storage.tar.gz" ]; then
         echo "Rolling back API storage volume..." >&2
-        docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh spine-api \
-          -c "rm -rf /var/lib/spine/storage/* /var/lib/spine/storage/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine/storage" < "${ROLLBACK_DIR}/spine_storage.tar.gz" >/dev/null 2>&1 || true
+        if ! docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh spine-api \
+          -c "rm -rf /var/lib/spine/storage/* /var/lib/spine/storage/.[!.]* && tar -xzf - -C /var/lib/spine/storage" < "${ROLLBACK_DIR}/spine_storage.tar.gz"; then
+          echo "ERROR: Failed to extract rollback archive for API storage!" >&2
+          ROLLBACK_FAILED=1
+        else
+          echo "API storage volume rolled back [OK]" >&2
+        fi
+      else
+        echo "ERROR: Missing rollback archive for API storage (${ROLLBACK_DIR}/spine_storage.tar.gz)!" >&2
+        ROLLBACK_FAILED=1
       fi
 
       # Roll back PostgreSQL
       if [ -f "${ROLLBACK_DIR}/postgres_data.tar.gz" ]; then
         echo "Rolling back PostgreSQL volume..." >&2
-        docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh postgres \
-          -c "rm -rf /var/lib/postgresql/data/* /var/lib/postgresql/data/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/postgresql/data" < "${ROLLBACK_DIR}/postgres_data.tar.gz" >/dev/null 2>&1 || true
+        if ! docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh postgres \
+          -c "rm -rf /var/lib/postgresql/data/* /var/lib/postgresql/data/.[!.]* && tar -xzf - -C /var/lib/postgresql/data" < "${ROLLBACK_DIR}/postgres_data.tar.gz"; then
+          echo "ERROR: Failed to extract rollback archive for PostgreSQL!" >&2
+          ROLLBACK_FAILED=1
+        elif ! docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint test postgres -f /var/lib/postgresql/data/PG_VERSION; then
+          echo "ERROR: PostgreSQL volume verification failed after rollback (PG_VERSION missing)!" >&2
+          ROLLBACK_FAILED=1
+        else
+          echo "PostgreSQL volume rolled back and verified [OK]" >&2
+        fi
+      else
+        echo "ERROR: Missing rollback archive for PostgreSQL (${ROLLBACK_DIR}/postgres_data.tar.gz)!" >&2
+        ROLLBACK_FAILED=1
       fi
 
-      echo "Rollback complete. Volumes restored to pre-restore state." >&2
+      if [ "${ROLLBACK_FAILED}" -ne 0 ]; then
+        echo "================================================================================" >&2
+        echo "CRITICAL FATAL: Automatic rollback FAILED on one or more cluster volumes." >&2
+        echo "Cluster services remain STRICTLY STOPPED to prevent further data corruption." >&2
+        echo "Rollback artifacts retained for emergency operator inspection at: ${ROLLBACK_DIR}" >&2
+        echo "OPERATOR ACTION REQUIRED: Do NOT start services. Inspect failed volumes manually." >&2
+        echo "================================================================================" >&2
+        exit 2
+      fi
+
+      echo "Rollback complete and all volumes verified. Cluster reverted to pre-restore state." >&2
+      echo "Cluster remains stopped to allow operator investigation." >&2
       echo "Rollback artifacts retained for manual inspection at: ${ROLLBACK_DIR}" >&2
       echo "================================================================================" >&2
     fi

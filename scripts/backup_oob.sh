@@ -4,6 +4,7 @@
 # Canonical Certified Procedure for Clusters > 15 MiB
 # ==============================================================================
 set -euo pipefail
+umask 077
 
 SPINE_API_URL="${SPINE_API_URL:-http://127.0.0.1:3000}"
 SPINE_ADMIN_TOKEN="${SPINE_ADMIN_TOKEN:-}"
@@ -106,7 +107,17 @@ echo "Unanimous fencing generation token verified: ${GENERATION_TOKEN}"
 
 TIMESTAMP=$(date -u +%Y%m%d_%H%M%SZ)
 BACKUP_DIR="${BACKUP_ROOT}/${TIMESTAMP}_gen_${GENERATION_TOKEN}"
+mkdir -p "${BACKUP_ROOT}"
+chmod 700 "${BACKUP_ROOT}" 2>/dev/null || true
 mkdir -p "${BACKUP_DIR}"
+chmod 700 "${BACKUP_DIR}"
+
+# Fail-closed permission check on newly created backup directory
+DIR_MODE=$(stat -c "%a" "${BACKUP_DIR}" 2>/dev/null || stat -f "%Lp" "${BACKUP_DIR}" 2>/dev/null || echo "")
+if [ -n "${DIR_MODE}" ] && [ "${DIR_MODE}" != "700" ]; then
+  echo "FATAL: Insecure permissions detected on backup directory ${BACKUP_DIR}: mode is ${DIR_MODE}, expected 700." >&2
+  exit 1
+fi
 
 echo "=== Phase 2: Capturing Multi-Volume Snapshots to ${BACKUP_DIR} ==="
 
@@ -166,6 +177,11 @@ docker compose -f "${COMPOSE_FILE}" exec -T spine-api \
 # 5. Checksum manifest
 echo "Generating SHA-256 checksum manifest..."
 (cd "${BACKUP_DIR}" && sha256sum * > SHA256SUMS)
+
+# 6. Enforce and verify restrictive permissions on all captured backup artifacts
+echo "Enforcing restrictive permissions (0600 files, 0700 dir) on backup artifacts..."
+chmod 600 "${BACKUP_DIR}"/*
+chmod 700 "${BACKUP_DIR}"
 
 echo "=== Phase 3: Releasing Maintenance Barrier & Verifying Cluster Health ==="
 curl -s -f -X POST "${SPINE_API_URL}/api/v1/admin/maintenance/release" \
