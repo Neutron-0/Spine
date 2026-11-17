@@ -109,20 +109,20 @@ mkdir -p "${BACKUP_DIR}"
 # 0. Record target fencing generation token
 echo "${GENERATION_TOKEN}" > "${BACKUP_DIR}/FENCING_GENERATION"
 
-# 1. Database snapshot
-docker exec spine-forge-postgres pg_dumpall -U spine_admin | gzip > "${BACKUP_DIR}/postgres_dump.sql.gz"
+# 1. Database snapshot via compose
+docker compose -f docker-compose.prod.yml exec -T postgres pg_dumpall -U spine_admin | gzip > "${BACKUP_DIR}/postgres_dump.sql.gz"
 
 # 2. Coordinator state
-docker exec spine-coordinator tar -czf - -C /var/lib/spine . > "${BACKUP_DIR}/coordinator.tar.gz"
+docker compose -f docker-compose.prod.yml exec -T coordinator tar -czf - -C /var/lib/spine . > "${BACKUP_DIR}/coordinator.tar.gz"
 
 # 3. Storage node volumes
 for NODE in 1 2 3; do
-  docker exec "spine-storage-node-${NODE}" tar -czf - -C "/var/lib/spine/node-${NODE}" . > "${BACKUP_DIR}/storage_node_${NODE}.tar.gz"
+  docker compose -f docker-compose.prod.yml exec -T "storage-node-${NODE}" tar -czf - -C "/var/lib/spine/node-${NODE}" . > "${BACKUP_DIR}/storage_node_${NODE}.tar.gz"
 done
 
 # 4. Host SSH keys & API storage
-docker exec spine-forge-api tar -czf - -C /var/lib/spine/ssh . > "${BACKUP_DIR}/spine_ssh.tar.gz"
-docker exec spine-forge-api tar -czf - -C /var/lib/spine/storage . > "${BACKUP_DIR}/spine_storage.tar.gz"
+docker compose -f docker-compose.prod.yml exec -T spine-api tar -czf - -C /var/lib/spine/ssh . > "${BACKUP_DIR}/spine_ssh.tar.gz"
+docker compose -f docker-compose.prod.yml exec -T spine-api tar -czf - -C /var/lib/spine/storage . > "${BACKUP_DIR}/spine_storage.tar.gz"
 
 # 5. Checksum manifest
 cd "${BACKUP_DIR}" && sha256sum * > SHA256SUMS
@@ -159,33 +159,45 @@ Follow these steps to restore a Spine Forge cluster from an out-of-band snapshot
 
 ### Step 2: Restore Volumes & Clean Leftover Staging Files
 
-1. **Restore Volumes:** Extract the verified backup archive into the corresponding volume directories:
+1. **Remove Ephemeral Staging Directories:**
+   Clean any leftover partial staging directories inside storage containers (using unquoted wildcards inside the container shell):
    ```bash
-   tar -xzf "${BACKUP_DIR}/coordinator.tar.gz" -C /var/lib/spine
    for NODE in 1 2 3; do
-     tar -xzf "${BACKUP_DIR}/storage_node_${NODE}.tar.gz" -C "/var/lib/spine/node-${NODE}"
+     docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
+       -c "rm -rf /var/lib/spine/node-${NODE}/.staged_restore_* /var/lib/spine/node-${NODE}/.old_restore_* 2>/dev/null || true"
    done
-   tar -xzf "${BACKUP_DIR}/spine_ssh.tar.gz" -C /var/lib/spine/ssh
-   tar -xzf "${BACKUP_DIR}/spine_storage.tar.gz" -C /var/lib/spine/storage
    ```
-2. **Remove Ephemeral Staging Directories:**
-   Ensure no leftover partial staging directories exist:
+
+2. **Restore Archive Volumes into Named Docker Volumes:**
+   Extract the verified backup archives directly into the container volumes using Docker Compose:
    ```bash
+   # Coordinator state into coordinator_data volume
+   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh coordinator \
+     -c "tar -xzf - -C /var/lib/spine" < "${BACKUP_DIR}/coordinator.tar.gz"
+
+   # Storage nodes into storage_1_data, storage_2_data, storage_3_data volumes
    for NODE in 1 2 3; do
-     rm -rf /var/lib/spine/node-${NODE}/.staged_restore_*
-     rm -rf /var/lib/spine/node-${NODE}/.old_restore_*
+     docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
+       -c "tar -xzf - -C /var/lib/spine/node-${NODE}" < "${BACKUP_DIR}/storage_node_${NODE}.tar.gz"
    done
+
+   # API SSH host keys and storage cache
+   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh spine-api \
+     -c "tar -xzf - -C /var/lib/spine/ssh" < "${BACKUP_DIR}/spine_ssh.tar.gz"
+   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh spine-api \
+     -c "tar -xzf - -C /var/lib/spine/storage" < "${BACKUP_DIR}/spine_storage.tar.gz"
    ```
 
 ### Step 3: Automated Fail-Closed Fencing Generation Verification
 
-Run the automated verification script to confirm that all nodes match the target generation token. **Execution will abort immediately with exit code 1 if any node diverges.**
+Run the automated verification script to confirm that all nodes match the target generation token directly inside their respective volumes. **Execution will abort immediately with exit code 1 if any node diverges.**
 
 ```bash
 TARGET_GEN=$(cat "${BACKUP_DIR}/FENCING_GENERATION" | tr -d '[:space:]')
 FAILED=0
 
-COORD_GEN=$(cat /var/lib/spine/.coordinator_fencing_generation 2>/dev/null || echo "MISSING")
+COORD_GEN=$(docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint cat coordinator \
+  /var/lib/spine/.coordinator_fencing_generation 2>/dev/null | tr -d '[:space:]' || echo "MISSING")
 if [ "${COORD_GEN}" != "${TARGET_GEN}" ]; then
   echo "FATAL: Coordinator generation (${COORD_GEN}) does not match target generation (${TARGET_GEN})."
   FAILED=1
@@ -194,7 +206,8 @@ else
 fi
 
 for NODE in 1 2 3; do
-  NODE_GEN=$(cat "/var/lib/spine/node-${NODE}/.fencing_generation" 2>/dev/null || echo "MISSING")
+  NODE_GEN=$(docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint cat "storage-node-${NODE}" \
+    "/var/lib/spine/node-${NODE}/.fencing_generation" 2>/dev/null | tr -d '[:space:]' || echo "MISSING")
   if [ "${NODE_GEN}" != "${TARGET_GEN}" ]; then
     echo "FATAL: Storage node ${NODE} generation (${NODE_GEN}) diverged from target generation (${TARGET_GEN})."
     FAILED=1
@@ -225,7 +238,8 @@ echo "All nodes verified at fencing generation ${TARGET_GEN}. Safe to proceed."
 > 4. **Quorum Reconciliation:** If the coordinator generation matches the snapshot token and at least a quorum (2 of 3) of storage nodes match, start only the matching nodes and run the coordinator anti-entropy repair command:
 >    ```bash
 >    docker compose -f docker-compose.prod.yml run --rm coordinator \
->      /usr/local/bin/spine-coordinator --repair-generation --expected-gen "${GENERATION_TOKEN}"
+>      repair-generation --expected-gen "${GENERATION_TOKEN}"
+>    # (Note: flag format is also accepted: --repair-generation --expected-gen "${GENERATION_TOKEN}")
 >    ```
 > 5. **Unresolvable Divergence:** If generation consensus cannot be established, abort the restore and fall back to the previous known consistent snapshot set.
 
@@ -234,20 +248,43 @@ echo "All nodes verified at fencing generation ${TARGET_GEN}. Safe to proceed."
 Run an offline integrity check on each storage node volume to verify chunk manifests and repository references:
 ```bash
 for NODE in 1 2 3; do
-  docker run --rm \
-    -v spine_storage_${NODE}_data:/var/lib/spine/node-${NODE} \
-    spine-storage-node:latest \
-    /usr/local/bin/spine-storage-node --verify-integrity --data-dir /var/lib/spine/node-${NODE}
+  docker compose -f docker-compose.prod.yml run --rm "storage-node-${NODE}" \
+    /usr/local/bin/spine-storage-node --verify-integrity --data-dir "/var/lib/spine/node-${NODE}"
 done
 ```
 
-### Step 5: Sequenced Cluster Startup
+### Step 5: Sequenced Cluster Startup & Database Restoration
 
 Start services in dependency order:
 
-1. **Start Core Cluster Infrastructure:**
+1. **Start PostgreSQL Container:**
    ```bash
-   docker compose -f docker-compose.prod.yml up -d postgres coordinator storage-node-1 storage-node-2 storage-node-3
+   docker compose -f docker-compose.prod.yml up -d postgres
+   ```
+2. **Wait for PostgreSQL Readiness:**
+   ```bash
+   until docker compose -f docker-compose.prod.yml exec -T postgres pg_isready -U spine_admin >/dev/null 2>&1; do
+     sleep 1
+   done
+   ```
+3. **Restore Database SQL Dump:**
+   ```bash
+   gzip -dc "${BACKUP_DIR}/postgres_dump.sql.gz" | \
+     docker compose -f docker-compose.prod.yml exec -T postgres psql -U spine_admin -d postgres
+   ```
+4. **Start Core Cluster Infrastructure:**
+   ```bash
+   docker compose -f docker-compose.prod.yml up -d coordinator storage-node-1 storage-node-2 storage-node-3
+   ```
+5. **Wait for Health Checks to Pass:**
+   ```bash
+   docker compose -f docker-compose.prod.yml ps
+   # Verify that postgres, coordinator, storage-node-1, storage-node-2, storage-node-3 are (healthy)
+   ```
+6. **Start Application Control Plane & Ingress:**
+   ```bash
+   docker compose -f docker-compose.prod.yml up -d spine-api spine-frontend ingress
+   ```
    ```
 2. **Wait for Health Checks to Pass:**
    ```bash
