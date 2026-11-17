@@ -480,8 +480,8 @@ pub fn flatten_tree_recursive<S: spine_object_store::ObjectStore>(
     prefix: &str,
     out: &mut std::collections::BTreeMap<String, (spine_core::FileMode, ObjectId)>,
 ) -> anyhow::Result<()> {
-    let mut visited = std::collections::HashSet::new();
-    flatten_tree_recursive_inner(store, tree_id, prefix, out, &mut visited, 0)
+    let mut active_ancestors = std::collections::HashSet::new();
+    flatten_tree_recursive_inner(store, tree_id, prefix, out, &mut active_ancestors, 0)
 }
 
 fn flatten_tree_recursive_inner<S: spine_object_store::ObjectStore>(
@@ -489,45 +489,50 @@ fn flatten_tree_recursive_inner<S: spine_object_store::ObjectStore>(
     tree_id: &ObjectId,
     prefix: &str,
     out: &mut std::collections::BTreeMap<String, (spine_core::FileMode, ObjectId)>,
-    visited: &mut std::collections::HashSet<ObjectId>,
+    active_ancestors: &mut std::collections::HashSet<ObjectId>,
     depth: usize,
 ) -> anyhow::Result<()> {
     const MAX_TREE_DEPTH: usize = 128;
     if depth > MAX_TREE_DEPTH {
         anyhow::bail!("Tree nesting exceeds maximum allowable depth ({})", MAX_TREE_DEPTH);
     }
-    if !visited.insert(*tree_id) {
+    if !active_ancestors.insert(*tree_id) {
         anyhow::bail!("Cyclic tree reference detected at object {}", tree_id);
     }
 
-    let (obj_type, payload) = store.read_object(tree_id)?;
-    if obj_type != spine_core::ObjectType::Tree {
-        return Ok(());
-    }
-    let entries = spine_format::deserialize_tree(&payload)?;
-    for entry in entries {
-        let full_path = if prefix.is_empty() {
-            entry.name.clone()
-        } else {
-            format!("{}/{}", prefix, entry.name)
-        };
-        if entry.mode == spine_core::FileMode::Directory {
-            flatten_tree_recursive_inner(store, &entry.object_id, &full_path, out, visited, depth + 1)?;
-        } else {
-            out.insert(full_path, (entry.mode, entry.object_id));
+    let res = (|| -> anyhow::Result<()> {
+        let (obj_type, payload) = store.read_object(tree_id)?;
+        if obj_type != spine_core::ObjectType::Tree {
+            return Ok(());
         }
-    }
-    Ok(())
+        let entries = spine_format::deserialize_tree(&payload)?;
+        for entry in entries {
+            let full_path = if prefix.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{}/{}", prefix, entry.name)
+            };
+            if entry.mode == spine_core::FileMode::Directory {
+                flatten_tree_recursive_inner(store, &entry.object_id, &full_path, out, active_ancestors, depth + 1)?;
+            } else {
+                out.insert(full_path, (entry.mode, entry.object_id));
+            }
+        }
+        Ok(())
+    })();
+
+    active_ancestors.remove(tree_id);
+    res
 }
 
 pub fn collect_changed_paths_from_commits<S: spine_object_store::ObjectStore>(
     store: &S,
     new_commits: &[(GitOid, ObjectId, spine_core::Commit)],
-) -> Vec<String> {
+) -> anyhow::Result<Vec<String>> {
     let mut paths = std::collections::HashSet::new();
     for (_goid, _sid, commit) in new_commits {
         let mut commit_tree_files = std::collections::BTreeMap::new();
-        let _ = flatten_tree_recursive(store, &commit.root_tree, "", &mut commit_tree_files);
+        flatten_tree_recursive(store, &commit.root_tree, "", &mut commit_tree_files)?;
 
         if commit.parents.is_empty() {
             for path in commit_tree_files.keys() {
@@ -535,27 +540,26 @@ pub fn collect_changed_paths_from_commits<S: spine_object_store::ObjectStore>(
             }
         } else {
             for parent_id in &commit.parents {
-                if let Ok((spine_core::ObjectType::Commit, payload)) = store.read_object(parent_id)
-                {
-                    if let Ok(parent_commit) = spine_format::deserialize_commit(&payload) {
-                        let mut parent_tree_files = std::collections::BTreeMap::new();
-                        let _ = flatten_tree_recursive(
-                            store,
-                            &parent_commit.root_tree,
-                            "",
-                            &mut parent_tree_files,
-                        );
-                        let diff =
-                            spine_diff::compare_trees(&parent_tree_files, &commit_tree_files);
-                        for change in diff {
-                            paths.insert(change.path().to_string());
-                        }
+                let (obj_type, payload) = store.read_object(parent_id)?;
+                if obj_type == spine_core::ObjectType::Commit {
+                    let parent_commit = spine_format::deserialize_commit(&payload)?;
+                    let mut parent_tree_files = std::collections::BTreeMap::new();
+                    flatten_tree_recursive(
+                        store,
+                        &parent_commit.root_tree,
+                        "",
+                        &mut parent_tree_files,
+                    )?;
+                    let diff =
+                        spine_diff::compare_trees(&parent_tree_files, &commit_tree_files);
+                    for change in diff {
+                        paths.insert(change.path().to_string());
                     }
                 }
             }
         }
     }
-    paths.into_iter().collect()
+    Ok(paths.into_iter().collect())
 }
 
 pub async fn process_git_receive_pack(
@@ -637,7 +641,15 @@ pub async fn process_git_receive_pack(
     };
 
     // 1c. LFS Lock Conflict Verification: Check modified paths in incoming commits
-    let changed_paths = collect_changed_paths_from_commits(&store, &ingest_res.new_commits);
+    let changed_paths = match collect_changed_paths_from_commits(&store, &ingest_res.new_commits) {
+        Ok(paths) => paths,
+        Err(e) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Failed to verify changed commit trees during lock check: {}\n", e),
+            ));
+        }
+    };
     let mut detected_lock_conflict: Option<(String, String)> = None;
     for path in &changed_paths {
         if let Ok(Some(lock)) = state.db.get_lfs_lock_by_path(&repo.id, path).await {
