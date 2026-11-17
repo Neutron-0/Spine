@@ -264,6 +264,8 @@ services:
       SPINE_STORAGE_ROOT: "/var/lib/spine/storage"
       SSH_DIR: "/var/lib/spine/ssh"
       FORGE_PUBLIC_ORIGIN: "${FORGE_PUBLIC_ORIGIN:?FORGE_PUBLIC_ORIGIN_required_must_be_https_URL}"
+      SPINE_AUTH_SECRET_KEY: "${SPINE_AUTH_SECRET_KEY:?SPINE_AUTH_SECRET_KEY_required_min_32_chars}"
+      SPINE_LFS_SECRET: "${SPINE_LFS_SECRET:-}"
       RUST_LOG: "info,spine_api=info"
     volumes:
       - spine_storage:/var/lib/spine/storage

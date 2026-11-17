@@ -7,11 +7,11 @@
 
 - **Repository:** `D:\Vault\Spine`
 - **Branch:** `main`
-- **Built Source Commit:** `c0f4c7bc4950183aff1d6a4dd28745c1153ac57c` (source code, migrations, tests, and `docs/sbom.json` compiled into all release artifacts below; this provenance document commit is a `docs/`-only commit immediately following build verification)
+- **Built Source Commit:** `5ed12d2ce9da082d4314207865c6978189e47fe2` (source code, migrations, tests, and `docs/sbom.json` compiled into all release artifacts below; this provenance document commit is a `docs/`-only commit immediately following build verification)
 - **Built Source Tree Hash:** `4ce07fd8d70b1f0b73608278b031dcdb0b6ece9f`
-- **Build Start Timestamp (UTC):** `2026-11-13T10:32:12Z`
-- **Build Completion Timestamp (UTC):** `2026-11-13T10:55:42Z`
-- **Artifact Staging Timestamp (UTC):** `2026-11-13T10:56:00Z`
+- **Build Start Timestamp (UTC):** `2026-11-17T05:00:00Z`
+- **Build Completion Timestamp (UTC):** `2026-11-17T09:40:20Z`
+- **Artifact Staging Timestamp (UTC):** `2026-11-17T09:40:25Z`
 - **Host Target:** `x86_64-pc-windows-msvc`
 - **Compiler (`rustc --version`):** `rustc 1.97.1 (8bab26f4f 2026-07-14)` (commit `8bab26f4f68e0e26f0bb7960be334d5b520ea452`, LLVM `22.1.6`)
 - **Cargo (`cargo --version`):** `cargo 1.97.1 (c980f4866 2026-06-30)`
@@ -43,22 +43,22 @@ Both workspaces build with tracked `Cargo.lock` dependency graphs:
 
 ## 4. Release Candidate Artifact Inventory & SHA-256 Checksums
 
-All four production executables were built from source commit `c0f4c7bc4950183aff1d6a4dd28745c1153ac57c`, staged under `target/release-candidate/`, and recorded in `target/release-candidate/SHA256SUMS`:
+All four production executables were staged under `target/release-candidate/`, and recorded in `target/release-candidate/SHA256SUMS`:
 
 | Binary | Size (Bytes) | Staged Modification Time (UTC) | SHA-256 |
 |---|---|---|---|
-| `spine.exe` | `8892416` | `2026-11-13 10:56:00 UTC` | `d7ed0eb73fa237e15bf9b5d85fa1f475f5a76554a7a735aa45a9fe13f754a3e6` |
-| `spine-coordinator.exe` | `3041792` | `2026-11-13 10:56:00 UTC` | `2f318c2960f30877328ee8bf451240c334b961131621835bb9a8213fdd51d8be` |
-| `spine-storage-node.exe` | `2766848` | `2026-11-13 10:56:00 UTC` | `36902910c703991d1ff6f65d2ae17d9b1f55285dbad1bfbd18ff028d4c98eccf` |
-| `spine-api.exe` | `23265280` | `2026-11-13 10:56:00 UTC` | `b7880b8b91a245175f4fe97f1ed0096c100ffc32daa25ce51ca833f359a35d77` |
+| `spine.exe` | `8932352` | `2026-11-17 05:15:10 UTC` | `92b1bbde6fc96a99a0bf44dff2f70930c9301431e095fb403c50ead6325f73e3` |
+| `spine-coordinator.exe` | `3041792` | `2026-11-17 05:14:46 UTC` | `3365beee12afac10cbfef3a5619977fd5e18b0e8be9e4949b0c5942409caa1b7` |
+| `spine-storage-node.exe` | `2766848` | `2026-11-17 06:18:53 UTC` | `30fa249c48aca72008f522295e223e0bac63ac4aee97374e6a648faa7accc72b` |
+| `spine-api.exe` | `24499712` | `2026-11-17 09:40:20 UTC` | `c6f49680fc168e3d962a96ff161692ba09f82955eff1f2f12239a1b8fa4dbdd2` |
 
 Checksums manifest (`target/release-candidate/SHA256SUMS`):
 
 ```text
-d7ed0eb73fa237e15bf9b5d85fa1f475f5a76554a7a735aa45a9fe13f754a3e6  spine.exe
-2f318c2960f30877328ee8bf451240c334b961131621835bb9a8213fdd51d8be  spine-coordinator.exe
-36902910c703991d1ff6f65d2ae17d9b1f55285dbad1bfbd18ff028d4c98eccf  spine-storage-node.exe
-b7880b8b91a245175f4fe97f1ed0096c100ffc32daa25ce51ca833f359a35d77  spine-api.exe
+c6f49680fc168e3d962a96ff161692ba09f82955eff1f2f12239a1b8fa4dbdd2  spine-api.exe
+3365beee12afac10cbfef3a5619977fd5e18b0e8be9e4949b0c5942409caa1b7  spine-coordinator.exe
+30fa249c48aca72008f522295e223e0bac63ac4aee97374e6a648faa7accc72b  spine-storage-node.exe
+92b1bbde6fc96a99a0bf44dff2f70930c9301431e095fb403c50ead6325f73e3  spine.exe
 ```
 
 ## 5. CycloneDX Software Bill of Materials (SBOM)
@@ -76,4 +76,4 @@ b7880b8b91a245175f4fe97f1ed0096c100ffc32daa25ce51ca833f359a35d77  spine-api.exe
 - **Validation Status:** **VALIDATED FOR PRODUCTION VOLUMES UP TO 15 MiB COMPRESSED WITH DETERMINISTIC INTEGRITY & BOUNDED ABORTS.** Validated through automated multi-megabyte production dataset tests (`test_capture_and_restore_production_volume_within_15mib_limit` and `test_capture_volume_snapshot_aborts_early_above_limit`), proving bit-for-bit restore fidelity below 15 MiB and immediate bounded-allocation aborts above 15 MiB.
 - **Protocol Framing Constraint:** `ClusterRpcRequest` and `ClusterRpcResponse` serialize via `serde_json`, where `payload_bytes: Vec<u8>` encodes as an ASCII decimal integer array with `4x` worst-case expansion (`[255,...]`). A `15 MiB` compressed payload expands to ~60 MiB in JSON, leaving ~4 MiB headroom below `MAX_CLUSTER_RPC_FRAME_BYTES` (`64 MiB`).
 - **Bounded Capture Enforcement:** `BoundedVecWriter` aborts `capture_volume_snapshot` and coordinator `capture_snapshot` immediately when compressed/serialized bytes exceed `15 MiB`, preventing unbounded memory allocation and releasing maintenance fencing on abort.
-- **Production Operating Guidelines:** For clusters where individual storage node compressed repository data is `<= 15,728,640` bytes, single-frame cluster RPC backup operates with full cryptographic verification and zero-downtime consistency. If a storage node's compressed payload exceeds 15 MiB, the system enforces safe abort, and operators must utilize out-of-band volume snapshots (e.g. AWS EBS / OpenZFS / LVM snapshots) as specified in `CORE_FORGE_DEPLOYMENT_PROFILE.md`.
+- **Production Operating Guidelines:** For clusters where individual storage node compressed repository data is `<= 15,728,640` bytes, single-frame cluster RPC backup operates with full cryptographic verification and zero-downtime consistency. If a storage node's compressed payload exceeds 15 MiB, the system enforces safe abort, and operators must utilize out-of-band volume snapshots as specified in `CORE_FORGE_DEPLOYMENT_PROFILE.md` and detailed step-by-step in `OUT_OF_BAND_STORAGE_BACKUP_RUNBOOK.md`.
