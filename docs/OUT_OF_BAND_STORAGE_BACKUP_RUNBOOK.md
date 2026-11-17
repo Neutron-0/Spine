@@ -56,9 +56,9 @@ docker exec spine-storage-node-1 sh -c \
 
 ## 4. Consistent Point-in-Time Out-of-Band Backup Procedure
 
-### Phase 1: Drain In-Flight Mutations & Enter Maintenance Mode
+### Phase 1: Drain In-Flight Mutations, Enter Maintenance Mode & Verify Participant Unanimity
 
-To prevent tearing across distributed chunk stores and PostgreSQL, in-flight writes must be drained and cluster maintenance mode acquired.
+To prevent tearing across distributed chunk stores and PostgreSQL, in-flight writes must be drained, cluster maintenance mode acquired, and all participants audited for generation unanimity before any snapshots are taken.
 
 1. **Acquire Maintenance Barrier via API / CLI:**
    ```bash
@@ -69,7 +69,7 @@ To prevent tearing across distributed chunk stores and PostgreSQL, in-flight wri
      -d '{"reason": "Scheduled Out-of-Band Snapshot", "timeout_seconds": 300}'
    ```
 
-2. **Verify Zero Active Writers & Monotonic Fencing Advance:**
+2. **Verify Zero Active Writers:**
    Check readiness endpoint diagnostics to confirm writer count has reached 0:
    ```bash
    curl -s http://127.0.0.1:3000/health/diagnostics | jq .
@@ -80,7 +80,26 @@ To prevent tearing across distributed chunk stores and PostgreSQL, in-flight wri
    #   "current_fencing_generation": 42
    # }
    ```
-   Record the current fencing generation (`GENERATION_TOKEN=42`).
+
+3. **Direct Pre-Capture Audit Across All Distributed Participants:**
+   Directly query the coordinator and all storage nodes inside their volumes to verify generation unanimity before snapshotting:
+   ```bash
+   API_GEN=$(curl -s http://127.0.0.1:3000/health/diagnostics | grep -o '"current_fencing_generation":[0-9]*' | cut -d: -f2)
+   COORD_GEN=$(docker compose -f docker-compose.prod.yml exec -T coordinator cat /var/lib/spine/.coordinator_fencing_generation | tr -d '[:space:]')
+   NODE_1_GEN=$(docker compose -f docker-compose.prod.yml exec -T storage-node-1 cat /var/lib/spine/node-1/.fencing_generation | tr -d '[:space:]')
+   NODE_2_GEN=$(docker compose -f docker-compose.prod.yml exec -T storage-node-2 cat /var/lib/spine/node-2/.fencing_generation | tr -d '[:space:]')
+   NODE_3_GEN=$(docker compose -f docker-compose.prod.yml exec -T storage-node-3 cat /var/lib/spine/node-3/.fencing_generation | tr -d '[:space:]')
+
+   if [ "${COORD_GEN}" != "${API_GEN}" ] || [ "${NODE_1_GEN}" != "${API_GEN}" ] || \
+      [ "${NODE_2_GEN}" != "${API_GEN}" ] || [ "${NODE_3_GEN}" != "${API_GEN}" ]; then
+     echo "FATAL: Pre-capture audit detected generation mismatch across participants. Aborting backup."
+     curl -s -X POST http://127.0.0.1:3000/api/v1/admin/maintenance/release \
+       -H "Authorization: Bearer ${SPINE_ADMIN_TOKEN}"
+     exit 1
+   fi
+   GENERATION_TOKEN="${API_GEN}"
+   echo "Unanimous generation token: ${GENERATION_TOKEN}"
+   ```
 
 ### Phase 2: Capture Multi-Volume Backup (Canonical Production Procedure)
 
@@ -146,21 +165,30 @@ curl -s -f http://127.0.0.1:3000/health/ready || echo "Cluster not ready!"
 
 Follow these steps to restore a Spine Forge cluster from an out-of-band snapshot archive (or execute `./scripts/restore_oob.sh <path-to-backup-dir>`).
 
-### Step 1: Quiesce Traffic & Stop Running Containers
+### Step 1: Quiesce Traffic, Stop Containers & Verify Full Quiescence
 
-1. Ingress shutdown to prevent clients from attempting writes during recovery:
+1. Ingress and API shutdown to prevent clients from attempting writes during recovery:
    ```bash
    docker compose -f docker-compose.prod.yml stop ingress spine-api
    ```
-2. Stop all storage and consensus components:
+2. Stop all storage, consensus, and database components:
    ```bash
    docker compose -f docker-compose.prod.yml stop storage-node-1 storage-node-2 storage-node-3 coordinator postgres spine-frontend
    ```
+3. **Verify All Containers Stopped (Fail-Closed Gate):**
+   ```bash
+   RUNNING=$(docker compose -f docker-compose.prod.yml ps --services --filter "status=running")
+   if [ -n "${RUNNING}" ]; then
+     echo "FATAL: Services still running: ${RUNNING}. Aborting restore to prevent data corruption."
+     exit 1
+   fi
+   ```
 
-### Step 2: Restore Volumes & Clean Leftover Staging Files
+### Step 2: Prepare Clean Target Volumes & Restore Archive Data
+
+To prevent old deleted files from persisting after restore, target volumes are not overlaid. Existing files are preserved in `.rollback_snapshot` inside the volume until verification succeeds.
 
 1. **Remove Ephemeral Staging Directories:**
-   Clean any leftover partial staging directories inside storage containers (using unquoted wildcards inside the container shell):
    ```bash
    for NODE in 1 2 3; do
      docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
@@ -168,24 +196,36 @@ Follow these steps to restore a Spine Forge cluster from an out-of-band snapshot
    done
    ```
 
-2. **Restore Archive Volumes into Named Docker Volumes:**
-   Extract the verified backup archives directly into the container volumes using Docker Compose:
+2. **Restore Archive Volumes into Clean Docker Volumes:**
    ```bash
-   # Coordinator state into coordinator_data volume
-   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh coordinator \
-     -c "tar -xzf - -C /var/lib/spine" < "${BACKUP_DIR}/coordinator.tar.gz"
+   # Coordinator state into clean coordinator_data volume
+   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh coordinator -c '
+     mkdir -p /var/lib/spine/.rollback_snapshot
+     find /var/lib/spine -mindepth 1 -maxdepth 1 ! -name ".rollback_snapshot" -exec mv -t /var/lib/spine/.rollback_snapshot {} + 2>/dev/null || true
+     tar -xzf - -C /var/lib/spine
+   ' < "${BACKUP_DIR}/coordinator.tar.gz"
 
-   # Storage nodes into storage_1_data, storage_2_data, storage_3_data volumes
+   # Storage nodes into clean storage volumes
    for NODE in 1 2 3; do
-     docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
-       -c "tar -xzf - -C /var/lib/spine/node-${NODE}" < "${BACKUP_DIR}/storage_node_${NODE}.tar.gz"
+     docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh "storage-node-${NODE}" -c '
+       mkdir -p /var/lib/spine/node-'"${NODE}"'/.rollback_snapshot
+       find /var/lib/spine/node-'"${NODE}"' -mindepth 1 -maxdepth 1 ! -name ".rollback_snapshot" -exec mv -t /var/lib/spine/node-'"${NODE}"'/.rollback_snapshot {} + 2>/dev/null || true
+       tar -xzf - -C /var/lib/spine/node-'"${NODE}"'
+     ' < "${BACKUP_DIR}/storage_node_${NODE}.tar.gz"
    done
 
    # API SSH host keys and storage cache
-   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh spine-api \
-     -c "tar -xzf - -C /var/lib/spine/ssh" < "${BACKUP_DIR}/spine_ssh.tar.gz"
-   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh spine-api \
-     -c "tar -xzf - -C /var/lib/spine/storage" < "${BACKUP_DIR}/spine_storage.tar.gz"
+   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh spine-api -c '
+     mkdir -p /var/lib/spine/ssh/.rollback_snapshot
+     find /var/lib/spine/ssh -mindepth 1 -maxdepth 1 ! -name ".rollback_snapshot" -exec mv -t /var/lib/spine/ssh/.rollback_snapshot {} + 2>/dev/null || true
+     tar -xzf - -C /var/lib/spine/ssh
+   ' < "${BACKUP_DIR}/spine_ssh.tar.gz"
+
+   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh spine-api -c '
+     mkdir -p /var/lib/spine/storage/.rollback_snapshot
+     find /var/lib/spine/storage -mindepth 1 -maxdepth 1 ! -name ".rollback_snapshot" -exec mv -t /var/lib/spine/storage/.rollback_snapshot {} + 2>/dev/null || true
+     tar -xzf - -C /var/lib/spine/storage
+   ' < "${BACKUP_DIR}/spine_storage.tar.gz"
    ```
 
 ### Step 3: Automated Fail-Closed Fencing Generation Verification
@@ -253,50 +293,53 @@ for NODE in 1 2 3; do
 done
 ```
 
-### Step 5: Sequenced Cluster Startup & Database Restoration
+### Step 5: Clean PostgreSQL Restoration & Verification
 
-Start services in dependency order:
-
-1. **Start PostgreSQL Container:**
+1. **Prepare Fresh Database Cluster (Rollback Preservation):**
+   ```bash
+   docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh postgres -c '
+     mkdir -p /var/lib/postgresql/data/.rollback_snapshot
+     find /var/lib/postgresql/data -mindepth 1 -maxdepth 1 ! -name ".rollback_snapshot" -exec mv -t /var/lib/postgresql/data/.rollback_snapshot {} + 2>/dev/null || true
+   '
+   ```
+2. **Start PostgreSQL Container & Wait for Readiness:**
    ```bash
    docker compose -f docker-compose.prod.yml up -d postgres
-   ```
-2. **Wait for PostgreSQL Readiness:**
-   ```bash
    until docker compose -f docker-compose.prod.yml exec -T postgres pg_isready -U spine_admin >/dev/null 2>&1; do
      sleep 1
    done
    ```
-3. **Restore Database SQL Dump:**
+3. **Restore Database SQL Dump (Fail Closed on Error with ON_ERROR_STOP=1):**
    ```bash
    gzip -dc "${BACKUP_DIR}/postgres_dump.sql.gz" | \
-     docker compose -f docker-compose.prod.yml exec -T postgres psql -U spine_admin -d postgres
+     docker compose -f docker-compose.prod.yml exec -T postgres \
+     psql -v ON_ERROR_STOP=1 -U spine_admin -d postgres
    ```
-4. **Start Core Cluster Infrastructure:**
+4. **Verify Restored Schema and Tables:**
+   ```bash
+   TABLE_COUNT=$(docker compose -f docker-compose.prod.yml exec -T postgres \
+     psql -U spine_admin -d spine_forge -t -A -c \
+     "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public';" 2>/dev/null || echo "0")
+   if [ "${TABLE_COUNT}" -eq 0 ]; then
+     echo "FATAL: Database restore produced 0 tables. Aborting."
+     exit 1
+   fi
+   ```
+5. **Start Core Cluster Infrastructure:**
    ```bash
    docker compose -f docker-compose.prod.yml up -d coordinator storage-node-1 storage-node-2 storage-node-3
    ```
-5. **Wait for Health Checks to Pass:**
+6. **Wait for Health Checks to Pass:**
    ```bash
    docker compose -f docker-compose.prod.yml ps
    # Verify that postgres, coordinator, storage-node-1, storage-node-2, storage-node-3 are (healthy)
    ```
-6. **Start Application Control Plane & Ingress:**
-   ```bash
-   docker compose -f docker-compose.prod.yml up -d spine-api spine-frontend ingress
-   ```
-   ```
-2. **Wait for Health Checks to Pass:**
-   ```bash
-   docker compose -f docker-compose.prod.yml ps
-   # Verify that postgres, coordinator, storage-node-1, storage-node-2, storage-node-3 are (healthy)
-   ```
-3. **Start Application Control Plane & Ingress:**
+7. **Start Application Control Plane & Ingress:**
    ```bash
    docker compose -f docker-compose.prod.yml up -d spine-api spine-frontend ingress
    ```
 
-### Step 6: Readiness Gate & Consistency Verification
+### Step 6: Readiness Gate & Rollback Purge Gate
 
 Execute the fail-closed readiness healthcheck:
 ```bash
@@ -304,6 +347,16 @@ curl -i http://127.0.0.1:3000/health/ready
 ```
 **Required Response:**
 - HTTP Status Code: `200 OK`
+
+After `/health/ready` returns 200 OK, purge preserved rollback directories across volumes:
+```bash
+docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh coordinator -c "rm -rf /var/lib/spine/.rollback_snapshot 2>/dev/null || true"
+for NODE in 1 2 3; do
+  docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh "storage-node-${NODE}" -c "rm -rf /var/lib/spine/node-${NODE}/.rollback_snapshot 2>/dev/null || true"
+done
+docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh spine-api -c "rm -rf /var/lib/spine/ssh/.rollback_snapshot /var/lib/spine/storage/.rollback_snapshot 2>/dev/null || true"
+docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh postgres -c "rm -rf /var/lib/postgresql/data/.rollback_snapshot 2>/dev/null || true"
+```
 - Body:
   ```json
   {
