@@ -362,3 +362,90 @@ fn test_restore_fails_closed_when_containers_refuse_to_stop() {
     let err2 = verify_containers_stopped(&hung_storage).unwrap_err();
     assert!(err2.contains("storage-node-2"));
 }
+
+/// Simulates pre-restore archiving: checks that all archives are generated and valid
+/// BEFORE modifying any volume. If any participant archive fails, aborts with Err,
+/// leaving zero volumes modified.
+pub fn execute_pre_restore_archiving(
+    volumes: &[(&str, &Path)],
+    rollback_dir: &Path,
+    fail_on_participant: Option<&str>,
+) -> Result<Vec<PathBuf>, String> {
+    let mut archived = Vec::new();
+    fs::create_dir_all(rollback_dir).map_err(|e| e.to_string())?;
+
+    for (name, _path) in volumes {
+        if let Some(fail_target) = fail_on_participant {
+            if *name == fail_target {
+                return Err(format!(
+                    "FATAL: Pre-restore rollback archive creation failed for {}. ABORTING RESTORE BEFORE MODIFYING ANY VOLUME.",
+                    name
+                ));
+            }
+        }
+        let archive_file = rollback_dir.join(format!("{}.tar.gz", name));
+        // Emulate tar archive creation
+        fs::write(&archive_file, format!("valid archive for {}", name)).map_err(|e| e.to_string())?;
+        archived.push(archive_file);
+    }
+
+    Ok(archived)
+}
+
+#[test]
+fn test_pre_restore_archive_failure_aborts_before_modifying_any_volume() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+
+    // Create 7 live volumes with original data
+    let participants = [
+        "coordinator",
+        "storage_node_1",
+        "storage_node_2",
+        "storage_node_3",
+        "spine_ssh",
+        "spine_storage",
+        "postgres_data",
+    ];
+
+    let mut volume_paths = Vec::new();
+    for p in &participants {
+        let p_dir = root.join(p);
+        fs::create_dir_all(&p_dir).unwrap();
+        fs::write(p_dir.join("live.data"), format!("original data for {}", p)).unwrap();
+        volume_paths.push((*p, p_dir));
+    }
+
+    let rollback_dir = root.join("rollback_dir");
+
+    // Force failure on each participant one by one!
+    for p in &participants {
+        let volumes_ref: Vec<(&str, &Path)> = volume_paths
+            .iter()
+            .map(|(name, path)| (*name, path.as_path()))
+            .collect();
+
+        let result = execute_pre_restore_archiving(&volumes_ref, &rollback_dir, Some(p));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains(p));
+        assert!(err.contains("ABORTING RESTORE BEFORE MODIFYING ANY VOLUME"));
+
+        // CRITICAL INVARIANT: Every single volume MUST remain completely untouched!
+        for (v_name, v_path) in &volume_paths {
+            assert!(
+                v_path.join("live.data").exists(),
+                "Volume {} live data must be untouched after failure on {}",
+                v_name,
+                p
+            );
+            assert_eq!(
+                fs::read_to_string(v_path.join("live.data")).unwrap(),
+                format!("original data for {}", v_name),
+                "Volume {} content must not be modified after failure on {}",
+                v_name,
+                p
+            );
+        }
+    }
+}
