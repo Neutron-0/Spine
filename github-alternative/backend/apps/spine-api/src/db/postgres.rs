@@ -3563,7 +3563,7 @@ impl Database for PgDatabase {
         limit: i64,
         now_nanos: i64,
     ) -> Result<Vec<WebhookOutboxItem>, ForgeError> {
-        let batch_buffer_secs = (limit as i64 - 1).max(0) * 30;
+        let batch_buffer_secs = (limit - 1).max(0) * 30;
         let lease_expiry_nanos = now_nanos + (60 + batch_buffer_secs) * 1_000_000_000;
         let query = "UPDATE webhook_outbox SET status = 'PROCESSING', attempts = attempts + 1, next_attempt_at_nanos = $3 WHERE id IN (SELECT id FROM webhook_outbox WHERE (status = 'PENDING' AND next_attempt_at_nanos <= $1) OR (status = 'PROCESSING' AND next_attempt_at_nanos <= $1) ORDER BY next_attempt_at_nanos ASC LIMIT $2 FOR UPDATE SKIP LOCKED) RETURNING id, event_type, owner_type, owner_id, payload, attempts, max_attempts, status, last_error, created_at_nanos, next_attempt_at_nanos";
         let rows = sqlx::query(query)

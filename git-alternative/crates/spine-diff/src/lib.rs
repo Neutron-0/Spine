@@ -219,8 +219,8 @@ fn myers_diff_slice(a: &[&str], b: &[&str], out: &mut Vec<DiffOp>) {
     }
 
     // Emit suffix
-    for i in (n - s)..n {
-        out.push(DiffOp::Context(a[i].to_string()));
+    for item in &a[(n - s)..n] {
+        out.push(DiffOp::Context(item.to_string()));
     }
 }
 
@@ -258,10 +258,8 @@ fn find_middle_snake(a: &[&str], b: &[&str]) -> (usize, usize) {
 
             vf[offset + k as usize] = x;
 
-            if odd && (k - delta).abs() <= (d - 1) {
-                if vf[offset + k as usize] >= vr[offset + k as usize] {
-                    return (x as usize, y as usize);
-                }
+            if odd && (k - delta).abs() <= (d - 1) && vf[offset + k as usize] >= vr[offset + k as usize] {
+                return (x as usize, y as usize);
             }
         }
 
@@ -281,10 +279,8 @@ fn find_middle_snake(a: &[&str], b: &[&str]) -> (usize, usize) {
 
             vr[offset + kr as usize] = x;
 
-            if !odd && k.abs() <= d {
-                if vf[offset + kr as usize] >= vr[offset + kr as usize] {
-                    return (x as usize, y as usize);
-                }
+            if !odd && k.abs() <= d && vf[offset + kr as usize] >= vr[offset + kr as usize] {
+                return (x as usize, y as usize);
             }
         }
     }

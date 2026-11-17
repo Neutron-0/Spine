@@ -68,9 +68,15 @@ pub async fn create_namespace(
 /// GET /api/v1/artifacts/namespaces
 pub async fn list_namespaces(
     State(state): State<AppState>,
+    user: Option<Extension<User>>,
 ) -> Result<Json<Vec<ArtifactNamespaceDto>>, ForgeError> {
+    let caller_id = user.as_ref().map(|Extension(u)| u.id.as_str());
     let list = state.db.list_artifact_namespaces().await?;
-    let dtos = list.iter().map(ArtifactNamespaceDto::from).collect();
+    let dtos = list
+        .into_iter()
+        .filter(|ns| !ns.is_private || caller_id == Some(&ns.owner_id))
+        .map(|ns| ArtifactNamespaceDto::from(&ns))
+        .collect();
     Ok(Json(dtos))
 }
 
@@ -158,6 +164,7 @@ pub async fn upload_artifact_version(
 /// GET /api/v1/artifacts/:namespace/:artifact/versions
 pub async fn list_artifact_versions(
     State(state): State<AppState>,
+    user: Option<Extension<User>>,
     Path((ns_name, artifact_name)): Path<(String, String)>,
 ) -> Result<Json<Vec<ArtifactVersionDto>>, ForgeError> {
     let ns = state
@@ -165,6 +172,17 @@ pub async fn list_artifact_versions(
         .get_artifact_namespace_by_name(&ns_name)
         .await?
         .ok_or_else(|| ForgeError::NotFound(format!("Namespace '{}' not found", ns_name)))?;
+
+    if ns.is_private {
+        let current_user = user
+            .ok_or_else(|| ForgeError::Unauthorized("Authentication required for private namespace".to_string()))?
+            .0;
+        if ns.owner_id != current_user.id {
+            return Err(ForgeError::Forbidden(
+                "Access denied to private namespace".to_string(),
+            ));
+        }
+    }
 
     let list = state
         .db
@@ -190,6 +208,7 @@ pub async fn list_artifact_versions(
 /// GET /api/v1/artifacts/:namespace/:artifact/versions/:version/download
 pub async fn download_artifact_version(
     State(state): State<AppState>,
+    user: Option<Extension<User>>,
     Path((ns_name, artifact_name, version)): Path<(String, String, String)>,
 ) -> Result<Response, ForgeError> {
     let ns = state
@@ -197,6 +216,17 @@ pub async fn download_artifact_version(
         .get_artifact_namespace_by_name(&ns_name)
         .await?
         .ok_or_else(|| ForgeError::NotFound(format!("Namespace '{}' not found", ns_name)))?;
+
+    if ns.is_private {
+        let current_user = user
+            .ok_or_else(|| ForgeError::Unauthorized("Authentication required for private namespace".to_string()))?
+            .0;
+        if ns.owner_id != current_user.id {
+            return Err(ForgeError::Forbidden(
+                "Access denied to private namespace".to_string(),
+            ));
+        }
+    }
 
     let ver = state
         .db

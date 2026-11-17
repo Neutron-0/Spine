@@ -47,6 +47,8 @@ impl Default for DevMailCatcher {
     }
 }
 
+pub const MAX_CACHED_EMAILS: usize = 1000;
+
 #[async_trait]
 impl MailDelivery for DevMailCatcher {
     async fn send_email(&self, to: &str, subject: &str, body: &str) -> anyhow::Result<()> {
@@ -56,7 +58,12 @@ impl MailDelivery for DevMailCatcher {
             body: body.to_string(),
             timestamp_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
         };
-        self.sent_emails.write().unwrap().push(sent);
+        tracing::info!(recipient = %to, subject = %subject, "Authentication email queued for delivery");
+        let mut list = self.sent_emails.write().unwrap();
+        if list.len() >= MAX_CACHED_EMAILS {
+            list.remove(0);
+        }
+        list.push(sent);
         Ok(())
     }
 }

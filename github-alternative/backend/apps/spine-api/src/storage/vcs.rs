@@ -527,6 +527,33 @@ impl NativeVcsService {
         prefix: &str,
         out: &mut BTreeMap<String, (FileMode, ObjectId)>,
     ) -> Result<(), ForgeError> {
+        let mut visited = std::collections::HashSet::new();
+        self.flatten_tree_inner(store, tree_oid, prefix, out, &mut visited, 0)
+    }
+
+    fn flatten_tree_inner<S: ObjectStore>(
+        &self,
+        store: &S,
+        tree_oid: &ObjectId,
+        prefix: &str,
+        out: &mut BTreeMap<String, (FileMode, ObjectId)>,
+        visited: &mut std::collections::HashSet<ObjectId>,
+        depth: usize,
+    ) -> Result<(), ForgeError> {
+        const MAX_TREE_DEPTH: usize = 128;
+        if depth > MAX_TREE_DEPTH {
+            return Err(ForgeError::Internal(format!(
+                "Tree depth exceeded maximum allowable depth ({})",
+                MAX_TREE_DEPTH
+            )));
+        }
+        if !visited.insert(*tree_oid) {
+            return Err(ForgeError::Internal(format!(
+                "Cyclic tree reference detected at object {}",
+                tree_oid
+            )));
+        }
+
         let (obj_type, payload) = store
             .read_object(tree_oid)
             .map_err(|e| ForgeError::Internal(format!("Tree read failed: {}", e)))?;
@@ -542,7 +569,7 @@ impl NativeVcsService {
                 format!("{}/{}", prefix, entry.name)
             };
             if entry.mode == FileMode::Directory {
-                self.flatten_tree(store, &entry.object_id, &path, out)?;
+                self.flatten_tree_inner(store, &entry.object_id, &path, out, visited, depth + 1)?;
             } else {
                 out.insert(path, (entry.mode, entry.object_id));
             }

@@ -480,6 +480,26 @@ pub fn flatten_tree_recursive<S: spine_object_store::ObjectStore>(
     prefix: &str,
     out: &mut std::collections::BTreeMap<String, (spine_core::FileMode, ObjectId)>,
 ) -> anyhow::Result<()> {
+    let mut visited = std::collections::HashSet::new();
+    flatten_tree_recursive_inner(store, tree_id, prefix, out, &mut visited, 0)
+}
+
+fn flatten_tree_recursive_inner<S: spine_object_store::ObjectStore>(
+    store: &S,
+    tree_id: &ObjectId,
+    prefix: &str,
+    out: &mut std::collections::BTreeMap<String, (spine_core::FileMode, ObjectId)>,
+    visited: &mut std::collections::HashSet<ObjectId>,
+    depth: usize,
+) -> anyhow::Result<()> {
+    const MAX_TREE_DEPTH: usize = 128;
+    if depth > MAX_TREE_DEPTH {
+        anyhow::bail!("Tree nesting exceeds maximum allowable depth ({})", MAX_TREE_DEPTH);
+    }
+    if !visited.insert(*tree_id) {
+        anyhow::bail!("Cyclic tree reference detected at object {}", tree_id);
+    }
+
     let (obj_type, payload) = store.read_object(tree_id)?;
     if obj_type != spine_core::ObjectType::Tree {
         return Ok(());
@@ -492,7 +512,7 @@ pub fn flatten_tree_recursive<S: spine_object_store::ObjectStore>(
             format!("{}/{}", prefix, entry.name)
         };
         if entry.mode == spine_core::FileMode::Directory {
-            flatten_tree_recursive(store, &entry.object_id, &full_path, out)?;
+            flatten_tree_recursive_inner(store, &entry.object_id, &full_path, out, visited, depth + 1)?;
         } else {
             out.insert(full_path, (entry.mode, entry.object_id));
         }

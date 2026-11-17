@@ -50,12 +50,12 @@ All four production executables were staged under `target/release-candidate/`, a
 | `spine.exe` | `8932352` | `2026-11-17 05:15:10 UTC` | `92b1bbde6fc96a99a0bf44dff2f70930c9301431e095fb403c50ead6325f73e3` |
 | `spine-coordinator.exe` | `3041792` | `2026-11-17 05:14:46 UTC` | `3365beee12afac10cbfef3a5619977fd5e18b0e8be9e4949b0c5942409caa1b7` |
 | `spine-storage-node.exe` | `2766848` | `2026-11-17 06:18:53 UTC` | `30fa249c48aca72008f522295e223e0bac63ac4aee97374e6a648faa7accc72b` |
-| `spine-api.exe` | `24499712` | `2026-11-17 09:40:20 UTC` | `c6f49680fc168e3d962a96ff161692ba09f82955eff1f2f12239a1b8fa4dbdd2` |
+| `spine-api.exe` | `24584704` | `2026-11-17 12:50:35 UTC` | `8c06ba6fa63e9dd7cbc58f728ee4b692f7a1d2c8d71885c3d56d3d0fe4c22fc8` |
 
 Checksums manifest (`target/release-candidate/SHA256SUMS`):
 
 ```text
-c6f49680fc168e3d962a96ff161692ba09f82955eff1f2f12239a1b8fa4dbdd2  spine-api.exe
+8c06ba6fa63e9dd7cbc58f728ee4b692f7a1d2c8d71885c3d56d3d0fe4c22fc8  spine-api.exe
 3365beee12afac10cbfef3a5619977fd5e18b0e8be9e4949b0c5942409caa1b7  spine-coordinator.exe
 30fa249c48aca72008f522295e223e0bac63ac4aee97374e6a648faa7accc72b  spine-storage-node.exe
 92b1bbde6fc96a99a0bf44dff2f70930c9301431e095fb403c50ead6325f73e3  spine.exe

@@ -307,11 +307,7 @@ impl WebhookOutboxWorker {
             // Read response (up to 64 KiB)
             let mut response_buf = Vec::new();
             let mut chunk = [0u8; 4096];
-            loop {
-                let n = match stream.read(&mut chunk).await {
-                    Ok(n) => n,
-                    _ => break,
-                };
+            while let Ok(n) = stream.read(&mut chunk).await {
                 if n == 0 {
                     break;
                 }

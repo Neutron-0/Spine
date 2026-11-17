@@ -45,11 +45,45 @@ pub struct MigrationPlanResponse {
     pub estimated_commits: usize,
 }
 
+fn validate_migration_path(path_str: &str) -> Result<(), (StatusCode, String)> {
+    let path = std::path::Path::new(path_str);
+    if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Path traversal ('..') is strictly prohibited in migration paths".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_repo_name(name: &str) -> Result<(), (StatusCode, String)> {
+    if name.trim().is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name.len() > 100
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid repository name for migration target".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn inspect_source(
     State(_state): State<AppState>,
-    _user: Option<Extension<User>>,
+    user: Option<Extension<User>>,
     Json(req): Json<InspectRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let _caller = user.ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Authentication required for migration operations".to_string(),
+        )
+    })?;
+    validate_migration_path(&req.source_path)?;
+
     let inspection = MigrationEngine::inspect(&req.source_path)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Inspection error: {}", e)))?;
     Ok(Json(inspection))
@@ -57,9 +91,17 @@ pub async fn inspect_source(
 
 pub async fn plan_migration(
     State(_state): State<AppState>,
-    _user: Option<Extension<User>>,
+    user: Option<Extension<User>>,
     Json(req): Json<PlanRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let _caller = user.ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Authentication required for migration operations".to_string(),
+        )
+    })?;
+    validate_migration_path(&req.source_path)?;
+
     let inspection = MigrationEngine::inspect(&req.source_path)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Planning error: {}", e)))?;
 
@@ -87,13 +129,23 @@ pub async fn run_migration(
     user: Option<Extension<User>>,
     Json(req): Json<RunMigrationRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let caller = user.ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Authentication required for migration operations".to_string(),
+        )
+    })?
+    .0;
+    validate_migration_path(&req.source_path)?;
+    validate_repo_name(&req.target_name)?;
+
     let storage_root = state.storage_root();
     let target_dir = storage_root.join("repos").join(&req.target_name);
 
-    let mut policy = AttributionPolicy::default();
-    if let Some(Extension(u)) = user {
-        policy.fallback_spine_user = u.username;
-    }
+    let policy = AttributionPolicy {
+        fallback_spine_user: caller.username,
+        ..Default::default()
+    };
 
     let report =
         MigrationEngine::run_git_import(&req.source_path, &target_dir, policy, req.dry_run)
@@ -109,9 +161,18 @@ pub async fn run_migration(
 
 pub async fn export_git(
     State(state): State<AppState>,
-    _user: Option<Extension<User>>,
+    user: Option<Extension<User>>,
     Json(req): Json<ExportGitRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let _caller = user.ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Authentication required for migration operations".to_string(),
+        )
+    })?;
+    validate_repo_name(&req.repo_name)?;
+    validate_migration_path(&req.target_path)?;
+
     let storage_root = state.storage_root();
     let source_spine_repo = storage_root.join("repos").join(&req.repo_name);
 
