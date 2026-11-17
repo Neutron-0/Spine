@@ -82,8 +82,13 @@ af2ade12b1cae0080a0f29e5b29c83ef43af2a9aff2f47d25328d5e9e9ba60f6  spine-api.exe
 
 When verifying working tree status from containerized sandboxes, external auditor harnesses (e.g. Codex), or non-default user accounts, Git 2.35.2+ requires directory ownership alignment:
 ```bash
-# Add directory exception to avoid 'fatal: detected dubious ownership' in sandbox runners
-git config --global --add safe.directory D:/Vault/Spine
-# Or execute inline
+# Automated cross-platform verifiers:
+./scripts/verify_workspace_clean.sh      # Linux / WSL / macOS
+.\scripts\verify_workspace_clean.ps1    # Windows PowerShell
+
+# Or direct Git inline command bypassing dubious ownership:
 git -c safe.directory=* status
+
+# Or configure persistent exception:
+git config --global --add safe.directory D:/Vault/Spine
 ```
