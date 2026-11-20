@@ -134,16 +134,20 @@ restore_cleanup() {
     rm -f "${RESOLVED_PASSPHRASE_FILE}"
   fi
 
-  # 2. Clean up temporary remote restore directory if created
-  if [ -n "${REMOTE_RESTORE_DIR:-}" ] && [ -d "${REMOTE_RESTORE_DIR}" ]; then
+  # 2. Clean up temporary remote download staging directory on every exit path (success, failure, signal)
+  if [ -n "${REMOTE_RESTORE_DIR:-}" ] && [ -e "${REMOTE_RESTORE_DIR}" ]; then
     echo "Purging temporary remote download staging directory: ${REMOTE_RESTORE_DIR}..." >&2
-    rm -rf "${REMOTE_RESTORE_DIR}"
+    chmod -R 700 "${REMOTE_RESTORE_DIR}" 2>/dev/null || true
+    if ! rm -rf "${REMOTE_RESTORE_DIR}"; then
+      echo "ERROR: Failed to remove remote download staging directory: ${REMOTE_RESTORE_DIR}" >&2
+    fi
   fi
 
   # 3. Always purge decrypted temporary payload directory on failure, abort, or signal
   if [ "${RESTORE_SUCCESS}" -eq 0 ]; then
-    if [ -n "${DECRYPT_DIR:-}" ] && [ -d "${DECRYPT_DIR}" ]; then
+    if [ -n "${DECRYPT_DIR:-}" ] && [ -e "${DECRYPT_DIR}" ]; then
       echo "Purging temporary decrypted restore directory: ${DECRYPT_DIR}..." >&2
+      chmod -R 700 "${DECRYPT_DIR}" 2>/dev/null || true
       if ! rm -rf "${DECRYPT_DIR}"; then
         echo "ERROR: Failed to remove decrypted restore directory: ${DECRYPT_DIR}" >&2
       fi
@@ -151,7 +155,8 @@ restore_cleanup() {
 
     if [ "${VOLUMES_MODIFIED}" -eq 0 ]; then
       echo "NOTICE: Restore aborted before any volume was modified. Live data remains untouched." >&2
-      if [ -n "${ROLLBACK_DIR:-}" ] && [ -d "${ROLLBACK_DIR}" ]; then
+      if [ -n "${ROLLBACK_DIR:-}" ] && [ -e "${ROLLBACK_DIR}" ]; then
+        chmod -R 700 "${ROLLBACK_DIR}" 2>/dev/null || true
         rm -rf "${ROLLBACK_DIR}"
       fi
     elif [ -d "${ROLLBACK_DIR:-}" ]; then
@@ -306,8 +311,20 @@ restore_cleanup() {
     fi
   fi
 }
-# Install cleanup trap immediately to cover every failure and interrupt path
-trap restore_cleanup EXIT ERR INT TERM
+handle_signal() {
+  local sig="$1"
+  echo "NOTICE: Signal ${sig} caught. Running restore cleanup and aborting..." >&2
+  restore_cleanup
+  if [ "${sig}" = "INT" ]; then
+    exit 130
+  else
+    exit 143
+  fi
+}
+# Install cleanup trap immediately to cover every exit, failure, and interrupt signal
+trap restore_cleanup EXIT ERR
+trap 'handle_signal INT' INT
+trap 'handle_signal TERM' TERM
 
 # Resolve passphrase and verify supported storage topology before proceeding
 resolve_passphrase_file
@@ -672,9 +689,10 @@ if [ ${READY_APP} -ne 1 ]; then
 fi
 
 RESTORE_SUCCESS=1
-echo "Readiness gate passed. Purging pre-restore rollback artifacts and decrypted payload..."
+echo "Readiness gate passed. Purging pre-restore rollback artifacts, decrypted payload, and remote staging..."
 rm -rf "${ROLLBACK_DIR}" "${DECRYPT_DIR}"
-if [ -n "${REMOTE_RESTORE_DIR:-}" ] && [ -d "${REMOTE_RESTORE_DIR}" ]; then
+if [ -n "${REMOTE_RESTORE_DIR:-}" ] && [ -e "${REMOTE_RESTORE_DIR}" ]; then
+  chmod -R 700 "${REMOTE_RESTORE_DIR}" 2>/dev/null || true
   rm -rf "${REMOTE_RESTORE_DIR}"
 fi
 

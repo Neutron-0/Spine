@@ -144,7 +144,8 @@ export SPINE_ADMIN_TOKEN="<administrative-token>"
 export BACKUP_ROOT="/mnt/backups/spine"
 export SPINE_BACKUP_PASSPHRASE_FILE="/etc/spine/backup_passphrase"
 
-# Optional: Off-host S3-compatible immutable replication
+# Off-host S3-compatible immutable replication (ENFORCED by default in production)
+export SPINE_BACKUP_REQUIRE_REMOTE=1  # 1 = Enforced (fails if unset or failed), 0 = Allow intentionally local-only
 export SPINE_BACKUP_REMOTE_S3_URI="s3://spine-disaster-recovery-vault/cluster-backups"
 export SPINE_BACKUP_OBJECT_LOCK_MODE="GOVERNANCE" # or COMPLIANCE
 export SPINE_BACKUP_RETENTION_DAYS="30"
@@ -153,18 +154,22 @@ export SPINE_BACKUP_RETENTION_DAYS="30"
 ./scripts/backup_oob.sh
 ```
 
-### Phase 2c: Off-Host Replication (S3 Object Lock) & Deployment Scope Limits
+### Phase 2c: Off-Host Replication (S3 Object Lock) & Policy Enforcement
 
-1. **Off-Host Replication Workflow:**
-   When `SPINE_BACKUP_REMOTE_S3_URI` is configured, `scripts/backup_oob.sh` automatically replicates the encrypted `backup.spnebak` and `SHA256SUMS` manifest to the designated object store:
+1. **Mandatory Off-Site Replication Policy (`SPINE_BACKUP_REQUIRE_REMOTE=1`):**
+   Under production deployment profile `core-forge-v1`, off-site replication is **enforced by default** (`SPINE_BACKUP_REQUIRE_REMOTE=1`).
+   - If `SPINE_BACKUP_REMOTE_S3_URI` is not configured or the `aws` CLI is missing, `scripts/backup_oob.sh` **fails closed immediately at pre-flight** (prior to acquiring the maintenance barrier or taking any snapshots).
+   - Local-only backups can only be created by explicitly overriding the policy (`SPINE_BACKUP_REQUIRE_REMOTE=0`), which emits an operational warning acknowledging the disaster recovery limitation.
+
+2. **Off-Host Replication & Cryptographic Byte-Level Verification:**
+   When `SPINE_BACKUP_REMOTE_S3_URI` is configured, `scripts/backup_oob.sh` replicates the encrypted `backup.spnebak` and `SHA256SUMS` manifest to the designated object store:
    - Configures S3 WORM / Object Lock immutability (`--object-lock-mode` and `--object-lock-retain-until-date`) to guarantee tamper-proof and ransomware-resistant retention.
-   - Executes remote integrity verification by comparing the uploaded object's byte size directly against the local encrypted archive.
-   - Fails closed if the remote upload or size verification does not match.
+   - **Cryptographic SHA-256 Digest Gate:** Rather than relying solely on file sizes, the script streams the uploaded archive from the remote object store (`aws s3 cp ... - | sha256sum`) and cryptographically compares the remote SHA-256 digest against the local archive before reporting backup success. Any mismatch or corruption immediately fails the backup with exit status 1.
 
-2. **Explicit Disaster Recovery Deployment Scope Limitation:**
+3. **Explicit Disaster Recovery Deployment Scope Limitation:**
    > [!WARNING]
    > **Deployment Limitation for Local-Only Backups:**
-   > If `SPINE_BACKUP_REMOTE_S3_URI` is omitted, backups remain exclusively on host storage under `BACKUP_ROOT`. Local-only backups **do not provide full disaster-recovery readiness** against total host hardware failure, disk controller destruction, or datacenter loss. Production installations must configure an off-host object store with Object Lock retention enabled.
+   > If `SPINE_BACKUP_REQUIRE_REMOTE=0` is explicitly set to permit local-only backups, archives remain exclusively on host storage under `BACKUP_ROOT`. Local-only backups **do not provide full disaster-recovery readiness** against total host hardware failure, disk controller destruction, or datacenter loss. Production installations must configure an off-host object store with Object Lock retention enabled.
 
 Or execute the canonical snapshot steps manually:
 ```bash
@@ -238,8 +243,10 @@ export SPINE_BACKUP_PASSPHRASE_FILE="/etc/spine/backup_passphrase"
 
 All out-of-band backups are stored encrypted using Spine's authenticated backup envelope (`SPNEBAK v2` AES-256-GCM AEAD, 100,000 PBKDF2 iterations). Before stopping services or modifying storage volumes, the incoming archive must be validated and authenticated fail-closed.
 
-1. **Remote Download (if S3 URI provided):**
-   When an `s3://` target is specified, `scripts/restore_oob.sh` automatically downloads `backup.spnebak` and `SHA256SUMS` into an isolated temporary directory (mode `0700`), verifies the checksum, and stages it for authentication. Downloaded artifacts are automatically purged upon restore completion.
+1. **Remote Download & Comprehensive Cleanup (if S3 URI provided):**
+   When an `s3://` target is specified, `scripts/restore_oob.sh` creates an isolated staging directory under `/tmp` (mode `0700`), downloads `backup.spnebak` and `SHA256SUMS`, verifies the checksum, and stages the archive.
+   - **Guaranteed Cleanup Trap (`EXIT`, `ERR`, `INT`, `TERM`):** The remote staging directory is strictly purged on **every exit path** — upon successful restore completion, during download failure, upon checksum mismatch, or on signal interruption (`SIGINT`/`SIGTERM`).
+   - Live live volume rollback archives remain safely preserved in `/var/tmp/.pre_restore_rollback_*` if failure occurs after volumes were modified.
 
 2. **Verify Envelope Magic & Integrity (Fail-Closed Gate):**
    ```bash

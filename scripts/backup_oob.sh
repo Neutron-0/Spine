@@ -15,6 +15,7 @@ POSTGRES_ADMIN_PASSWORD="${POSTGRES_ADMIN_PASSWORD:-}"
 SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE:-}"
 SPINE_BACKUP_PASSPHRASE_FILE="${SPINE_BACKUP_PASSPHRASE_FILE:-}"
 SPINE_BACKUP_REMOTE_S3_URI="${SPINE_BACKUP_REMOTE_S3_URI:-}"
+SPINE_BACKUP_REQUIRE_REMOTE="${SPINE_BACKUP_REQUIRE_REMOTE:-${SPINE_BACKUP_REQUIRE_OFF_SITE:-1}}"
 SPINE_BACKUP_OBJECT_LOCK_MODE="${SPINE_BACKUP_OBJECT_LOCK_MODE:-GOVERNANCE}"
 SPINE_BACKUP_RETENTION_DAYS="${SPINE_BACKUP_RETENTION_DAYS:-30}"
 SPINE_S3_ENDPOINT_URL="${SPINE_S3_ENDPOINT_URL:-}"
@@ -99,6 +100,30 @@ verify_supported_storage_topology() {
   echo "Supported storage topology verified: Docker Compose with local volume driver."
 }
 
+verify_off_site_replication_policy() {
+  echo "=== Verifying Off-Site Replication Policy ==="
+  if [ "${SPINE_BACKUP_REQUIRE_REMOTE}" = "1" ] || [ "${SPINE_BACKUP_REQUIRE_REMOTE}" = "true" ]; then
+    if [ -z "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
+      echo "================================================================================" >&2
+      echo "FATAL: Off-site replication policy is ENFORCED (SPINE_BACKUP_REQUIRE_REMOTE=1)," >&2
+      echo "but SPINE_BACKUP_REMOTE_S3_URI is not set." >&2
+      echo "Under production profile 'core-forge-v1', backups must be replicated to an" >&2
+      echo "off-host object store with Object Lock retention to survive total host destruction." >&2
+      echo "To explicitly allow local-only backups for testing or dev, set SPINE_BACKUP_REQUIRE_REMOTE=0." >&2
+      echo "================================================================================" >&2
+      exit 1
+    fi
+    if ! command -v aws >/dev/null 2>&1; then
+      echo "FATAL: Off-site replication is required (SPINE_BACKUP_REQUIRE_REMOTE=1), but 'aws' CLI is not found on host." >&2
+      exit 1
+    fi
+    echo "Off-site replication policy verified [ENFORCED] -> Target: ${SPINE_BACKUP_REMOTE_S3_URI}"
+  else
+    echo "Off-site replication policy: INTENTIONALLY LOCAL-ONLY (SPINE_BACKUP_REQUIRE_REMOTE=0)."
+    echo "OPERATIONAL NOTICE: Local-only backups do not protect against total host loss."
+  fi
+}
+
 RELEASED=0
 STAGING_DIR=""
 PLAINTEXT_TAR=""
@@ -139,9 +164,10 @@ cleanup_backup() {
 }
 trap cleanup_backup EXIT ERR INT TERM
 
-# Resolve passphrase and verify supported storage topology before acquiring barrier
+# Resolve passphrase, verify supported storage topology, and enforce off-site policy before acquiring barrier
 resolve_passphrase_file
 verify_supported_storage_topology
+verify_off_site_replication_policy
 
 echo "=== Phase 1: Acquiring Maintenance Barrier & Draining In-Flight Mutations ==="
 ACQUIRE_RESP=$(curl -s -f -X POST "${SPINE_API_URL}/api/v1/admin/maintenance/acquire" \
@@ -348,7 +374,7 @@ chmod 600 "${BACKUP_DIR}"/*
 chmod 700 "${BACKUP_DIR}"
 
 # Phase 2c: Off-Host Immutable Replication (S3 / Object Lock)
-echo "=== Phase 2c: Off-Host Immutable Replication & Remote Verification ==="
+echo "=== Phase 2c: Off-Host Immutable Replication & Cryptographic Verification ==="
 if [ -n "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
   REMOTE_BASE="${SPINE_BACKUP_REMOTE_S3_URI%/}"
   REMOTE_TARGET="${REMOTE_BASE}/$(basename "${BACKUP_DIR}")"
@@ -381,27 +407,42 @@ if [ -n "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
       exit 1
     fi
 
-    echo "Verifying remote object integrity..."
+    echo "Verifying remote object size and cryptographic byte integrity..."
     LOCAL_SIZE=$(stat -c%s "${ENCRYPTED_ARCHIVE}" 2>/dev/null || stat -f%z "${ENCRYPTED_ARCHIVE}" 2>/dev/null || wc -c < "${ENCRYPTED_ARCHIVE}" | tr -d '[:space:]')
     REMOTE_SIZE=$(aws s3 ls "${REMOTE_TARGET}/backup.spnebak" "${AWS_EXTRA_ARGS[@]}" | awk '{print $3}' | tr -d '[:space:]' || echo "0")
     if [ -z "${REMOTE_SIZE}" ] || [ "${LOCAL_SIZE}" != "${REMOTE_SIZE}" ]; then
       echo "FATAL: Remote size mismatch for ${REMOTE_TARGET}/backup.spnebak: local=${LOCAL_SIZE}, remote=${REMOTE_SIZE}" >&2
       exit 1
     fi
-    echo "Remote replication verified [OK] (${REMOTE_SIZE} bytes, immutable retention active)."
+
+    LOCAL_SHA256=$(sha256sum "${ENCRYPTED_ARCHIVE}" | awk '{print $1}')
+    echo "Streaming remote object from ${REMOTE_TARGET}/backup.spnebak to verify SHA-256 digest..."
+    REMOTE_SHA256=$(aws s3 cp "${REMOTE_TARGET}/backup.spnebak" - "${AWS_EXTRA_ARGS[@]}" | sha256sum | awk '{print $1}')
+    if [ -z "${REMOTE_SHA256}" ] || [ "${LOCAL_SHA256}" != "${REMOTE_SHA256}" ]; then
+      echo "FATAL: Cryptographic verification failed! Remote SHA-256 does not match local archive." >&2
+      echo "  Local SHA-256:  ${LOCAL_SHA256}" >&2
+      echo "  Remote SHA-256: ${REMOTE_SHA256}" >&2
+      exit 1
+    fi
+
+    echo "Remote replication cryptographically verified [OK] (${REMOTE_SIZE} bytes, SHA-256: ${REMOTE_SHA256}, immutable retention active)."
   else
     echo "FATAL: SPINE_BACKUP_REMOTE_S3_URI specified, but 'aws' CLI is not available on host. Cannot complete off-host replication." >&2
     exit 1
   fi
 else
-  echo "================================================================================"
-  echo "NOTICE: Off-host backup replication (SPINE_BACKUP_REMOTE_S3_URI) is not configured."
-  echo "Backup is stored solely on local host storage (${BACKUP_DIR})."
-  echo "OPERATIONAL LIMITATION: In the event of catastrophic host destruction, storage controller"
-  echo "failure, or host compromise, local-only backups will be unrecoverable."
-  echo "To achieve full disaster recovery compliance, configure SPINE_BACKUP_REMOTE_S3_URI"
-  echo "with Object Lock immutability enabled."
-  echo "================================================================================"
+  if [ "${SPINE_BACKUP_REQUIRE_REMOTE}" = "1" ] || [ "${SPINE_BACKUP_REQUIRE_REMOTE}" = "true" ]; then
+    echo "FATAL: Off-site replication policy is ENFORCED (SPINE_BACKUP_REQUIRE_REMOTE=1), but upload was not configured." >&2
+    exit 1
+  else
+    echo "================================================================================"
+    echo "NOTICE: Off-host backup replication (SPINE_BACKUP_REMOTE_S3_URI) is not configured."
+    echo "Operating in INTENTIONALLY LOCAL-ONLY mode (SPINE_BACKUP_REQUIRE_REMOTE=0)."
+    echo "Backup is stored solely on local host storage (${BACKUP_DIR})."
+    echo "OPERATIONAL LIMITATION: In the event of catastrophic host destruction, storage controller"
+    echo "failure, or host compromise, local-only backups will be unrecoverable."
+    echo "================================================================================"
+  fi
 fi
 
 echo "=== Phase 3: Releasing Maintenance Barrier & Verifying Cluster Health ==="
