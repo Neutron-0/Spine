@@ -37,8 +37,8 @@ ENV PORT="3000"
 ENV SSH_PORT="2222"
 ENV STORAGE_ROOT="/var/lib/spine/storage"
 
-HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://127.0.0.1:3000/healthz || exit 1
+HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=5 \
+    CMD curl -f http://127.0.0.1:3000/health/ready || exit 1
 
 ENTRYPOINT ["/usr/local/bin/spine-api"]
 CMD ["serve", "--bind", "0.0.0.0", "--port", "3000", "--ssh-port", "2222", "--storage-root", "/var/lib/spine/storage"]

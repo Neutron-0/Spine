@@ -296,9 +296,10 @@ impl CargoRegistryAdapter {
         crate_name: &str,
         version: &str,
         yanked: bool,
+        user_id: &str,
     ) -> Result<(), ForgeError> {
         self.package_service
-            .set_yanked(CARGO_ECOSYSTEM, crate_name, version, yanked)
+            .set_yanked(CARGO_ECOSYSTEM, crate_name, version, yanked, user_id)
             .await
     }
 }

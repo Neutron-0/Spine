@@ -512,6 +512,11 @@ pub async fn delete_label(
         .check_write_access(Some(&caller), &repo)
         .await?;
 
+    let repo_labels = state.db.list_labels_for_repo(&repo.id).await?;
+    if !repo_labels.iter().any(|l| l.id == label_id) {
+        return Err(ForgeError::NotFound("Label not found in repository".into()));
+    }
+
     state.db.delete_label(&label_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -590,6 +595,10 @@ pub async fn update_milestone(
         .await?
         .ok_or_else(|| ForgeError::NotFound("Milestone not found".into()))?;
 
+    if milestone.repo_id != repo.id {
+        return Err(ForgeError::NotFound("Milestone not found in repository".into()));
+    }
+
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
     if let Some(t) = payload.title {
         milestone.title = t;
@@ -631,6 +640,16 @@ pub async fn delete_milestone(
         .permissions
         .check_write_access(Some(&caller), &repo)
         .await?;
+
+    let milestone = state
+        .db
+        .get_milestone_by_id(&milestone_id)
+        .await?
+        .ok_or_else(|| ForgeError::NotFound("Milestone not found".into()))?;
+
+    if milestone.repo_id != repo.id {
+        return Err(ForgeError::NotFound("Milestone not found in repository".into()));
+    }
 
     state.db.delete_milestone(&milestone_id).await?;
     Ok(StatusCode::NO_CONTENT)

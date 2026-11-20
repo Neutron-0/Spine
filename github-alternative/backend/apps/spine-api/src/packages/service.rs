@@ -96,6 +96,14 @@ impl PackageService {
             .get_or_create_package(ecosystem, name, owner_type, owner_id, "")
             .await?;
 
+        // Ownership authorization check
+        if pkg.owner_id != owner_id {
+            return Err(ForgeError::Forbidden(format!(
+                "Only the package owner can publish new versions of package '{}'",
+                name
+            )));
+        }
+
         // Version immutability check
         if self
             .db
@@ -152,12 +160,20 @@ impl PackageService {
         name: &str,
         version: &str,
         yanked: bool,
+        user_id: &str,
     ) -> Result<(), ForgeError> {
         let pkg = self
             .db
             .get_package_by_name(ecosystem, name)
             .await?
             .ok_or_else(|| ForgeError::NotFound(format!("Package '{}' not found", name)))?;
+
+        if pkg.owner_id != user_id {
+            return Err(ForgeError::Forbidden(format!(
+                "Only the package owner can yank or unyank versions of package '{}'",
+                name
+            )));
+        }
 
         self.db
             .set_package_version_yanked(&pkg.id, version, yanked)
