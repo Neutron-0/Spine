@@ -7,11 +7,11 @@
 
 - **Repository:** `D:\Vault\Spine`
 - **Branch:** `main`
-- **Built Source Commit:** `74f72a6c3156780ec97f1a8fd25494abc2fa0378` (source code, migrations, tests, and `docs/sbom.json` compiled into all release artifacts below; this provenance document commit is a `docs/`-only commit immediately following build verification)
-- **Built Source Tree Hash:** `6f238fe50fd9511c79ece01efb42695f35d70720`
-- **Build Start Timestamp (UTC):** `2026-11-17T05:00:00Z`
-- **Build Completion Timestamp (UTC):** `2026-11-17T15:35:10Z`
-- **Artifact Staging Timestamp (UTC):** `2026-11-17T15:35:15Z`
+- **Built Source Commit:** `13f4ab076f0de947f4b8b4d6211ee37b55276045` (source code, migrations, tests, and `docs/sbom.json` compiled into all release artifacts below; this provenance document commit is a `docs/`-only commit immediately following build verification)
+- **Built Source Tree Hash:** `574bdbdd916850ef2392a14fdaf445708a639434`
+- **Build Start Timestamp (UTC):** `2026-11-20T14:50:00Z`
+- **Build Completion Timestamp (UTC):** `2026-11-20T14:54:15Z`
+- **Artifact Staging Timestamp (UTC):** `2026-11-20T14:55:00Z`
 - **Host Target:** `x86_64-pc-windows-msvc`
 - **Compiler (`rustc --version`):** `rustc 1.97.1 (8bab26f4f 2026-07-14)` (commit `8bab26f4f68e0e26f0bb7960be334d5b520ea452`, LLVM `22.1.6`)
 - **Cargo (`cargo --version`):** `cargo 1.97.1 (c980f4866 2026-06-30)`
@@ -48,15 +48,15 @@ All four production executables were staged under `target/release-candidate/`, a
 | Binary | Size (Bytes) | Staged Modification Time (UTC) | SHA-256 |
 |---|---|---|---|
 | `spine.exe` | `8932352` | `2026-11-17 15:24:12 UTC` | `5a987eb7a1a1c3f6bc017be82560b191ea69bf21dde9751a8c9db43c91faef5f` |
-| `spine-coordinator.exe` | `3068416` | `2026-11-17 15:24:12 UTC` | `8f7ed491e1b04d62e801cd7bb09c8b083bd6eebe911685304e836994a96994b1` |
+| `spine-coordinator.exe` | `3068416` | `2026-11-20 14:51:05 UTC` | `0b47434eb9e508407c831613d5dec742b014e3e96894e56fbddbfb9dec207ec8` |
 | `spine-storage-node.exe` | `2792960` | `2026-11-17 15:24:12 UTC` | `1ed8049200a6a2b306ca9d2cffcf2df6b7b0558c9dcd5f4d07d45d18192edd74` |
-| `spine-api.exe` | `24640512` | `2026-11-17 15:35:07 UTC` | `af2ade12b1cae0080a0f29e5b29c83ef43af2a9aff2f47d25328d5e9e9ba60f6` |
+| `spine-api.exe` | `24722944` | `2026-11-20 14:54:15 UTC` | `d967fce88f583e8a1b0f55e665ad592b2e07e37d999011e1e103b41ad7ab6ebb` |
 
 Checksums manifest (`target/release-candidate/SHA256SUMS`):
 
 ```text
-af2ade12b1cae0080a0f29e5b29c83ef43af2a9aff2f47d25328d5e9e9ba60f6  spine-api.exe
-8f7ed491e1b04d62e801cd7bb09c8b083bd6eebe911685304e836994a96994b1  spine-coordinator.exe
+d967fce88f583e8a1b0f55e665ad592b2e07e37d999011e1e103b41ad7ab6ebb  spine-api.exe
+0b47434eb9e508407c831613d5dec742b014e3e96894e56fbddbfb9dec207ec8  spine-coordinator.exe
 1ed8049200a6a2b306ca9d2cffcf2df6b7b0558c9dcd5f4d07d45d18192edd74  spine-storage-node.exe
 5a987eb7a1a1c3f6bc017be82560b191ea69bf21dde9751a8c9db43c91faef5f  spine.exe
 ```
