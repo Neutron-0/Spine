@@ -101,6 +101,7 @@ services:
   # 3. State Coordinator - Raft Consensus (No Host Port Exposure)
   # ----------------------------------------------------------------------------
   coordinator:
+    image: spine-coordinator:latest
     build:
       context: .
       dockerfile: git-alternative/Dockerfile.coordinator
@@ -131,6 +132,7 @@ services:
   # 4. Storage Nodes (No Host Port Exposure)
   # ----------------------------------------------------------------------------
   storage-node-1:
+    image: spine-storage-node:latest
     build:
       context: .
       dockerfile: git-alternative/Dockerfile.storage-node
@@ -165,6 +167,7 @@ services:
       - ALL
 
   storage-node-2:
+    image: spine-storage-node:latest
     build:
       context: .
       dockerfile: git-alternative/Dockerfile.storage-node
@@ -199,6 +202,7 @@ services:
       - ALL
 
   storage-node-3:
+    image: spine-storage-node:latest
     build:
       context: .
       dockerfile: git-alternative/Dockerfile.storage-node
@@ -236,6 +240,7 @@ services:
   # 5. Core Application Server - Spine Forge API & Native SSH Daemon
   # ----------------------------------------------------------------------------
   spine-api:
+    image: spine-api:latest
     build:
       context: .
       dockerfile: github-alternative/backend/Dockerfile.api
@@ -303,6 +308,7 @@ services:
   # 6. Web User Interface - Internal Static Asset Server
   # ----------------------------------------------------------------------------
   spine-frontend:
+    image: spine-frontend:latest
     build:
       context: github-alternative/frontend
       dockerfile: Dockerfile
