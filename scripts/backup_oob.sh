@@ -100,27 +100,80 @@ verify_supported_storage_topology() {
   echo "Supported storage topology verified: Docker Compose with local volume driver."
 }
 
+compute_retain_until_date() {
+  local days="$1"
+  local d=""
+  d=$(date -u -d "+${days} days" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || true)
+  if [ -z "${d}" ]; then
+    d=$(date -u -v "+${days}d" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || true)
+  fi
+  printf "%s" "${d}"
+}
+
 verify_off_site_replication_policy() {
   echo "=== Verifying Off-Site Replication Policy ==="
-  if [ "${SPINE_BACKUP_REQUIRE_REMOTE}" = "1" ] || [ "${SPINE_BACKUP_REQUIRE_REMOTE}" = "true" ]; then
-    if [ -z "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
+  case "${SPINE_BACKUP_REQUIRE_REMOTE}" in
+    1|true)
+      if [ -z "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
+        echo "================================================================================" >&2
+        echo "FATAL: Off-site replication policy is ENFORCED (SPINE_BACKUP_REQUIRE_REMOTE=${SPINE_BACKUP_REQUIRE_REMOTE})," >&2
+        echo "but SPINE_BACKUP_REMOTE_S3_URI is not set." >&2
+        echo "Under production profile 'core-forge-v1', backups must be replicated to an" >&2
+        echo "off-host object store with Object Lock retention to survive total host destruction." >&2
+        echo "To explicitly allow local-only backups for testing or dev, set SPINE_BACKUP_REQUIRE_REMOTE=0." >&2
+        echo "================================================================================" >&2
+        exit 1
+      fi
+      if ! command -v aws >/dev/null 2>&1; then
+        echo "FATAL: Off-site replication is required (SPINE_BACKUP_REQUIRE_REMOTE=${SPINE_BACKUP_REQUIRE_REMOTE}), but 'aws' CLI is not found on host." >&2
+        exit 1
+      fi
+      echo "Off-site replication policy verified [ENFORCED] -> Target: ${SPINE_BACKUP_REMOTE_S3_URI}"
+      ;;
+    0|false)
+      echo "Off-site replication policy: INTENTIONALLY LOCAL-ONLY (SPINE_BACKUP_REQUIRE_REMOTE=${SPINE_BACKUP_REQUIRE_REMOTE})."
+      echo "OPERATIONAL NOTICE: Local-only backups do not protect against total host loss."
+      ;;
+    *)
       echo "================================================================================" >&2
-      echo "FATAL: Off-site replication policy is ENFORCED (SPINE_BACKUP_REQUIRE_REMOTE=1)," >&2
-      echo "but SPINE_BACKUP_REMOTE_S3_URI is not set." >&2
-      echo "Under production profile 'core-forge-v1', backups must be replicated to an" >&2
-      echo "off-host object store with Object Lock retention to survive total host destruction." >&2
-      echo "To explicitly allow local-only backups for testing or dev, set SPINE_BACKUP_REQUIRE_REMOTE=0." >&2
+      echo "FATAL: Invalid SPINE_BACKUP_REQUIRE_REMOTE value: '${SPINE_BACKUP_REQUIRE_REMOTE}'" >&2
+      echo "Strict policy validation: SPINE_BACKUP_REQUIRE_REMOTE must be strictly '1' (or 'true')" >&2
+      echo "to enforce off-site replication, or '0' (or 'false') to explicitly permit local-only backups." >&2
+      echo "All other values (e.g. typos like 'yes', 'no', '2') are rejected fail-closed." >&2
       echo "================================================================================" >&2
       exit 1
-    fi
-    if ! command -v aws >/dev/null 2>&1; then
-      echo "FATAL: Off-site replication is required (SPINE_BACKUP_REQUIRE_REMOTE=1), but 'aws' CLI is not found on host." >&2
-      exit 1
-    fi
-    echo "Off-site replication policy verified [ENFORCED] -> Target: ${SPINE_BACKUP_REMOTE_S3_URI}"
-  else
-    echo "Off-site replication policy: INTENTIONALLY LOCAL-ONLY (SPINE_BACKUP_REQUIRE_REMOTE=0)."
-    echo "OPERATIONAL NOTICE: Local-only backups do not protect against total host loss."
+      ;;
+  esac
+
+  # Validate remote retention configuration whenever S3 replication is configured
+  if [ -n "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
+    case "${SPINE_BACKUP_OBJECT_LOCK_MODE}" in
+      GOVERNANCE|COMPLIANCE)
+        if ! [[ "${SPINE_BACKUP_RETENTION_DAYS}" =~ ^[1-9][0-9]*$ ]]; then
+          echo "FATAL: Invalid SPINE_BACKUP_RETENTION_DAYS='${SPINE_BACKUP_RETENTION_DAYS}'. Must be a positive integer." >&2
+          exit 1
+        fi
+        local test_date
+        test_date=$(compute_retain_until_date "${SPINE_BACKUP_RETENTION_DAYS}")
+        if [ -z "${test_date}" ]; then
+          echo "FATAL: Cannot compute retain-until date for S3 Object Lock retention (+${SPINE_BACKUP_RETENTION_DAYS} days)." >&2
+          echo "Neither GNU date nor BSD date produced a valid UTC ISO 8601 timestamp." >&2
+          echo "Date calculation is required to enforce immutable retention. Failing closed before snapshot capture." >&2
+          exit 1
+        fi
+        echo "S3 Object Lock retention policy verified: mode=${SPINE_BACKUP_OBJECT_LOCK_MODE}, days=${SPINE_BACKUP_RETENTION_DAYS} (sample retain-until: ${test_date})."
+        ;;
+      ""|NONE)
+        echo "NOTICE: S3 Object Lock retention is not configured (SPINE_BACKUP_OBJECT_LOCK_MODE='${SPINE_BACKUP_OBJECT_LOCK_MODE}')."
+        ;;
+      *)
+        echo "================================================================================" >&2
+        echo "FATAL: Unsupported SPINE_BACKUP_OBJECT_LOCK_MODE: '${SPINE_BACKUP_OBJECT_LOCK_MODE}'" >&2
+        echo "Supported S3 Object Lock modes are strictly 'GOVERNANCE' or 'COMPLIANCE' (or ''/NONE to disable)." >&2
+        echo "================================================================================" >&2
+        exit 1
+        ;;
+    esac
   fi
 }
 
@@ -385,64 +438,110 @@ if [ -n "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
     AWS_EXTRA_ARGS+=(--endpoint-url "${SPINE_S3_ENDPOINT_URL}")
   fi
 
-  RETAIN_UNTIL=$(date -u -d "+${SPINE_BACKUP_RETENTION_DAYS} days" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || \
-                date -u -v "+${SPINE_BACKUP_RETENTION_DAYS}d" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "")
-
-  if command -v aws >/dev/null 2>&1; then
-    UPLOAD_ARGS=("${AWS_EXTRA_ARGS[@]}")
-    if [ -n "${RETAIN_UNTIL}" ] && [ -n "${SPINE_BACKUP_OBJECT_LOCK_MODE}" ]; then
-      echo "Applying S3 Object Lock retention: mode=${SPINE_BACKUP_OBJECT_LOCK_MODE}, retain_until=${RETAIN_UNTIL} (${SPINE_BACKUP_RETENTION_DAYS} days)"
-      UPLOAD_ARGS+=(--object-lock-mode "${SPINE_BACKUP_OBJECT_LOCK_MODE}" --object-lock-retain-until-date "${RETAIN_UNTIL}")
-    fi
-
-    echo "Uploading backup.spnebak to ${REMOTE_TARGET}/backup.spnebak..."
-    if ! aws s3 cp "${ENCRYPTED_ARCHIVE}" "${REMOTE_TARGET}/backup.spnebak" "${UPLOAD_ARGS[@]}"; then
-      echo "FATAL: Failed to replicate backup archive to remote object store ${REMOTE_TARGET}/backup.spnebak" >&2
-      exit 1
-    fi
-
-    echo "Uploading SHA256SUMS to ${REMOTE_TARGET}/SHA256SUMS..."
-    if ! aws s3 cp "${BACKUP_DIR}/SHA256SUMS" "${REMOTE_TARGET}/SHA256SUMS" "${AWS_EXTRA_ARGS[@]}"; then
-      echo "FATAL: Failed to replicate SHA256SUMS to remote object store ${REMOTE_TARGET}/SHA256SUMS" >&2
-      exit 1
-    fi
-
-    echo "Verifying remote object size and cryptographic byte integrity..."
-    LOCAL_SIZE=$(stat -c%s "${ENCRYPTED_ARCHIVE}" 2>/dev/null || stat -f%z "${ENCRYPTED_ARCHIVE}" 2>/dev/null || wc -c < "${ENCRYPTED_ARCHIVE}" | tr -d '[:space:]')
-    REMOTE_SIZE=$(aws s3 ls "${REMOTE_TARGET}/backup.spnebak" "${AWS_EXTRA_ARGS[@]}" | awk '{print $3}' | tr -d '[:space:]' || echo "0")
-    if [ -z "${REMOTE_SIZE}" ] || [ "${LOCAL_SIZE}" != "${REMOTE_SIZE}" ]; then
-      echo "FATAL: Remote size mismatch for ${REMOTE_TARGET}/backup.spnebak: local=${LOCAL_SIZE}, remote=${REMOTE_SIZE}" >&2
-      exit 1
-    fi
-
-    LOCAL_SHA256=$(sha256sum "${ENCRYPTED_ARCHIVE}" | awk '{print $1}')
-    echo "Streaming remote object from ${REMOTE_TARGET}/backup.spnebak to verify SHA-256 digest..."
-    REMOTE_SHA256=$(aws s3 cp "${REMOTE_TARGET}/backup.spnebak" - "${AWS_EXTRA_ARGS[@]}" | sha256sum | awk '{print $1}')
-    if [ -z "${REMOTE_SHA256}" ] || [ "${LOCAL_SHA256}" != "${REMOTE_SHA256}" ]; then
-      echo "FATAL: Cryptographic verification failed! Remote SHA-256 does not match local archive." >&2
-      echo "  Local SHA-256:  ${LOCAL_SHA256}" >&2
-      echo "  Remote SHA-256: ${REMOTE_SHA256}" >&2
-      exit 1
-    fi
-
-    echo "Remote replication cryptographically verified [OK] (${REMOTE_SIZE} bytes, SHA-256: ${REMOTE_SHA256}, immutable retention active)."
-  else
+  if ! command -v aws >/dev/null 2>&1; then
     echo "FATAL: SPINE_BACKUP_REMOTE_S3_URI specified, but 'aws' CLI is not available on host. Cannot complete off-host replication." >&2
     exit 1
   fi
-else
-  if [ "${SPINE_BACKUP_REQUIRE_REMOTE}" = "1" ] || [ "${SPINE_BACKUP_REQUIRE_REMOTE}" = "true" ]; then
-    echo "FATAL: Off-site replication policy is ENFORCED (SPINE_BACKUP_REQUIRE_REMOTE=1), but upload was not configured." >&2
+
+  UPLOAD_ARGS=("${AWS_EXTRA_ARGS[@]}")
+  APPLY_OBJECT_LOCK=0
+  if [ "${SPINE_BACKUP_OBJECT_LOCK_MODE}" = "GOVERNANCE" ] || [ "${SPINE_BACKUP_OBJECT_LOCK_MODE}" = "COMPLIANCE" ]; then
+    RETAIN_UNTIL=$(compute_retain_until_date "${SPINE_BACKUP_RETENTION_DAYS}")
+    if [ -z "${RETAIN_UNTIL}" ]; then
+      echo "FATAL: S3 Object Lock retention is required (mode=${SPINE_BACKUP_OBJECT_LOCK_MODE}), but failed to compute retain-until date (+${SPINE_BACKUP_RETENTION_DAYS} days)." >&2
+      exit 1
+    fi
+    echo "Applying S3 Object Lock retention: mode=${SPINE_BACKUP_OBJECT_LOCK_MODE}, retain_until=${RETAIN_UNTIL} (${SPINE_BACKUP_RETENTION_DAYS} days)"
+    UPLOAD_ARGS+=(--object-lock-mode "${SPINE_BACKUP_OBJECT_LOCK_MODE}" --object-lock-retain-until-date "${RETAIN_UNTIL}")
+    APPLY_OBJECT_LOCK=1
+  elif [ -n "${SPINE_BACKUP_OBJECT_LOCK_MODE}" ] && [ "${SPINE_BACKUP_OBJECT_LOCK_MODE}" != "NONE" ]; then
+    echo "FATAL: Unsupported SPINE_BACKUP_OBJECT_LOCK_MODE: '${SPINE_BACKUP_OBJECT_LOCK_MODE}'. Must be 'GOVERNANCE' or 'COMPLIANCE'." >&2
     exit 1
-  else
-    echo "================================================================================"
-    echo "NOTICE: Off-host backup replication (SPINE_BACKUP_REMOTE_S3_URI) is not configured."
-    echo "Operating in INTENTIONALLY LOCAL-ONLY mode (SPINE_BACKUP_REQUIRE_REMOTE=0)."
-    echo "Backup is stored solely on local host storage (${BACKUP_DIR})."
-    echo "OPERATIONAL LIMITATION: In the event of catastrophic host destruction, storage controller"
-    echo "failure, or host compromise, local-only backups will be unrecoverable."
-    echo "================================================================================"
   fi
+
+  echo "Uploading backup.spnebak to ${REMOTE_TARGET}/backup.spnebak..."
+  if ! aws s3 cp "${ENCRYPTED_ARCHIVE}" "${REMOTE_TARGET}/backup.spnebak" "${UPLOAD_ARGS[@]}"; then
+    echo "FATAL: Failed to replicate backup archive to remote object store ${REMOTE_TARGET}/backup.spnebak" >&2
+    exit 1
+  fi
+
+  echo "Uploading SHA256SUMS to ${REMOTE_TARGET}/SHA256SUMS..."
+  if ! aws s3 cp "${BACKUP_DIR}/SHA256SUMS" "${REMOTE_TARGET}/SHA256SUMS" "${AWS_EXTRA_ARGS[@]}"; then
+    echo "FATAL: Failed to replicate SHA256SUMS to remote object store ${REMOTE_TARGET}/SHA256SUMS" >&2
+    exit 1
+  fi
+
+  echo "Verifying remote object size and cryptographic byte integrity..."
+  LOCAL_SIZE=$(stat -c%s "${ENCRYPTED_ARCHIVE}" 2>/dev/null || stat -f%z "${ENCRYPTED_ARCHIVE}" 2>/dev/null || wc -c < "${ENCRYPTED_ARCHIVE}" | tr -d '[:space:]')
+  REMOTE_SIZE=$(aws s3 ls "${REMOTE_TARGET}/backup.spnebak" "${AWS_EXTRA_ARGS[@]}" | awk '{print $3}' | tr -d '[:space:]' || echo "0")
+  if [ -z "${REMOTE_SIZE}" ] || [ "${LOCAL_SIZE}" != "${REMOTE_SIZE}" ]; then
+    echo "FATAL: Remote size mismatch for ${REMOTE_TARGET}/backup.spnebak: local=${LOCAL_SIZE}, remote=${REMOTE_SIZE}" >&2
+    exit 1
+  fi
+
+  LOCAL_SHA256=$(sha256sum "${ENCRYPTED_ARCHIVE}" | awk '{print $1}')
+  echo "Streaming remote object from ${REMOTE_TARGET}/backup.spnebak to verify SHA-256 digest..."
+  REMOTE_SHA256=$(aws s3 cp "${REMOTE_TARGET}/backup.spnebak" - "${AWS_EXTRA_ARGS[@]}" | sha256sum | awk '{print $1}')
+  if [ -z "${REMOTE_SHA256}" ] || [ "${LOCAL_SHA256}" != "${REMOTE_SHA256}" ]; then
+    echo "FATAL: Cryptographic verification failed! Remote SHA-256 does not match local archive." >&2
+    echo "  Local SHA-256:  ${LOCAL_SHA256}" >&2
+    echo "  Remote SHA-256: ${REMOTE_SHA256}" >&2
+    exit 1
+  fi
+
+  # Parse S3 bucket and object key for retention metadata verification
+  NO_SCHEME="${REMOTE_TARGET#s3://}"
+  S3_BUCKET="${NO_SCHEME%%/*}"
+  if [ "${NO_SCHEME}" != "${S3_BUCKET}" ]; then
+    S3_PREFIX="${NO_SCHEME#*/}"
+    S3_KEY="${S3_PREFIX}/backup.spnebak"
+  else
+    S3_KEY="backup.spnebak"
+  fi
+
+  if [ "${APPLY_OBJECT_LOCK}" -eq 1 ]; then
+    echo "Verifying S3 Object Lock retention metadata on remote object (${S3_BUCKET}/${S3_KEY})..."
+    RETENTION_OUTPUT=$(aws s3api get-object-retention --bucket "${S3_BUCKET}" --key "${S3_KEY}" "${AWS_EXTRA_ARGS[@]}" 2>&1 || true)
+    REMOTE_LOCK_MODE=$(echo "${RETENTION_OUTPUT}" | grep -o '"Mode"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -E 's/.*"Mode"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/' || echo "")
+    REMOTE_RETAIN_UNTIL=$(echo "${RETENTION_OUTPUT}" | grep -o '"RetainUntilDate"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -E 's/.*"RetainUntilDate"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/' || echo "")
+
+    if [ -z "${REMOTE_LOCK_MODE}" ] || [ "${REMOTE_LOCK_MODE}" != "${SPINE_BACKUP_OBJECT_LOCK_MODE}" ]; then
+      echo "================================================================================" >&2
+      echo "FATAL: S3 Object Lock retention verification failed for ${REMOTE_TARGET}/backup.spnebak!" >&2
+      echo "  Expected lock mode:   ${SPINE_BACKUP_OBJECT_LOCK_MODE}" >&2
+      echo "  Observed lock mode:   ${REMOTE_LOCK_MODE:-<absent>}" >&2
+      echo "  Observed retain date: ${REMOTE_RETAIN_UNTIL:-<absent>}" >&2
+      echo "  s3api raw response:   ${RETENTION_OUTPUT}" >&2
+      echo "Object Lock must be confirmed by remote metadata before declaring backup success." >&2
+      echo "================================================================================" >&2
+      exit 1
+    fi
+
+    echo "Remote Object Lock metadata verified: mode=${REMOTE_LOCK_MODE}, retain_until=${REMOTE_RETAIN_UNTIL}."
+    echo "Remote replication cryptographically verified [OK] (${REMOTE_SIZE} bytes, SHA-256: ${REMOTE_SHA256}, immutable retention active: ${REMOTE_LOCK_MODE} until ${REMOTE_RETAIN_UNTIL})."
+  else
+    echo "Remote replication cryptographically verified [OK] (${REMOTE_SIZE} bytes, SHA-256: ${REMOTE_SHA256}, standard replication without Object Lock)."
+  fi
+else
+  case "${SPINE_BACKUP_REQUIRE_REMOTE}" in
+    1|true)
+      echo "FATAL: Off-site replication policy is ENFORCED (SPINE_BACKUP_REQUIRE_REMOTE=${SPINE_BACKUP_REQUIRE_REMOTE}), but upload was not configured." >&2
+      exit 1
+      ;;
+    0|false)
+      echo "================================================================================"
+      echo "NOTICE: Off-host backup replication (SPINE_BACKUP_REMOTE_S3_URI) is not configured."
+      echo "Operating in INTENTIONALLY LOCAL-ONLY mode (SPINE_BACKUP_REQUIRE_REMOTE=${SPINE_BACKUP_REQUIRE_REMOTE})."
+      echo "Backup is stored solely on local host storage (${BACKUP_DIR})."
+      echo "OPERATIONAL LIMITATION: In the event of catastrophic host destruction, storage controller"
+      echo "failure, or host compromise, local-only backups will be unrecoverable."
+      echo "================================================================================"
+      ;;
+    *)
+      echo "FATAL: Invalid SPINE_BACKUP_REQUIRE_REMOTE value: '${SPINE_BACKUP_REQUIRE_REMOTE}'" >&2
+      exit 1
+      ;;
+  esac
 fi
 
 echo "=== Phase 3: Releasing Maintenance Barrier & Verifying Cluster Health ==="

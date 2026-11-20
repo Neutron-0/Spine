@@ -1438,22 +1438,32 @@ exit 0
 
 #[test]
 fn test_backup_off_site_policy_enforcement_and_local_only_mode() {
-    // 1. Rust logic unit test: Enforced policy requires S3 URI
-    fn check_policy(enforced: bool, s3_uri: Option<&str>) -> Result<(), String> {
-        if enforced {
-            match s3_uri {
+    // 1. Rust logic unit test: Enforced policy requires S3 URI; invalid values fail closed
+    fn check_policy(policy: &str, s3_uri: Option<&str>) -> Result<(), String> {
+        match policy {
+            "1" | "true" => match s3_uri {
                 Some(uri) if !uri.trim().is_empty() => Ok(()),
                 _ => Err("FATAL: Off-site replication policy is ENFORCED (SPINE_BACKUP_REQUIRE_REMOTE=1), but SPINE_BACKUP_REMOTE_S3_URI is not set.".to_string()),
-            }
-        } else {
-            Ok(())
+            },
+            "0" | "false" => Ok(()),
+            other => Err(format!(
+                "FATAL: Invalid SPINE_BACKUP_REQUIRE_REMOTE value: '{}'. Must be '1', 'true', '0', or 'false'.",
+                other
+            )),
         }
     }
 
-    assert!(check_policy(true, Some("s3://vault/backups")).is_ok());
-    assert!(check_policy(true, None).is_err());
-    assert!(check_policy(true, Some("")).is_err());
-    assert!(check_policy(false, None).is_ok());
+    assert!(check_policy("1", Some("s3://vault/backups")).is_ok());
+    assert!(check_policy("true", Some("s3://vault/backups")).is_ok());
+    assert!(check_policy("1", None).is_err());
+    assert!(check_policy("1", Some("")).is_err());
+    assert!(check_policy("0", None).is_ok());
+    assert!(check_policy("false", None).is_ok());
+    // Reject invalid values
+    assert!(check_policy("yes", Some("s3://vault/backups")).is_err());
+    assert!(check_policy("2", Some("s3://vault/backups")).is_err());
+    assert!(check_policy("no", None).is_err());
+    assert!(check_policy("maybe", None).is_err());
 
     // 2. Shell execution test: verify exact pre-flight check in bash
     if let Ok(bash_check) = Command::new("bash").arg("-c").arg("echo ok").output() {
@@ -1463,15 +1473,32 @@ set -euo pipefail
 WORK_DIR="/tmp/spine_test_policy_$$"
 mkdir -p "${WORK_DIR}"
 
-verify_off_site_replication_policy() {
-  if [ "${SPINE_BACKUP_REQUIRE_REMOTE}" = "1" ] || [ "${SPINE_BACKUP_REQUIRE_REMOTE}" = "true" ]; then
-    if [ -z "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
-      echo "FATAL: Off-site replication policy is ENFORCED (SPINE_BACKUP_REQUIRE_REMOTE=1), but SPINE_BACKUP_REMOTE_S3_URI is not set." >&2
-      exit 1
-    fi
-  else
-    echo "NOTICE: Operating in INTENTIONALLY LOCAL-ONLY mode."
+compute_retain_until_date() {
+  local days="$1"
+  local d=""
+  d=$(date -u -d "+${days} days" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || true)
+  if [ -z "${d}" ]; then
+    d=$(date -u -v "+${days}d" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || true)
   fi
+  printf "%s" "${d}"
+}
+
+verify_off_site_replication_policy() {
+  case "${SPINE_BACKUP_REQUIRE_REMOTE}" in
+    1|true)
+      if [ -z "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
+        echo "FATAL: Off-site replication policy is ENFORCED (SPINE_BACKUP_REQUIRE_REMOTE=${SPINE_BACKUP_REQUIRE_REMOTE}), but SPINE_BACKUP_REMOTE_S3_URI is not set." >&2
+        exit 1
+      fi
+      ;;
+    0|false)
+      echo "NOTICE: Operating in INTENTIONALLY LOCAL-ONLY mode."
+      ;;
+    *)
+      echo "FATAL: Invalid SPINE_BACKUP_REQUIRE_REMOTE value: '${SPINE_BACKUP_REQUIRE_REMOTE}'" >&2
+      exit 1
+      ;;
+  esac
 }
 
 # 1. Enforced mode with missing URI must exit 1
@@ -1483,11 +1510,25 @@ if ( verify_off_site_replication_policy 2>"${WORK_DIR}/enforce.log" ); then
 fi
 grep -q "FATAL: Off-site replication policy is ENFORCED" "${WORK_DIR}/enforce.log"
 
-# 2. Local-only mode (overridden) must exit 0 and emit notice
+# 2. Local-only mode (overridden with 0 or false) must exit 0 and emit notice
 export SPINE_BACKUP_REQUIRE_REMOTE=0
 export SPINE_BACKUP_REMOTE_S3_URI=""
 verify_off_site_replication_policy > "${WORK_DIR}/local_only.log"
 grep -q "INTENTIONALLY LOCAL-ONLY" "${WORK_DIR}/local_only.log"
+
+export SPINE_BACKUP_REQUIRE_REMOTE=false
+verify_off_site_replication_policy > "${WORK_DIR}/local_false.log"
+grep -q "INTENTIONALLY LOCAL-ONLY" "${WORK_DIR}/local_false.log"
+
+# 3. Invalid values (such as 'yes', '2', 'maybe') must fail closed
+for bad_val in "yes" "2" "maybe" "no"; do
+  export SPINE_BACKUP_REQUIRE_REMOTE="${bad_val}"
+  if ( verify_off_site_replication_policy 2>"${WORK_DIR}/bad_${bad_val}.log" ); then
+    echo "FAIL: Invalid policy value '${bad_val}' did not fail closed!" >&2
+    exit 98
+  fi
+  grep -q "FATAL: Invalid SPINE_BACKUP_REQUIRE_REMOTE value" "${WORK_DIR}/bad_${bad_val}.log"
+done
 
 rm -rf "${WORK_DIR}"
 exit 0
@@ -1690,6 +1731,372 @@ exit 0
             assert!(
                 res.status.success(),
                 "Remote restore download cleanup test failed. Stderr: {}, Stdout: {}",
+                String::from_utf8_lossy(&res.stderr),
+                String::from_utf8_lossy(&res.stdout)
+            );
+        }
+    }
+}
+
+#[test]
+fn test_backup_rejects_invalid_policy_values_fail_closed() {
+    if let Ok(bash_check) = Command::new("bash").arg("-c").arg("echo ok").output() {
+        if bash_check.status.success() {
+            let script = r#"
+set -euo pipefail
+WORK_DIR="/tmp/spine_test_invalid_policy_$$"
+mkdir -p "${WORK_DIR}"
+
+compute_retain_until_date() {
+  local days="$1"
+  local d=""
+  d=$(date -u -d "+${days} days" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || true)
+  if [ -z "${d}" ]; then
+    d=$(date -u -v "+${days}d" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || true)
+  fi
+  printf "%s" "${d}"
+}
+
+verify_off_site_replication_policy() {
+  case "${SPINE_BACKUP_REQUIRE_REMOTE}" in
+    1|true)
+      if [ -z "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
+        echo "FATAL: Off-site replication policy is ENFORCED, but URI unset." >&2
+        exit 1
+      fi
+      ;;
+    0|false)
+      echo "NOTICE: Operating in INTENTIONALLY LOCAL-ONLY mode."
+      ;;
+    *)
+      echo "FATAL: Invalid SPINE_BACKUP_REQUIRE_REMOTE value: '${SPINE_BACKUP_REQUIRE_REMOTE}'" >&2
+      exit 1
+      ;;
+  esac
+
+  if [ -n "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
+    case "${SPINE_BACKUP_OBJECT_LOCK_MODE}" in
+      GOVERNANCE|COMPLIANCE)
+        if ! [[ "${SPINE_BACKUP_RETENTION_DAYS}" =~ ^[1-9][0-9]*$ ]]; then
+          echo "FATAL: Invalid SPINE_BACKUP_RETENTION_DAYS='${SPINE_BACKUP_RETENTION_DAYS}'." >&2
+          exit 1
+        fi
+        local test_date
+        test_date=$(compute_retain_until_date "${SPINE_BACKUP_RETENTION_DAYS}")
+        if [ -z "${test_date}" ]; then
+          echo "FATAL: Cannot compute retain-until date for S3 Object Lock retention." >&2
+          exit 1
+        fi
+        ;;
+      ""|NONE)
+        ;;
+      *)
+        echo "FATAL: Unsupported SPINE_BACKUP_OBJECT_LOCK_MODE: '${SPINE_BACKUP_OBJECT_LOCK_MODE}'" >&2
+        exit 1
+        ;;
+    esac
+  fi
+}
+
+# 1. Invalid SPINE_BACKUP_REQUIRE_REMOTE values
+export SPINE_BACKUP_REMOTE_S3_URI="s3://test-bucket/backups"
+export SPINE_BACKUP_OBJECT_LOCK_MODE="GOVERNANCE"
+export SPINE_BACKUP_RETENTION_DAYS="30"
+
+for invalid_val in "yes" "no" "2" "True" "maybe" " " "disabled" "enabled"; do
+  export SPINE_BACKUP_REQUIRE_REMOTE="${invalid_val}"
+  if ( verify_off_site_replication_policy 2>"${WORK_DIR}/err.log" ); then
+    echo "FAIL: Invalid policy value '${invalid_val}' was accepted!" >&2
+    exit 1
+  fi
+  grep -q "FATAL: Invalid SPINE_BACKUP_REQUIRE_REMOTE value" "${WORK_DIR}/err.log"
+done
+
+# 2. Unsupported SPINE_BACKUP_OBJECT_LOCK_MODE values
+export SPINE_BACKUP_REQUIRE_REMOTE="1"
+for bad_mode in "TEMPORARY" "STANDARD" "governance" "compliance" "INVALID" "1" "true"; do
+  export SPINE_BACKUP_OBJECT_LOCK_MODE="${bad_mode}"
+  if ( verify_off_site_replication_policy 2>"${WORK_DIR}/mode_err.log" ); then
+    echo "FAIL: Unsupported lock mode '${bad_mode}' was accepted!" >&2
+    exit 2
+  fi
+  grep -q "FATAL: Unsupported SPINE_BACKUP_OBJECT_LOCK_MODE" "${WORK_DIR}/mode_err.log"
+done
+
+rm -rf "${WORK_DIR}"
+exit 0
+"#
+            .replace("\r\n", "\n")
+            .replace('\r', "");
+
+            let mut child = Command::new("bash")
+                .arg("-s")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("failed to spawn bash");
+
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(script.as_bytes()).expect("failed to write script to stdin");
+            }
+            let res = child.wait_with_output().expect("failed to wait on bash child");
+            assert!(
+                res.status.success(),
+                "Invalid policy values rejection test failed. Stderr: {}, Stdout: {}",
+                String::from_utf8_lossy(&res.stderr),
+                String::from_utf8_lossy(&res.stdout)
+            );
+        }
+    }
+}
+
+#[test]
+fn test_backup_rejects_unavailable_date_calculation_fail_closed() {
+    if let Ok(bash_check) = Command::new("bash").arg("-c").arg("echo ok").output() {
+        if bash_check.status.success() {
+            let script = r#"
+set -euo pipefail
+WORK_DIR="/tmp/spine_test_date_fail_$$"
+mkdir -p "${WORK_DIR}"
+BIN_DIR="${WORK_DIR}/bin"
+mkdir -p "${BIN_DIR}"
+
+# 1. Test invalid non-numeric retention days
+export SPINE_BACKUP_REQUIRE_REMOTE="1"
+export SPINE_BACKUP_REMOTE_S3_URI="s3://test-bucket/backups"
+export SPINE_BACKUP_OBJECT_LOCK_MODE="GOVERNANCE"
+
+compute_retain_until_date() {
+  local days="$1"
+  local d=""
+  d=$(date -u -d "+${days} days" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || true)
+  if [ -z "${d}" ]; then
+    d=$(date -u -v "+${days}d" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || true)
+  fi
+  printf "%s" "${d}"
+}
+
+verify_retention_date_gate() {
+  if ! [[ "${SPINE_BACKUP_RETENTION_DAYS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "FATAL: Invalid SPINE_BACKUP_RETENTION_DAYS='${SPINE_BACKUP_RETENTION_DAYS}'. Must be a positive integer." >&2
+    exit 1
+  fi
+  local test_date
+  test_date=$(compute_retain_until_date "${SPINE_BACKUP_RETENTION_DAYS}")
+  if [ -z "${test_date}" ]; then
+    echo "FATAL: Cannot compute retain-until date for S3 Object Lock retention (+${SPINE_BACKUP_RETENTION_DAYS} days)." >&2
+    exit 1
+  fi
+}
+
+for bad_days in "0" "-1" "invalid" "30days" " 30" "null"; do
+  export SPINE_BACKUP_RETENTION_DAYS="${bad_days}"
+  if ( verify_retention_date_gate 2>"${WORK_DIR}/days_err.log" ); then
+    echo "FAIL: Bad retention days '${bad_days}' passed gate!" >&2
+    exit 1
+  fi
+  grep -q "FATAL: Invalid SPINE_BACKUP_RETENTION_DAYS" "${WORK_DIR}/days_err.log"
+done
+
+# 2. Test when date command cannot format relative dates (simulating unavailable date calculation)
+cat <<'EOF' > "${BIN_DIR}/date"
+#!/usr/bin/env bash
+# Fail if relative date syntax is requested
+for arg in "$@"; do
+  if [ "$arg" = "-d" ] || [ "$arg" = "-v" ]; then
+    exit 1
+  fi
+done
+exit 1
+EOF
+chmod +x "${BIN_DIR}/date"
+
+export PATH="${BIN_DIR}:${PATH}"
+export SPINE_BACKUP_RETENTION_DAYS="30"
+
+if ( verify_retention_date_gate 2>"${WORK_DIR}/date_fail.log" ); then
+  echo "FAIL: Unavailable date calculation did not fail closed!" >&2
+  exit 2
+fi
+grep -q "FATAL: Cannot compute retain-until date" "${WORK_DIR}/date_fail.log"
+
+rm -rf "${WORK_DIR}"
+exit 0
+"#
+            .replace("\r\n", "\n")
+            .replace('\r', "");
+
+            let mut child = Command::new("bash")
+                .arg("-s")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("failed to spawn bash");
+
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(script.as_bytes()).expect("failed to write script to stdin");
+            }
+            let res = child.wait_with_output().expect("failed to wait on bash child");
+            assert!(
+                res.status.success(),
+                "Unavailable date calculation fail-closed test failed. Stderr: {}, Stdout: {}",
+                String::from_utf8_lossy(&res.stderr),
+                String::from_utf8_lossy(&res.stdout)
+            );
+        }
+    }
+}
+
+#[test]
+fn test_backup_fails_closed_when_remote_object_lock_metadata_absent_or_mismatched() {
+    if let Ok(bash_check) = Command::new("bash").arg("-c").arg("echo ok").output() {
+        if bash_check.status.success() {
+            let script = r#"
+set -euo pipefail
+WORK_DIR="/tmp/spine_test_lock_metadata_$$"
+mkdir -p "${WORK_DIR}"
+MOCK_BIN="${WORK_DIR}/bin"
+mkdir -p "${MOCK_BIN}"
+MOCK_S3="${WORK_DIR}/s3"
+mkdir -p "${MOCK_S3}"
+
+# Configurable mock behavior
+export MOCK_RETENTION_BEHAVIOR="absent" # "absent", "mismatched", "valid"
+
+cat <<EOF > "${MOCK_BIN}/aws"
+#!/usr/bin/env bash
+if [ "\$1" = "s3" ] && [ "\$2" = "cp" ]; then
+  SRC="\$3"
+  DST="\$4"
+  if [ "\$DST" = "-" ]; then
+    KEY=\$(basename "\$SRC")
+    cat "${MOCK_S3}/\${KEY}"
+  elif [[ "\$DST" =~ ^s3:// ]]; then
+    KEY=\$(basename "\$DST")
+    cp "\$SRC" "${MOCK_S3}/\${KEY}"
+  fi
+  exit 0
+elif [ "\$1" = "s3" ] && [ "\$2" = "ls" ]; then
+  KEY=\$(basename "\$3")
+  SIZE=\$(stat -c%s "${MOCK_S3}/\${KEY}" 2>/dev/null || stat -f%z "${MOCK_S3}/\${KEY}" 2>/dev/null || wc -c < "${MOCK_S3}/\${KEY}")
+  echo "2026-11-20 12:00:00 \${SIZE} \${KEY}"
+  exit 0
+elif [ "\$1" = "s3api" ] && [ "\$2" = "get-object-retention" ]; then
+  case "\${MOCK_RETENTION_BEHAVIOR}" in
+    "absent")
+      echo "An error occurred (NoSuchObjectLockConfiguration) when calling the GetObjectRetention operation: The specified object does not have a ObjectLock configuration" >&2
+      exit 1
+      ;;
+    "mismatched")
+      echo '{"Retention": {"Mode": "COMPLIANCE", "RetainUntilDate": "2026-12-20T12:00:00.000Z"}}'
+      exit 0
+      ;;
+    "valid")
+      echo '{"Retention": {"Mode": "GOVERNANCE", "RetainUntilDate": "2026-12-20T12:00:00.000Z"}}'
+      exit 0
+      ;;
+    *)
+      exit 1
+      ;;
+  esac
+fi
+EOF
+chmod +x "${MOCK_BIN}/aws"
+export PATH="${MOCK_BIN}:${PATH}"
+
+LOCAL_FILE="${WORK_DIR}/backup.spnebak"
+echo "AUTHENTICATED_SPNEBAK_DATA_CONTENT" > "${LOCAL_FILE}"
+REMOTE_TARGET="s3://test-vault/spine/backup_test"
+
+run_retention_confirmation_gate() {
+  local mode="$1"
+  local apply_lock="$2"
+
+  NO_SCHEME="${REMOTE_TARGET#s3://}"
+  S3_BUCKET="${NO_SCHEME%%/*}"
+  if [ "${NO_SCHEME}" != "${S3_BUCKET}" ]; then
+    S3_PREFIX="${NO_SCHEME#*/}"
+    S3_KEY="${S3_PREFIX}/backup.spnebak"
+  else
+    S3_KEY="backup.spnebak"
+  fi
+
+  if [ "${apply_lock}" -eq 1 ]; then
+    RETENTION_OUTPUT=$(aws s3api get-object-retention --bucket "${S3_BUCKET}" --key "${S3_KEY}" 2>&1 || true)
+    REMOTE_LOCK_MODE=$(echo "${RETENTION_OUTPUT}" | grep -o '"Mode"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -E 's/.*"Mode"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/' || echo "")
+    REMOTE_RETAIN_UNTIL=$(echo "${RETENTION_OUTPUT}" | grep -o '"RetainUntilDate"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -E 's/.*"RetainUntilDate"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/' || echo "")
+
+    if [ -z "${REMOTE_LOCK_MODE}" ] || [ "${REMOTE_LOCK_MODE}" != "${mode}" ]; then
+      echo "FATAL: S3 Object Lock retention verification failed for ${REMOTE_TARGET}/backup.spnebak!" >&2
+      echo "  Expected lock mode:   ${mode}" >&2
+      echo "  Observed lock mode:   ${REMOTE_LOCK_MODE:-<absent>}" >&2
+      exit 1
+    fi
+    echo "Remote replication cryptographically verified [OK] (immutable retention active: ${REMOTE_LOCK_MODE} until ${REMOTE_RETAIN_UNTIL})."
+  else
+    echo "Remote replication cryptographically verified [OK] (standard replication without Object Lock)."
+  fi
+}
+
+# Upload local file
+aws s3 cp "${LOCAL_FILE}" "${REMOTE_TARGET}/backup.spnebak"
+
+# Scenario A: Object Lock metadata absent -> must FAIL CLOSED and NOT report retention active
+export MOCK_RETENTION_BEHAVIOR="absent"
+if ( run_retention_confirmation_gate "GOVERNANCE" 1 2>"${WORK_DIR}/absent.err" ); then
+  echo "FAIL: Gate succeeded despite absent retention metadata!" >&2
+  exit 1
+fi
+grep -q "FATAL: S3 Object Lock retention verification failed" "${WORK_DIR}/absent.err"
+if grep -q "immutable retention active" "${WORK_DIR}/absent.err"; then
+  echo "FAIL: Erroneously reported immutable retention active when absent!" >&2
+  exit 2
+fi
+
+# Scenario B: Object Lock metadata mode mismatched (expected GOVERNANCE, got COMPLIANCE) -> must FAIL CLOSED
+export MOCK_RETENTION_BEHAVIOR="mismatched"
+if ( run_retention_confirmation_gate "GOVERNANCE" 1 2>"${WORK_DIR}/mismatch.err" ); then
+  echo "FAIL: Gate succeeded despite mode mismatch!" >&2
+  exit 3
+fi
+grep -q "FATAL: S3 Object Lock retention verification failed" "${WORK_DIR}/mismatch.err"
+
+# Scenario C: Object Lock metadata confirmed -> succeeds and confirms active retention
+export MOCK_RETENTION_BEHAVIOR="valid"
+OUT=$(run_retention_confirmation_gate "GOVERNANCE" 1)
+echo "${OUT}" | grep -q "immutable retention active: GOVERNANCE until 2026-12-20T12:00:00.000Z"
+
+# Scenario D: Object Lock not applied (standard replication) -> succeeds and does NOT claim immutable retention
+OUT_NO_LOCK=$(run_retention_confirmation_gate "" 0)
+echo "${OUT_NO_LOCK}" | grep -q "standard replication without Object Lock"
+if echo "${OUT_NO_LOCK}" | grep -q "immutable retention active"; then
+  echo "FAIL: Claimed immutable retention active on non-lock backup!" >&2
+  exit 4
+fi
+
+rm -rf "${WORK_DIR}"
+exit 0
+"#
+            .replace("\r\n", "\n")
+            .replace('\r', "");
+
+            let mut child = Command::new("bash")
+                .arg("-s")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("failed to spawn bash");
+
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(script.as_bytes()).expect("failed to write script to stdin");
+            }
+            let res = child.wait_with_output().expect("failed to wait on bash child");
+            assert!(
+                res.status.success(),
+                "Remote Object Lock metadata absent/mismatched failure test failed. Stderr: {}, Stdout: {}",
                 String::from_utf8_lossy(&res.stderr),
                 String::from_utf8_lossy(&res.stdout)
             );

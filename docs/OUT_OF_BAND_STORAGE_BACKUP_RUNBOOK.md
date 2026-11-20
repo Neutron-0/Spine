@@ -156,17 +156,24 @@ export SPINE_BACKUP_RETENTION_DAYS="30"
 
 ### Phase 2c: Off-Host Replication (S3 Object Lock) & Policy Enforcement
 
-1. **Mandatory Off-Site Replication Policy (`SPINE_BACKUP_REQUIRE_REMOTE=1`):**
+1. **Strict Off-Site Replication Policy (`SPINE_BACKUP_REQUIRE_REMOTE`):**
    Under production deployment profile `core-forge-v1`, off-site replication is **enforced by default** (`SPINE_BACKUP_REQUIRE_REMOTE=1`).
-   - If `SPINE_BACKUP_REMOTE_S3_URI` is not configured or the `aws` CLI is missing, `scripts/backup_oob.sh` **fails closed immediately at pre-flight** (prior to acquiring the maintenance barrier or taking any snapshots).
-   - Local-only backups can only be created by explicitly overriding the policy (`SPINE_BACKUP_REQUIRE_REMOTE=0`), which emits an operational warning acknowledging the disaster recovery limitation.
+   - **Strict Value Validation:** `SPINE_BACKUP_REQUIRE_REMOTE` strictly accepts only `1` or `true` (enforced replication) and `0` or `false` (explicit local-only override). Any other value (such as typos like `yes`, `no`, `2`, or whitespace) is **rejected fail-closed** prior to acquiring the maintenance barrier or creating snapshots.
+   - If `SPINE_BACKUP_REQUIRE_REMOTE=1` (or `true`) and `SPINE_BACKUP_REMOTE_S3_URI` is not configured or the `aws` CLI is missing, `scripts/backup_oob.sh` **fails closed immediately at pre-flight**.
+   - Local-only backups can only be created by explicitly overriding the policy (`SPINE_BACKUP_REQUIRE_REMOTE=0` or `false`), which emits an operational warning acknowledging the disaster recovery limitation.
 
-2. **Off-Host Replication & Cryptographic Byte-Level Verification:**
+2. **S3 Object Lock Mode, Retain-Until Date Calculation & Fail-Closed Gate:**
+   When off-host replication is configured:
+   - **Supported Lock Modes:** `SPINE_BACKUP_OBJECT_LOCK_MODE` strictly requires `GOVERNANCE` or `COMPLIANCE` (or `NONE`/`""` to explicitly disable Object Lock). Unsupported modes (e.g. `TEMPORARY`, `STANDARD`) are rejected fail-closed.
+   - **Mandatory Retain-Until Calculation:** Pre-flight and pre-upload gates calculate the retention date (+`SPINE_BACKUP_RETENTION_DAYS` days, e.g. `2026-12-20T12:00:00Z`). If date calculation is unavailable or fails, backup aborts fail-closed before taking snapshots or uploading.
+   - **Remote Object Lock Metadata Confirmation Gate (`aws s3api get-object-retention`):** Following upload, the script queries remote S3 retention metadata to confirm that `Mode` matches the expected mode (`GOVERNANCE` or `COMPLIANCE`) and `RetainUntilDate` is recorded. If remote retention metadata is absent, rejected, or mismatched, the backup aborts fail-closed with exit status 1. The script **never reports immutable retention as active** unless verified by remote object metadata.
+
+3. **Off-Host Replication & Cryptographic Byte-Level Verification:**
    When `SPINE_BACKUP_REMOTE_S3_URI` is configured, `scripts/backup_oob.sh` replicates the encrypted `backup.spnebak` and `SHA256SUMS` manifest to the designated object store:
    - Configures S3 WORM / Object Lock immutability (`--object-lock-mode` and `--object-lock-retain-until-date`) to guarantee tamper-proof and ransomware-resistant retention.
    - **Cryptographic SHA-256 Digest Gate:** Rather than relying solely on file sizes, the script streams the uploaded archive from the remote object store (`aws s3 cp ... - | sha256sum`) and cryptographically compares the remote SHA-256 digest against the local archive before reporting backup success. Any mismatch or corruption immediately fails the backup with exit status 1.
 
-3. **Explicit Disaster Recovery Deployment Scope Limitation:**
+4. **Explicit Disaster Recovery Deployment Scope Limitation:**
    > [!WARNING]
    > **Deployment Limitation for Local-Only Backups:**
    > If `SPINE_BACKUP_REQUIRE_REMOTE=0` is explicitly set to permit local-only backups, archives remain exclusively on host storage under `BACKUP_ROOT`. Local-only backups **do not provide full disaster-recovery readiness** against total host hardware failure, disk controller destruction, or datacenter loss. Production installations must configure an off-host object store with Object Lock retention enabled.
