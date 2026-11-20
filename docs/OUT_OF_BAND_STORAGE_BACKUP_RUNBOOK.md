@@ -111,12 +111,12 @@ With active mutations drained and write permits rejected with HTTP 503, capture 
 > *(For optional cloud hypervisor volume snapshots such as AWS EBS / GCP PD, see Appendix A).*
 
 > [!SECURITY]
-> **Mandatory Authenticated AEAD Encryption (SPNEBAK v2):**
+> **Mandatory Authenticated AEAD Encryption (SPNEBAK v2) & Fail-Safe Cleanup:**
 > Under production deployment profile `core-forge-v1`, unencrypted plaintext backups containing PostgreSQL relational tables, SSH host private keys, and repository data are **strictly forbidden**.
 > - All backups must be authenticated and encrypted using the platform-supported **SPNEBAK v2** format (`AES-256-GCM`, 100,000 PBKDF2 iterations, per-chunk monotonic nonces, and authenticated manifest).
 > - `SPINE_BACKUP_PASSPHRASE` or `SPINE_BACKUP_PASSPHRASE_FILE` is mandatory.
 > - `scripts/backup_oob.sh` packages the multi-volume snapshot and encrypts it into `backup.spnebak`.
-> - All unencrypted intermediate archives and database dumps are purged immediately upon encryption.
+> - **Comprehensive Cleanup Trap (`EXIT ERR INT TERM`):** All intermediate plaintext staging directories (`.staging`) and unencrypted bundles (`.plaintext_bundle.tar.gz`) are guaranteed to be purged on every exit path — including snapshot failure, encryption error, verification abort, or operator interruption — while retaining the encrypted `backup.spnebak` archive and reporting any cleanup failures.
 > - Restrictive permissions (`0700` directory, `0600` encrypted archive) are enforced.
 
 Execute the automated backup script:
@@ -207,19 +207,26 @@ All out-of-band backups are stored encrypted using Spine's authenticated backup 
 
 2. **Authenticate & Decrypt to Private Staging Directory:**
    ```bash
-   DECRYPT_DIR="${BACKUP_DIR}/.decrypted_payload_$(date +%s)"
+   DECRYPT_DIR="${BACKUP_DIR}/.decrypted_restore_$(date +%s)"
    mkdir -m 0700 -p "${DECRYPT_DIR}"
 
    export SPINE_BACKUP_PASSPHRASE  # or provide via SPINE_BACKUP_PASSPHRASE_FILE
-   spine-api backup decrypt --input "${BACKUP_DIR}/backup.spnebak" --output "${DECRYPT_DIR}/payload.tar.gz"
-   tar -xzf "${DECRYPT_DIR}/payload.tar.gz" -C "${DECRYPT_DIR}"
-   rm -f "${DECRYPT_DIR}/payload.tar.gz"
+
+   # Decrypt using host binary or container fallback
+   if command -v spine-api >/dev/null 2>&1; then
+     spine-api backup decrypt --input "${BACKUP_DIR}/backup.spnebak" --output - | tar -xzf - -C "${DECRYPT_DIR}"
+   else
+     # Note: Container ENTRYPOINT is /usr/local/bin/spine-api, so arguments must NOT repeat `spine-api`
+     docker compose -f docker-compose.prod.yml run --rm -i --no-deps \
+       -e SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE}" spine-api \
+       backup decrypt --input - --output - < "${BACKUP_DIR}/backup.spnebak" | tar -xzf - -C "${DECRYPT_DIR}"
+   fi
 
    # Verify inner payload SHA256SUMS
    (cd "${DECRYPT_DIR}" && sha256sum -c SHA256SUMS)
    ```
    > [!IMPORTANT]
-   > Any AEAD authentication tag failure, ciphertext corruption, wrong passphrase, or checksum mismatch aborts restore immediately at Step 0 with zero services stopped and zero storage volumes touched.
+   > **Immediate Fail-Closed Cleanup Trap:** `scripts/restore_oob.sh` installs the cleanup trap (`EXIT ERR INT TERM`) immediately upon creating `${DECRYPT_DIR}`. Any failure during AEAD authentication, decryption, archive extraction, or inner checksum verification (`sha256sum -c SHA256SUMS`) immediately triggers the trap and purges `${DECRYPT_DIR}` from disk, guaranteeing zero plaintext database dumps or SSH host private keys remain exposed.
 
 ### Step 1: Quiesce Traffic, Stop Containers & Verify Full Quiescence
 
@@ -242,51 +249,58 @@ All out-of-band backups are stored encrypted using Spine's authenticated backup 
 
 ### Step 2: Mandatory Pre-Restore Archiving & Clean Target Volume Extraction
 
-To prevent old deleted files from persisting after restore, target volumes are not overlaid. Existing files across all volumes are archived to an external rollback directory (`${BACKUP_DIR}/.pre_restore_rollback`) outside the volume mount paths.
+To prevent old deleted files from persisting after restore, target volumes are not overlaid. Existing files across all volumes are preserved in an external rollback directory (`${BACKUP_DIR}/.pre_restore_rollback_<timestamp>`) outside the volume mount paths.
+
+> [!SECURITY]
+> **Encrypted Rollback Artifacts (Zero Plaintext Persistence):**
+> Under production security standards, pre-restore rollback archives are **never persisted in plaintext**. All 7 participant volumes are streamed directly through `encrypt_stream` into authenticated `SPNEBAK v2` AEAD envelopes (`*.spnebak`) using the same backup passphrase, with strict `0600` file permissions and `0700` directory permissions. This ensures sensitive live data — including PostgreSQL relational tables and SSH host private keys — remains protected for the entire recovery window.
 
 > [!IMPORTANT]
-> **Zero Modifications Gate:** All 7 participant rollback archives (`coordinator`, `storage_node_1/2/3`, `spine_ssh`, `spine_storage`, `postgres_data`) MUST be generated without error suppression and verified readable (`tar -tzf`) BEFORE any volume directory is emptied or modified. If any rollback archive creation fails, restore aborts immediately leaving all live volumes completely untouched.
+> **Zero Modifications Gate:** All 7 participant rollback archives (`coordinator`, `storage_node_1/2/3`, `spine_ssh`, `spine_storage`, `postgres_data`) MUST be generated without error suppression and verified via streaming AEAD MAC authentication and tar integrity checks (`decrypt_stream < file | tar -tzf -`) BEFORE any volume directory is emptied or modified. If any rollback archive creation or verification fails, restore aborts immediately leaving all live volumes completely untouched.
 
 > [!CAUTION]
 > **Automatic Fail-Closed Rollback Handler (`scripts/restore_oob.sh`):**
 > If an unrecoverable failure occurs during volume extraction, post-restore verification, or service startup:
-> 1. `scripts/restore_oob.sh` executes `rollback_volumes()` automatically via bash trap (`EXIT ERR INT TERM`).
+> 1. `scripts/restore_oob.sh` executes `restore_cleanup()` automatically via bash trap (`EXIT ERR INT TERM`).
 > 2. **Mandatory Quiescence Verification Before Rollback Extraction:** The handler executes `docker compose stop` without error suppression and verifies that all services are stopped (`RUNNING=0`). If any container is running or refuses to stop, rollback extraction is strictly aborted (`ROLLBACK_FAILED=1`), leaving all volumes untouched and cluster stopped to prevent data tearing.
-> 3. Rollback extraction commands run **without error suppression** and stream visible output.
+> 3. Rollback extraction commands stream on the fly from encrypted `*.spnebak` archives into container volume extractors without writing intermediate plaintext files to disk.
 > 4. Following extraction, every volume is checked for critical marker files (`.coordinator_fencing_generation`, `.fencing_generation`, `PG_VERSION`).
 > 5. If any rollback step fails or fewer than all 7 participants are verified, `restore_oob.sh` logs a `CRITICAL FATAL` alert identifying the failure, **strictly leaves all cluster services stopped**, and exits with code 2. It will NEVER report rollback success unless all 7 volumes are confirmed restored and verified.
-> 6. Staged rollback archives in `${ROLLBACK_DIR}` are retained intact for operator emergency triage.
+> 6. Staged rollback archives in `${ROLLBACK_DIR}` are retained intact in encrypted `SPNEBAK v2` format for operator emergency triage.
 
 1. **Phase 2a: Mandatory Pre-Restore Archiving & Integrity Verification (Volumes Untouched):**
    ```bash
    ROLLBACK_DIR="${BACKUP_DIR}/.pre_restore_rollback_$(date +%s)"
    mkdir -p "${ROLLBACK_DIR}"
+   chmod 700 "${ROLLBACK_DIR}"
 
-   # Archive all 7 participants without error suppression
+   # Archive and encrypt all 7 participants on the fly (SPNEBAK v2)
    docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint tar coordinator \
-     -czf - -C /var/lib/spine . > "${ROLLBACK_DIR}/coordinator.tar.gz"
+     -czf - -C /var/lib/spine . | encrypt_stream > "${ROLLBACK_DIR}/coordinator.spnebak"
 
    for NODE in 1 2 3; do
      docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint tar "storage-node-${NODE}" \
-       -czf - -C "/var/lib/spine/node-${NODE}" . > "${ROLLBACK_DIR}/storage_node_${NODE}.tar.gz"
+       -czf - -C "/var/lib/spine/node-${NODE}" . | encrypt_stream > "${ROLLBACK_DIR}/storage_node_${NODE}.spnebak"
    done
 
    docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint tar spine-api \
-     -czf - -C /var/lib/spine/ssh . > "${ROLLBACK_DIR}/spine_ssh.tar.gz"
+     -czf - -C /var/lib/spine/ssh . | encrypt_stream > "${ROLLBACK_DIR}/spine_ssh.spnebak"
    docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint tar spine-api \
-     -czf - -C /var/lib/spine/storage . > "${ROLLBACK_DIR}/spine_storage.tar.gz"
+     -czf - -C /var/lib/spine/storage . | encrypt_stream > "${ROLLBACK_DIR}/spine_storage.spnebak"
    docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint tar postgres \
-     -czf - -C /var/lib/postgresql/data . > "${ROLLBACK_DIR}/postgres_data.tar.gz"
+     -czf - -C /var/lib/postgresql/data . | encrypt_stream > "${ROLLBACK_DIR}/postgres_data.spnebak"
 
-   # Verify all 7 rollback archives are non-empty and readable
+   chmod 600 "${ROLLBACK_DIR}"/*
+
+   # Verify all 7 rollback archives exist, are non-empty, and pass AEAD MAC & tar integrity checks
    for ARCHIVE in coordinator storage_node_1 storage_node_2 storage_node_3 spine_ssh spine_storage postgres_data; do
-     FILE="${ROLLBACK_DIR}/${ARCHIVE}.tar.gz"
-     if [ ! -s "${FILE}" ] || ! tar -tzf "${FILE}" >/dev/null 2>&1; then
+     FILE="${ROLLBACK_DIR}/${ARCHIVE}.spnebak"
+     if [ ! -s "${FILE}" ] || ! decrypt_stream < "${FILE}" | tar -tzf - >/dev/null 2>&1; then
        echo "FATAL: Pre-restore rollback archive ${FILE} is missing or corrupted. Aborting restore with zero volumes modified."
        exit 1
      fi
    done
-   echo "All 7 pre-restore rollback archives verified valid. Safe to proceed with volume modification."
+   echo "All 7 pre-restore rollback archives verified valid and encrypted. Safe to proceed with volume modification."
    ```
 
 2. **Phase 2b: Clean Target Volumes & Extract Incoming Backup:**
@@ -464,6 +478,38 @@ cd /tmp/verify-repo
 git commit --allow-empty -m "OOB restore post-flight verification $(date)"
 git push origin main
 ```
+
+### Preserved Rollback Artifacts: Operator Inspection & Safe Removal
+
+In the event of a failed restore that triggers automatic rollback, the pre-restore rollback directory (`${BACKUP_DIR}/.pre_restore_rollback_<timestamp>`) is intentionally retained on disk to permit forensic investigation without risk of data exposure.
+
+1. **Format and Protection:**
+   - All files within the rollback directory (`coordinator.spnebak`, `storage_node_1.spnebak`, `storage_node_2.spnebak`, `storage_node_3.spnebak`, `spine_ssh.spnebak`, `spine_storage.spnebak`, `postgres_data.spnebak`) are authenticated `SPNEBAK v2` AES-256-GCM AEAD envelopes.
+   - Files are restricted to mode `0600` (owner read/write only) and the directory to `0700`.
+   - No unencrypted plaintext is persisted on disk.
+
+2. **Operator Inspection of Rollback Artifacts:**
+   An operator can safely inspect the contents of any preserved participant archive using the CLI decryptor:
+   ```bash
+   export SPINE_BACKUP_PASSPHRASE="<backup-passphrase>"
+   # Inspect PostgreSQL dump or file structure
+   spine-api backup decrypt --input "${ROLLBACK_DIR}/postgres_data.spnebak" --output - | tar -tzf -
+
+   # Inspect storage node or coordinator metadata
+   spine-api backup decrypt --input "${ROLLBACK_DIR}/coordinator.spnebak" --output - | tar -tzf -
+   ```
+   Or via container fallback if the host binary is not installed:
+   ```bash
+   docker compose -f docker-compose.prod.yml run --rm -i --no-deps \
+     -e SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE}" spine-api \
+     backup decrypt --input - --output - < "${ROLLBACK_DIR}/postgres_data.spnebak" | tar -tzf -
+   ```
+
+3. **Safe Removal After Investigation:**
+   Once cluster health is verified or the incident review is completed, securely remove the preserved rollback directory:
+   ```bash
+   rm -rf "${ROLLBACK_DIR}"
+   ```
 
 ---
 

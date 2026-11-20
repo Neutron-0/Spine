@@ -31,14 +31,39 @@ if [ -z "${SPINE_ADMIN_TOKEN}" ]; then
 fi
 
 RELEASED=0
-cleanup_barrier() {
+STAGING_DIR=""
+PLAINTEXT_TAR=""
+
+cleanup_backup() {
+  local exit_code=$?
   if [ "${RELEASED}" -eq 0 ] && [ -n "${SPINE_ADMIN_TOKEN:-}" ]; then
     echo "NOTICE: Cleaning up — ensuring cluster maintenance barrier is released..." >&2
     curl -s -X POST "${SPINE_API_URL}/api/v1/admin/maintenance/release" \
       -H "Authorization: Bearer ${SPINE_ADMIN_TOKEN}" > /dev/null 2>&1 || true
   fi
+
+  local cleanup_failed=0
+  if [ -n "${PLAINTEXT_TAR:-}" ] && [ -e "${PLAINTEXT_TAR}" ]; then
+    echo "Purging unencrypted plaintext bundle from disk: ${PLAINTEXT_TAR}..." >&2
+    if ! rm -rf "${PLAINTEXT_TAR}"; then
+      echo "ERROR: Failed to remove plaintext bundle: ${PLAINTEXT_TAR}" >&2
+      cleanup_failed=1
+    fi
+  fi
+
+  if [ -n "${STAGING_DIR:-}" ] && [ -e "${STAGING_DIR}" ]; then
+    echo "Purging unencrypted staging directory from disk: ${STAGING_DIR}..." >&2
+    if ! rm -rf "${STAGING_DIR}"; then
+      echo "ERROR: Failed to remove staging directory: ${STAGING_DIR}" >&2
+      cleanup_failed=1
+    fi
+  fi
+
+  if [ "${cleanup_failed}" -ne 0 ]; then
+    echo "WARNING: Cleanup of unencrypted backup artifacts encountered errors!" >&2
+  fi
 }
-trap cleanup_barrier EXIT ERR INT TERM
+trap cleanup_backup EXIT ERR INT TERM
 
 echo "=== Phase 1: Acquiring Maintenance Barrier & Draining In-Flight Mutations ==="
 ACQUIRE_RESP=$(curl -s -f -X POST "${SPINE_API_URL}/api/v1/admin/maintenance/acquire" \
@@ -133,6 +158,7 @@ fi
 
 echo "=== Phase 2: Capturing Multi-Volume Snapshots to ${BACKUP_DIR} ==="
 STAGING_DIR="${BACKUP_DIR}/.staging"
+PLAINTEXT_TAR="${BACKUP_DIR}/.plaintext_bundle.tar.gz"
 mkdir -p "${STAGING_DIR}"
 chmod 700 "${STAGING_DIR}"
 

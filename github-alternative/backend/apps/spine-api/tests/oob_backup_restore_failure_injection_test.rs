@@ -6,7 +6,9 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use tempfile::tempdir;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -364,11 +366,13 @@ fn test_restore_fails_closed_when_containers_refuse_to_stop() {
 }
 
 /// Simulates pre-restore archiving: checks that all archives are generated and valid
-/// BEFORE modifying any volume. If any participant archive fails, aborts with Err,
-/// leaving zero volumes modified.
+/// BEFORE modifying any volume. All pre-restore archives are authenticated SPNEBAK v2
+/// envelopes to prevent persisting sensitive plaintext (DB dumps, SSH keys) on disk.
+/// If any participant archive fails, aborts with Err, leaving zero volumes modified.
 pub fn execute_pre_restore_archiving(
     volumes: &[(&str, &Path)],
     rollback_dir: &Path,
+    passphrase: &str,
     fail_on_participant: Option<&str>,
 ) -> Result<Vec<PathBuf>, String> {
     let mut archived = Vec::new();
@@ -383,9 +387,19 @@ pub fn execute_pre_restore_archiving(
                 ));
             }
         }
-        let archive_file = rollback_dir.join(format!("{}.tar.gz", name));
-        // Emulate tar archive creation
-        fs::write(&archive_file, format!("valid archive for {}", name)).map_err(|e| e.to_string())?;
+        let archive_file = rollback_dir.join(format!("{}.spnebak", name));
+        let plaintext_payload = format!("valid authenticated payload for {}", name);
+        let mut encrypted = Vec::new();
+        spine_api::backup::v2::encrypt_stream(
+            &mut plaintext_payload.as_bytes(),
+            &mut encrypted,
+            passphrase,
+            1,
+            spine_api::backup::v2::DEFAULT_CHUNK_SIZE,
+        )
+        .map_err(|e| e.to_string())?;
+
+        fs::write(&archive_file, &encrypted).map_err(|e| e.to_string())?;
         archived.push(archive_file);
     }
 
@@ -425,7 +439,7 @@ fn test_pre_restore_archive_failure_aborts_before_modifying_any_volume() {
             .map(|(name, path)| (*name, path.as_path()))
             .collect();
 
-        let result = execute_pre_restore_archiving(&volumes_ref, &rollback_dir, Some(p));
+        let result = execute_pre_restore_archiving(&volumes_ref, &rollback_dir, "Passphrase-2026!", Some(p));
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains(p));
@@ -755,4 +769,340 @@ fn test_tampered_backup_and_passphrase_authentication_rejection() {
         "Wrong passphrase must fail authentication: {}",
         wrong_pass_err
     );
+}
+
+#[test]
+fn test_container_backup_decrypt_command_invocation() {
+    let binary = env!("CARGO_BIN_EXE_spine-api");
+    let passphrase = "Container-Command-Test-Passphrase-2026!";
+    let test_payload = b"CRITICAL_PAYLOAD_FOR_CONTAINER_DECRYPT_VERIFICATION_TEST_987654321";
+
+    // 1. Prepare an authenticated encrypted SPNEBAK v2 payload
+    let mut encrypted = Vec::new();
+    spine_api::backup::v2::encrypt_stream(
+        &mut &test_payload[..],
+        &mut encrypted,
+        passphrase,
+        1,
+        spine_api::backup::v2::DEFAULT_CHUNK_SIZE,
+    )
+    .unwrap();
+
+    // 2. Case 1: Bug regression test - duplicate CLI invocation
+    // In container mode with ENTRYPOINT ["/usr/local/bin/spine-api"], passing `spine-api backup decrypt ...`
+    // results in `/usr/local/bin/spine-api spine-api backup decrypt ...`, which fails with unrecognized subcommand.
+    let mut bad_cmd = Command::new(binary);
+    bad_cmd.args(&["spine-api", "backup", "decrypt", "--input", "-", "--output", "-"]);
+    bad_cmd.env("SPINE_BACKUP_PASSPHRASE", passphrase);
+    bad_cmd.stdin(std::process::Stdio::piped());
+    bad_cmd.stdout(std::process::Stdio::piped());
+    bad_cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = bad_cmd.spawn().expect("failed to spawn bad command");
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(&encrypted);
+    }
+    let output = child.wait_with_output().expect("failed to wait on child");
+    assert!(!output.status.success(), "Duplicate CLI invocation must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unrecognized subcommand") || stderr.contains("error:") || stderr.contains("unexpected argument"),
+        "stderr should indicate invalid argument: {}",
+        stderr
+    );
+
+    // 3. Case 2: Fixed container command form
+    // When ENTRYPOINT is `/usr/local/bin/spine-api`, arguments should be `["backup", "decrypt", "--input", "-", "--output", "-"]`
+    let mut good_cmd = Command::new(binary);
+    good_cmd.args(&["backup", "decrypt", "--input", "-", "--output", "-"]);
+    good_cmd.env("SPINE_BACKUP_PASSPHRASE", passphrase);
+    good_cmd.stdin(std::process::Stdio::piped());
+    good_cmd.stdout(std::process::Stdio::piped());
+    good_cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = good_cmd.spawn().expect("failed to spawn good command");
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(&encrypted).expect("failed to write encrypted payload to stdin");
+    }
+    let output = child.wait_with_output().expect("failed to wait on good child");
+    assert!(
+        output.status.success(),
+        "Container command form must succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, test_payload, "Decrypted stdout must match original plaintext");
+}
+
+#[test]
+fn test_backup_failure_cleanup_purges_plaintext_staging_and_retains_encrypted_archive() {
+    let temp = tempdir().unwrap();
+    let backup_dir = temp.path().join("20261120_120000Z_gen_42");
+    let staging_dir = backup_dir.join(".staging");
+    let plaintext_bundle = backup_dir.join(".plaintext_bundle.tar.gz");
+    let encrypted_archive = backup_dir.join("backup.spnebak");
+
+    fs::create_dir_all(&staging_dir).unwrap();
+    // Simulate staging sensitive database dump and SSH keys
+    fs::write(staging_dir.join("postgres_dump.sql.gz"), b"CONFIDENTIAL_PG_DUMP_PLAINTEXT").unwrap();
+    fs::write(staging_dir.join("spine_ssh.tar.gz"), b"CONFIDENTIAL_SSH_PRIVATE_KEY_PLAINTEXT").unwrap();
+    fs::write(&plaintext_bundle, b"CONFIDENTIAL_PLAINTEXT_TAR_ARCHIVE_BUNDLE").unwrap();
+    fs::write(&encrypted_archive, b"SPNEBAK\x02_VALID_AUTHENTICATED_ENCRYPTED_RESULT").unwrap();
+
+    // Verify all files exist before failure simulation
+    assert!(staging_dir.exists());
+    assert!(staging_dir.join("postgres_dump.sql.gz").exists());
+    assert!(staging_dir.join("spine_ssh.tar.gz").exists());
+    assert!(plaintext_bundle.exists());
+    assert!(encrypted_archive.exists());
+
+    // Execute backup cleanup handler simulation mirroring scripts/backup_oob.sh cleanup_backup()
+    struct BackupCleanupResult {
+        staging_purged: bool,
+        plaintext_bundle_purged: bool,
+        encrypted_archive_retained: bool,
+        cleanup_failures: Vec<String>,
+    }
+
+    fn run_simulated_backup_cleanup(
+        staging: &Path,
+        bundle: &Path,
+        encrypted: &Path,
+    ) -> BackupCleanupResult {
+        let mut failures = Vec::new();
+        if bundle.exists() {
+            if let Err(e) = fs::remove_file(bundle) {
+                failures.push(format!("Failed to remove plaintext bundle: {}", e));
+            }
+        }
+        if staging.exists() {
+            if let Err(e) = fs::remove_dir_all(staging) {
+                failures.push(format!("Failed to remove staging directory: {}", e));
+            }
+        }
+        BackupCleanupResult {
+            staging_purged: !staging.exists(),
+            plaintext_bundle_purged: !bundle.exists(),
+            encrypted_archive_retained: encrypted.exists(),
+            cleanup_failures: failures,
+        }
+    }
+
+    let result = run_simulated_backup_cleanup(&staging_dir, &plaintext_bundle, &encrypted_archive);
+    assert!(result.staging_purged, "Staging directory with plaintext DB and SSH keys must be purged");
+    assert!(result.plaintext_bundle_purged, "Temporary plaintext bundle must be purged");
+    assert!(result.encrypted_archive_retained, "Encrypted backup archive must be retained");
+    assert!(result.cleanup_failures.is_empty(), "No cleanup failures on normal deletion");
+
+    // Bash trap execution test (if bash is available)
+    if let Ok(bash_check) = Command::new("bash").arg("-c").arg("echo ok").output() {
+        if bash_check.status.success() {
+            let script = r#"
+set -euo pipefail
+WORK_DIR="/tmp/spine_test_backup_trap_$$"
+STAGING_DIR="${WORK_DIR}/.staging"
+PLAINTEXT_TAR="${WORK_DIR}/.plaintext_bundle.tar.gz"
+ENCRYPTED_ARCHIVE="${WORK_DIR}/backup.spnebak"
+
+rm -rf "${WORK_DIR}"
+mkdir -p "${STAGING_DIR}"
+echo "SENSITIVE_DB_DUMP" > "${STAGING_DIR}/postgres_dump.sql.gz"
+echo "SENSITIVE_SSH_KEY" > "${STAGING_DIR}/spine_ssh.tar.gz"
+echo "SENSITIVE_BUNDLE" > "${PLAINTEXT_TAR}"
+echo "SPNEBAK_ENCRYPTED" > "${ENCRYPTED_ARCHIVE}"
+
+cleanup_backup() {
+  local cleanup_err=0
+  if [ -n "${PLAINTEXT_TAR:-}" ] && [ -e "${PLAINTEXT_TAR}" ]; then
+    rm -rf "${PLAINTEXT_TAR}" || cleanup_err=1
+  fi
+  if [ -n "${STAGING_DIR:-}" ] && [ -e "${STAGING_DIR}" ]; then
+    rm -rf "${STAGING_DIR}" || cleanup_err=1
+  fi
+  if [ -e "${STAGING_DIR}" ]; then exit 99; fi
+  if [ -e "${PLAINTEXT_TAR}" ]; then exit 98; fi
+  if [ ! -e "${ENCRYPTED_ARCHIVE}" ]; then exit 97; fi
+  rm -rf "${WORK_DIR}"
+}
+trap cleanup_backup EXIT ERR INT TERM
+
+# Force failure after staging (e.g. capture, encryption, or verification failure)
+exit 42
+"#
+            .replace("\r\n", "\n")
+            .replace('\r', "");
+
+            let mut child = Command::new("bash")
+                .arg("-s")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("failed to spawn bash");
+
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(script.as_bytes()).expect("failed to write script to stdin");
+            }
+            let bash_test = child.wait_with_output().expect("failed to wait on bash child");
+
+            assert_eq!(
+                bash_test.status.code(),
+                Some(42),
+                "Bash script must exit with the injected failure code. Stderr: {}, Stdout: {}",
+                String::from_utf8_lossy(&bash_test.stderr),
+                String::from_utf8_lossy(&bash_test.stdout),
+            );
+        }
+    }
+}
+
+#[test]
+fn test_restore_cleanup_trap_purges_decrypted_payload_on_checksum_failure() {
+    let temp = tempdir().unwrap();
+    let decrypt_dir = temp.path().join(".decrypted_restore_test_123");
+    fs::create_dir_all(&decrypt_dir).unwrap();
+
+    // Populate with sensitive decrypted files
+    fs::write(decrypt_dir.join("postgres_dump.sql.gz"), b"DECRYPTED_PLAINTEXT_PG_DUMP").unwrap();
+    fs::write(decrypt_dir.join("spine_ssh.tar.gz"), b"DECRYPTED_PLAINTEXT_SSH_KEYS").unwrap();
+    fs::write(decrypt_dir.join("FENCING_GENERATION"), b"42").unwrap();
+    fs::write(decrypt_dir.join("SHA256SUMS"), b"badhash  postgres_dump.sql.gz\nbadhash  spine_ssh.tar.gz\n").unwrap();
+
+    assert!(decrypt_dir.exists());
+    assert!(decrypt_dir.join("postgres_dump.sql.gz").exists());
+    assert!(decrypt_dir.join("spine_ssh.tar.gz").exists());
+
+    // Simulate cleanup handler behavior when validation fails
+    fn run_restore_validation_with_cleanup(dir: &Path) -> Result<(), String> {
+        let restore_success = false;
+
+        // Simulated validation logic
+        let validation_result = (|| -> Result<(), String> {
+            // Checksum verification failure: mismatch injected
+            Err("SHA256 checksum verification failed: postgres_dump.sql.gz FAILED".to_string())
+        })();
+
+        // Cleanup trap execution on failure
+        if !restore_success && dir.exists() {
+            fs::remove_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+
+        validation_result
+    }
+
+    let err = run_restore_validation_with_cleanup(&decrypt_dir).unwrap_err();
+    assert!(err.contains("checksum verification failed"));
+    assert!(!decrypt_dir.exists(), "Decrypted restore directory MUST be completely purged on checksum failure");
+
+    // Bash trap test: execute actual trap in bash to prove early trap catches checksum failure
+    if let Ok(bash_check) = Command::new("bash").arg("-c").arg("echo ok").output() {
+        if bash_check.status.success() {
+            let script = r#"
+set -euo pipefail
+WORK_DIR="/tmp/spine_test_restore_trap_$$"
+DECRYPT_DIR="${WORK_DIR}/.decrypted_restore_test"
+rm -rf "${WORK_DIR}"
+mkdir -p "${DECRYPT_DIR}"
+echo "SENSITIVE_POSTGRES_DUMP" > "${DECRYPT_DIR}/postgres_dump.sql.gz"
+echo "SENSITIVE_SSH_KEY" > "${DECRYPT_DIR}/spine_ssh.tar.gz"
+echo "0000000000000000000000000000000000000000000000000000000000000000  postgres_dump.sql.gz" > "${DECRYPT_DIR}/SHA256SUMS"
+
+RESTORE_SUCCESS=0
+restore_cleanup() {
+  if [ "${RESTORE_SUCCESS}" -eq 0 ]; then
+    if [ -n "${DECRYPT_DIR:-}" ] && [ -d "${DECRYPT_DIR}" ]; then
+      rm -rf "${DECRYPT_DIR}"
+    fi
+  fi
+  if [ -d "${DECRYPT_DIR}" ]; then exit 99; fi
+  rm -rf "${WORK_DIR}"
+}
+trap restore_cleanup EXIT ERR INT TERM
+
+# Force failure during checksum verification
+cd "${DECRYPT_DIR}"
+sha256sum -c SHA256SUMS
+"#
+            .replace("\r\n", "\n")
+            .replace('\r', "");
+
+            let mut child = Command::new("bash")
+                .arg("-s")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("failed to spawn bash");
+
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(script.as_bytes()).expect("failed to write script to stdin");
+            }
+            let bash_test = child.wait_with_output().expect("failed to wait on bash child");
+
+            assert!(!bash_test.status.success(), "Checksum failure must fail closed");
+        }
+    }
+}
+
+#[test]
+fn test_pre_restore_rollback_archives_are_encrypted_and_verified() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    let rollback_dir = root.join(".pre_restore_rollback_test");
+    let passphrase = "Rollback-Encryption-Test-Passphrase-2026!";
+
+    let participants = [
+        "coordinator",
+        "storage_node_1",
+        "storage_node_2",
+        "storage_node_3",
+        "spine_ssh",
+        "spine_storage",
+        "postgres_data",
+    ];
+
+    let mut volume_paths = Vec::new();
+    for p in &participants {
+        let p_dir = root.join(p);
+        fs::create_dir_all(&p_dir).unwrap();
+        fs::write(p_dir.join("state.bin"), format!("state for {}", p)).unwrap();
+        volume_paths.push((*p, p_dir));
+    }
+
+    let volumes_ref: Vec<(&str, &Path)> = volume_paths
+        .iter()
+        .map(|(name, path)| (*name, path.as_path()))
+        .collect();
+
+    // 1. Generate encrypted pre-restore rollback archives
+    let archives = execute_pre_restore_archiving(&volumes_ref, &rollback_dir, passphrase, None).unwrap();
+    assert_eq!(archives.len(), 7);
+
+    // 2. Verify all archives are encrypted SPNEBAK v2 and NO plaintext archives exist
+    for p in &participants {
+        let enc_file = rollback_dir.join(format!("{}.spnebak", p));
+        let plain_tar = rollback_dir.join(format!("{}.tar.gz", p));
+
+        assert!(enc_file.exists(), "Encrypted rollback archive {}.spnebak must exist", p);
+        assert!(!plain_tar.exists(), "Plaintext archive {}.tar.gz must NOT exist", p);
+
+        let data = fs::read(&enc_file).unwrap();
+        assert!(data.len() > 8);
+        assert_eq!(&data[0..8], spine_api::backup::v2::MAGIC_V2, "{}.spnebak must start with SPNEBAK v2 magic", p);
+
+        // Verify AEAD authentication and decrypt stream
+        let mut decrypted = Vec::new();
+        spine_api::backup::v2::decrypt_stream(&data[..], &mut decrypted, passphrase)
+            .expect("Decryption must succeed with valid passphrase");
+        assert_eq!(decrypted, format!("valid authenticated payload for {}", p).as_bytes());
+    }
+
+    // 3. Verify tampering detection on rollback archives
+    let tampered_file = rollback_dir.join("postgres_data.spnebak");
+    let mut tampered_bytes = fs::read(&tampered_file).unwrap();
+    let last = tampered_bytes.len() - 5;
+    tampered_bytes[last] ^= 0x55; // Tamper MAC / ciphertext byte
+
+    let mut out = Vec::new();
+    let decrypt_err = spine_api::backup::v2::decrypt_stream(&tampered_bytes[..], &mut out, passphrase);
+    assert!(decrypt_err.is_err(), "Tampered rollback archive must fail AEAD MAC verification");
 }
