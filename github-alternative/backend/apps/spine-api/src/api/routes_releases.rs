@@ -78,9 +78,21 @@ pub async fn list_releases(
 /// GET /api/v1/repos/:owner/:repo/releases/:release_id
 pub async fn get_release(
     State(state): State<AppState>,
-    Path((_owner, _repo, release_id)): Path<(String, String, String)>,
+    Path((owner, repo_name, release_id)): Path<(String, String, String)>,
+    user: Option<Extension<User>>,
 ) -> Result<Json<ReleaseDto>, ForgeError> {
+    let caller = user.as_ref().map(|Extension(u)| u);
+    let repo = state
+        .repositories
+        .get_repository(caller, &owner, &repo_name)
+        .await?;
+
+    state.permissions.check_read_access(caller, &repo).await?;
+
     let rel = state.releases.get_release(&release_id).await?;
+    if rel.repo_id != repo.id {
+        return Err(ForgeError::NotFound("Release not found in repository".into()));
+    }
     Ok(Json(rel))
 }
 
@@ -125,6 +137,11 @@ pub async fn update_release(
         .check_write_access(Some(&current_user), &repo)
         .await?;
 
+    let existing = state.releases.get_release(&release_id).await?;
+    if existing.repo_id != repo.id {
+        return Err(ForgeError::NotFound("Release not found in repository".into()));
+    }
+
     let updated = state.releases.update_release(&release_id, payload).await?;
     Ok(Json(updated))
 }
@@ -150,6 +167,11 @@ pub async fn delete_release(
         .permissions
         .check_admin_access(Some(&current_user), &repo)
         .await?;
+
+    let existing = state.releases.get_release(&release_id).await?;
+    if existing.repo_id != repo.id {
+        return Err(ForgeError::NotFound("Release not found in repository".into()));
+    }
 
     state.releases.delete_release(&release_id).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -179,6 +201,11 @@ pub async fn upload_release_asset(
         .check_write_access(Some(&current_user), &repo)
         .await?;
 
+    let rel = state.releases.get_release(&release_id).await?;
+    if rel.repo_id != repo.id {
+        return Err(ForgeError::NotFound("Release not found in repository".into()));
+    }
+
     let content_type = query
         .content_type
         .unwrap_or_else(|| "application/octet-stream".to_string());
@@ -194,9 +221,26 @@ pub async fn upload_release_asset(
 /// GET /api/v1/repos/:owner/:repo/releases/:release_id/assets/:asset_id/download
 pub async fn download_release_asset(
     State(state): State<AppState>,
-    Path((_owner, _repo, _release_id, asset_id)): Path<(String, String, String, String)>,
+    Path((owner, repo_name, release_id, asset_id)): Path<(String, String, String, String)>,
+    user: Option<Extension<User>>,
 ) -> Result<Response, ForgeError> {
+    let caller = user.as_ref().map(|Extension(u)| u);
+    let repo = state
+        .repositories
+        .get_repository(caller, &owner, &repo_name)
+        .await?;
+
+    state.permissions.check_read_access(caller, &repo).await?;
+
+    let rel = state.releases.get_release(&release_id).await?;
+    if rel.repo_id != repo.id {
+        return Err(ForgeError::NotFound("Release not found in repository".into()));
+    }
+
     let (asset, bytes) = state.releases.download_asset(&asset_id).await?;
+    if asset.release_id != release_id {
+        return Err(ForgeError::NotFound("Asset not found in release".into()));
+    }
 
     let res = Response::builder()
         .status(StatusCode::OK)
@@ -215,7 +259,7 @@ pub async fn download_release_asset(
 /// DELETE /api/v1/repos/:owner/:repo/releases/:release_id/assets/:asset_id
 pub async fn delete_release_asset(
     State(state): State<AppState>,
-    Path((owner, repo_name, _release_id, asset_id)): Path<(String, String, String, String)>,
+    Path((owner, repo_name, release_id, asset_id)): Path<(String, String, String, String)>,
     user: Option<Extension<User>>,
 ) -> Result<StatusCode, ForgeError> {
     let _permit = state.consistency_barrier.acquire_write_permit().await?;
@@ -233,6 +277,16 @@ pub async fn delete_release_asset(
         .permissions
         .check_write_access(Some(&current_user), &repo)
         .await?;
+
+    let rel = state.releases.get_release(&release_id).await?;
+    if rel.repo_id != repo.id {
+        return Err(ForgeError::NotFound("Release not found in repository".into()));
+    }
+
+    let (asset, _) = state.releases.download_asset(&asset_id).await?;
+    if asset.release_id != release_id {
+        return Err(ForgeError::NotFound("Asset not found in release".into()));
+    }
 
     state.releases.delete_asset(&asset_id).await?;
     Ok(StatusCode::NO_CONTENT)

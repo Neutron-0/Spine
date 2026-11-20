@@ -50,11 +50,16 @@ services:
       - CHOWN
       - SETUID
       - SETGID
+    healthcheck:
+      test: ["CMD-SHELL", "pidof nginx && nc -z 127.0.0.1 80 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
     depends_on:
       spine-api:
         condition: service_healthy
       spine-frontend:
-        condition: service_started
+        condition: service_healthy
 
   # ----------------------------------------------------------------------------
   # 2. Database - PostgreSQL (No Host Port Exposure)
@@ -318,9 +323,15 @@ services:
       - CHOWN
       - SETUID
       - SETGID
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:80/ || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
     # No host port exposed; routed strictly via ingress on port 443
     depends_on:
-      - spine-api
+      spine-api:
+        condition: service_healthy
 
 volumes:
   postgres_data:

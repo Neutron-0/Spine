@@ -104,8 +104,15 @@ async fn test_cargo_registry_sparse_index_and_publish_protocol() {
     assert_eq!(downloaded_crate, fake_crate_tarball);
 
     // 7. Test Yank and Unyank
+    // 7a. Non-owner cannot yank
+    let unauthorized_yank = cargo
+        .set_yanked("spine-test-crate", "0.1.0", true, "attacker_user")
+        .await;
+    assert!(unauthorized_yank.is_err(), "Non-owner must be forbidden from yanking crate");
+
+    // 7b. Owner can yank
     cargo
-        .set_yanked("spine-test-crate", "0.1.0", true)
+        .set_yanked("spine-test-crate", "0.1.0", true, user_id)
         .await
         .expect("Yank should succeed");
 
@@ -118,8 +125,15 @@ async fn test_cargo_registry_sparse_index_and_publish_protocol() {
         serde_json::from_str(yanked_index.lines().next().unwrap()).unwrap();
     assert_eq!(yanked_entry["yanked"], true);
 
+    // 7c. Non-owner cannot unyank
+    let unauthorized_unyank = cargo
+        .set_yanked("spine-test-crate", "0.1.0", false, "attacker_user")
+        .await;
+    assert!(unauthorized_unyank.is_err(), "Non-owner must be forbidden from unyanking crate");
+
+    // 7d. Owner can unyank
     cargo
-        .set_yanked("spine-test-crate", "0.1.0", false)
+        .set_yanked("spine-test-crate", "0.1.0", false, user_id)
         .await
         .expect("Unyank should succeed");
 
@@ -132,7 +146,21 @@ async fn test_cargo_registry_sparse_index_and_publish_protocol() {
         serde_json::from_str(unyanked_index.lines().next().unwrap()).unwrap();
     assert_eq!(unyanked_entry["yanked"], false);
 
-    // 8. Immutability: Attempting to publish same version again must fail
+    // 8. Immutability & Cross-User Publishing:
+    // 8a. Attempting to publish same version again must fail
     let dup_err = cargo.publish(&payload, user_id).await;
     assert!(dup_err.is_err());
+
+    // 8b. Attempting to publish new version as different user must fail
+    let mut meta_v2 = meta_json.clone();
+    meta_v2["vers"] = serde_json::json!("0.2.0");
+    let meta_v2_bytes = serde_json::to_vec(&meta_v2).unwrap();
+    let mut payload_v2 = Vec::new();
+    payload_v2.extend_from_slice(&(meta_v2_bytes.len() as u32).to_le_bytes());
+    payload_v2.extend_from_slice(&meta_v2_bytes);
+    payload_v2.extend_from_slice(&(fake_crate_tarball.len() as u32).to_le_bytes());
+    payload_v2.extend_from_slice(fake_crate_tarball);
+
+    let hijack_err = cargo.publish(&payload_v2, "attacker_user").await;
+    assert!(hijack_err.is_err(), "Non-owner must be forbidden from publishing new versions to existing package");
 }

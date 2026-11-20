@@ -89,6 +89,13 @@ pub async fn delete_branch_protection(
         .check_admin_access(Some(&caller), &repo)
         .await?;
 
+    let rules = state.db.list_branch_protection_rules(&repo.id).await?;
+    if !rules.iter().any(|r| r.id == rule_id) {
+        return Err(ForgeError::NotFound(
+            "Branch protection rule not found in repository".into(),
+        ));
+    }
+
     state.db.delete_branch_protection(&rule_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }

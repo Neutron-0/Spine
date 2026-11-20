@@ -100,12 +100,15 @@ pub async fn cargo_yank(
     user: Option<Extension<User>>,
 ) -> Result<Json<serde_json::Value>, ForgeError> {
     let _permit = state.consistency_barrier.acquire_write_permit().await?;
-    let _current_user = user
+    let current_user = user
         .ok_or_else(|| {
             ForgeError::Unauthorized("Authentication required to yank crate".to_string())
         })?
         .0;
-    state.cargo.set_yanked(&crate_name, &version, true).await?;
+    state
+        .cargo
+        .set_yanked(&crate_name, &version, true, &current_user.id)
+        .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -116,12 +119,15 @@ pub async fn cargo_unyank(
     user: Option<Extension<User>>,
 ) -> Result<Json<serde_json::Value>, ForgeError> {
     let _permit = state.consistency_barrier.acquire_write_permit().await?;
-    let _current_user = user
+    let current_user = user
         .ok_or_else(|| {
             ForgeError::Unauthorized("Authentication required to unyank crate".to_string())
         })?
         .0;
-    state.cargo.set_yanked(&crate_name, &version, false).await?;
+    state
+        .cargo
+        .set_yanked(&crate_name, &version, false, &current_user.id)
+        .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
