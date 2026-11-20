@@ -520,7 +520,7 @@ async fn main() -> anyhow::Result<()> {
                     "Connecting to PostgreSQL database for admin bootstrap ({})...",
                     sanitize_db_url(&active_url)
                 );
-                Arc::new(PgDatabase::connect_and_migrate(&active_url).await?)
+                Arc::new(PgDatabase::connect(&active_url).await?)
             } else if in_memory_db || db_url.is_none() {
                 println!("Initializing bootstrap with in-memory database...");
                 Arc::new(InMemoryDatabase::new())
@@ -538,7 +538,7 @@ async fn main() -> anyhow::Result<()> {
                     "Connecting to PostgreSQL database for admin bootstrap ({})...",
                     sanitize_db_url(&active_url)
                 );
-                Arc::new(PgDatabase::connect_and_migrate(&active_url).await?)
+                Arc::new(PgDatabase::connect(&active_url).await?)
             };
 
             // Single execution lockout check
@@ -2166,6 +2166,20 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    let bind = std::env::var("BIND")
+        .or_else(|_| std::env::var("SPINE_BIND"))
+        .unwrap_or(args.bind);
+    let port = std::env::var("PORT")
+        .or_else(|_| std::env::var("SPINE_PORT"))
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(args.port);
+    let ssh_port = std::env::var("SSH_PORT")
+        .or_else(|_| std::env::var("SPINE_SSH_PORT"))
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(args.ssh_port);
+
     let database_url = resolve_postgres_url(
         None,
         args.database_url_file.as_deref(),
@@ -2503,7 +2517,7 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
             if profile == spine_api::DeploymentProfile::CoreForge {
                 "https://localhost".to_string()
             } else {
-                format!("http://{}:{}", args.bind, args.port)
+                format!("http://{}:{}", bind, port)
             }
         });
 
@@ -2563,12 +2577,12 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
 
     // 5. Start HTTP and SSH servers
     let ssh_addr_str =
-        std::env::var("SSH_ADDR").unwrap_or_else(|_| format!("{}:{}", args.bind, args.ssh_port));
+        std::env::var("SSH_ADDR").unwrap_or_else(|_| format!("{}:{}", bind, ssh_port));
     let ssh_addr: SocketAddr = ssh_addr_str.parse()?;
     let (_bound_ssh, _ssh_handle) = spine_api::start_ssh_server(state.clone(), ssh_addr).await?;
 
     let app = build_router(state);
-    let addr: SocketAddr = format!("{}:{}", args.bind, args.port).parse()?;
+    let addr: SocketAddr = format!("{}:{}", bind, port).parse()?;
     tracing::info!("Spine Forge API listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

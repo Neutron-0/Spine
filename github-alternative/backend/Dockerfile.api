@@ -1,5 +1,6 @@
 # Multi-stage build for Spine Forge API & SSH Service
 FROM rust:1.88-bookworm AS builder
+RUN rustup toolchain install 1.89.0 && rustup default 1.89.0
 
 WORKDIR /usr/src/spine
 
@@ -44,4 +45,4 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=5 \
     CMD curl -f http://127.0.0.1:3000/health/ready || exit 1
 
 ENTRYPOINT ["/usr/local/bin/spine-api"]
-CMD ["serve", "--bind", "0.0.0.0", "--port", "3000", "--ssh-port", "2222", "--storage-root", "/var/lib/spine/storage"]
+CMD ["serve"]
