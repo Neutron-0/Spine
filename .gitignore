@@ -17,3 +17,8 @@ references/sources/
 .env.local
 *.log
 .superpowers/
+
+# TLS Certificates and private keys
+*.crt
+*.key
+deploy/nginx/certs/
