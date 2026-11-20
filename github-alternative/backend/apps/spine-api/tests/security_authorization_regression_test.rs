@@ -534,4 +534,294 @@ async fn test_security_authorization_and_cross_tenant_isolation_regression() {
         .unwrap();
     let alice_unyank_res = router.clone().oneshot(alice_unyank_req).await.unwrap();
     assert_eq!(alice_unyank_res.status(), StatusCode::OK);
+
+    // -------------------------------------------------------------------------
+    // 7. Route Authorization: Webhooks Cross-Tenant Isolation
+    // -------------------------------------------------------------------------
+    // Alice creates a webhook for her private repository
+    let create_hook_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/repos/alice/secret-project/webhooks")
+        .header(header::AUTHORIZATION, format!("Bearer {}", pat_alice_plain))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({
+                "target_url": "https://example.com/webhook",
+                "secret": "hook-secret",
+                "events": ["push"],
+                "is_active": true
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let create_hook_res = router.clone().oneshot(create_hook_req).await.unwrap();
+    assert_eq!(create_hook_res.status(), StatusCode::CREATED);
+    let hook_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(create_hook_res.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let webhook_id = hook_body["id"].as_str().unwrap();
+
+    // Bob attempts to read Alice's webhook -> 404 / 403 Forbidden
+    let bob_get_hook_req = Request::builder()
+        .method("GET")
+        .uri(format!("/api/v1/webhooks/{}", webhook_id))
+        .header(header::AUTHORIZATION, format!("Bearer {}", pat_bob_plain))
+        .body(Body::empty())
+        .unwrap();
+    let bob_get_hook_res = router.clone().oneshot(bob_get_hook_req).await.unwrap();
+    assert!(
+        bob_get_hook_res.status() == StatusCode::FORBIDDEN
+            || bob_get_hook_res.status() == StatusCode::NOT_FOUND,
+        "Bob must not read Alice's webhook; got {}",
+        bob_get_hook_res.status()
+    );
+
+    // Bob attempts to list deliveries for Alice's webhook -> 404 / 403 Forbidden
+    let bob_list_deliv_req = Request::builder()
+        .method("GET")
+        .uri(format!("/api/v1/webhooks/{}/deliveries", webhook_id))
+        .header(header::AUTHORIZATION, format!("Bearer {}", pat_bob_plain))
+        .body(Body::empty())
+        .unwrap();
+    let bob_list_deliv_res = router.clone().oneshot(bob_list_deliv_req).await.unwrap();
+    assert!(
+        bob_list_deliv_res.status() == StatusCode::FORBIDDEN
+            || bob_list_deliv_res.status() == StatusCode::NOT_FOUND,
+        "Bob must not list deliveries for Alice's webhook; got {}",
+        bob_list_deliv_res.status()
+    );
+
+    // Bob attempts to delete Alice's webhook -> 404 / 403 Forbidden
+    let bob_del_hook_req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/v1/webhooks/{}", webhook_id))
+        .header(header::AUTHORIZATION, format!("Bearer {}", pat_bob_plain))
+        .body(Body::empty())
+        .unwrap();
+    let bob_del_hook_res = router.clone().oneshot(bob_del_hook_req).await.unwrap();
+    assert!(
+        bob_del_hook_res.status() == StatusCode::FORBIDDEN
+            || bob_del_hook_res.status() == StatusCode::NOT_FOUND,
+        "Bob must not delete Alice's webhook; got {}",
+        bob_del_hook_res.status()
+    );
+
+    // Alice successfully retrieves her webhook
+    let alice_get_hook_req = Request::builder()
+        .method("GET")
+        .uri(format!("/api/v1/webhooks/{}", webhook_id))
+        .header(header::AUTHORIZATION, format!("Bearer {}", pat_alice_plain))
+        .body(Body::empty())
+        .unwrap();
+    let alice_get_hook_res = router.clone().oneshot(alice_get_hook_req).await.unwrap();
+    assert_eq!(alice_get_hook_res.status(), StatusCode::OK);
+
+    // -------------------------------------------------------------------------
+    // 8. Route Authorization: Reviews & Comments Cross-Tenant IDOR
+    // -------------------------------------------------------------------------
+    // Set up PR #1 in Alice's repo with a review and comment
+    let pr_alice_record = PullRequest {
+        id: "pr_alice_1_id".to_string(),
+        repo_id: repo_alice.id.clone(),
+        pr_number: 1,
+        author_id: alice.id.clone(),
+        title: "Feature branch".to_string(),
+        body: "Feature description".to_string(),
+        base_branch: "main".to_string(),
+        head_branch: "feat".to_string(),
+        base_commit_id: "0000000000000000000000000000000000000001".to_string(),
+        head_commit_id: "0000000000000000000000000000000000000002".to_string(),
+        state: "OPEN".to_string(),
+        is_draft: false,
+        merge_commit_id: None,
+        merge_strategy: None,
+        merged_by_user_id: None,
+        created_at_nanos: now,
+        updated_at_nanos: now,
+        closed_at_nanos: None,
+        merged_at_nanos: None,
+    };
+    db.create_pull_request(pr_alice_record).await.unwrap();
+
+    let rev_alice = PullRequestReview {
+        id: "rev_alice_id".to_string(),
+        pr_id: "pr_alice_1_id".to_string(),
+        reviewer_id: alice.id.clone(),
+        commit_id: "0000000000000000000000000000000000000002".to_string(),
+        state: "APPROVED".to_string(),
+        body: "LGTM".to_string(),
+        dismissed_by_user_id: None,
+        created_at_nanos: now,
+        updated_at_nanos: now,
+    };
+    db.create_pr_review(rev_alice).await.unwrap();
+
+    let prc_alice = PullRequestReviewComment {
+        id: "prc_alice_id".to_string(),
+        pr_id: "pr_alice_1_id".to_string(),
+        review_id: Some("rev_alice_id".to_string()),
+        author_id: alice.id.clone(),
+        file_path: "src/main.rs".to_string(),
+        commit_id: "0000000000000000000000000000000000000002".to_string(),
+        diff_side: "RIGHT".to_string(),
+        line_number: 10,
+        body: "Consider renaming".to_string(),
+        is_resolved: false,
+        created_at_nanos: now,
+        updated_at_nanos: now,
+    };
+    db.create_pr_review_comment(prc_alice).await.unwrap();
+
+    // Set up PR #1 in Bob's repo
+    let pr_bob_record = PullRequest {
+        id: "pr_bob_1_id".to_string(),
+        repo_id: repo_bob.id.clone(),
+        pr_number: 1,
+        author_id: bob.id.clone(),
+        title: "Bob Feature".to_string(),
+        body: "Bob description".to_string(),
+        base_branch: "main".to_string(),
+        head_branch: "feat".to_string(),
+        base_commit_id: "0000000000000000000000000000000000000001".to_string(),
+        head_commit_id: "0000000000000000000000000000000000000002".to_string(),
+        state: "OPEN".to_string(),
+        is_draft: false,
+        merge_commit_id: None,
+        merge_strategy: None,
+        merged_by_user_id: None,
+        created_at_nanos: now,
+        updated_at_nanos: now,
+        closed_at_nanos: None,
+        merged_at_nanos: None,
+    };
+    db.create_pull_request(pr_bob_record).await.unwrap();
+
+    // Bob attempts cross-tenant IDOR to dismiss Alice's review using his own repo context -> 404 Not Found
+    let bob_dismiss_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/repos/bob/public-repo/pulls/1/reviews/rev_alice_id/dismiss")
+        .header(header::AUTHORIZATION, format!("Bearer {}", pat_bob_plain))
+        .body(Body::empty())
+        .unwrap();
+    let bob_dismiss_res = router.clone().oneshot(bob_dismiss_req).await.unwrap();
+    assert_eq!(
+        bob_dismiss_res.status(),
+        StatusCode::NOT_FOUND,
+        "Cross-PR review dismissal must fail with 404 Not Found"
+    );
+
+    // Bob attempts cross-tenant IDOR to resolve Alice's review comment using his own repo context -> 404 Not Found
+    let bob_resolve_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/repos/bob/public-repo/pulls/1/reviews/comments/prc_alice_id/resolve")
+        .header(header::AUTHORIZATION, format!("Bearer {}", pat_bob_plain))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({ "resolved": true }).to_string()))
+        .unwrap();
+    let bob_resolve_res = router.clone().oneshot(bob_resolve_req).await.unwrap();
+    assert_eq!(
+        bob_resolve_res.status(),
+        StatusCode::NOT_FOUND,
+        "Cross-PR review comment resolution must fail with 404 Not Found"
+    );
+
+    // -------------------------------------------------------------------------
+    // 9. Route Authorization: Discussions & Discovery Private Leakage Prevention
+    // -------------------------------------------------------------------------
+    // Anonymous user attempts to list discussion categories on Alice's private repo -> 404 Not Found
+    let anon_cats_req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/repos/alice/secret-project/discussions/categories")
+        .body(Body::empty())
+        .unwrap();
+    let anon_cats_res = router.clone().oneshot(anon_cats_req).await.unwrap();
+    assert_eq!(
+        anon_cats_res.status(),
+        StatusCode::NOT_FOUND,
+        "Anonymous category access on private repo must fail with 404 Not Found"
+    );
+
+    // Anonymous user attempts to list topics on Alice's private repo -> 404 Not Found
+    let anon_topics_req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/repos/alice/secret-project/topics")
+        .body(Body::empty())
+        .unwrap();
+    let anon_topics_res = router.clone().oneshot(anon_topics_req).await.unwrap();
+    assert_eq!(
+        anon_topics_res.status(),
+        StatusCode::NOT_FOUND,
+        "Anonymous topics access on private repo must fail with 404 Not Found"
+    );
+
+    // Anonymous user attempts to list languages on Alice's private repo -> 404 Not Found
+    let anon_langs_req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/repos/alice/secret-project/languages")
+        .body(Body::empty())
+        .unwrap();
+    let anon_langs_res = router.clone().oneshot(anon_langs_req).await.unwrap();
+    assert_eq!(
+        anon_langs_res.status(),
+        StatusCode::NOT_FOUND,
+        "Anonymous languages access on private repo must fail with 404 Not Found"
+    );
+
+    // Anonymous user attempts to trigger language analysis on Alice's private repo -> 401 Unauthorized
+    let anon_analyze_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/repos/alice/secret-project/languages/analyze")
+        .body(Body::empty())
+        .unwrap();
+    let anon_analyze_res = router.clone().oneshot(anon_analyze_req).await.unwrap();
+    assert_eq!(anon_analyze_res.status(), StatusCode::UNAUTHORIZED);
+
+    // Bob (non-member) attempts to trigger language analysis on Alice's private repo -> 404 / 403
+    let bob_analyze_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/repos/alice/secret-project/languages/analyze")
+        .header(header::AUTHORIZATION, format!("Bearer {}", pat_bob_plain))
+        .body(Body::empty())
+        .unwrap();
+    let bob_analyze_res = router.clone().oneshot(bob_analyze_req).await.unwrap();
+    assert!(
+        bob_analyze_res.status() == StatusCode::FORBIDDEN
+            || bob_analyze_res.status() == StatusCode::NOT_FOUND,
+        "Bob must not trigger language analysis on Alice's private repo; got {}",
+        bob_analyze_res.status()
+    );
+
+    // -------------------------------------------------------------------------
+    // 10. Route Authorization: Security Center Cross-Tenant Remediation IDOR
+    // -------------------------------------------------------------------------
+    let finding_alice = SecretScanFinding {
+        id: "finding_alice_id".to_string(),
+        repo_id: repo_alice.id.clone(),
+        commit_oid: "head".to_string(),
+        file_path: "secret.key".to_string(),
+        line_number: 1,
+        rule_id: "spine-api-key".to_string(),
+        rule_name: "Spine API Key".to_string(),
+        severity: "CRITICAL".to_string(),
+        safe_fingerprint: "safe_fp_1234".to_string(),
+        status: "OPEN".to_string(),
+        resolved_at_nanos: None,
+        created_at_nanos: now,
+    };
+    db.create_secret_scan_finding(finding_alice).await.unwrap();
+
+    // Bob attempts cross-tenant remediation of Alice's finding using his own repo context -> 404 Not Found
+    let bob_remediate_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/repos/bob/public-repo/security/secrets/findings/finding_alice_id/remediate")
+        .header(header::AUTHORIZATION, format!("Bearer {}", pat_bob_plain))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({ "status": "RESOLVED" }).to_string()))
+        .unwrap();
+    let bob_remediate_res = router.clone().oneshot(bob_remediate_req).await.unwrap();
+    assert_eq!(
+        bob_remediate_res.status(),
+        StatusCode::NOT_FOUND,
+        "Cross-tenant secret finding remediation must fail with 404 Not Found"
+    );
 }

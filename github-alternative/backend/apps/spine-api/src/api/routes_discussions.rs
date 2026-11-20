@@ -67,9 +67,12 @@ async fn resolve_repo(
 
 pub async fn list_categories(
     State(state): State<AppState>,
+    user: Option<Extension<User>>,
     Path((owner, repo_name)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
+    let caller_id = user.as_ref().map(|Extension(u)| u.id.as_str());
+    state.permissions.require_repo_read(caller_id, &repo_id).await?;
     let cats = state.discussions.list_categories(&repo_id).await?;
     Ok(Json(cats))
 }
@@ -233,12 +236,22 @@ pub async fn mark_answer(
 pub async fn toggle_comment_reaction(
     State(state): State<AppState>,
     user: Option<Extension<User>>,
-    Path((_owner, _repo_name, _number, comment_id)): Path<(String, String, i32, String)>,
+    Path((owner, repo_name, number, comment_id)): Path<(String, String, i32, String)>,
     Json(payload): Json<ReactionRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let _permit = state.consistency_barrier.acquire_write_permit().await?;
     let Extension(user) =
         user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
+    state.permissions.require_repo_read(Some(&user.id), &repo_id).await?;
+
+    let comments = state.discussions.list_comments(Some(&user.id), &repo_id, number).await?;
+    if !comments.iter().any(|c| c.id == comment_id) {
+        return Err(ForgeError::NotFound(
+            "Comment not found on this discussion".into(),
+        ));
+    }
+
     let added = state
         .discussions
         .toggle_reaction(&user.id, "COMMENT", &comment_id, &payload.reaction)

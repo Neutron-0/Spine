@@ -175,6 +175,12 @@ impl SecurityService {
         status: &str, // "RESOLVED" or "FALSE_POSITIVE"
     ) -> Result<(), ForgeError> {
         self.perms.require_repo_write(actor_id, repo_id).await?;
+        let findings = self.db.list_secret_scan_findings(repo_id, None).await?;
+        if !findings.iter().any(|f| f.id == finding_id) {
+            return Err(ForgeError::NotFound(
+                "Secret scan finding not found for this repository".into(),
+            ));
+        }
         let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
         self.db
             .update_secret_scan_finding_status(finding_id, status, now)
@@ -290,6 +296,12 @@ impl SecurityService {
         status: &str, // "FIXED" or "DISMISSED"
     ) -> Result<(), ForgeError> {
         self.perms.require_repo_write(actor_id, repo_id).await?;
+        let vulns = self.db.list_dependency_vulnerabilities(repo_id, None).await?;
+        if !vulns.iter().any(|v| v.id == vuln_id) {
+            return Err(ForgeError::NotFound(
+                "Dependency vulnerability not found for this repository".into(),
+            ));
+        }
         let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
         self.db
             .update_dependency_vulnerability_status(vuln_id, status, now)

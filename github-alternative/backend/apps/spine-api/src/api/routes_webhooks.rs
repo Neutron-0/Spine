@@ -122,12 +122,35 @@ pub async fn list_repo_webhooks(
     Ok(Json(dtos))
 }
 
+async fn check_webhook_admin_access(
+    state: &AppState,
+    caller: &User,
+    sub: &crate::core::types::WebhookSubscription,
+) -> Result<(), ForgeError> {
+    if sub.owner_type == "REPO" {
+        let repo = state
+            .db
+            .get_repository_by_id(&sub.owner_id)
+            .await?
+            .ok_or_else(|| ForgeError::NotFound("Repository not found".into()))?;
+        state
+            .permissions
+            .check_admin_access(Some(caller), &repo)
+            .await?;
+    } else if sub.owner_type == "ORG" {
+        state.permissions.check_org_admin(caller, &sub.owner_id).await?;
+    } else {
+        return Err(ForgeError::Forbidden("Unauthorized access to webhook".into()));
+    }
+    Ok(())
+}
+
 pub async fn get_webhook(
     State(state): State<AppState>,
     user: Option<Extension<User>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let _caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let sub = state
         .webhooks
         .get_subscription(&id)
@@ -139,6 +162,8 @@ pub async fn get_webhook(
             crate::webhook::WebhookError::Database(d) => d,
             _ => ForgeError::Internal(e.to_string()),
         })?;
+
+    check_webhook_admin_access(&state, &caller, &sub).await?;
 
     let dto = WebhookSubscriptionDto {
         id: sub.id,
@@ -164,7 +189,21 @@ pub async fn delete_webhook(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let _permit = state.consistency_barrier.acquire_write_permit().await?;
-    let _caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let sub = state
+        .webhooks
+        .get_subscription(&id)
+        .await
+        .map_err(|e| match e {
+            crate::webhook::WebhookError::NotFound => {
+                ForgeError::NotFound("Webhook not found".into())
+            }
+            crate::webhook::WebhookError::Database(d) => d,
+            _ => ForgeError::Internal(e.to_string()),
+        })?;
+
+    check_webhook_admin_access(&state, &caller, &sub).await?;
+
     state
         .webhooks
         .delete_subscription(&id)
@@ -183,7 +222,21 @@ pub async fn list_webhook_deliveries(
     Path(id): Path<String>,
     Query(query): Query<DeliveryQuery>,
 ) -> Result<impl IntoResponse, ForgeError> {
-    let _caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
+    let sub = state
+        .webhooks
+        .get_subscription(&id)
+        .await
+        .map_err(|e| match e {
+            crate::webhook::WebhookError::NotFound => {
+                ForgeError::NotFound("Webhook not found".into())
+            }
+            crate::webhook::WebhookError::Database(d) => d,
+            _ => ForgeError::Internal(e.to_string()),
+        })?;
+
+    check_webhook_admin_access(&state, &caller, &sub).await?;
+
     let limit = query.limit.unwrap_or(50);
     let deliveries = state.db.list_webhook_deliveries(&id, limit).await?;
     Ok(Json(deliveries))

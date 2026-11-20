@@ -159,7 +159,7 @@ pub async fn create_review(
 pub async fn dismiss_review(
     State(state): State<AppState>,
     user: Option<Extension<User>>,
-    Path((owner, repo_name, _number, review_id)): Path<(String, String, i64, String)>,
+    Path((owner, repo_name, number, review_id)): Path<(String, String, i64, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo = state
@@ -170,6 +170,19 @@ pub async fn dismiss_review(
         .permissions
         .check_admin_access(Some(&caller), &repo)
         .await?;
+
+    let pr = state
+        .db
+        .get_pull_request_by_number(&repo.id, number)
+        .await?
+        .ok_or_else(|| ForgeError::NotFound("Pull request not found".into()))?;
+
+    let reviews = state.db.list_pr_reviews(&pr.id).await?;
+    if !reviews.iter().any(|r| r.id == review_id) {
+        return Err(ForgeError::NotFound(
+            "Review not found on this pull request".into(),
+        ));
+    }
 
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
     state
@@ -328,7 +341,7 @@ pub async fn create_review_comment(
 pub async fn resolve_review_comment(
     State(state): State<AppState>,
     user: Option<Extension<User>>,
-    Path((owner, repo_name, _number, comment_id)): Path<(String, String, i64, String)>,
+    Path((owner, repo_name, number, comment_id)): Path<(String, String, i64, String)>,
     Json(payload): Json<ResolveCommentRequest>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
@@ -340,6 +353,19 @@ pub async fn resolve_review_comment(
         .permissions
         .check_write_access(Some(&caller), &repo)
         .await?;
+
+    let pr = state
+        .db
+        .get_pull_request_by_number(&repo.id, number)
+        .await?
+        .ok_or_else(|| ForgeError::NotFound("Pull request not found".into()))?;
+
+    let comments = state.db.list_pr_review_comments(&pr.id).await?;
+    if !comments.iter().any(|c| c.id == comment_id) {
+        return Err(ForgeError::NotFound(
+            "Comment not found on this pull request".into(),
+        ));
+    }
 
     state
         .db

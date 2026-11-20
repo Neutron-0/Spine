@@ -103,9 +103,12 @@ pub async fn list_explore_repositories(
 
 pub async fn list_repo_topics(
     State(state): State<AppState>,
+    user: Option<Extension<User>>,
     Path((owner, repo_name)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
+    let caller_id = user.as_ref().map(|Extension(u)| u.id.as_str());
+    state.permissions.require_repo_read(caller_id, &repo_id).await?;
     let topics = state.discovery.list_repository_topics(&repo_id).await?;
     Ok(Json(topics))
 }
@@ -128,18 +131,25 @@ pub async fn set_repo_topics(
 
 pub async fn list_repo_languages(
     State(state): State<AppState>,
+    user: Option<Extension<User>>,
     Path((owner, repo_name)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
+    let caller_id = user.as_ref().map(|Extension(u)| u.id.as_str());
+    state.permissions.require_repo_read(caller_id, &repo_id).await?;
     let langs = state.discovery.list_repository_languages(&repo_id).await?;
     Ok(Json(langs))
 }
 
 pub async fn analyze_repo_languages(
     State(state): State<AppState>,
+    user: Option<Extension<User>>,
     Path((owner, repo_name)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ForgeError> {
+    let _permit = state.consistency_barrier.acquire_write_permit().await?;
+    let caller = user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
+    state.permissions.require_repo_write(&caller.id, &repo_id).await?;
     let langs = state
         .discovery
         .analyze_repository_languages(&repo_id)

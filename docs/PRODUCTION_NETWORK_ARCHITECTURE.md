@@ -59,8 +59,9 @@ server {
     listen 443 ssl http2;
     server_name forge.example.com;
 
-    ssl_certificate /etc/letsencrypt/live/forge.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/forge.example.com/privkey.pem;
+    # TLS Certificates (Mounted from host SPINE_TLS_CERT_FILE and SPINE_TLS_KEY_FILE)
+    ssl_certificate /etc/spine/certs/tls.crt;
+    ssl_certificate_key /etc/spine/certs/tls.key;
 
     client_max_body_size 10G; # Required for large LFS uploads and packfiles
 
