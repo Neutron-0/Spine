@@ -14,9 +14,10 @@ POSTGRES_ADMIN_USER="${POSTGRES_ADMIN_USER:-spine_admin}"
 POSTGRES_ADMIN_PASSWORD="${POSTGRES_ADMIN_PASSWORD:-}"
 SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE:-}"
 SPINE_BACKUP_PASSPHRASE_FILE="${SPINE_BACKUP_PASSPHRASE_FILE:-}"
+SPINE_DEPLOYMENT_PROFILE="${SPINE_DEPLOYMENT_PROFILE:-core-forge-v1}"
 SPINE_BACKUP_REMOTE_S3_URI="${SPINE_BACKUP_REMOTE_S3_URI:-}"
 SPINE_BACKUP_REQUIRE_REMOTE="${SPINE_BACKUP_REQUIRE_REMOTE:-${SPINE_BACKUP_REQUIRE_OFF_SITE:-1}}"
-SPINE_BACKUP_OBJECT_LOCK_MODE="${SPINE_BACKUP_OBJECT_LOCK_MODE:-GOVERNANCE}"
+SPINE_BACKUP_OBJECT_LOCK_MODE="${SPINE_BACKUP_OBJECT_LOCK_MODE:-COMPLIANCE}"
 SPINE_BACKUP_RETENTION_DAYS="${SPINE_BACKUP_RETENTION_DAYS:-30}"
 SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE="${SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE:-0}"
 SPINE_S3_ENDPOINT_URL="${SPINE_S3_ENDPOINT_URL:-}"
@@ -135,8 +136,36 @@ iso_to_epoch() {
   printf "%s" "${epoch}"
 }
 
+normalize_deployment_profile() {
+  case "${SPINE_DEPLOYMENT_PROFILE}" in
+    core-forge-v1|core-forge|production|prod)
+      echo "core-forge-v1"
+      ;;
+    development|dev)
+      echo "development"
+      ;;
+    test)
+      echo "test"
+      ;;
+    *)
+      echo "invalid"
+      ;;
+  esac
+}
+
 verify_off_site_replication_policy() {
   echo "=== Verifying Off-Site Replication Policy ==="
+  local profile
+  profile=$(normalize_deployment_profile)
+  if [ "${profile}" = "invalid" ]; then
+    echo "================================================================================" >&2
+    echo "FATAL: Invalid SPINE_DEPLOYMENT_PROFILE='${SPINE_DEPLOYMENT_PROFILE}'." >&2
+    echo "Supported deployment profiles: 'core-forge-v1' (production), 'development', 'test'." >&2
+    echo "================================================================================" >&2
+    exit 1
+  fi
+  echo "Deployment profile: ${SPINE_DEPLOYMENT_PROFILE} (normalized: ${profile})"
+
   case "${SPINE_BACKUP_REQUIRE_REMOTE}" in
     1|true)
       if [ -z "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
@@ -184,8 +213,33 @@ verify_off_site_replication_policy() {
 
   # Validate remote retention configuration whenever S3 replication is configured
   if [ -n "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
+    # Production profile check: core-forge-v1 strictly forbids unlocked remote replication
+    if [ "${profile}" = "core-forge-v1" ]; then
+      if [ "${SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE}" = "1" ] || [ "${SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE}" = "true" ]; then
+        echo "================================================================================" >&2
+        echo "FATAL: S3 Object Lock retention bypass (SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=1) is" >&2
+        echo "strictly FORBIDDEN under production profile 'core-forge-v1'." >&2
+        echo "Production backups must have immutable Object Lock retention to guarantee resilience" >&2
+        echo "against ransomware, compromised credentials, and operator error." >&2
+        echo "The unlocked bypass is only available under non-production profiles ('development' or 'test')." >&2
+        echo "================================================================================" >&2
+        exit 1
+      fi
+
+      if [ "${SPINE_BACKUP_OBJECT_LOCK_MODE}" = "GOVERNANCE" ]; then
+        echo "================================================================================" >&2
+        echo "FATAL: S3 Object Lock mode 'GOVERNANCE' is rejected under production profile 'core-forge-v1'." >&2
+        echo "Under production profile 'core-forge-v1', backups require non-bypassable WORM immutability" >&2
+        echo "('COMPLIANCE') to protect against host compromise and privileged ransomware." >&2
+        echo "'GOVERNANCE' mode is bypassable by principals with s3:BypassGovernanceRetention permissions" >&2
+        echo "and is strictly reserved for non-production profiles ('development' or 'test')." >&2
+        echo "================================================================================" >&2
+        exit 1
+      fi
+    fi
+
     case "${SPINE_BACKUP_OBJECT_LOCK_MODE}" in
-      GOVERNANCE|COMPLIANCE)
+      COMPLIANCE)
         if ! [[ "${SPINE_BACKUP_RETENTION_DAYS}" =~ ^[1-9][0-9]*$ ]]; then
           echo "FATAL: Invalid SPINE_BACKUP_RETENTION_DAYS='${SPINE_BACKUP_RETENTION_DAYS}'. Must be a positive integer." >&2
           exit 1
@@ -198,25 +252,45 @@ verify_off_site_replication_policy() {
           echo "Date calculation is required to enforce immutable retention. Failing closed before snapshot capture." >&2
           exit 1
         fi
-        echo "S3 Object Lock retention policy verified: mode=${SPINE_BACKUP_OBJECT_LOCK_MODE}, days=${SPINE_BACKUP_RETENTION_DAYS} (sample retain-until: ${test_date})."
+        echo "S3 Object Lock retention policy verified [PRODUCTION COMPLIANCE]: mode=COMPLIANCE, days=${SPINE_BACKUP_RETENTION_DAYS} (sample retain-until: ${test_date})."
+        ;;
+      GOVERNANCE)
+        if ! [[ "${SPINE_BACKUP_RETENTION_DAYS}" =~ ^[1-9][0-9]*$ ]]; then
+          echo "FATAL: Invalid SPINE_BACKUP_RETENTION_DAYS='${SPINE_BACKUP_RETENTION_DAYS}'. Must be a positive integer." >&2
+          exit 1
+        fi
+        local test_date
+        test_date=$(compute_retain_until_date "${SPINE_BACKUP_RETENTION_DAYS}")
+        if [ -z "${test_date}" ]; then
+          echo "FATAL: Cannot compute retain-until date for S3 Object Lock retention (+${SPINE_BACKUP_RETENTION_DAYS} days)." >&2
+          echo "Neither GNU date nor BSD date produced a valid UTC ISO 8601 timestamp." >&2
+          echo "Date calculation is required to enforce immutable retention. Failing closed before snapshot capture." >&2
+          exit 1
+        fi
+        echo "S3 Object Lock retention policy verified [NON-PRODUCTION GOVERNANCE]: mode=GOVERNANCE, days=${SPINE_BACKUP_RETENTION_DAYS} (sample retain-until: ${test_date})."
         ;;
       ""|NONE)
+        if [ "${profile}" = "core-forge-v1" ]; then
+          echo "================================================================================" >&2
+          echo "FATAL: S3 Object Lock retention is MANDATORY under production profile 'core-forge-v1'" >&2
+          echo "when off-site replication is configured. Omitting Object Lock is strictly forbidden." >&2
+          echo "================================================================================" >&2
+          exit 1
+        fi
+
         if [ "${SPINE_BACKUP_REQUIRE_REMOTE}" = "1" ] || [ "${SPINE_BACKUP_REQUIRE_REMOTE}" = "true" ]; then
           if [ "${SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE}" != "1" ] && [ "${SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE}" != "true" ]; then
             echo "================================================================================" >&2
-            echo "FATAL: S3 Object Lock retention is MANDATORY when off-site replication is enforced" >&2
+            echo "FATAL: S3 Object Lock retention is mandatory when off-site replication is enforced" >&2
             echo "(SPINE_BACKUP_REQUIRE_REMOTE=${SPINE_BACKUP_REQUIRE_REMOTE}), but SPINE_BACKUP_OBJECT_LOCK_MODE is disabled ('${SPINE_BACKUP_OBJECT_LOCK_MODE}')." >&2
-            echo "Under production profile 'core-forge-v1', backups must be replicated to an" >&2
-            echo "off-host object store with Object Lock retention (GOVERNANCE or COMPLIANCE) to" >&2
-            echo "guarantee immutability and survive total host compromise or ransomware." >&2
             echo "To explicitly allow un-locked remote replication for non-production testing, set" >&2
             echo "SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=1." >&2
             echo "================================================================================" >&2
             exit 1
           fi
           echo "================================================================================"
-          echo "NON-PRODUCTION WARNING: S3 Object Lock retention is explicitly bypassed via"
-          echo "SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=1 while SPINE_BACKUP_REQUIRE_REMOTE=${SPINE_BACKUP_REQUIRE_REMOTE}."
+          echo "NON-PRODUCTION NOTICE: S3 Object Lock retention is explicitly bypassed for"
+          echo "non-production profile '${SPINE_DEPLOYMENT_PROFILE}' via SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=1."
           echo "OPERATIONAL RISK: Remote archives are not immutable and can be overwritten or deleted."
           echo "================================================================================"
         else
@@ -226,7 +300,9 @@ verify_off_site_replication_policy() {
       *)
         echo "================================================================================" >&2
         echo "FATAL: Unsupported SPINE_BACKUP_OBJECT_LOCK_MODE: '${SPINE_BACKUP_OBJECT_LOCK_MODE}'" >&2
-        echo "Supported S3 Object Lock modes are strictly 'GOVERNANCE' or 'COMPLIANCE' (or ''/NONE to disable with non-production override)." >&2
+        echo "Supported S3 Object Lock modes are 'COMPLIANCE' (mandatory for production) or" >&2
+        echo "'GOVERNANCE' (non-production only). Disabling Object Lock is permitted only in" >&2
+        echo "non-production profiles with SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=1." >&2
         echo "================================================================================" >&2
         exit 1
         ;;
@@ -502,7 +578,13 @@ if [ -n "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
 
   UPLOAD_ARGS=("${AWS_EXTRA_ARGS[@]}")
   APPLY_OBJECT_LOCK=0
-  if [ "${SPINE_BACKUP_OBJECT_LOCK_MODE}" = "GOVERNANCE" ] || [ "${SPINE_BACKUP_OBJECT_LOCK_MODE}" = "COMPLIANCE" ]; then
+  if [ "${SPINE_BACKUP_OBJECT_LOCK_MODE}" = "COMPLIANCE" ] || [ "${SPINE_BACKUP_OBJECT_LOCK_MODE}" = "GOVERNANCE" ]; then
+    local profile
+    profile=$(normalize_deployment_profile)
+    if [ "${profile}" = "core-forge-v1" ] && [ "${SPINE_BACKUP_OBJECT_LOCK_MODE}" = "GOVERNANCE" ]; then
+      echo "FATAL: S3 Object Lock mode 'GOVERNANCE' is rejected under production profile 'core-forge-v1'. Must be 'COMPLIANCE'." >&2
+      exit 1
+    fi
     RETAIN_UNTIL=$(compute_retain_until_date "${SPINE_BACKUP_RETENTION_DAYS}")
     if [ -z "${RETAIN_UNTIL}" ]; then
       echo "FATAL: S3 Object Lock retention is required (mode=${SPINE_BACKUP_OBJECT_LOCK_MODE}), but failed to compute retain-until date (+${SPINE_BACKUP_RETENTION_DAYS} days)." >&2
@@ -512,6 +594,12 @@ if [ -n "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
     UPLOAD_ARGS+=(--object-lock-mode "${SPINE_BACKUP_OBJECT_LOCK_MODE}" --object-lock-retain-until-date "${RETAIN_UNTIL}")
     APPLY_OBJECT_LOCK=1
   elif [ "${SPINE_BACKUP_OBJECT_LOCK_MODE}" = "" ] || [ "${SPINE_BACKUP_OBJECT_LOCK_MODE}" = "NONE" ]; then
+    local profile
+    profile=$(normalize_deployment_profile)
+    if [ "${profile}" = "core-forge-v1" ]; then
+      echo "FATAL: S3 Object Lock retention cannot be omitted under production profile 'core-forge-v1'." >&2
+      exit 1
+    fi
     if [ "${SPINE_BACKUP_REQUIRE_REMOTE}" = "1" ] || [ "${SPINE_BACKUP_REQUIRE_REMOTE}" = "true" ]; then
       if [ "${SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE}" != "1" ] && [ "${SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE}" != "true" ]; then
         echo "FATAL: S3 Object Lock retention is mandatory for production remote backups." >&2
@@ -519,7 +607,7 @@ if [ -n "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
       fi
     fi
   else
-    echo "FATAL: Unsupported SPINE_BACKUP_OBJECT_LOCK_MODE: '${SPINE_BACKUP_OBJECT_LOCK_MODE}'. Must be 'GOVERNANCE' or 'COMPLIANCE'." >&2
+    echo "FATAL: Unsupported SPINE_BACKUP_OBJECT_LOCK_MODE: '${SPINE_BACKUP_OBJECT_LOCK_MODE}'. Must be 'COMPLIANCE' or 'GOVERNANCE'." >&2
     exit 1
   fi
 

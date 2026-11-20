@@ -1340,7 +1340,7 @@ echo "AWS_CALL: \$@" >> "${AUDIT_AWS}"
 if [ "\$1" = "s3" ] && [ "\$2" = "cp" ]; then
   SRC="\$3"
   DST="\$4"
-  if [[ "\$*" == *"--object-lock-mode GOVERNANCE"* ]] && [[ "\$*" == *"--object-lock-retain-until-date"* ]]; then
+  if [[ "\$*" == *"--object-lock-mode COMPLIANCE"* ]] && [[ "\$*" == *"--object-lock-retain-until-date"* ]]; then
     echo "OBJECT_LOCK_CONFIRMED" >> "${AUDIT_AWS}"
   fi
   if [[ "\${DST}" =~ ^s3:// ]]; then
@@ -1374,7 +1374,7 @@ LOCAL_MANIFEST="${WORK_DIR}/SHA256SUMS"
 sha256sum "${LOCAL_BACKUP}" > "${LOCAL_MANIFEST}"
 
 export SPINE_BACKUP_REMOTE_S3_URI="s3://disaster-recovery-vault/spine"
-export SPINE_BACKUP_OBJECT_LOCK_MODE="GOVERNANCE"
+export SPINE_BACKUP_OBJECT_LOCK_MODE="COMPLIANCE"
 export SPINE_BACKUP_RETENTION_DAYS="30"
 export SPINE_S3_ENDPOINT_URL=""
 
@@ -1757,7 +1757,31 @@ compute_retain_until_date() {
   printf "%s" "${d}"
 }
 
+normalize_deployment_profile() {
+  case "${SPINE_DEPLOYMENT_PROFILE:-core-forge-v1}" in
+    core-forge-v1|core-forge|production|prod)
+      echo "core-forge-v1"
+      ;;
+    development|dev)
+      echo "development"
+      ;;
+    test)
+      echo "test"
+      ;;
+    *)
+      echo "invalid"
+      ;;
+  esac
+}
+
 verify_off_site_replication_policy() {
+  local profile
+  profile=$(normalize_deployment_profile)
+  if [ "${profile}" = "invalid" ]; then
+    echo "FATAL: Invalid SPINE_DEPLOYMENT_PROFILE='${SPINE_DEPLOYMENT_PROFILE}'." >&2
+    exit 1
+  fi
+
   case "${SPINE_BACKUP_REQUIRE_REMOTE}" in
     1|true)
       if [ -z "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
@@ -1784,8 +1808,31 @@ verify_off_site_replication_policy() {
   esac
 
   if [ -n "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
+    if [ "${profile}" = "core-forge-v1" ]; then
+      if [ "${SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE:-0}" = "1" ] || [ "${SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE:-0}" = "true" ]; then
+        echo "FATAL: S3 Object Lock retention bypass (SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=1) is strictly FORBIDDEN under production profile 'core-forge-v1'." >&2
+        exit 1
+      fi
+      if [ "${SPINE_BACKUP_OBJECT_LOCK_MODE}" = "GOVERNANCE" ]; then
+        echo "FATAL: S3 Object Lock mode 'GOVERNANCE' is rejected under production profile 'core-forge-v1'. Production requires 'COMPLIANCE'." >&2
+        exit 1
+      fi
+    fi
+
     case "${SPINE_BACKUP_OBJECT_LOCK_MODE}" in
-      GOVERNANCE|COMPLIANCE)
+      COMPLIANCE)
+        if ! [[ "${SPINE_BACKUP_RETENTION_DAYS}" =~ ^[1-9][0-9]*$ ]]; then
+          echo "FATAL: Invalid SPINE_BACKUP_RETENTION_DAYS='${SPINE_BACKUP_RETENTION_DAYS}'." >&2
+          exit 1
+        fi
+        local test_date
+        test_date=$(compute_retain_until_date "${SPINE_BACKUP_RETENTION_DAYS}")
+        if [ -z "${test_date}" ]; then
+          echo "FATAL: Cannot compute retain-until date for S3 Object Lock retention." >&2
+          exit 1
+        fi
+        ;;
+      GOVERNANCE)
         if ! [[ "${SPINE_BACKUP_RETENTION_DAYS}" =~ ^[1-9][0-9]*$ ]]; then
           echo "FATAL: Invalid SPINE_BACKUP_RETENTION_DAYS='${SPINE_BACKUP_RETENTION_DAYS}'." >&2
           exit 1
@@ -1798,12 +1845,16 @@ verify_off_site_replication_policy() {
         fi
         ;;
       ""|NONE)
+        if [ "${profile}" = "core-forge-v1" ]; then
+          echo "FATAL: S3 Object Lock retention is MANDATORY under production profile 'core-forge-v1'." >&2
+          exit 1
+        fi
         if [ "${SPINE_BACKUP_REQUIRE_REMOTE}" = "1" ] || [ "${SPINE_BACKUP_REQUIRE_REMOTE}" = "true" ]; then
           if [ "${SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE:-0}" != "1" ] && [ "${SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE:-0}" != "true" ]; then
             echo "FATAL: S3 Object Lock retention is MANDATORY when off-site replication is enforced." >&2
             exit 1
           fi
-          echo "NON-PRODUCTION WARNING: S3 Object Lock retention is explicitly bypassed via SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=1."
+          echo "NON-PRODUCTION NOTICE: S3 Object Lock retention is explicitly bypassed via SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=1."
         else
           echo "NOTICE: S3 Object Lock retention is not configured."
         fi
@@ -1816,50 +1867,86 @@ verify_off_site_replication_policy() {
   fi
 }
 
-# 1. Invalid SPINE_BACKUP_REQUIRE_REMOTE values
+# 1. Invalid SPINE_DEPLOYMENT_PROFILE value
+export SPINE_DEPLOYMENT_PROFILE="staging"
+export SPINE_BACKUP_REQUIRE_REMOTE="1"
 export SPINE_BACKUP_REMOTE_S3_URI="s3://test-bucket/backups"
-export SPINE_BACKUP_OBJECT_LOCK_MODE="GOVERNANCE"
+export SPINE_BACKUP_OBJECT_LOCK_MODE="COMPLIANCE"
 export SPINE_BACKUP_RETENTION_DAYS="30"
 export SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=0
 
+if ( verify_off_site_replication_policy 2>"${WORK_DIR}/prof_err.log" ); then
+  echo "FAIL: Invalid deployment profile 'staging' was accepted!" >&2
+  exit 1
+fi
+grep -q "FATAL: Invalid SPINE_DEPLOYMENT_PROFILE" "${WORK_DIR}/prof_err.log"
+
+# Reset to core-forge-v1 production profile
+export SPINE_DEPLOYMENT_PROFILE="core-forge-v1"
+
+# 2. Invalid SPINE_BACKUP_REQUIRE_REMOTE values
 for invalid_val in "yes" "no" "2" "True" "maybe" " " "disabled" "enabled"; do
   export SPINE_BACKUP_REQUIRE_REMOTE="${invalid_val}"
   if ( verify_off_site_replication_policy 2>"${WORK_DIR}/err.log" ); then
     echo "FAIL: Invalid policy value '${invalid_val}' was accepted!" >&2
-    exit 1
+    exit 2
   fi
   grep -q "FATAL: Invalid SPINE_BACKUP_REQUIRE_REMOTE value" "${WORK_DIR}/err.log"
 done
 
-# 2. Unsupported SPINE_BACKUP_OBJECT_LOCK_MODE values
+# 3. Unsupported SPINE_BACKUP_OBJECT_LOCK_MODE values
 export SPINE_BACKUP_REQUIRE_REMOTE="1"
-for bad_mode in "TEMPORARY" "STANDARD" "governance" "compliance" "INVALID" "1" "true"; do
+for bad_mode in "TEMPORARY" "STANDARD" "compliance" "governance" "INVALID" "1" "true"; do
   export SPINE_BACKUP_OBJECT_LOCK_MODE="${bad_mode}"
   if ( verify_off_site_replication_policy 2>"${WORK_DIR}/mode_err.log" ); then
     echo "FAIL: Unsupported lock mode '${bad_mode}' was accepted!" >&2
-    exit 2
+    exit 3
   fi
   grep -q "FATAL: Unsupported SPINE_BACKUP_OBJECT_LOCK_MODE" "${WORK_DIR}/mode_err.log"
 done
 
-# 3. Production mode (REQUIRE_REMOTE=1) rejects disabled Object Lock without explicit override
-export SPINE_BACKUP_REQUIRE_REMOTE="1"
-export SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=0
-for disabled_lock in "" "NONE"; do
-  export SPINE_BACKUP_OBJECT_LOCK_MODE="${disabled_lock}"
-  if ( verify_off_site_replication_policy 2>"${WORK_DIR}/prod_unlocked_err.log" ); then
-    echo "FAIL: Production mode accepted disabled Object Lock without override!" >&2
-    exit 3
-  fi
-  grep -q "FATAL: S3 Object Lock retention is MANDATORY" "${WORK_DIR}/prod_unlocked_err.log"
-done
+# 4. Under production profile 'core-forge-v1':
+# a) GOVERNANCE mode is rejected fail-closed
+export SPINE_BACKUP_OBJECT_LOCK_MODE="GOVERNANCE"
+if ( verify_off_site_replication_policy 2>"${WORK_DIR}/gov_err.log" ); then
+  echo "FAIL: Production mode accepted bypassable GOVERNANCE lock mode!" >&2
+  exit 4
+fi
+grep -q "FATAL: S3 Object Lock mode 'GOVERNANCE' is rejected under production profile 'core-forge-v1'" "${WORK_DIR}/gov_err.log"
 
-# 4. Explicit non-production override permits disabled Object Lock
-export SPINE_BACKUP_REQUIRE_REMOTE="1"
+# b) Non-production override (ALLOW_UNLOCKED_REMOTE=1) cannot disable Object Lock under production profile
 export SPINE_BACKUP_OBJECT_LOCK_MODE="NONE"
 export SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=1
-verify_off_site_replication_policy > "${WORK_DIR}/override.log"
-grep -q "NON-PRODUCTION WARNING" "${WORK_DIR}/override.log"
+if ( verify_off_site_replication_policy 2>"${WORK_DIR}/prod_override_err.log" ); then
+  echo "FAIL: Production profile accepted SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=1 override!" >&2
+  exit 5
+fi
+grep -q "FATAL: S3 Object Lock retention bypass (SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=1) is strictly FORBIDDEN under production profile 'core-forge-v1'" "${WORK_DIR}/prod_override_err.log"
+
+# c) Valid COMPLIANCE mode under core-forge-v1 succeeds
+export SPINE_BACKUP_OBJECT_LOCK_MODE="COMPLIANCE"
+export SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=0
+verify_off_site_replication_policy > "${WORK_DIR}/prod_success.log"
+
+# 5. Under non-production profile 'development':
+export SPINE_DEPLOYMENT_PROFILE="development"
+# a) GOVERNANCE mode is accepted
+export SPINE_BACKUP_OBJECT_LOCK_MODE="GOVERNANCE"
+verify_off_site_replication_policy > "${WORK_DIR}/dev_gov.log"
+
+# b) ALLOW_UNLOCKED_REMOTE=1 is honored in development
+export SPINE_BACKUP_OBJECT_LOCK_MODE="NONE"
+export SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=1
+verify_off_site_replication_policy > "${WORK_DIR}/dev_override.log"
+grep -q "NON-PRODUCTION NOTICE" "${WORK_DIR}/dev_override.log"
+
+# c) ALLOW_UNLOCKED_REMOTE=0 in development still fails closed if lock is omitted
+export SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=0
+if ( verify_off_site_replication_policy 2>"${WORK_DIR}/dev_no_override_err.log" ); then
+  echo "FAIL: Development mode without override accepted omitted Object Lock!" >&2
+  exit 6
+fi
+grep -q "FATAL: S3 Object Lock retention is MANDATORY" "${WORK_DIR}/dev_no_override_err.log"
 
 rm -rf "${WORK_DIR}"
 exit 0
@@ -2028,31 +2115,31 @@ elif [ "\$1" = "s3api" ] && [ "\$2" = "get-object-retention" ]; then
       exit 1
       ;;
     "absent_date")
-      echo '{"Retention": {"Mode": "GOVERNANCE"}}'
+      echo '{"Retention": {"Mode": "COMPLIANCE"}}'
       exit 0
       ;;
     "malformed_date")
-      echo '{"Retention": {"Mode": "GOVERNANCE", "RetainUntilDate": "malformed_not_a_date"}}'
+      echo '{"Retention": {"Mode": "COMPLIANCE", "RetainUntilDate": "malformed_not_a_date"}}'
       exit 0
       ;;
     "expired_date")
-      echo '{"Retention": {"Mode": "GOVERNANCE", "RetainUntilDate": "2020-01-01T00:00:00.000Z"}}'
+      echo '{"Retention": {"Mode": "COMPLIANCE", "RetainUntilDate": "2020-01-01T00:00:00.000Z"}}'
       exit 0
       ;;
     "too_short_date")
       # Compute 1 day in the future (far shorter than 30 days configured)
       SHORT_DATE=\$(date -u -d "+1 day" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -v "+1d" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "2026-11-21T12:00:00Z")
-      echo "{\"Retention\": {\"Mode\": \"GOVERNANCE\", \"RetainUntilDate\": \"\${SHORT_DATE}\"}}"
+      echo "{\"Retention\": {\"Mode\": \"COMPLIANCE\", \"RetainUntilDate\": \"\${SHORT_DATE}\"}}"
       exit 0
       ;;
     "mismatched_mode")
       VALID_DATE=\$(date -u -d "+35 days" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -v "+35d" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "2027-01-01T12:00:00Z")
-      echo "{\"Retention\": {\"Mode\": \"COMPLIANCE\", \"RetainUntilDate\": \"\${VALID_DATE}\"}}"
+      echo "{\"Retention\": {\"Mode\": \"GOVERNANCE\", \"RetainUntilDate\": \"\${VALID_DATE}\"}}"
       exit 0
       ;;
     "valid")
       VALID_DATE=\$(date -u -d "+35 days" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -v "+35d" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "2027-01-01T12:00:00Z")
-      echo "{\"Retention\": {\"Mode\": \"GOVERNANCE\", \"RetainUntilDate\": \"\${VALID_DATE}\"}}"
+      echo "{\"Retention\": {\"Mode\": \"COMPLIANCE\", \"RetainUntilDate\": \"\${VALID_DATE}\"}}"
       exit 0
       ;;
     *)
@@ -2098,10 +2185,15 @@ run_retention_confirmation_gate() {
   local require_remote="${3:-1}"
   local allow_unlocked="${4:-0}"
   local retention_days="${5:-30}"
+  local profile="${6:-core-forge-v1}"
 
-  # Production mode requires Object Lock unless explicit override is given
-  if [ "${require_remote}" = "1" ] && [ "${apply_lock}" -eq 0 ]; then
-    if [ "${allow_unlocked}" != "1" ] && [ "${allow_unlocked}" != "true" ]; then
+  # Production mode requires Object Lock; unlocked bypass is strictly forbidden under core-forge-v1
+  if [ "${apply_lock}" -eq 0 ]; then
+    if [ "${profile}" = "core-forge-v1" ]; then
+      echo "FATAL: S3 Object Lock retention cannot be omitted under production profile 'core-forge-v1'." >&2
+      exit 1
+    fi
+    if [ "${require_remote}" = "1" ] && [ "${allow_unlocked}" != "1" ]; then
       echo "FATAL: S3 Object Lock retention is mandatory for production remote backups." >&2
       exit 1
     fi
@@ -2167,7 +2259,7 @@ aws s3 cp "${LOCAL_FILE}" "${REMOTE_TARGET}/backup.spnebak"
 
 # 1. Object Lock configuration absent -> must FAIL CLOSED
 export MOCK_RETENTION_BEHAVIOR="absent_config"
-if ( run_retention_confirmation_gate "GOVERNANCE" 1 2>"${WORK_DIR}/absent.err" ); then
+if ( run_retention_confirmation_gate "COMPLIANCE" 1 2>"${WORK_DIR}/absent.err" ); then
   echo "FAIL: Gate succeeded despite absent retention configuration!" >&2
   exit 1
 fi
@@ -2179,7 +2271,7 @@ fi
 
 # 2. RetainUntilDate missing -> must FAIL CLOSED
 export MOCK_RETENTION_BEHAVIOR="absent_date"
-if ( run_retention_confirmation_gate "GOVERNANCE" 1 2>"${WORK_DIR}/absent_date.err" ); then
+if ( run_retention_confirmation_gate "COMPLIANCE" 1 2>"${WORK_DIR}/absent_date.err" ); then
   echo "FAIL: Gate succeeded despite missing RetainUntilDate!" >&2
   exit 3
 fi
@@ -2187,7 +2279,7 @@ grep -q "RetainUntilDate is missing" "${WORK_DIR}/absent_date.err"
 
 # 3. RetainUntilDate malformed -> must FAIL CLOSED
 export MOCK_RETENTION_BEHAVIOR="malformed_date"
-if ( run_retention_confirmation_gate "GOVERNANCE" 1 2>"${WORK_DIR}/malformed_date.err" ); then
+if ( run_retention_confirmation_gate "COMPLIANCE" 1 2>"${WORK_DIR}/malformed_date.err" ); then
   echo "FAIL: Gate succeeded despite malformed RetainUntilDate!" >&2
   exit 4
 fi
@@ -2195,7 +2287,7 @@ grep -q "malformed or unparseable" "${WORK_DIR}/malformed_date.err"
 
 # 4. RetainUntilDate expired -> must FAIL CLOSED
 export MOCK_RETENTION_BEHAVIOR="expired_date"
-if ( run_retention_confirmation_gate "GOVERNANCE" 1 2>"${WORK_DIR}/expired_date.err" ); then
+if ( run_retention_confirmation_gate "COMPLIANCE" 1 2>"${WORK_DIR}/expired_date.err" ); then
   echo "FAIL: Gate succeeded despite expired RetainUntilDate!" >&2
   exit 5
 fi
@@ -2203,15 +2295,15 @@ grep -q "is expired or in the past" "${WORK_DIR}/expired_date.err"
 
 # 5. RetainUntilDate too short (e.g. 1 day vs 30 days) -> must FAIL CLOSED
 export MOCK_RETENTION_BEHAVIOR="too_short_date"
-if ( run_retention_confirmation_gate "GOVERNANCE" 1 2>"${WORK_DIR}/too_short.err" ); then
+if ( run_retention_confirmation_gate "COMPLIANCE" 1 2>"${WORK_DIR}/too_short.err" ); then
   echo "FAIL: Gate succeeded despite too-short RetainUntilDate!" >&2
   exit 6
 fi
 grep -q "is earlier than the configured retention period" "${WORK_DIR}/too_short.err"
 
-# 6. Mode mismatch (expected GOVERNANCE, got COMPLIANCE) -> must FAIL CLOSED
+# 6. Mode mismatch (expected COMPLIANCE, got GOVERNANCE) -> must FAIL CLOSED
 export MOCK_RETENTION_BEHAVIOR="mismatched_mode"
-if ( run_retention_confirmation_gate "GOVERNANCE" 1 2>"${WORK_DIR}/mismatch.err" ); then
+if ( run_retention_confirmation_gate "COMPLIANCE" 1 2>"${WORK_DIR}/mismatch.err" ); then
   echo "FAIL: Gate succeeded despite mode mismatch!" >&2
   exit 7
 fi
@@ -2219,20 +2311,20 @@ grep -q "FATAL: S3 Object Lock retention verification failed" "${WORK_DIR}/misma
 
 # 7. Confirmed valid metadata meeting retention window -> SUCCEEDS
 export MOCK_RETENTION_BEHAVIOR="valid"
-OUT=$(run_retention_confirmation_gate "GOVERNANCE" 1)
-echo "${OUT}" | grep -q "immutable retention active: GOVERNANCE until"
+OUT=$(run_retention_confirmation_gate "COMPLIANCE" 1)
+echo "${OUT}" | grep -q "immutable retention active: COMPLIANCE until"
 
-# 8. Production mode with Object Lock omitted WITHOUT override -> must FAIL CLOSED
-if ( run_retention_confirmation_gate "" 0 1 0 2>"${WORK_DIR}/prod_unlocked.err" ); then
-  echo "FAIL: Production mode accepted omitted Object Lock without override!" >&2
+# 8. Production profile (core-forge-v1) cannot omit Object Lock even with allow_unlocked=1 -> must FAIL CLOSED
+if ( run_retention_confirmation_gate "" 0 1 1 30 "core-forge-v1" 2>"${WORK_DIR}/prod_unlocked.err" ); then
+  echo "FAIL: Production profile accepted omitted Object Lock!" >&2
   exit 8
 fi
-grep -q "FATAL: S3 Object Lock retention is mandatory for production" "${WORK_DIR}/prod_unlocked.err"
+grep -q "FATAL: S3 Object Lock retention cannot be omitted under production profile 'core-forge-v1'" "${WORK_DIR}/prod_unlocked.err"
 
-# 9. Production mode with Object Lock omitted WITH explicit non-production override -> SUCCEEDS without claiming immutable retention
-OUT_OVERRIDE=$(run_retention_confirmation_gate "" 0 1 1)
-echo "${OUT_OVERRIDE}" | grep -q "standard replication without Object Lock"
-if echo "${OUT_OVERRIDE}" | grep -q "immutable retention active"; then
+# 9. Non-production profile (development) with Object Lock omitted WITH explicit override -> SUCCEEDS without claiming immutable retention
+OUT_DEV_OVERRIDE=$(run_retention_confirmation_gate "" 0 1 1 30 "development")
+echo "${OUT_DEV_OVERRIDE}" | grep -q "standard replication without Object Lock"
+if echo "${OUT_DEV_OVERRIDE}" | grep -q "immutable retention active"; then
   echo "FAIL: Claimed immutable retention active under non-lock override!" >&2
   exit 9
 fi

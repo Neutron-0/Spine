@@ -145,9 +145,10 @@ export BACKUP_ROOT="/mnt/backups/spine"
 export SPINE_BACKUP_PASSPHRASE_FILE="/etc/spine/backup_passphrase"
 
 # Off-host S3-compatible immutable replication (ENFORCED by default in production)
+export SPINE_DEPLOYMENT_PROFILE="core-forge-v1"
 export SPINE_BACKUP_REQUIRE_REMOTE=1  # 1 = Enforced (fails if unset or failed), 0 = Allow intentionally local-only
 export SPINE_BACKUP_REMOTE_S3_URI="s3://spine-disaster-recovery-vault/cluster-backups"
-export SPINE_BACKUP_OBJECT_LOCK_MODE="GOVERNANCE" # or COMPLIANCE
+export SPINE_BACKUP_OBJECT_LOCK_MODE="COMPLIANCE" # Mandatory for core-forge-v1 production
 export SPINE_BACKUP_RETENTION_DAYS="30"
 # export SPINE_S3_ENDPOINT_URL="https://s3.us-east-1.amazonaws.com"
 
@@ -162,16 +163,16 @@ export SPINE_BACKUP_RETENTION_DAYS="30"
    - If `SPINE_BACKUP_REQUIRE_REMOTE=1` (or `true`) and `SPINE_BACKUP_REMOTE_S3_URI` is not configured or the `aws` CLI is missing, `scripts/backup_oob.sh` **fails closed immediately at pre-flight**.
    - Local-only backups can only be created by explicitly overriding the policy (`SPINE_BACKUP_REQUIRE_REMOTE=0` or `false`), which emits an operational warning acknowledging the disaster recovery limitation.
 
-2. **Mandatory Production Object Lock Policy & Non-Production Override:**
+2. **Non-Bypassable Compliance Immutability (`COMPLIANCE`) & Profile-Gated Overrides:**
    When off-host replication is configured (`SPINE_BACKUP_REMOTE_S3_URI` is set):
-   - **Mandatory in Production (`SPINE_BACKUP_REQUIRE_REMOTE=1`):** Under production profile `core-forge-v1`, Object Lock is strictly mandatory. Attempting to disable or omit Object Lock (`SPINE_BACKUP_OBJECT_LOCK_MODE=""` or `NONE`) **fails closed immediately at pre-flight** (`exit 1`).
-   - **Explicit Non-Production Override (`SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=1`):** To permit un-locked S3 replication exclusively in non-production, staging, or dev environments whose object storage lacks Object Lock capabilities, operators must explicitly set `SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=1`. The script logs an operational risk warning and runs standard replication without claiming immutability.
-   - **Supported Lock Modes:** `SPINE_BACKUP_OBJECT_LOCK_MODE` strictly requires `GOVERNANCE` or `COMPLIANCE`. All other values (e.g. `TEMPORARY`, `STANDARD`, `invalid`) are rejected fail-closed.
+   - **Mandatory Non-Bypassable Compliance Mode (`COMPLIANCE`):** Under production profile `core-forge-v1`, `SPINE_BACKUP_OBJECT_LOCK_MODE` **defaults to `COMPLIANCE`** and strictly requires `COMPLIANCE`. `GOVERNANCE` mode is **rejected fail-closed** under `core-forge-v1` because principals with `s3:BypassGovernanceRetention` permissions could shorten or delete the retention in a compromised environment. `COMPLIANCE` guarantees strict WORM immutability that cannot be altered or removed by any IAM principal or root user.
+   - **Bypass Unavailable in Production:** The unlocked bypass `SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=1` is **strictly forbidden and rejected fail-closed** when `SPINE_DEPLOYMENT_PROFILE=core-forge-v1`. Attempting to bypass Object Lock under the production profile aborts execution immediately (`exit 1`).
+   - **Non-Production Profile Scoping (`development` / `test`):** The unlocked bypass is only honored when `SPINE_DEPLOYMENT_PROFILE` is explicitly set to a validated non-production profile (`development` or `test`). Non-production profiles also permit `GOVERNANCE` mode for test buckets.
    - **Mandatory Retain-Until Calculation:** Pre-flight and pre-upload gates calculate the retention date (+`SPINE_BACKUP_RETENTION_DAYS` days, e.g. `2026-12-20T12:00:00Z`). If date calculation is unavailable or fails, backup aborts fail-closed before taking snapshots or uploading.
 
 3. **Remote Retention Confirmation Gate (Mode & Retention Window Verification):**
    Following archive upload, the script queries remote S3 retention metadata via `aws s3api get-object-retention` and enforces five fail-closed checks before declaring backup success:
-   - **Mode Verification:** `Retention.Mode` must match configured `SPINE_BACKUP_OBJECT_LOCK_MODE` (`GOVERNANCE` or `COMPLIANCE`).
+   - **Mode Verification:** `Retention.Mode` must match configured `SPINE_BACKUP_OBJECT_LOCK_MODE` (`COMPLIANCE` in production).
    - **Presence Check:** `Retention.RetainUntilDate` must be present in the remote metadata (absent date fails closed).
    - **Format & Validity:** `Retention.RetainUntilDate` must be a valid, parseable ISO 8601 UTC timestamp (malformed date fails closed).
    - **Non-Expired Check:** `Retention.RetainUntilDate` must not be expired or in the past relative to the host epoch time.
