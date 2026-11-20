@@ -56,77 +56,44 @@ if [ "${MAGIC_CHECK}" != "SPNEBAK"$'\x02' ]; then
   exit 1
 fi
 
-echo "=== Step 0a: Authenticating and Decrypting SPNEBAK v2 Backup Archive ==="
-DECRYPT_DIR="${BACKUP_DIR}/.decrypted_restore_$(date +%s)"
-mkdir -p "${DECRYPT_DIR}"
-chmod 700 "${DECRYPT_DIR}"
-
-DECRYPT_FAILED=0
-if command -v spine-api >/dev/null 2>&1; then
-  if ! SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE}" \
-    spine-api backup decrypt --input "${ENCRYPTED_FILE}" --output - | tar -xzf - -C "${DECRYPT_DIR}"; then
-    DECRYPT_FAILED=1
-  fi
-else
-  if ! docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps \
-    -e SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE}" spine-api \
-    spine-api backup decrypt --input - --output - < "${ENCRYPTED_FILE}" | tar -xzf - -C "${DECRYPT_DIR}"; then
-    DECRYPT_FAILED=1
-  fi
-fi
-
-if [ ${DECRYPT_FAILED} -ne 0 ]; then
-  echo "================================================================================" >&2
-  echo "CRITICAL FATAL: Backup authentication or decryption failed!" >&2
-  echo "The backup archive is corrupted, tampered, or the encryption passphrase is invalid." >&2
-  echo "ABORTING RESTORE IMMEDIATELY. Zero cluster services have been touched." >&2
-  echo "================================================================================" >&2
-  rm -rf "${DECRYPT_DIR}"
-  exit 1
-fi
-
-echo "Backup authentication verified [OK]. All AES-256-GCM chunk MACs and SHA-256 manifest valid."
-
-if [ ! -f "${DECRYPT_DIR}/FENCING_GENERATION" ] || [ ! -f "${DECRYPT_DIR}/SHA256SUMS" ]; then
-  echo "FATAL: Invalid decrypted backup contents. FENCING_GENERATION or SHA256SUMS missing." >&2
-  rm -rf "${DECRYPT_DIR}"
-  exit 1
-fi
-
-TARGET_GEN=$(cat "${DECRYPT_DIR}/FENCING_GENERATION" | tr -d '[:space:]')
-echo "Target recovery generation: ${TARGET_GEN}"
-
-echo "=== Step 0b: Verifying Restored Payload SHA-256 Checksum Manifest ==="
-(cd "${DECRYPT_DIR}" && sha256sum -c SHA256SUMS)
-
-echo "=== Step 1: Stopping Cluster Services & Verifying Full Quiescence ==="
-# Stop services; failures here are fatal (no || true)
-docker compose -f "${COMPOSE_FILE}" stop ingress spine-api
-docker compose -f "${COMPOSE_FILE}" stop storage-node-1 storage-node-2 storage-node-3 coordinator postgres spine-frontend
-
-# Strictly verify no stateful containers are running
-RUNNING=$(docker compose -f "${COMPOSE_FILE}" ps --services --filter "status=running")
-if [ -n "${RUNNING}" ]; then
-  echo "FATAL: The following services failed to stop and are still running:" >&2
-  echo "${RUNNING}" >&2
-  echo "Aborting restore to prevent data corruption." >&2
-  exit 1
-fi
-echo "All cluster services confirmed stopped."
-
-# Set up external rollback directory outside container volume paths
-ROLLBACK_DIR="${BACKUP_DIR}/.pre_restore_rollback_$(date +%s)"
-mkdir -p "${ROLLBACK_DIR}"
-chmod 700 "${ROLLBACK_DIR}"
-
+# State variables for cleanup and rollback handling
 RESTORE_SUCCESS=0
 VOLUMES_MODIFIED=0
+DECRYPT_DIR=""
+ROLLBACK_DIR=""
 
-rollback_volumes() {
+encrypt_stream() {
+  if command -v spine-api >/dev/null 2>&1; then
+    SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE}" \
+      spine-api backup encrypt --input - --output -
+  else
+    docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps \
+      -e SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE}" spine-api \
+      backup encrypt --input - --output -
+  fi
+}
+
+decrypt_stream() {
+  if command -v spine-api >/dev/null 2>&1; then
+    SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE}" \
+      spine-api backup decrypt --input - --output -
+  else
+    docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps \
+      -e SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE}" spine-api \
+      backup decrypt --input - --output -
+  fi
+}
+
+restore_cleanup() {
+  local exit_code=$?
+
+  # 1. Always purge decrypted temporary payload directory on failure, abort, or signal
   if [ "${RESTORE_SUCCESS}" -eq 0 ]; then
-    # Always clean up decrypted temporary payload directory on abort/exit
     if [ -n "${DECRYPT_DIR:-}" ] && [ -d "${DECRYPT_DIR}" ]; then
-      rm -rf "${DECRYPT_DIR}"
+      echo "Purging temporary decrypted restore directory: ${DECRYPT_DIR}..." >&2
+      if ! rm -rf "${DECRYPT_DIR}"; then
+        echo "ERROR: Failed to remove decrypted restore directory: ${DECRYPT_DIR}" >&2
+      fi
     fi
 
     if [ "${VOLUMES_MODIFIED}" -eq 0 ]; then
@@ -164,17 +131,17 @@ rollback_volumes() {
         echo "================================================================================" >&2
         echo "CRITICAL FATAL: Automatic rollback extraction halted because services refused to stop." >&2
         echo "Cluster services remain STRICTLY STOPPED to prevent further data corruption." >&2
-        echo "Rollback artifacts preserved for emergency operator inspection at: ${ROLLBACK_DIR}" >&2
+        echo "Rollback artifacts preserved in encrypted format (SPNEBAK v2) at: ${ROLLBACK_DIR}" >&2
         echo "OPERATOR ACTION REQUIRED: Terminate hung containers and inspect volumes manually." >&2
         echo "================================================================================" >&2
         exit 2
       fi
 
-      # 3. Roll back Coordinator
-      if [ -f "${ROLLBACK_DIR}/coordinator.tar.gz" ]; then
-        echo "Rolling back Coordinator volume..." >&2
-        if ! docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh coordinator \
-          -c "rm -rf /var/lib/spine/* /var/lib/spine/.[!.]* && tar -xzf - -C /var/lib/spine" < "${ROLLBACK_DIR}/coordinator.tar.gz"; then
+      # 3. Roll back Coordinator from encrypted archive
+      if [ -f "${ROLLBACK_DIR}/coordinator.spnebak" ]; then
+        echo "Rolling back Coordinator volume from encrypted archive..." >&2
+        if ! decrypt_stream < "${ROLLBACK_DIR}/coordinator.spnebak" | docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps --entrypoint sh coordinator \
+          -c "rm -rf /var/lib/spine/* /var/lib/spine/.[!.]* && tar -xzf - -C /var/lib/spine"; then
           echo "ERROR: Failed to extract rollback archive for Coordinator!" >&2
           ROLLBACK_FAILED=1
         elif ! docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint test coordinator -f /var/lib/spine/.coordinator_fencing_generation; then
@@ -185,16 +152,16 @@ rollback_volumes() {
           VERIFIED_COUNT=$((VERIFIED_COUNT + 1))
         fi
       else
-        echo "ERROR: Missing rollback archive for Coordinator (${ROLLBACK_DIR}/coordinator.tar.gz)!" >&2
+        echo "ERROR: Missing rollback archive for Coordinator (${ROLLBACK_DIR}/coordinator.spnebak)!" >&2
         ROLLBACK_FAILED=1
       fi
 
-      # 4. Roll back Storage Nodes (1, 2, 3)
+      # 4. Roll back Storage Nodes (1, 2, 3) from encrypted archives
       for NODE in 1 2 3; do
-        if [ -f "${ROLLBACK_DIR}/storage_node_${NODE}.tar.gz" ]; then
-          echo "Rolling back Storage Node ${NODE} volume..." >&2
-          if ! docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
-            -c "rm -rf /var/lib/spine/node-${NODE}/* /var/lib/spine/node-${NODE}/.[!.]* && tar -xzf - -C /var/lib/spine/node-${NODE}" < "${ROLLBACK_DIR}/storage_node_${NODE}.tar.gz"; then
+        if [ -f "${ROLLBACK_DIR}/storage_node_${NODE}.spnebak" ]; then
+          echo "Rolling back Storage Node ${NODE} volume from encrypted archive..." >&2
+          if ! decrypt_stream < "${ROLLBACK_DIR}/storage_node_${NODE}.spnebak" | docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps --entrypoint sh "storage-node-${NODE}" \
+            -c "rm -rf /var/lib/spine/node-${NODE}/* /var/lib/spine/node-${NODE}/.[!.]* && tar -xzf - -C /var/lib/spine/node-${NODE}"; then
             echo "ERROR: Failed to extract rollback archive for Storage Node ${NODE}!" >&2
             ROLLBACK_FAILED=1
           elif ! docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint test "storage-node-${NODE}" -f "/var/lib/spine/node-${NODE}/.fencing_generation"; then
@@ -205,16 +172,16 @@ rollback_volumes() {
             VERIFIED_COUNT=$((VERIFIED_COUNT + 1))
           fi
         else
-          echo "ERROR: Missing rollback archive for Storage Node ${NODE} (${ROLLBACK_DIR}/storage_node_${NODE}.tar.gz)!" >&2
+          echo "ERROR: Missing rollback archive for Storage Node ${NODE} (${ROLLBACK_DIR}/storage_node_${NODE}.spnebak)!" >&2
           ROLLBACK_FAILED=1
         fi
       done
 
-      # 5. Roll back API SSH
-      if [ -f "${ROLLBACK_DIR}/spine_ssh.tar.gz" ]; then
-        echo "Rolling back API SSH volume..." >&2
-        if ! docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh spine-api \
-          -c "rm -rf /var/lib/spine/ssh/* /var/lib/spine/ssh/.[!.]* && tar -xzf - -C /var/lib/spine/ssh" < "${ROLLBACK_DIR}/spine_ssh.tar.gz"; then
+      # 5. Roll back API SSH from encrypted archive
+      if [ -f "${ROLLBACK_DIR}/spine_ssh.spnebak" ]; then
+        echo "Rolling back API SSH volume from encrypted archive..." >&2
+        if ! decrypt_stream < "${ROLLBACK_DIR}/spine_ssh.spnebak" | docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps --entrypoint sh spine-api \
+          -c "rm -rf /var/lib/spine/ssh/* /var/lib/spine/ssh/.[!.]* && tar -xzf - -C /var/lib/spine/ssh"; then
           echo "ERROR: Failed to extract rollback archive for API SSH!" >&2
           ROLLBACK_FAILED=1
         elif ! docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint test spine-api -d /var/lib/spine/ssh; then
@@ -225,15 +192,15 @@ rollback_volumes() {
           VERIFIED_COUNT=$((VERIFIED_COUNT + 1))
         fi
       else
-        echo "ERROR: Missing rollback archive for API SSH (${ROLLBACK_DIR}/spine_ssh.tar.gz)!" >&2
+        echo "ERROR: Missing rollback archive for API SSH (${ROLLBACK_DIR}/spine_ssh.spnebak)!" >&2
         ROLLBACK_FAILED=1
       fi
 
-      # 6. Roll back API storage
-      if [ -f "${ROLLBACK_DIR}/spine_storage.tar.gz" ]; then
-        echo "Rolling back API storage volume..." >&2
-        if ! docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh spine-api \
-          -c "rm -rf /var/lib/spine/storage/* /var/lib/spine/storage/.[!.]* && tar -xzf - -C /var/lib/spine/storage" < "${ROLLBACK_DIR}/spine_storage.tar.gz"; then
+      # 6. Roll back API storage from encrypted archive
+      if [ -f "${ROLLBACK_DIR}/spine_storage.spnebak" ]; then
+        echo "Rolling back API storage volume from encrypted archive..." >&2
+        if ! decrypt_stream < "${ROLLBACK_DIR}/spine_storage.spnebak" | docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps --entrypoint sh spine-api \
+          -c "rm -rf /var/lib/spine/storage/* /var/lib/spine/storage/.[!.]* && tar -xzf - -C /var/lib/spine/storage"; then
           echo "ERROR: Failed to extract rollback archive for API storage!" >&2
           ROLLBACK_FAILED=1
         elif ! docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint test spine-api -d /var/lib/spine/storage; then
@@ -244,15 +211,15 @@ rollback_volumes() {
           VERIFIED_COUNT=$((VERIFIED_COUNT + 1))
         fi
       else
-        echo "ERROR: Missing rollback archive for API storage (${ROLLBACK_DIR}/spine_storage.tar.gz)!" >&2
+        echo "ERROR: Missing rollback archive for API storage (${ROLLBACK_DIR}/spine_storage.spnebak)!" >&2
         ROLLBACK_FAILED=1
       fi
 
-      # 7. Roll back PostgreSQL
-      if [ -f "${ROLLBACK_DIR}/postgres_data.tar.gz" ]; then
-        echo "Rolling back PostgreSQL volume..." >&2
-        if ! docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh postgres \
-          -c "rm -rf /var/lib/postgresql/data/* /var/lib/postgresql/data/.[!.]* && tar -xzf - -C /var/lib/postgresql/data" < "${ROLLBACK_DIR}/postgres_data.tar.gz"; then
+      # 7. Roll back PostgreSQL from encrypted archive
+      if [ -f "${ROLLBACK_DIR}/postgres_data.spnebak" ]; then
+        echo "Rolling back PostgreSQL volume from encrypted archive..." >&2
+        if ! decrypt_stream < "${ROLLBACK_DIR}/postgres_data.spnebak" | docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps --entrypoint sh postgres \
+          -c "rm -rf /var/lib/postgresql/data/* /var/lib/postgresql/data/.[!.]* && tar -xzf - -C /var/lib/postgresql/data"; then
           echo "ERROR: Failed to extract rollback archive for PostgreSQL!" >&2
           ROLLBACK_FAILED=1
         elif ! docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint test postgres -f /var/lib/postgresql/data/PG_VERSION; then
@@ -263,7 +230,7 @@ rollback_volumes() {
           VERIFIED_COUNT=$((VERIFIED_COUNT + 1))
         fi
       else
-        echo "ERROR: Missing rollback archive for PostgreSQL (${ROLLBACK_DIR}/postgres_data.tar.gz)!" >&2
+        echo "ERROR: Missing rollback archive for PostgreSQL (${ROLLBACK_DIR}/postgres_data.spnebak)!" >&2
         ROLLBACK_FAILED=1
       fi
 
@@ -272,7 +239,7 @@ rollback_volumes() {
         echo "================================================================================" >&2
         echo "CRITICAL FATAL: Automatic rollback FAILED. Only ${VERIFIED_COUNT}/7 volumes verified." >&2
         echo "Cluster services remain STRICTLY STOPPED to prevent further data corruption." >&2
-        echo "Rollback artifacts retained for emergency operator inspection at: ${ROLLBACK_DIR}" >&2
+        echo "Rollback artifacts preserved in encrypted format (SPNEBAK v2) at: ${ROLLBACK_DIR}" >&2
         echo "OPERATOR ACTION REQUIRED: Do NOT start services. Inspect failed volumes manually." >&2
         echo "================================================================================" >&2
         exit 2
@@ -280,56 +247,130 @@ rollback_volumes() {
 
       echo "Rollback complete and all 7/7 volumes verified. Cluster reverted to pre-restore state." >&2
       echo "Cluster remains stopped to allow operator investigation." >&2
-      echo "Rollback artifacts retained for manual inspection at: ${ROLLBACK_DIR}" >&2
+      echo "Rollback artifacts preserved in encrypted format (SPNEBAK v2) at: ${ROLLBACK_DIR}" >&2
+      echo "OPERATOR ACTION: Once investigation is complete, remove encrypted rollback artifacts with: rm -rf ${ROLLBACK_DIR}" >&2
       echo "================================================================================" >&2
     fi
   fi
 }
-trap rollback_volumes EXIT ERR INT TERM
+# Install cleanup trap immediately to cover every failure and interrupt path
+trap restore_cleanup EXIT ERR INT TERM
+
+echo "=== Step 0a: Authenticating and Decrypting SPNEBAK v2 Backup Archive ==="
+DECRYPT_DIR="${BACKUP_DIR}/.decrypted_restore_$(date +%s)"
+mkdir -p "${DECRYPT_DIR}"
+chmod 700 "${DECRYPT_DIR}"
+
+DECRYPT_FAILED=0
+if command -v spine-api >/dev/null 2>&1; then
+  if ! SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE}" \
+    spine-api backup decrypt --input "${ENCRYPTED_FILE}" --output - | tar -xzf - -C "${DECRYPT_DIR}"; then
+    DECRYPT_FAILED=1
+  fi
+else
+  if ! docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps \
+    -e SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE}" spine-api \
+    backup decrypt --input - --output - < "${ENCRYPTED_FILE}" | tar -xzf - -C "${DECRYPT_DIR}"; then
+    DECRYPT_FAILED=1
+  fi
+fi
+
+if [ ${DECRYPT_FAILED} -ne 0 ]; then
+  echo "================================================================================" >&2
+  echo "CRITICAL FATAL: Backup authentication or decryption failed!" >&2
+  echo "The backup archive is corrupted, tampered, or the encryption passphrase is invalid." >&2
+  echo "ABORTING RESTORE IMMEDIATELY. Zero cluster services have been touched." >&2
+  echo "================================================================================" >&2
+  exit 1
+fi
+
+echo "Backup authentication verified [OK]. All AES-256-GCM chunk MACs and SHA-256 manifest valid."
+
+if [ ! -f "${DECRYPT_DIR}/FENCING_GENERATION" ] || [ ! -f "${DECRYPT_DIR}/SHA256SUMS" ]; then
+  echo "FATAL: Invalid decrypted backup contents. FENCING_GENERATION or SHA256SUMS missing." >&2
+  exit 1
+fi
+
+TARGET_GEN=$(cat "${DECRYPT_DIR}/FENCING_GENERATION" | tr -d '[:space:]')
+echo "Target recovery generation: ${TARGET_GEN}"
+
+echo "=== Step 0b: Verifying Restored Payload SHA-256 Checksum Manifest ==="
+(cd "${DECRYPT_DIR}" && sha256sum -c SHA256SUMS)
+
+echo "=== Step 1: Stopping Cluster Services & Verifying Full Quiescence ==="
+# Stop services; failures here are fatal (no || true)
+docker compose -f "${COMPOSE_FILE}" stop ingress spine-api
+docker compose -f "${COMPOSE_FILE}" stop storage-node-1 storage-node-2 storage-node-3 coordinator postgres spine-frontend
+
+# Strictly verify no stateful containers are running
+RUNNING=$(docker compose -f "${COMPOSE_FILE}" ps --services --filter "status=running")
+if [ -n "${RUNNING}" ]; then
+  echo "FATAL: The following services failed to stop and are still running:" >&2
+  echo "${RUNNING}" >&2
+  echo "Aborting restore to prevent data corruption." >&2
+  exit 1
+fi
+echo "All cluster services confirmed stopped."
+
+# Set up external rollback directory outside container volume paths
+ROLLBACK_DIR="${BACKUP_DIR}/.pre_restore_rollback_$(date +%s)"
+mkdir -p "${ROLLBACK_DIR}"
+chmod 700 "${ROLLBACK_DIR}"
 
 echo "=== Step 2a: Mandatory Pre-Restore Archiving & Integrity Gate (Volumes Untouched) ==="
 # Capture pre-restore archives for EVERY participant without error suppression.
+# All rollback artifacts are encrypted on the fly (SPNEBAK v2) to prevent persisting plaintext on disk.
 # Any failure here aborts immediately before a single byte of live volume data is modified.
 
-echo "Archiving Coordinator volume..."
+echo "Archiving Coordinator volume (encrypted)..."
 docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint tar coordinator \
-  -czf - -C /var/lib/spine . > "${ROLLBACK_DIR}/coordinator.tar.gz"
+  -czf - -C /var/lib/spine . | encrypt_stream > "${ROLLBACK_DIR}/coordinator.spnebak"
 
 for NODE in 1 2 3; do
-  echo "Archiving Storage Node ${NODE} volume..."
+  echo "Archiving Storage Node ${NODE} volume (encrypted)..."
   docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint tar "storage-node-${NODE}" \
-    -czf - -C "/var/lib/spine/node-${NODE}" . > "${ROLLBACK_DIR}/storage_node_${NODE}.tar.gz"
+    -czf - -C "/var/lib/spine/node-${NODE}" . | encrypt_stream > "${ROLLBACK_DIR}/storage_node_${NODE}.spnebak"
 done
 
-echo "Archiving API SSH identities..."
+echo "Archiving API SSH identities (encrypted)..."
 docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint tar spine-api \
-  -czf - -C /var/lib/spine/ssh . > "${ROLLBACK_DIR}/spine_ssh.tar.gz"
+  -czf - -C /var/lib/spine/ssh . | encrypt_stream > "${ROLLBACK_DIR}/spine_ssh.spnebak"
 
-echo "Archiving API storage cache..."
+echo "Archiving API storage cache (encrypted)..."
 docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint tar spine-api \
-  -czf - -C /var/lib/spine/storage . > "${ROLLBACK_DIR}/spine_storage.tar.gz"
+  -czf - -C /var/lib/spine/storage . | encrypt_stream > "${ROLLBACK_DIR}/spine_storage.spnebak"
 
-echo "Archiving PostgreSQL volume..."
+echo "Archiving PostgreSQL volume (encrypted)..."
 docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint tar postgres \
-  -czf - -C /var/lib/postgresql/data . > "${ROLLBACK_DIR}/postgres_data.tar.gz"
+  -czf - -C /var/lib/postgresql/data . | encrypt_stream > "${ROLLBACK_DIR}/postgres_data.spnebak"
 
-# Rigorous verification gate: all 7 rollback archives must exist, be non-empty, and pass tar integrity check
+# Restrictive permissions on rollback directory and encrypted archives
+chmod 600 "${ROLLBACK_DIR}"/*
+chmod 700 "${ROLLBACK_DIR}"
+
+# Rigorous verification gate: all 7 rollback archives must exist, be non-empty, and pass AEAD authentication and tar integrity check
 for ARCHIVE in coordinator storage_node_1 storage_node_2 storage_node_3 spine_ssh spine_storage postgres_data; do
-  FILE="${ROLLBACK_DIR}/${ARCHIVE}.tar.gz"
+  FILE="${ROLLBACK_DIR}/${ARCHIVE}.spnebak"
   if [ ! -s "${FILE}" ]; then
     echo "FATAL: Pre-restore rollback archive ${FILE} is missing or zero-byte empty." >&2
     echo "ABORTING RESTORE IMMEDIATELY. Zero volumes have been modified." >&2
     exit 1
   fi
-  if ! tar -tzf "${FILE}" >/dev/null 2>&1; then
-    echo "FATAL: Pre-restore rollback archive ${FILE} is corrupted or unreadable." >&2
+  MAGIC_CHECK=$(dd if="${FILE}" bs=1 count=8 2>/dev/null || true)
+  if [ "${MAGIC_CHECK}" != "SPNEBAK"$'\x02' ]; then
+    echo "FATAL: Pre-restore rollback archive ${FILE} is not a valid SPNEBAK v2 encrypted envelope." >&2
     echo "ABORTING RESTORE IMMEDIATELY. Zero volumes have been modified." >&2
     exit 1
   fi
-  echo "Verified rollback archive: ${ARCHIVE}.tar.gz [OK]"
+  if ! decrypt_stream < "${FILE}" | tar -tzf - >/dev/null 2>&1; then
+    echo "FATAL: Pre-restore rollback archive ${FILE} failed AEAD authentication or tar integrity check." >&2
+    echo "ABORTING RESTORE IMMEDIATELY. Zero volumes have been modified." >&2
+    exit 1
+  fi
+  echo "Verified encrypted rollback archive: ${ARCHIVE}.spnebak [OK]"
 done
 
-echo "All 7 pre-restore rollback archives verified readable. Safe to proceed with volume modification."
+echo "All 7 pre-restore rollback archives verified valid and encrypted. Safe to proceed with volume modification."
 VOLUMES_MODIFIED=1
 
 echo "=== Step 2b: Cleaning Target Volumes & Extracting Incoming Backup ==="
