@@ -14,21 +14,90 @@ POSTGRES_ADMIN_USER="${POSTGRES_ADMIN_USER:-spine_admin}"
 POSTGRES_ADMIN_PASSWORD="${POSTGRES_ADMIN_PASSWORD:-}"
 SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE:-}"
 SPINE_BACKUP_PASSPHRASE_FILE="${SPINE_BACKUP_PASSPHRASE_FILE:-}"
-
-if [ -z "${SPINE_BACKUP_PASSPHRASE}" ] && [ -n "${SPINE_BACKUP_PASSPHRASE_FILE}" ] && [ -f "${SPINE_BACKUP_PASSPHRASE_FILE}" ]; then
-  SPINE_BACKUP_PASSPHRASE=$(cat "${SPINE_BACKUP_PASSPHRASE_FILE}")
-fi
-
-if [ -z "${SPINE_BACKUP_PASSPHRASE}" ]; then
-  echo "FATAL: Authenticated encryption is mandatory for production backups." >&2
-  echo "Please set SPINE_BACKUP_PASSPHRASE or provide SPINE_BACKUP_PASSPHRASE_FILE." >&2
-  exit 1
-fi
+SPINE_BACKUP_REMOTE_S3_URI="${SPINE_BACKUP_REMOTE_S3_URI:-}"
+SPINE_BACKUP_OBJECT_LOCK_MODE="${SPINE_BACKUP_OBJECT_LOCK_MODE:-GOVERNANCE}"
+SPINE_BACKUP_RETENTION_DAYS="${SPINE_BACKUP_RETENTION_DAYS:-30}"
+SPINE_S3_ENDPOINT_URL="${SPINE_S3_ENDPOINT_URL:-}"
 
 if [ -z "${SPINE_ADMIN_TOKEN}" ]; then
   echo "FATAL: SPINE_ADMIN_TOKEN must be set to acquire the cluster maintenance barrier." >&2
   exit 1
 fi
+
+RESOLVED_PASSPHRASE_FILE=""
+CLEANUP_TEMP_PASSPHRASE=0
+
+resolve_passphrase_file() {
+  if [ -n "${SPINE_BACKUP_PASSPHRASE_FILE:-}" ] && [ -f "${SPINE_BACKUP_PASSPHRASE_FILE}" ]; then
+    RESOLVED_PASSPHRASE_FILE="${SPINE_BACKUP_PASSPHRASE_FILE}"
+  elif [ -n "${SPINE_BACKUP_PASSPHRASE:-}" ]; then
+    RESOLVED_PASSPHRASE_FILE=$(mktemp /tmp/spine_pass_XXXXXX 2>/dev/null || mktemp "${TMPDIR:-/tmp}/spine_pass_XXXXXX")
+    chmod 600 "${RESOLVED_PASSPHRASE_FILE}"
+    printf "%s" "${SPINE_BACKUP_PASSPHRASE}" > "${RESOLVED_PASSPHRASE_FILE}"
+    CLEANUP_TEMP_PASSPHRASE=1
+    unset SPINE_BACKUP_PASSPHRASE
+  else
+    echo "FATAL: Authenticated encryption is mandatory for production backups." >&2
+    echo "Please provide SPINE_BACKUP_PASSPHRASE_FILE or set SPINE_BACKUP_PASSPHRASE." >&2
+    exit 1
+  fi
+
+  if [ ! -s "${RESOLVED_PASSPHRASE_FILE}" ]; then
+    echo "FATAL: Backup encryption passphrase file is empty or missing: ${RESOLVED_PASSPHRASE_FILE}" >&2
+    exit 1
+  fi
+}
+
+verify_supported_storage_topology() {
+  echo "=== Verifying Supported Storage Topology ==="
+  if [ ! -f "${COMPOSE_FILE}" ]; then
+    echo "FATAL: Docker Compose configuration file not found: ${COMPOSE_FILE}" >&2
+    exit 1
+  fi
+
+  local required_volumes=("postgres_data" "coordinator_data" "storage_1_data" "storage_2_data" "storage_3_data" "spine_storage" "spine_ssh")
+
+  # 1. Parse compose file volume definitions for non-local drivers
+  for vol in "${required_volumes[@]}"; do
+    local custom_driver
+    custom_driver=$(awk -v v="${vol}:" '
+      $1 == v { in_vol=1; next }
+      in_vol && /^[^ ]/ { in_vol=0 }
+      in_vol && /^  [^ ]/ { in_vol=0 }
+      in_vol && /driver:/ { print $2; exit }
+    ' "${COMPOSE_FILE}" 2>/dev/null | tr -d '[:space:]"' | tr -d "'" || echo "")
+    if [ -n "${custom_driver}" ] && [ "${custom_driver}" != "local" ]; then
+      echo "FATAL: Volume '${vol}' in ${COMPOSE_FILE} is configured with unsupported driver '${custom_driver}'." >&2
+      echo "Only driver 'local' is supported for production profile core-forge-v1." >&2
+      exit 1
+    fi
+  done
+
+  # 2. Check live Docker volumes if docker daemon is reachable
+  if command -v docker >/dev/null 2>&1; then
+    local project_name
+    project_name=$(docker compose -f "${COMPOSE_FILE}" config --format json 2>/dev/null | grep -o '"name": *"[^"]*"' | head -1 | cut -d'"' -f4 || echo "")
+    if [ -z "${project_name}" ]; then
+      project_name="spine"
+    fi
+
+    for vol in "${required_volumes[@]}"; do
+      for candidate in "${project_name}_${vol}" "${vol}"; do
+        local live_driver
+        live_driver=$(docker volume inspect "${candidate}" --format '{{.Driver}}' 2>/dev/null || echo "")
+        if [ -n "${live_driver}" ]; then
+          if [ "${live_driver}" != "local" ]; then
+            echo "FATAL: Docker volume '${candidate}' uses unsupported driver '${live_driver}'." >&2
+            echo "Only driver 'local' is supported for production profile core-forge-v1." >&2
+            exit 1
+          fi
+          break
+        fi
+      done
+    done
+  fi
+  echo "Supported storage topology verified: Docker Compose with local volume driver."
+}
 
 RELEASED=0
 STAGING_DIR=""
@@ -59,11 +128,20 @@ cleanup_backup() {
     fi
   fi
 
+  if [ "${CLEANUP_TEMP_PASSPHRASE}" -eq 1 ] && [ -n "${RESOLVED_PASSPHRASE_FILE:-}" ] && [ -f "${RESOLVED_PASSPHRASE_FILE}" ]; then
+    dd if=/dev/urandom of="${RESOLVED_PASSPHRASE_FILE}" bs=64 count=1 conv=notrunc 2>/dev/null || true
+    rm -f "${RESOLVED_PASSPHRASE_FILE}"
+  fi
+
   if [ "${cleanup_failed}" -ne 0 ]; then
     echo "WARNING: Cleanup of unencrypted backup artifacts encountered errors!" >&2
   fi
 }
 trap cleanup_backup EXIT ERR INT TERM
+
+# Resolve passphrase and verify supported storage topology before acquiring barrier
+resolve_passphrase_file
+verify_supported_storage_topology
 
 echo "=== Phase 1: Acquiring Maintenance Barrier & Draining In-Flight Mutations ==="
 ACQUIRE_RESP=$(curl -s -f -X POST "${SPINE_API_URL}/api/v1/admin/maintenance/acquire" \
@@ -229,13 +307,18 @@ tar -czf "${PLAINTEXT_TAR}" -C "${STAGING_DIR}" .
 
 echo "Encrypting backup bundle into SPNEBAK v2 AEAD envelope (AES-256-GCM)..."
 if command -v spine-api >/dev/null 2>&1; then
-  SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE}" \
-    spine-api backup encrypt --input "${PLAINTEXT_TAR}" --output "${ENCRYPTED_ARCHIVE}"
+  spine-api backup encrypt \
+    --passphrase-file "${RESOLVED_PASSPHRASE_FILE}" \
+    --input "${PLAINTEXT_TAR}" \
+    --output "${ENCRYPTED_ARCHIVE}"
 else
-  # Encrypt through the spine-api container
-  docker compose -f "${COMPOSE_FILE}" exec -T \
-    -e SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE}" spine-api \
-    spine-api backup encrypt --input - --output - < "${PLAINTEXT_TAR}" > "${ENCRYPTED_ARCHIVE}"
+  # Encrypt through the spine-api container via mounted read-only secret file.
+  # Credentials are never passed in process arguments or container environment variables.
+  docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps \
+    -v "${RESOLVED_PASSPHRASE_FILE}:/run/secrets/backup_passphrase:ro" \
+    spine-api \
+    backup encrypt --passphrase-file /run/secrets/backup_passphrase --input - --output - \
+    < "${PLAINTEXT_TAR}" > "${ENCRYPTED_ARCHIVE}"
 fi
 
 # Verify the encrypted archive is valid SPNEBAK v2 format
@@ -263,6 +346,63 @@ rm -rf "${PLAINTEXT_TAR}" "${STAGING_DIR}"
 echo "Enforcing restrictive permissions (0600 files, 0700 dir) on backup artifacts..."
 chmod 600 "${BACKUP_DIR}"/*
 chmod 700 "${BACKUP_DIR}"
+
+# Phase 2c: Off-Host Immutable Replication (S3 / Object Lock)
+echo "=== Phase 2c: Off-Host Immutable Replication & Remote Verification ==="
+if [ -n "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
+  REMOTE_BASE="${SPINE_BACKUP_REMOTE_S3_URI%/}"
+  REMOTE_TARGET="${REMOTE_BASE}/$(basename "${BACKUP_DIR}")"
+  echo "Replicating encrypted backup to remote object store: ${REMOTE_TARGET}..."
+
+  AWS_EXTRA_ARGS=()
+  if [ -n "${SPINE_S3_ENDPOINT_URL}" ]; then
+    AWS_EXTRA_ARGS+=(--endpoint-url "${SPINE_S3_ENDPOINT_URL}")
+  fi
+
+  RETAIN_UNTIL=$(date -u -d "+${SPINE_BACKUP_RETENTION_DAYS} days" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || \
+                date -u -v "+${SPINE_BACKUP_RETENTION_DAYS}d" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "")
+
+  if command -v aws >/dev/null 2>&1; then
+    UPLOAD_ARGS=("${AWS_EXTRA_ARGS[@]}")
+    if [ -n "${RETAIN_UNTIL}" ] && [ -n "${SPINE_BACKUP_OBJECT_LOCK_MODE}" ]; then
+      echo "Applying S3 Object Lock retention: mode=${SPINE_BACKUP_OBJECT_LOCK_MODE}, retain_until=${RETAIN_UNTIL} (${SPINE_BACKUP_RETENTION_DAYS} days)"
+      UPLOAD_ARGS+=(--object-lock-mode "${SPINE_BACKUP_OBJECT_LOCK_MODE}" --object-lock-retain-until-date "${RETAIN_UNTIL}")
+    fi
+
+    echo "Uploading backup.spnebak to ${REMOTE_TARGET}/backup.spnebak..."
+    if ! aws s3 cp "${ENCRYPTED_ARCHIVE}" "${REMOTE_TARGET}/backup.spnebak" "${UPLOAD_ARGS[@]}"; then
+      echo "FATAL: Failed to replicate backup archive to remote object store ${REMOTE_TARGET}/backup.spnebak" >&2
+      exit 1
+    fi
+
+    echo "Uploading SHA256SUMS to ${REMOTE_TARGET}/SHA256SUMS..."
+    if ! aws s3 cp "${BACKUP_DIR}/SHA256SUMS" "${REMOTE_TARGET}/SHA256SUMS" "${AWS_EXTRA_ARGS[@]}"; then
+      echo "FATAL: Failed to replicate SHA256SUMS to remote object store ${REMOTE_TARGET}/SHA256SUMS" >&2
+      exit 1
+    fi
+
+    echo "Verifying remote object integrity..."
+    LOCAL_SIZE=$(stat -c%s "${ENCRYPTED_ARCHIVE}" 2>/dev/null || stat -f%z "${ENCRYPTED_ARCHIVE}" 2>/dev/null || wc -c < "${ENCRYPTED_ARCHIVE}" | tr -d '[:space:]')
+    REMOTE_SIZE=$(aws s3 ls "${REMOTE_TARGET}/backup.spnebak" "${AWS_EXTRA_ARGS[@]}" | awk '{print $3}' | tr -d '[:space:]' || echo "0")
+    if [ -z "${REMOTE_SIZE}" ] || [ "${LOCAL_SIZE}" != "${REMOTE_SIZE}" ]; then
+      echo "FATAL: Remote size mismatch for ${REMOTE_TARGET}/backup.spnebak: local=${LOCAL_SIZE}, remote=${REMOTE_SIZE}" >&2
+      exit 1
+    fi
+    echo "Remote replication verified [OK] (${REMOTE_SIZE} bytes, immutable retention active)."
+  else
+    echo "FATAL: SPINE_BACKUP_REMOTE_S3_URI specified, but 'aws' CLI is not available on host. Cannot complete off-host replication." >&2
+    exit 1
+  fi
+else
+  echo "================================================================================"
+  echo "NOTICE: Off-host backup replication (SPINE_BACKUP_REMOTE_S3_URI) is not configured."
+  echo "Backup is stored solely on local host storage (${BACKUP_DIR})."
+  echo "OPERATIONAL LIMITATION: In the event of catastrophic host destruction, storage controller"
+  echo "failure, or host compromise, local-only backups will be unrecoverable."
+  echo "To achieve full disaster recovery compliance, configure SPINE_BACKUP_REMOTE_S3_URI"
+  echo "with Object Lock immutability enabled."
+  echo "================================================================================"
+fi
 
 echo "=== Phase 3: Releasing Maintenance Barrier & Verifying Cluster Health ==="
 curl -s -f -X POST "${SPINE_API_URL}/api/v1/admin/maintenance/release" \

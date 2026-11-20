@@ -14,45 +14,87 @@ POSTGRES_ADMIN_USER="${POSTGRES_ADMIN_USER:-spine_admin}"
 POSTGRES_ADMIN_PASSWORD="${POSTGRES_ADMIN_PASSWORD:-}"
 SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE:-}"
 SPINE_BACKUP_PASSPHRASE_FILE="${SPINE_BACKUP_PASSPHRASE_FILE:-}"
+SPINE_S3_ENDPOINT_URL="${SPINE_S3_ENDPOINT_URL:-}"
 
-if [ -z "${SPINE_BACKUP_PASSPHRASE}" ] && [ -n "${SPINE_BACKUP_PASSPHRASE_FILE}" ] && [ -f "${SPINE_BACKUP_PASSPHRASE_FILE}" ]; then
-  SPINE_BACKUP_PASSPHRASE=$(cat "${SPINE_BACKUP_PASSPHRASE_FILE}")
-fi
+RESOLVED_PASSPHRASE_FILE=""
+CLEANUP_TEMP_PASSPHRASE=0
 
-if [ -z "${SPINE_BACKUP_PASSPHRASE}" ]; then
-  echo "FATAL: SPINE_BACKUP_PASSPHRASE or SPINE_BACKUP_PASSPHRASE_FILE is required to authenticate and decrypt the backup archive." >&2
-  exit 1
-fi
+resolve_passphrase_file() {
+  if [ -n "${SPINE_BACKUP_PASSPHRASE_FILE:-}" ] && [ -f "${SPINE_BACKUP_PASSPHRASE_FILE}" ]; then
+    RESOLVED_PASSPHRASE_FILE="${SPINE_BACKUP_PASSPHRASE_FILE}"
+  elif [ -n "${SPINE_BACKUP_PASSPHRASE:-}" ]; then
+    RESOLVED_PASSPHRASE_FILE=$(mktemp /tmp/spine_pass_XXXXXX 2>/dev/null || mktemp "${TMPDIR:-/tmp}/spine_pass_XXXXXX")
+    chmod 600 "${RESOLVED_PASSPHRASE_FILE}"
+    printf "%s" "${SPINE_BACKUP_PASSPHRASE}" > "${RESOLVED_PASSPHRASE_FILE}"
+    CLEANUP_TEMP_PASSPHRASE=1
+    unset SPINE_BACKUP_PASSPHRASE
+  else
+    echo "FATAL: SPINE_BACKUP_PASSPHRASE_FILE or SPINE_BACKUP_PASSPHRASE is required to authenticate and decrypt the backup archive." >&2
+    exit 1
+  fi
+
+  if [ ! -s "${RESOLVED_PASSPHRASE_FILE}" ]; then
+    echo "FATAL: Backup encryption passphrase file is empty or missing: ${RESOLVED_PASSPHRASE_FILE}" >&2
+    exit 1
+  fi
+}
+
+verify_supported_storage_topology() {
+  echo "=== Verifying Supported Storage Topology ==="
+  if [ ! -f "${COMPOSE_FILE}" ]; then
+    echo "FATAL: Docker Compose configuration file not found: ${COMPOSE_FILE}" >&2
+    exit 1
+  fi
+
+  local required_volumes=("postgres_data" "coordinator_data" "storage_1_data" "storage_2_data" "storage_3_data" "spine_storage" "spine_ssh")
+
+  # 1. Parse compose file volume definitions for non-local drivers
+  for vol in "${required_volumes[@]}"; do
+    local custom_driver
+    custom_driver=$(awk -v v="${vol}:" '
+      $1 == v { in_vol=1; next }
+      in_vol && /^[^ ]/ { in_vol=0 }
+      in_vol && /^  [^ ]/ { in_vol=0 }
+      in_vol && /driver:/ { print $2; exit }
+    ' "${COMPOSE_FILE}" 2>/dev/null | tr -d '[:space:]"' | tr -d "'" || echo "")
+    if [ -n "${custom_driver}" ] && [ "${custom_driver}" != "local" ]; then
+      echo "FATAL: Volume '${vol}' in ${COMPOSE_FILE} is configured with unsupported driver '${custom_driver}'." >&2
+      echo "Only driver 'local' is supported for production profile core-forge-v1." >&2
+      exit 1
+    fi
+  done
+
+  # 2. Check live Docker volumes if docker daemon is reachable
+  if command -v docker >/dev/null 2>&1; then
+    local project_name
+    project_name=$(docker compose -f "${COMPOSE_FILE}" config --format json 2>/dev/null | grep -o '"name": *"[^"]*"' | head -1 | cut -d'"' -f4 || echo "")
+    if [ -z "${project_name}" ]; then
+      project_name="spine"
+    fi
+
+    for vol in "${required_volumes[@]}"; do
+      for candidate in "${project_name}_${vol}" "${vol}"; do
+        local live_driver
+        live_driver=$(docker volume inspect "${candidate}" --format '{{.Driver}}' 2>/dev/null || echo "")
+        if [ -n "${live_driver}" ]; then
+          if [ "${live_driver}" != "local" ]; then
+            echo "FATAL: Docker volume '${candidate}' uses unsupported driver '${live_driver}'." >&2
+            echo "Only driver 'local' is supported for production profile core-forge-v1." >&2
+            exit 1
+          fi
+          break
+        fi
+      done
+    done
+  fi
+  echo "Supported storage topology verified: Docker Compose with local volume driver."
+}
 
 if [ -z "${TARGET_INPUT}" ]; then
-  echo "Usage: $0 <path-to-backup-dir-or-archive>" >&2
+  echo "Usage: $0 <path-to-backup-dir-or-archive-or-s3-uri>" >&2
   echo "Example: $0 /mnt/backups/spine/20261117_120000Z_gen_42" >&2
   echo "Example: $0 /mnt/backups/spine/20261117_120000Z_gen_42/backup.spnebak" >&2
-  exit 1
-fi
-
-if [ -f "${TARGET_INPUT}" ]; then
-  ENCRYPTED_FILE="${TARGET_INPUT}"
-  BACKUP_DIR="$(dirname "${TARGET_INPUT}")"
-elif [ -d "${TARGET_INPUT}" ]; then
-  BACKUP_DIR="${TARGET_INPUT}"
-  ENCRYPTED_FILE="${BACKUP_DIR}/backup.spnebak"
-else
-  echo "FATAL: Target backup path does not exist: ${TARGET_INPUT}" >&2
-  exit 1
-fi
-
-if [ ! -f "${ENCRYPTED_FILE}" ]; then
-  echo "FATAL: Encrypted backup archive ${ENCRYPTED_FILE} does not exist." >&2
-  echo "Under production profile 'core-forge-v1', restoring unencrypted plaintext archives is strictly forbidden." >&2
-  exit 1
-fi
-
-# Verify format header magic: MUST be authenticated SPNEBAK v2 AEAD envelope
-MAGIC_CHECK=$(dd if="${ENCRYPTED_FILE}" bs=1 count=8 2>/dev/null || true)
-if [ "${MAGIC_CHECK}" != "SPNEBAK"$'\x02' ]; then
-  echo "FATAL: Backup archive is unencrypted or invalid! Magic header does not match SPNEBAK v2." >&2
-  echo "Under production profile 'core-forge-v1', restoring unencrypted plaintext archives is strictly forbidden." >&2
+  echo "Example: $0 s3://spine-backups/20261117_120000Z_gen_42/backup.spnebak" >&2
   exit 1
 fi
 
@@ -61,33 +103,44 @@ RESTORE_SUCCESS=0
 VOLUMES_MODIFIED=0
 DECRYPT_DIR=""
 ROLLBACK_DIR=""
+REMOTE_RESTORE_DIR=""
 
 encrypt_stream() {
   if command -v spine-api >/dev/null 2>&1; then
-    SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE}" \
-      spine-api backup encrypt --input - --output -
+    spine-api backup encrypt --passphrase-file "${RESOLVED_PASSPHRASE_FILE}" --input - --output -
   else
     docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps \
-      -e SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE}" spine-api \
-      backup encrypt --input - --output -
+      -v "${RESOLVED_PASSPHRASE_FILE}:/run/secrets/backup_passphrase:ro" spine-api \
+      backup encrypt --passphrase-file /run/secrets/backup_passphrase --input - --output -
   fi
 }
 
 decrypt_stream() {
   if command -v spine-api >/dev/null 2>&1; then
-    SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE}" \
-      spine-api backup decrypt --input - --output -
+    spine-api backup decrypt --passphrase-file "${RESOLVED_PASSPHRASE_FILE}" --input - --output -
   else
     docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps \
-      -e SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE}" spine-api \
-      backup decrypt --input - --output -
+      -v "${RESOLVED_PASSPHRASE_FILE}:/run/secrets/backup_passphrase:ro" spine-api \
+      backup decrypt --passphrase-file /run/secrets/backup_passphrase --input - --output -
   fi
 }
 
 restore_cleanup() {
   local exit_code=$?
 
-  # 1. Always purge decrypted temporary payload directory on failure, abort, or signal
+  # 1. Clean up temporary passphrase file if created
+  if [ "${CLEANUP_TEMP_PASSPHRASE}" -eq 1 ] && [ -n "${RESOLVED_PASSPHRASE_FILE:-}" ] && [ -f "${RESOLVED_PASSPHRASE_FILE}" ]; then
+    dd if=/dev/urandom of="${RESOLVED_PASSPHRASE_FILE}" bs=64 count=1 conv=notrunc 2>/dev/null || true
+    rm -f "${RESOLVED_PASSPHRASE_FILE}"
+  fi
+
+  # 2. Clean up temporary remote restore directory if created
+  if [ -n "${REMOTE_RESTORE_DIR:-}" ] && [ -d "${REMOTE_RESTORE_DIR}" ]; then
+    echo "Purging temporary remote download staging directory: ${REMOTE_RESTORE_DIR}..." >&2
+    rm -rf "${REMOTE_RESTORE_DIR}"
+  fi
+
+  # 3. Always purge decrypted temporary payload directory on failure, abort, or signal
   if [ "${RESTORE_SUCCESS}" -eq 0 ]; then
     if [ -n "${DECRYPT_DIR:-}" ] && [ -d "${DECRYPT_DIR}" ]; then
       echo "Purging temporary decrypted restore directory: ${DECRYPT_DIR}..." >&2
@@ -256,6 +309,76 @@ restore_cleanup() {
 # Install cleanup trap immediately to cover every failure and interrupt path
 trap restore_cleanup EXIT ERR INT TERM
 
+# Resolve passphrase and verify supported storage topology before proceeding
+resolve_passphrase_file
+verify_supported_storage_topology
+
+# Handle remote S3 target download if specified
+if [[ "${TARGET_INPUT}" =~ ^s3:// ]]; then
+  echo "=== Detected Remote S3 Target: ${TARGET_INPUT} ==="
+  if ! command -v aws >/dev/null 2>&1; then
+    echo "FATAL: Restoring from S3 URI requires 'aws' CLI on host." >&2
+    exit 1
+  fi
+
+  REMOTE_RESTORE_DIR=$(mktemp -d /tmp/spine_remote_restore_XXXXXX 2>/dev/null || mktemp -d "${TMPDIR:-/tmp}/spine_remote_restore_XXXXXX")
+  chmod 700 "${REMOTE_RESTORE_DIR}"
+
+  AWS_EXTRA_ARGS=()
+  if [ -n "${SPINE_S3_ENDPOINT_URL}" ]; then
+    AWS_EXTRA_ARGS+=(--endpoint-url "${SPINE_S3_ENDPOINT_URL}")
+  fi
+
+  if [[ "${TARGET_INPUT}" =~ \.spnebak$ ]]; then
+    REMOTE_ARCHIVE_URI="${TARGET_INPUT}"
+    REMOTE_MANIFEST_URI="$(dirname "${TARGET_INPUT}")/SHA256SUMS"
+  else
+    REMOTE_ARCHIVE_URI="${TARGET_INPUT%/}/backup.spnebak"
+    REMOTE_MANIFEST_URI="${TARGET_INPUT%/}/SHA256SUMS"
+  fi
+
+  echo "Downloading backup archive from ${REMOTE_ARCHIVE_URI}..."
+  if ! aws s3 cp "${REMOTE_ARCHIVE_URI}" "${REMOTE_RESTORE_DIR}/backup.spnebak" "${AWS_EXTRA_ARGS[@]}"; then
+    echo "FATAL: Failed to download remote backup archive from ${REMOTE_ARCHIVE_URI}" >&2
+    exit 1
+  fi
+
+  echo "Downloading checksum manifest from ${REMOTE_MANIFEST_URI}..."
+  if aws s3 cp "${REMOTE_MANIFEST_URI}" "${REMOTE_RESTORE_DIR}/SHA256SUMS" "${AWS_EXTRA_ARGS[@]}" 2>/dev/null; then
+    echo "Verifying downloaded archive checksum against remote SHA256SUMS..."
+    (cd "${REMOTE_RESTORE_DIR}" && sha256sum -c SHA256SUMS)
+  else
+    echo "NOTICE: Remote SHA256SUMS manifest not found on object store; proceeding with AEAD cryptographic integrity verification."
+  fi
+
+  TARGET_INPUT="${REMOTE_RESTORE_DIR}/backup.spnebak"
+fi
+
+if [ -f "${TARGET_INPUT}" ]; then
+  ENCRYPTED_FILE="${TARGET_INPUT}"
+  BACKUP_DIR="$(dirname "${TARGET_INPUT}")"
+elif [ -d "${TARGET_INPUT}" ]; then
+  BACKUP_DIR="${TARGET_INPUT}"
+  ENCRYPTED_FILE="${BACKUP_DIR}/backup.spnebak"
+else
+  echo "FATAL: Target backup path does not exist: ${TARGET_INPUT}" >&2
+  exit 1
+fi
+
+if [ ! -f "${ENCRYPTED_FILE}" ]; then
+  echo "FATAL: Encrypted backup archive ${ENCRYPTED_FILE} does not exist." >&2
+  echo "Under production profile 'core-forge-v1', restoring unencrypted plaintext archives is strictly forbidden." >&2
+  exit 1
+fi
+
+# Verify format header magic: MUST be authenticated SPNEBAK v2 AEAD envelope
+MAGIC_CHECK=$(dd if="${ENCRYPTED_FILE}" bs=1 count=8 2>/dev/null || true)
+if [ "${MAGIC_CHECK}" != "SPNEBAK"$'\x02' ]; then
+  echo "FATAL: Backup archive is unencrypted or invalid! Magic header does not match SPNEBAK v2." >&2
+  echo "Under production profile 'core-forge-v1', restoring unencrypted plaintext archives is strictly forbidden." >&2
+  exit 1
+fi
+
 echo "=== Step 0a: Authenticating and Decrypting SPNEBAK v2 Backup Archive ==="
 DECRYPT_DIR="${BACKUP_DIR}/.decrypted_restore_$(date +%s)"
 mkdir -p "${DECRYPT_DIR}"
@@ -263,14 +386,16 @@ chmod 700 "${DECRYPT_DIR}"
 
 DECRYPT_FAILED=0
 if command -v spine-api >/dev/null 2>&1; then
-  if ! SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE}" \
-    spine-api backup decrypt --input "${ENCRYPTED_FILE}" --output - | tar -xzf - -C "${DECRYPT_DIR}"; then
+  if ! spine-api backup decrypt --passphrase-file "${RESOLVED_PASSPHRASE_FILE}" \
+    --input "${ENCRYPTED_FILE}" --output - | tar -xzf - -C "${DECRYPT_DIR}"; then
     DECRYPT_FAILED=1
   fi
 else
+  # Decrypt through spine-api container via read-only mounted secret file.
+  # Credentials are never passed in process arguments or container environment variables.
   if ! docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps \
-    -e SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE}" spine-api \
-    backup decrypt --input - --output - < "${ENCRYPTED_FILE}" | tar -xzf - -C "${DECRYPT_DIR}"; then
+    -v "${RESOLVED_PASSPHRASE_FILE}:/run/secrets/backup_passphrase:ro" spine-api \
+    backup decrypt --passphrase-file /run/secrets/backup_passphrase --input - --output - < "${ENCRYPTED_FILE}" | tar -xzf - -C "${DECRYPT_DIR}"; then
     DECRYPT_FAILED=1
   fi
 fi
@@ -312,8 +437,14 @@ if [ -n "${RUNNING}" ]; then
 fi
 echo "All cluster services confirmed stopped."
 
-# Set up external rollback directory outside container volume paths
-ROLLBACK_DIR="${BACKUP_DIR}/.pre_restore_rollback_$(date +%s)"
+# Set up external rollback directory outside container volume paths and remote download dir
+if [ -n "${REMOTE_RESTORE_DIR:-}" ]; then
+  ROLLBACK_PARENT="/var/tmp"
+  [ -w "${ROLLBACK_PARENT}" ] || ROLLBACK_PARENT="/tmp"
+  ROLLBACK_DIR="${ROLLBACK_PARENT}/.pre_restore_rollback_$(date +%s)"
+else
+  ROLLBACK_DIR="${BACKUP_DIR}/.pre_restore_rollback_$(date +%s)"
+fi
 mkdir -p "${ROLLBACK_DIR}"
 chmod 700 "${ROLLBACK_DIR}"
 
@@ -543,5 +674,8 @@ fi
 RESTORE_SUCCESS=1
 echo "Readiness gate passed. Purging pre-restore rollback artifacts and decrypted payload..."
 rm -rf "${ROLLBACK_DIR}" "${DECRYPT_DIR}"
+if [ -n "${REMOTE_RESTORE_DIR:-}" ] && [ -d "${REMOTE_RESTORE_DIR}" ]; then
+  rm -rf "${REMOTE_RESTORE_DIR}"
+fi
 
 echo "SUCCESS: Spine Forge cluster restored, verified, and fully ready at generation ${TARGET_GEN}."

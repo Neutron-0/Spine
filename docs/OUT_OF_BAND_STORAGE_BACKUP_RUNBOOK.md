@@ -37,6 +37,20 @@ A valid Spine Forge production deployment consists of 7 canonical stateful resou
 | `spine_storage` | `spine-forge-api` | `/var/lib/spine/storage` | API runtime caches, scratch files, Git upload-pack temp buffers. |
 | `spine_ssh` | `spine-forge-api` | `/var/lib/spine/ssh` | Authoritative host Ed25519 host key pair (`host_key_ed25519`). |
 
+### 2.1 Supported Production Storage Topology & Topology Enforcement
+
+Under deployment profile `core-forge-v1`, **Docker Compose with local volume mounts (`driver: local`) is the sole verified and supported production target**.
+
+> [!IMPORTANT]
+> **Strict Storage Driver Constraints:**
+> - Non-local volume drivers (e.g. NFS, CIFS/SMB, GlusterFS, or unverified distributed network volumes) lack the strict POSIX `fsync` flush guarantees and atomic directory rename semantics required by:
+>   1. **`spine-coordinator` Raft Consensus:** Requires durable fsync write-ahead logs to avoid state divergence.
+>   2. **PostgreSQL Relational Engine:** Shared storage without strict POSIX file locks risks silent database corruption.
+>   3. **BLAKE3 Content-Addressed Chunk Store:** Atomic commit of immutable chunks depends on atomic same-filesystem renames.
+> - Network filesystems lacking node-level fencing introduce high risk of split-brain writes during failover.
+> - Both `scripts/backup_oob.sh` and `scripts/restore_oob.sh` enforce this via `verify_supported_storage_topology()`. If any volume is configured with a driver other than `local`, the scripts immediately abort fail-closed prior to acquiring the maintenance barrier or touching cluster volumes.
+> - Multi-node Kubernetes/CSI or cloud storage workflows requiring distributed fencing are outside the verified production scope of profile `core-forge-v1`. Any deployment attempting non-local drivers will be rejected.
+
 ---
 
 ## 3. Pre-Flight Sizing & Decision Matrix
@@ -111,11 +125,14 @@ With active mutations drained and write permits rejected with HTTP 503, capture 
 > *(For optional cloud hypervisor volume snapshots such as AWS EBS / GCP PD, see Appendix A).*
 
 > [!SECURITY]
-> **Mandatory Authenticated AEAD Encryption (SPNEBAK v2) & Fail-Safe Cleanup:**
+> **Mandatory Authenticated AEAD Encryption (SPNEBAK v2) & Credential Isolation:**
 > Under production deployment profile `core-forge-v1`, unencrypted plaintext backups containing PostgreSQL relational tables, SSH host private keys, and repository data are **strictly forbidden**.
 > - All backups must be authenticated and encrypted using the platform-supported **SPNEBAK v2** format (`AES-256-GCM`, 100,000 PBKDF2 iterations, per-chunk monotonic nonces, and authenticated manifest).
-> - `SPINE_BACKUP_PASSPHRASE` or `SPINE_BACKUP_PASSPHRASE_FILE` is mandatory.
-> - `scripts/backup_oob.sh` packages the multi-volume snapshot and encrypts it into `backup.spnebak`.
+> - `SPINE_BACKUP_PASSPHRASE_FILE` (or `SPINE_BACKUP_PASSPHRASE`) is mandatory.
+> - **Credential Protection from Process Arguments & Container Environment:**
+>   - The backup encryption passphrase is **never passed in process arguments (`argv`) or container environment variables (`-e`)**.
+>   - Passphrase files are mounted read-only into `/run/secrets/backup_passphrase:ro` inside the container, and CLI commands consume `--passphrase-file /run/secrets/backup_passphrase`.
+>   - If an operator provides `SPINE_BACKUP_PASSPHRASE` via the host shell, the script writes it to an ephemeral `0600` secret file, unsets the shell environment variable immediately, mounts the secret file, and securely shreds/removes the temporary file on exit.
 > - **Comprehensive Cleanup Trap (`EXIT ERR INT TERM`):** All intermediate plaintext staging directories (`.staging`) and unencrypted bundles (`.plaintext_bundle.tar.gz`) are guaranteed to be purged on every exit path — including snapshot failure, encryption error, verification abort, or operator interruption — while retaining the encrypted `backup.spnebak` archive and reporting any cleanup failures.
 > - Restrictive permissions (`0700` directory, `0600` encrypted archive) are enforced.
 
@@ -125,10 +142,29 @@ Execute the automated backup script:
 export SPINE_API_URL="http://127.0.0.1:3000"
 export SPINE_ADMIN_TOKEN="<administrative-token>"
 export BACKUP_ROOT="/mnt/backups/spine"
-export SPINE_BACKUP_PASSPHRASE="<production-backup-passphrase>"
+export SPINE_BACKUP_PASSPHRASE_FILE="/etc/spine/backup_passphrase"
+
+# Optional: Off-host S3-compatible immutable replication
+export SPINE_BACKUP_REMOTE_S3_URI="s3://spine-disaster-recovery-vault/cluster-backups"
+export SPINE_BACKUP_OBJECT_LOCK_MODE="GOVERNANCE" # or COMPLIANCE
+export SPINE_BACKUP_RETENTION_DAYS="30"
+# export SPINE_S3_ENDPOINT_URL="https://s3.us-east-1.amazonaws.com"
 
 ./scripts/backup_oob.sh
 ```
+
+### Phase 2c: Off-Host Replication (S3 Object Lock) & Deployment Scope Limits
+
+1. **Off-Host Replication Workflow:**
+   When `SPINE_BACKUP_REMOTE_S3_URI` is configured, `scripts/backup_oob.sh` automatically replicates the encrypted `backup.spnebak` and `SHA256SUMS` manifest to the designated object store:
+   - Configures S3 WORM / Object Lock immutability (`--object-lock-mode` and `--object-lock-retain-until-date`) to guarantee tamper-proof and ransomware-resistant retention.
+   - Executes remote integrity verification by comparing the uploaded object's byte size directly against the local encrypted archive.
+   - Fails closed if the remote upload or size verification does not match.
+
+2. **Explicit Disaster Recovery Deployment Scope Limitation:**
+   > [!WARNING]
+   > **Deployment Limitation for Local-Only Backups:**
+   > If `SPINE_BACKUP_REMOTE_S3_URI` is omitted, backups remain exclusively on host storage under `BACKUP_ROOT`. Local-only backups **do not provide full disaster-recovery readiness** against total host hardware failure, disk controller destruction, or datacenter loss. Production installations must configure an off-host object store with Object Lock retention enabled.
 
 Or execute the canonical snapshot steps manually:
 ```bash
@@ -186,13 +222,26 @@ curl -s -f http://127.0.0.1:3000/health/ready || echo "Cluster not ready!"
 
 ## 5. Point-in-Time Out-of-Band Disaster Recovery Procedure
 
-Follow these steps to restore a Spine Forge cluster from an out-of-band snapshot archive (or execute `./scripts/restore_oob.sh <path-to-backup-dir>`).
+Follow these steps to restore a Spine Forge cluster from an out-of-band snapshot archive (or execute `./scripts/restore_oob.sh <path-or-s3-uri>`).
+
+```bash
+# Example 1: Local restore
+export SPINE_BACKUP_PASSPHRASE_FILE="/etc/spine/backup_passphrase"
+./scripts/restore_oob.sh /mnt/backups/spine/20261120_120000Z_gen_42/backup.spnebak
+
+# Example 2: Remote off-host S3 restore
+export SPINE_BACKUP_PASSPHRASE_FILE="/etc/spine/backup_passphrase"
+./scripts/restore_oob.sh s3://spine-disaster-recovery-vault/cluster-backups/20261120_120000Z_gen_42/backup.spnebak
+```
 
 ### Step 0: Authenticate, Decrypt & Validate Archive (SPNEBAK v2 AEAD Envelope)
 
 All out-of-band backups are stored encrypted using Spine's authenticated backup envelope (`SPNEBAK v2` AES-256-GCM AEAD, 100,000 PBKDF2 iterations). Before stopping services or modifying storage volumes, the incoming archive must be validated and authenticated fail-closed.
 
-1. **Verify Envelope Magic & Integrity (Fail-Closed Gate):**
+1. **Remote Download (if S3 URI provided):**
+   When an `s3://` target is specified, `scripts/restore_oob.sh` automatically downloads `backup.spnebak` and `SHA256SUMS` into an isolated temporary directory (mode `0700`), verifies the checksum, and stages it for authentication. Downloaded artifacts are automatically purged upon restore completion.
+
+2. **Verify Envelope Magic & Integrity (Fail-Closed Gate):**
    ```bash
    # Check envelope header magic
    MAGIC=$(head -c 8 "${BACKUP_DIR}/backup.spnebak" 2>/dev/null || true)
@@ -205,21 +254,22 @@ All out-of-band backups are stored encrypted using Spine's authenticated backup 
    (cd "${BACKUP_DIR}" && sha256sum -c SHA256SUMS)
    ```
 
-2. **Authenticate & Decrypt to Private Staging Directory:**
+3. **Authenticate & Decrypt with Isolated Credential Mounting:**
    ```bash
    DECRYPT_DIR="${BACKUP_DIR}/.decrypted_restore_$(date +%s)"
    mkdir -m 0700 -p "${DECRYPT_DIR}"
 
-   export SPINE_BACKUP_PASSPHRASE  # or provide via SPINE_BACKUP_PASSPHRASE_FILE
-
-   # Decrypt using host binary or container fallback
+   # Decrypt using host binary or container fallback with mounted secret file
    if command -v spine-api >/dev/null 2>&1; then
-     spine-api backup decrypt --input "${BACKUP_DIR}/backup.spnebak" --output - | tar -xzf - -C "${DECRYPT_DIR}"
+     spine-api backup decrypt --passphrase-file /etc/spine/backup_passphrase \
+       --input "${BACKUP_DIR}/backup.spnebak" --output - | tar -xzf - -C "${DECRYPT_DIR}"
    else
-     # Note: Container ENTRYPOINT is /usr/local/bin/spine-api, so arguments must NOT repeat `spine-api`
+     # Note: Secret file is mounted read-only; no secrets in container environment or CLI args
      docker compose -f docker-compose.prod.yml run --rm -i --no-deps \
-       -e SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE}" spine-api \
-       backup decrypt --input - --output - < "${BACKUP_DIR}/backup.spnebak" | tar -xzf - -C "${DECRYPT_DIR}"
+       -v /etc/spine/backup_passphrase:/run/secrets/backup_passphrase:ro \
+       spine-api \
+       backup decrypt --passphrase-file /run/secrets/backup_passphrase \
+       --input - --output - < "${BACKUP_DIR}/backup.spnebak" | tar -xzf - -C "${DECRYPT_DIR}"
    fi
 
    # Verify inner payload SHA256SUMS

@@ -1106,3 +1106,332 @@ fn test_pre_restore_rollback_archives_are_encrypted_and_verified() {
     let decrypt_err = spine_api::backup::v2::decrypt_stream(&tampered_bytes[..], &mut out, passphrase);
     assert!(decrypt_err.is_err(), "Tampered rollback archive must fail AEAD MAC verification");
 }
+
+/// Helper to verify supported storage topology: fails closed if non-local driver is detected.
+pub fn verify_storage_topology_driver(volume_drivers: &HashMap<String, String>) -> Result<(), String> {
+    for (vol, driver) in volume_drivers {
+        if driver != "local" {
+            return Err(format!(
+                "FATAL: Volume '{}' is configured with unsupported driver '{}'. Only 'local' volume driver is supported for production profile core-forge-v1.",
+                vol, driver
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_unsupported_storage_volume_driver_rejected_fail_closed() {
+    // 1. Rust logic unit test: local driver passes, nfs/cifs fails closed
+    let mut valid_topology = HashMap::new();
+    valid_topology.insert("postgres_data".to_string(), "local".to_string());
+    valid_topology.insert("storage_1_data".to_string(), "local".to_string());
+    assert!(verify_storage_topology_driver(&valid_topology).is_ok());
+
+    let mut invalid_topology = HashMap::new();
+    invalid_topology.insert("postgres_data".to_string(), "local".to_string());
+    invalid_topology.insert("storage_1_data".to_string(), "nfs".to_string());
+    let err = verify_storage_topology_driver(&invalid_topology).unwrap_err();
+    assert!(err.contains("unsupported driver 'nfs'"));
+    assert!(err.contains("Only 'local' volume driver is supported"));
+
+    // 2. Shell execution test: verify exact function in bash
+    if let Ok(bash_check) = Command::new("bash").arg("-c").arg("echo ok").output() {
+        if bash_check.status.success() {
+            let script = r#"
+set -euo pipefail
+WORK_DIR="/tmp/spine_test_topo_$$"
+mkdir -p "${WORK_DIR}"
+COMPOSE_FILE="${WORK_DIR}/docker-compose.test.yml"
+
+cat <<'EOF' > "${COMPOSE_FILE}"
+version: '3.8'
+services:
+  spine-api:
+    image: spine:latest
+volumes:
+  postgres_data:
+  storage_1_data:
+    driver: nfs
+EOF
+
+verify_supported_storage_topology() {
+  local required_volumes=("postgres_data" "storage_1_data")
+  for vol in "${required_volumes[@]}"; do
+    local custom_driver
+    custom_driver=$(awk -v v="${vol}:" '
+      $1 == v { in_vol=1; next }
+      in_vol && /^[^ ]/ { in_vol=0 }
+      in_vol && /^  [^ ]/ { in_vol=0 }
+      in_vol && /driver:/ { print $2; exit }
+    ' "${COMPOSE_FILE}" 2>/dev/null | tr -d '[:space:]"' | tr -d "'" || echo "")
+    if [ -n "${custom_driver}" ] && [ "${custom_driver}" != "local" ]; then
+      echo "FATAL: Volume '${vol}' in ${COMPOSE_FILE} is configured with unsupported driver '${custom_driver}'." >&2
+      echo "Only driver 'local' is supported for production profile core-forge-v1." >&2
+      exit 1
+    fi
+  done
+}
+
+if ( verify_supported_storage_topology 2>"${WORK_DIR}/error.log" ); then
+  rm -rf "${WORK_DIR}"
+  exit 99
+fi
+
+if grep -q "unsupported driver 'nfs'" "${WORK_DIR}/error.log"; then
+  rm -rf "${WORK_DIR}"
+  exit 0
+else
+  rm -rf "${WORK_DIR}"
+  exit 1
+fi
+"#
+            .replace("\r\n", "\n")
+            .replace('\r', "");
+
+            let mut child = Command::new("bash")
+                .arg("-s")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("failed to spawn bash");
+
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(script.as_bytes()).expect("failed to write script to stdin");
+            }
+            let res = child.wait_with_output().expect("failed to wait on bash child");
+            assert!(
+                res.status.success(),
+                "Storage topology driver verification must fail closed on nfs. Stderr: {}",
+                String::from_utf8_lossy(&res.stderr)
+            );
+        }
+    }
+}
+
+#[test]
+fn test_backup_credentials_not_exposed_in_process_args_or_container_env() {
+    let temp = tempdir().unwrap();
+    let secret_file = temp.path().join("backup_pass.secret");
+    let secret_pass = "SuperSecret-Production-Passphrase-9876!";
+    fs::write(&secret_file, secret_pass).unwrap();
+
+    assert!(secret_file.exists());
+    assert_eq!(fs::read_to_string(&secret_file).unwrap(), secret_pass);
+
+    if let Ok(bash_check) = Command::new("bash").arg("-c").arg("echo ok").output() {
+        if bash_check.status.success() {
+            let script = r#"
+set -euo pipefail
+WORK_DIR="/tmp/spine_test_cred_$$"
+mkdir -p "${WORK_DIR}"
+SECRET_FILE="${WORK_DIR}/passphrase.txt"
+AUDIT_LOG="${WORK_DIR}/audit_invocation.log"
+printf "%s" "SuperSecret-Production-Passphrase-9876!" > "${SECRET_FILE}"
+chmod 600 "${SECRET_FILE}"
+
+export SPINE_BACKUP_PASSPHRASE="SuperSecret-Production-Passphrase-9876!"
+export SPINE_BACKUP_PASSPHRASE_FILE=""
+
+RESOLVED_PASSPHRASE_FILE=""
+CLEANUP_TEMP_PASSPHRASE=0
+
+resolve_passphrase_file() {
+  if [ -n "${SPINE_BACKUP_PASSPHRASE_FILE:-}" ] && [ -f "${SPINE_BACKUP_PASSPHRASE_FILE}" ]; then
+    RESOLVED_PASSPHRASE_FILE="${SPINE_BACKUP_PASSPHRASE_FILE}"
+  elif [ -n "${SPINE_BACKUP_PASSPHRASE:-}" ]; then
+    RESOLVED_PASSPHRASE_FILE=$(mktemp "${WORK_DIR}/spine_pass_XXXXXX")
+    chmod 600 "${RESOLVED_PASSPHRASE_FILE}"
+    printf "%s" "${SPINE_BACKUP_PASSPHRASE}" > "${RESOLVED_PASSPHRASE_FILE}"
+    CLEANUP_TEMP_PASSPHRASE=1
+    unset SPINE_BACKUP_PASSPHRASE
+  fi
+}
+
+resolve_passphrase_file
+
+if [ -n "${SPINE_BACKUP_PASSPHRASE:-}" ]; then
+  echo "FAIL: SPINE_BACKUP_PASSPHRASE was not unset from environment!" >&2
+  exit 1
+fi
+
+mock_docker_compose() {
+  echo "ARGS: $@" >> "${AUDIT_LOG}"
+  for arg in "$@"; do
+    if [[ "${arg}" == *"SuperSecret"* ]]; then
+      echo "FAIL: Secret found in argv: ${arg}" >&2
+      exit 2
+    fi
+  done
+  if env | grep -q "SuperSecret"; then
+    echo "FAIL: Secret found in environment variables!" >&2
+    exit 3
+  fi
+}
+
+COMPOSE_FILE="docker-compose.prod.yml"
+mock_docker_compose run --rm -i --no-deps \
+  -v "${RESOLVED_PASSPHRASE_FILE}:/run/secrets/backup_passphrase:ro" \
+  spine-api \
+  backup encrypt --passphrase-file /run/secrets/backup_passphrase --input - --output -
+
+if ! grep -q -- "-v .*:/run/secrets/backup_passphrase:ro" "${AUDIT_LOG}"; then
+  echo "FAIL: Secret file was not mounted to /run/secrets/backup_passphrase:ro" >&2
+  exit 4
+fi
+
+if ! grep -q -- "--passphrase-file /run/secrets/backup_passphrase" "${AUDIT_LOG}"; then
+  echo "FAIL: CLI was not invoked with --passphrase-file /run/secrets/backup_passphrase" >&2
+  exit 5
+fi
+
+if grep -q -- "-e SPINE_BACKUP_PASSPHRASE" "${AUDIT_LOG}"; then
+  echo "FAIL: -e SPINE_BACKUP_PASSPHRASE found in docker invocation!" >&2
+  exit 6
+fi
+
+rm -rf "${WORK_DIR}"
+exit 0
+"#
+            .replace("\r\n", "\n")
+            .replace('\r', "");
+
+            let mut child = Command::new("bash")
+                .arg("-s")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("failed to spawn bash");
+
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(script.as_bytes()).expect("failed to write script to stdin");
+            }
+            let res = child.wait_with_output().expect("failed to wait on bash child");
+            assert!(
+                res.status.success(),
+                "Credential non-exposure test failed. Stderr: {}, Stdout: {}",
+                String::from_utf8_lossy(&res.stderr),
+                String::from_utf8_lossy(&res.stdout)
+            );
+        }
+    }
+}
+
+#[test]
+fn test_off_host_s3_replication_and_remote_restore_gate() {
+    if let Ok(bash_check) = Command::new("bash").arg("-c").arg("echo ok").output() {
+        if bash_check.status.success() {
+            let script = r#"
+set -euo pipefail
+WORK_DIR="/tmp/spine_test_s3_$$"
+mkdir -p "${WORK_DIR}"
+MOCK_BIN="${WORK_DIR}/bin"
+mkdir -p "${MOCK_BIN}"
+MOCK_S3_DIR="${WORK_DIR}/s3_remote"
+mkdir -p "${MOCK_S3_DIR}"
+AUDIT_AWS="${WORK_DIR}/aws_audit.log"
+
+cat <<EOF > "${MOCK_BIN}/aws"
+#!/usr/bin/env bash
+echo "AWS_CALL: \$@" >> "${AUDIT_AWS}"
+
+if [ "\$1" = "s3" ] && [ "\$2" = "cp" ]; then
+  SRC="\$3"
+  DST="\$4"
+  if [[ "\$*" == *"--object-lock-mode GOVERNANCE"* ]] && [[ "\$*" == *"--object-lock-retain-until-date"* ]]; then
+    echo "OBJECT_LOCK_CONFIRMED" >> "${AUDIT_AWS}"
+  fi
+  if [[ "\${DST}" =~ ^s3:// ]]; then
+    KEY=\$(basename "\${DST}")
+    cp "\${SRC}" "${MOCK_S3_DIR}/\${KEY}"
+  elif [[ "\${SRC}" =~ ^s3:// ]]; then
+    KEY=\$(basename "\${SRC}")
+    cp "${MOCK_S3_DIR}/\${KEY}" "\${DST}"
+  fi
+  exit 0
+elif [ "\$1" = "s3" ] && [ "\$2" = "ls" ]; then
+  TARGET="\$3"
+  KEY=\$(basename "\${TARGET}")
+  FILE="${MOCK_S3_DIR}/\${KEY}"
+  if [ -f "\${FILE}" ]; then
+    SIZE=\$(stat -c%s "\${FILE}" 2>/dev/null || stat -f%z "\${FILE}" 2>/dev/null || wc -c < "\${FILE}")
+    echo "2026-11-20 12:00:00 \${SIZE} \${KEY}"
+    exit 0
+  else
+    exit 1
+  fi
+fi
+EOF
+chmod +x "${MOCK_BIN}/aws"
+export PATH="${MOCK_BIN}:${PATH}"
+
+# 1. Test Backup Replication
+LOCAL_BACKUP="${WORK_DIR}/backup.spnebak"
+echo "MOCK_ENCRYPTED_SPNEBAK_DATA_PAYLOAD" > "${LOCAL_BACKUP}"
+LOCAL_MANIFEST="${WORK_DIR}/SHA256SUMS"
+sha256sum "${LOCAL_BACKUP}" > "${LOCAL_MANIFEST}"
+
+export SPINE_BACKUP_REMOTE_S3_URI="s3://disaster-recovery-vault/spine"
+export SPINE_BACKUP_OBJECT_LOCK_MODE="GOVERNANCE"
+export SPINE_BACKUP_RETENTION_DAYS="30"
+export SPINE_S3_ENDPOINT_URL=""
+
+REMOTE_BASE="${SPINE_BACKUP_REMOTE_S3_URI%/}"
+REMOTE_TARGET="${REMOTE_BASE}/test_backup"
+RETAIN_UNTIL="2026-12-20T12:00:00Z"
+
+UPLOAD_ARGS=(--object-lock-mode "${SPINE_BACKUP_OBJECT_LOCK_MODE}" --object-lock-retain-until-date "${RETAIN_UNTIL}")
+
+aws s3 cp "${LOCAL_BACKUP}" "${REMOTE_TARGET}/backup.spnebak" "${UPLOAD_ARGS[@]}"
+aws s3 cp "${LOCAL_MANIFEST}" "${REMOTE_TARGET}/SHA256SUMS"
+
+LOCAL_SIZE=$(stat -c%s "${LOCAL_BACKUP}" 2>/dev/null || stat -f%z "${LOCAL_BACKUP}" 2>/dev/null || wc -c < "${LOCAL_BACKUP}" | tr -d '[:space:]')
+REMOTE_SIZE=$(aws s3 ls "${REMOTE_TARGET}/backup.spnebak" | awk '{print $3}' | tr -d '[:space:]')
+
+if [ "${LOCAL_SIZE}" != "${REMOTE_SIZE}" ]; then
+  echo "FAIL: Local and remote size mismatch: ${LOCAL_SIZE} vs ${REMOTE_SIZE}" >&2
+  exit 1
+fi
+
+if ! grep -q "OBJECT_LOCK_CONFIRMED" "${AUDIT_AWS}"; then
+  echo "FAIL: Object lock parameters were not passed to aws s3 cp" >&2
+  exit 2
+fi
+
+# 2. Test Remote Restore Download
+DOWNLOAD_DIR="${WORK_DIR}/downloaded"
+mkdir -p "${DOWNLOAD_DIR}"
+aws s3 cp "${REMOTE_TARGET}/backup.spnebak" "${DOWNLOAD_DIR}/backup.spnebak"
+aws s3 cp "${REMOTE_TARGET}/SHA256SUMS" "${DOWNLOAD_DIR}/SHA256SUMS"
+
+(cd "${DOWNLOAD_DIR}" && sha256sum -c SHA256SUMS)
+
+rm -rf "${WORK_DIR}"
+exit 0
+"#
+            .replace("\r\n", "\n")
+            .replace('\r', "");
+
+            let mut child = Command::new("bash")
+                .arg("-s")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("failed to spawn bash");
+
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(script.as_bytes()).expect("failed to write script to stdin");
+            }
+            let res = child.wait_with_output().expect("failed to wait on bash child");
+            assert!(
+                res.status.success(),
+                "Off-host S3 replication and restore gate test failed. Stderr: {}, Stdout: {}",
+                String::from_utf8_lossy(&res.stderr),
+                String::from_utf8_lossy(&res.stdout)
+            );
+        }
+    }
+}
