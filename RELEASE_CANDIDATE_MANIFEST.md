@@ -3,7 +3,7 @@
 
 **Target Milestone:** Batch 21J Distributed Restore Convergence & Batch 21K Production Hardening  
 **Target Profile:** `core-forge-v1` (Mandatory PostgreSQL, TLS Ingress, Strict Role Separation)  
-**Source Commit Revision:** `74f72a6c3156780ec97f1a8fd25494abc2fa0378`  
+**Source Commit Revision:** `13f4ab076f0de947f4b8b4d6211ee37b55276045`  
 
 ---
 
@@ -11,8 +11,8 @@
 Artifacts compiled and verified in `target/release-candidate/`:
 
 ```
-af2ade12b1cae0080a0f29e5b29c83ef43af2a9aff2f47d25328d5e9e9ba60f6  spine-api.exe
-8f7ed491e1b04d62e801cd7bb09c8b083bd6eebe911685304e836994a96994b1  spine-coordinator.exe
+d967fce88f583e8a1b0f55e665ad592b2e07e37d999011e1e103b41ad7ab6ebb  spine-api.exe
+0b47434eb9e508407c831613d5dec742b014e3e96894e56fbddbfb9dec207ec8  spine-coordinator.exe
 1ed8049200a6a2b306ca9d2cffcf2df6b7b0558c9dcd5f4d07d45d18192edd74  spine-storage-node.exe
 5a987eb7a1a1c3f6bc017be82560b191ea69bf21dde9751a8c9db43c91faef5f  spine.exe
 ```
@@ -20,9 +20,9 @@ af2ade12b1cae0080a0f29e5b29c83ef43af2a9aff2f47d25328d5e9e9ba60f6  spine-api.exe
 ---
 
 ### 2. Service Architecture & Security Topology
-- **Edge Reverse Proxy (`ingress`):** Hardened NGINX edge gateway; mandatory HTTP 80 -> HTTPS 443 redirection, TLS 1.2/1.3 only, HSTS headers.
-- **Frontend (`spine-frontend`):** Attached strictly to `spine-ingress-proxy`. Public network `spine-public` removed, eliminating ingress bypass risks.
-- **Control Plane API (`spine-api`):** Unprivileged user (UID 10001). Connects to PostgreSQL using least-privilege DML role `spine_app` with structured connection URL building, percent-encoding of credentials, and elimination of raw environment variable credential interpolations in `docker-compose.prod.yml`. Enforces non-default storage root under `core-forge-v1`.
+- **Edge Reverse Proxy (`ingress`):** Hardened NGINX edge gateway; mandatory HTTP 80 -> HTTPS 443 redirection, TLS 1.2/1.3 only, HSTS headers, container healthcheck with live TCP & master process probing (`pidof nginx && nc -z 127.0.0.1 80`).
+- **Frontend (`spine-frontend`):** Attached strictly to `spine-ingress-proxy`. Public network `spine-public` removed, eliminating ingress bypass risks. Gated with HTTP asset healthcheck (`wget -q -O - http://127.0.0.1:80/`).
+- **Control Plane API (`spine-api`):** Unprivileged user (UID 10001). Connects to PostgreSQL using least-privilege DML role `spine_app` with structured connection URL building, percent-encoding of credentials, and elimination of raw environment variable credential interpolations in `docker-compose.prod.yml`. Enforces non-default storage root under `core-forge-v1`. Full readiness healthcheck (`/health/ready`).
 - **Database Engine (`postgres`):** Bound to internal private network `spine-internal`. No host port publication. Configurable role setup supporting `POSTGRES_MIGRATOR_USER` and `POSTGRES_APP_USER` via `upgrade_postgres_roles.sh` with stdin SQL piping and parameterized psql identifiers (no credentials on process command lines).
 - **Consensus Coordinator (`spine-coordinator`):** Raft consensus node on `spine-internal` (port `8400`). Guarded by RAII `CoordinatorWriterGuard`, atomic writer tracking, mutation barrier, draining maintenance barrier, persisted monotonic fencing generation (`.coordinator_fencing_generation` with `safe_atomic_replace`), and crash-resilient rollback state.
 - **Storage Nodes (`spine-storage-node-1/2/3`):** Chunked BLAKE3 storage nodes on `spine-internal` (port `8401`). Responding with explicit logical node IDs (`node-1`, `node-2`, `node-3`). Guarded by RAII `StorageWriterGuard`, atomic writer tracking, mutation barrier, draining maintenance barrier, persisted monotonic fencing generation (`.fencing_generation` with error propagation and atomic replacement), and distributed volume restore verification.
