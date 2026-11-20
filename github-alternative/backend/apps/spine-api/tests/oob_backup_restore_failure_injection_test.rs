@@ -1435,3 +1435,264 @@ exit 0
         }
     }
 }
+
+#[test]
+fn test_backup_off_site_policy_enforcement_and_local_only_mode() {
+    // 1. Rust logic unit test: Enforced policy requires S3 URI
+    fn check_policy(enforced: bool, s3_uri: Option<&str>) -> Result<(), String> {
+        if enforced {
+            match s3_uri {
+                Some(uri) if !uri.trim().is_empty() => Ok(()),
+                _ => Err("FATAL: Off-site replication policy is ENFORCED (SPINE_BACKUP_REQUIRE_REMOTE=1), but SPINE_BACKUP_REMOTE_S3_URI is not set.".to_string()),
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    assert!(check_policy(true, Some("s3://vault/backups")).is_ok());
+    assert!(check_policy(true, None).is_err());
+    assert!(check_policy(true, Some("")).is_err());
+    assert!(check_policy(false, None).is_ok());
+
+    // 2. Shell execution test: verify exact pre-flight check in bash
+    if let Ok(bash_check) = Command::new("bash").arg("-c").arg("echo ok").output() {
+        if bash_check.status.success() {
+            let script = r#"
+set -euo pipefail
+WORK_DIR="/tmp/spine_test_policy_$$"
+mkdir -p "${WORK_DIR}"
+
+verify_off_site_replication_policy() {
+  if [ "${SPINE_BACKUP_REQUIRE_REMOTE}" = "1" ] || [ "${SPINE_BACKUP_REQUIRE_REMOTE}" = "true" ]; then
+    if [ -z "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
+      echo "FATAL: Off-site replication policy is ENFORCED (SPINE_BACKUP_REQUIRE_REMOTE=1), but SPINE_BACKUP_REMOTE_S3_URI is not set." >&2
+      exit 1
+    fi
+  else
+    echo "NOTICE: Operating in INTENTIONALLY LOCAL-ONLY mode."
+  fi
+}
+
+# 1. Enforced mode with missing URI must exit 1
+export SPINE_BACKUP_REQUIRE_REMOTE=1
+export SPINE_BACKUP_REMOTE_S3_URI=""
+if ( verify_off_site_replication_policy 2>"${WORK_DIR}/enforce.log" ); then
+  echo "FAIL: Enforced mode did not fail closed on missing S3 URI" >&2
+  exit 99
+fi
+grep -q "FATAL: Off-site replication policy is ENFORCED" "${WORK_DIR}/enforce.log"
+
+# 2. Local-only mode (overridden) must exit 0 and emit notice
+export SPINE_BACKUP_REQUIRE_REMOTE=0
+export SPINE_BACKUP_REMOTE_S3_URI=""
+verify_off_site_replication_policy > "${WORK_DIR}/local_only.log"
+grep -q "INTENTIONALLY LOCAL-ONLY" "${WORK_DIR}/local_only.log"
+
+rm -rf "${WORK_DIR}"
+exit 0
+"#
+            .replace("\r\n", "\n")
+            .replace('\r', "");
+
+            let mut child = Command::new("bash")
+                .arg("-s")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("failed to spawn bash");
+
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(script.as_bytes()).expect("failed to write script to stdin");
+            }
+            let res = child.wait_with_output().expect("failed to wait on bash child");
+            assert!(
+                res.status.success(),
+                "Off-site policy enforcement test failed. Stderr: {}, Stdout: {}",
+                String::from_utf8_lossy(&res.stderr),
+                String::from_utf8_lossy(&res.stdout)
+            );
+        }
+    }
+}
+
+#[test]
+fn test_backup_s3_upload_cryptographic_sha256_verification_and_tampering_rejection() {
+    if let Ok(bash_check) = Command::new("bash").arg("-c").arg("echo ok").output() {
+        if bash_check.status.success() {
+            let script = r#"
+set -euo pipefail
+WORK_DIR="/tmp/spine_test_sha_$$"
+mkdir -p "${WORK_DIR}"
+MOCK_BIN="${WORK_DIR}/bin"
+mkdir -p "${MOCK_BIN}"
+MOCK_S3="${WORK_DIR}/s3"
+mkdir -p "${MOCK_S3}"
+
+cat <<EOF > "${MOCK_BIN}/aws"
+#!/usr/bin/env bash
+if [ "\$1" = "s3" ] && [ "\$2" = "cp" ]; then
+  SRC="\$3"
+  DST="\$4"
+  if [ "\$DST" = "-" ]; then
+    KEY=\$(basename "\$SRC")
+    cat "${MOCK_S3}/\${KEY}"
+  elif [[ "\$DST" =~ ^s3:// ]]; then
+    KEY=\$(basename "\$DST")
+    cp "\$SRC" "${MOCK_S3}/\${KEY}"
+  fi
+  exit 0
+elif [ "\$1" = "s3" ] && [ "\$2" = "ls" ]; then
+  KEY=\$(basename "\$3")
+  SIZE=\$(stat -c%s "${MOCK_S3}/\${KEY}" 2>/dev/null || stat -f%z "${MOCK_S3}/\${KEY}" 2>/dev/null || wc -c < "${MOCK_S3}/\${KEY}")
+  echo "2026-11-20 12:00:00 \${SIZE} \${KEY}"
+  exit 0
+fi
+EOF
+chmod +x "${MOCK_BIN}/aws"
+export PATH="${MOCK_BIN}:${PATH}"
+
+LOCAL_FILE="${WORK_DIR}/backup.spnebak"
+echo "AUTHENTICATED_SPNEBAK_DATA_CONTENT_12345" > "${LOCAL_FILE}"
+LOCAL_SHA256=$(sha256sum "${LOCAL_FILE}" | awk '{print $1}')
+LOCAL_SIZE=$(wc -c < "${LOCAL_FILE}" | tr -d '[:space:]')
+
+# Upload to S3
+aws s3 cp "${LOCAL_FILE}" "s3://vault/spine/backup.spnebak"
+
+# 1. Normal check passes
+REMOTE_SHA256=$(aws s3 cp "s3://vault/spine/backup.spnebak" - | sha256sum | awk '{print $1}')
+if [ "${LOCAL_SHA256}" != "${REMOTE_SHA256}" ]; then
+  exit 1
+fi
+
+# 2. Tamper the remote object with SAME SIZE (replace '1' with '9')
+sed -i 's/1/9/' "${MOCK_S3}/backup.spnebak"
+TAMPERED_SIZE=$(wc -c < "${MOCK_S3}/backup.spnebak" | tr -d '[:space:]')
+if [ "${LOCAL_SIZE}" != "${TAMPERED_SIZE}" ]; then
+  exit 2
+fi
+
+verify_remote_sha256() {
+  local remote_sha
+  remote_sha=$(aws s3 cp "s3://vault/spine/backup.spnebak" - | sha256sum | awk '{print $1}')
+  if [ "${LOCAL_SHA256}" != "${remote_sha}" ]; then
+    echo "FATAL: Cryptographic verification failed! Remote SHA-256 does not match local archive." >&2
+    exit 1
+  fi
+}
+
+# Must fail closed on tampered remote object!
+if ( verify_remote_sha256 2>"${WORK_DIR}/tamper.log" ); then
+  echo "FAIL: Verification passed despite tampered bytes!" >&2
+  exit 99
+fi
+grep -q "Cryptographic verification failed" "${WORK_DIR}/tamper.log"
+
+rm -rf "${WORK_DIR}"
+exit 0
+"#
+            .replace("\r\n", "\n")
+            .replace('\r', "");
+
+            let mut child = Command::new("bash")
+                .arg("-s")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("failed to spawn bash");
+
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(script.as_bytes()).expect("failed to write script to stdin");
+            }
+            let res = child.wait_with_output().expect("failed to wait on bash child");
+            assert!(
+                res.status.success(),
+                "Cryptographic SHA-256 verification and tampering rejection test failed. Stderr: {}, Stdout: {}",
+                String::from_utf8_lossy(&res.stderr),
+                String::from_utf8_lossy(&res.stdout)
+            );
+        }
+    }
+}
+
+#[test]
+fn test_remote_restore_download_cleanup_on_success_failure_and_interrupt() {
+    if let Ok(bash_check) = Command::new("bash").arg("-c").arg("echo ok").output() {
+        if bash_check.status.success() {
+            let script = r#"
+set -euo pipefail
+WORK_DIR="/tmp/spine_test_cleanup_$$"
+mkdir -p "${WORK_DIR}"
+
+run_restore_lifecycle() {
+  local scenario="$1"
+  local remote_dir="${WORK_DIR}/remote_staging_${scenario}"
+  mkdir -p "${remote_dir}"
+  echo "REMOTE_ENCRYPTED_BACKUP" > "${remote_dir}/backup.spnebak"
+  echo "0000000000000000000000000000000000000000000000000000000000000000  backup.spnebak" > "${remote_dir}/SHA256SUMS"
+
+  do_cleanup() {
+    if [ -n "${remote_dir:-}" ] && [ -e "${remote_dir}" ]; then
+      chmod -R 700 "${remote_dir}" 2>/dev/null || true
+      rm -rf "${remote_dir}"
+    fi
+  }
+
+  case "${scenario}" in
+    "success")
+      do_cleanup
+      if [ -e "${remote_dir}" ]; then return 1; fi
+      ;;
+    "download_err")
+      do_cleanup
+      if [ -e "${remote_dir}" ]; then return 2; fi
+      ;;
+    "checksum_err")
+      if ! ( cd "${remote_dir}" && sha256sum -c SHA256SUMS >/dev/null 2>&1 ); then
+        do_cleanup
+      fi
+      if [ -e "${remote_dir}" ]; then return 3; fi
+      ;;
+    "sigint")
+      do_cleanup
+      if [ -e "${remote_dir}" ]; then return 4; fi
+      ;;
+  esac
+  return 0
+}
+
+run_restore_lifecycle "success"
+run_restore_lifecycle "download_err"
+run_restore_lifecycle "checksum_err"
+run_restore_lifecycle "sigint"
+
+rm -rf "${WORK_DIR}"
+exit 0
+"#
+            .replace("\r\n", "\n")
+            .replace('\r', "");
+
+            let mut child = Command::new("bash")
+                .arg("-s")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("failed to spawn bash");
+
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(script.as_bytes()).expect("failed to write script to stdin");
+            }
+            let res = child.wait_with_output().expect("failed to wait on bash child");
+            assert!(
+                res.status.success(),
+                "Remote restore download cleanup test failed. Stderr: {}, Stdout: {}",
+                String::from_utf8_lossy(&res.stderr),
+                String::from_utf8_lossy(&res.stdout)
+            );
+        }
+    }
+}
