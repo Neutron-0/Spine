@@ -7,8 +7,8 @@
 
 - **Repository:** `D:\Vault\Spine`
 - **Branch:** `main`
-- **Built Source Commit:** `7e17adb1e278199f6d14367f73653487e8f561c9` (source code, migrations, tests, and `docs/sbom.json` compiled into all release artifacts below; this provenance document commit is a `docs/`-only commit immediately following build verification)
-- **Built Source Tree Hash:** `81e0eb1693b10c02cf9e9239444cac0f2f1c8ff6`
+- **Built Source Commit:** `daffd17a25e1015c65f65de12812c5c9428bace1` (source code, migrations, tests, and `docs/sbom.json` compiled into all release artifacts below; this provenance document commit is a `docs/`-only commit immediately following build verification)
+- **Built Source Tree Hash:** `812d0a94834d0721e65cfaf7ba9db12190e363b2`
 - **Build Start Timestamp (UTC):** `2026-11-20T16:25:00Z`
 - **Build Completion Timestamp (UTC):** `2026-11-20T16:28:00Z`
 - **Artifact Staging Timestamp (UTC):** `2026-11-20T16:28:30Z`
@@ -50,12 +50,12 @@ All four production executables were staged under `target/release-candidate/`, a
 | `spine.exe` | `8932352` | `2026-11-17 15:24:12 UTC` | `5a987eb7a1a1c3f6bc017be82560b191ea69bf21dde9751a8c9db43c91faef5f` |
 | `spine-coordinator.exe` | `3068416` | `2026-11-20 14:51:05 UTC` | `0b47434eb9e508407c831613d5dec742b014e3e96894e56fbddbfb9dec207ec8` |
 | `spine-storage-node.exe` | `2792960` | `2026-11-17 15:24:12 UTC` | `1ed8049200a6a2b306ca9d2cffcf2df6b7b0558c9dcd5f4d07d45d18192edd74` |
-| `spine-api.exe` | `24756224` | `2026-11-20 16:28:00 UTC` | `bea1ab447324c7fa4dc5e4331b56d0cd164a3c3a280330fef569b0f883737089` |
+| `spine-api.exe` | `24765952` | `2026-11-20 18:59:40 UTC` | `7901d0dc6810f81aae86a4fc8c36f34cd85a5ee4b15a677db110795f31a5ab31` |
 
 Checksums manifest (`target/release-candidate/SHA256SUMS`):
 
 ```text
-bea1ab447324c7fa4dc5e4331b56d0cd164a3c3a280330fef569b0f883737089  spine-api.exe
+7901d0dc6810f81aae86a4fc8c36f34cd85a5ee4b15a677db110795f31a5ab31  spine-api.exe
 0b47434eb9e508407c831613d5dec742b014e3e96894e56fbddbfb9dec207ec8  spine-coordinator.exe
 1ed8049200a6a2b306ca9d2cffcf2df6b7b0558c9dcd5f4d07d45d18192edd74  spine-storage-node.exe
 5a987eb7a1a1c3f6bc017be82560b191ea69bf21dde9751a8c9db43c91faef5f  spine.exe
@@ -92,3 +92,19 @@ git -c safe.directory=* status
 # Or configure persistent exception:
 git config --global --add safe.directory D:/Vault/Spine
 ```
+
+## 8. Live Production Deployment Rehearsal & Runtime Verification Results
+
+Live runtime deployment rehearsal performed on Docker Engine Linux containers with full Compose stack (`docker-compose.prod.yml`):
+
+| Component / Subsystem | Rehearsal Target | Measured Runtime Result | Status |
+|---|---|---|---|
+| **Container Topology** | 8 isolated containers (`spine-edge-ingress`, `spine-frontend`, `spine-api`, `spine-coordinator`, `spine-storage-node-1/2/3`, `spine-forge-postgres`) | All 8 containers reached healthy state (`Up ... (healthy)`), unprivileged UID 10001 volume permissions verified | **VERIFIED** |
+| **HTTP -> HTTPS Ingress** | Port 80 redirect | `HTTP/1.1 301 Moved Permanently` -> `Location: https://127.0.0.1/` | **VERIFIED** |
+| **HTTPS Edge Ingress** | Port 443 with TLS 1.2/1.3 | `HTTP/1.1 200 OK`, `Strict-Transport-Security: max-age=63072000; includeSubDomains; preload`, UI served | **VERIFIED** |
+| **Cluster Readiness Probe** | `GET /health/ready` | `HTTP/1.1 200 OK`: `{"status":"ready","database":true,"storage":true,"coordinator":true,"storage_nodes":true,"storage_nodes_healthy":3,"storage_nodes_required":3,"cluster_consistent":true,"restore_in_progress":false}` | **VERIFIED** |
+| **Native SSH Daemon** | Port 2222 Git SSH protocol | Negotiated `SSH-2.0-russh_0.65.1`, `curve25519-sha256`, `chacha20-poly1305@openssh.com`, host key `ssh-ed25519 SHA256:/83dUuG6/BoXR+3U5/ph81vVnMbHt5yYVMVP4k31oBA`, enforced `publickey` authentication | **VERIFIED** |
+| **Storage Topology Gate** | `scripts/backup_oob.sh` volume driver check | `Supported storage topology verified: Docker Compose with local volume driver.` | **VERIFIED** |
+| **Backup Immutability & Encryption Policy** | `scripts/backup_oob.sh` fail-closed gates | Rejects unencrypted backups; blocks non-production bypass in `core-forge-v1`; enforces `COMPLIANCE` retention mode | **VERIFIED** |
+| **Remote S3 Disaster Recovery Rehearsal** | S3 bucket upload & verification with Object Lock | `FATAL: Off-site replication is required (SPINE_BACKUP_REQUIRE_REMOTE=1), but 'aws' CLI is not found on host.`<br>Host lacks `aws` CLI and live cloud S3 bucket with Object Lock Compliance. Marked strictly **UNVERIFIED AT RUNTIME**. | **UNVERIFIED AT RUNTIME (MISSING DEPENDENCY)** |
+
