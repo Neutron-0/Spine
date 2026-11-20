@@ -12,6 +12,18 @@ BACKUP_ROOT="${BACKUP_ROOT:-/mnt/backups/spine}"
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
 POSTGRES_ADMIN_USER="${POSTGRES_ADMIN_USER:-spine_admin}"
 POSTGRES_ADMIN_PASSWORD="${POSTGRES_ADMIN_PASSWORD:-}"
+SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE:-}"
+SPINE_BACKUP_PASSPHRASE_FILE="${SPINE_BACKUP_PASSPHRASE_FILE:-}"
+
+if [ -z "${SPINE_BACKUP_PASSPHRASE}" ] && [ -n "${SPINE_BACKUP_PASSPHRASE_FILE}" ] && [ -f "${SPINE_BACKUP_PASSPHRASE_FILE}" ]; then
+  SPINE_BACKUP_PASSPHRASE=$(cat "${SPINE_BACKUP_PASSPHRASE_FILE}")
+fi
+
+if [ -z "${SPINE_BACKUP_PASSPHRASE}" ]; then
+  echo "FATAL: Authenticated encryption is mandatory for production backups." >&2
+  echo "Please set SPINE_BACKUP_PASSPHRASE or provide SPINE_BACKUP_PASSPHRASE_FILE." >&2
+  exit 1
+fi
 
 if [ -z "${SPINE_ADMIN_TOKEN}" ]; then
   echo "FATAL: SPINE_ADMIN_TOKEN must be set to acquire the cluster maintenance barrier." >&2
@@ -120,16 +132,19 @@ if [ -n "${DIR_MODE}" ] && [ "${DIR_MODE}" != "700" ]; then
 fi
 
 echo "=== Phase 2: Capturing Multi-Volume Snapshots to ${BACKUP_DIR} ==="
+STAGING_DIR="${BACKUP_DIR}/.staging"
+mkdir -p "${STAGING_DIR}"
+chmod 700 "${STAGING_DIR}"
 
 # Record fencing metadata for global and individual participants
-echo "${GENERATION_TOKEN}" > "${BACKUP_DIR}/FENCING_GENERATION"
-echo "${COORD_GEN}" > "${BACKUP_DIR}/FENCING_GENERATION_COORDINATOR"
-echo "${NODE_1_GEN}" > "${BACKUP_DIR}/FENCING_GENERATION_NODE_1"
-echo "${NODE_2_GEN}" > "${BACKUP_DIR}/FENCING_GENERATION_NODE_2"
-echo "${NODE_3_GEN}" > "${BACKUP_DIR}/FENCING_GENERATION_NODE_3"
-echo "${API_GENERATION}" > "${BACKUP_DIR}/FENCING_GENERATION_API"
+echo "${GENERATION_TOKEN}" > "${STAGING_DIR}/FENCING_GENERATION"
+echo "${COORD_GEN}" > "${STAGING_DIR}/FENCING_GENERATION_COORDINATOR"
+echo "${NODE_1_GEN}" > "${STAGING_DIR}/FENCING_GENERATION_NODE_1"
+echo "${NODE_2_GEN}" > "${STAGING_DIR}/FENCING_GENERATION_NODE_2"
+echo "${NODE_3_GEN}" > "${STAGING_DIR}/FENCING_GENERATION_NODE_3"
+echo "${API_GENERATION}" > "${STAGING_DIR}/FENCING_GENERATION_API"
 
-cat <<EOF > "${BACKUP_DIR}/PARTICIPANT_GENERATION_AUDIT.json"
+cat <<EOF > "${STAGING_DIR}/PARTICIPANT_GENERATION_AUDIT.json"
 {
   "timestamp_utc": "${TIMESTAMP}",
   "consensus_generation": ${GENERATION_TOKEN},
@@ -149,36 +164,76 @@ EOF
 echo "Capturing PostgreSQL dump..."
 if [ -n "${POSTGRES_ADMIN_PASSWORD}" ]; then
   docker compose -f "${COMPOSE_FILE}" exec -T -e PGPASSWORD="${POSTGRES_ADMIN_PASSWORD}" postgres \
-    pg_dumpall -U "${POSTGRES_ADMIN_USER}" | gzip > "${BACKUP_DIR}/postgres_dump.sql.gz"
+    pg_dumpall -U "${POSTGRES_ADMIN_USER}" | gzip > "${STAGING_DIR}/postgres_dump.sql.gz"
 else
   docker compose -f "${COMPOSE_FILE}" exec -T postgres \
-    pg_dumpall -U "${POSTGRES_ADMIN_USER}" | gzip > "${BACKUP_DIR}/postgres_dump.sql.gz"
+    pg_dumpall -U "${POSTGRES_ADMIN_USER}" | gzip > "${STAGING_DIR}/postgres_dump.sql.gz"
 fi
 
 # 2. Coordinator state
 echo "Capturing Coordinator consensus state..."
 docker compose -f "${COMPOSE_FILE}" exec -T coordinator \
-  tar -czf - -C /var/lib/spine . > "${BACKUP_DIR}/coordinator.tar.gz"
+  tar -czf - -C /var/lib/spine . > "${STAGING_DIR}/coordinator.tar.gz"
 
 # 3. Storage node volumes
 for NODE in 1 2 3; do
   echo "Capturing Storage Node ${NODE} volume..."
   docker compose -f "${COMPOSE_FILE}" exec -T "storage-node-${NODE}" \
-    tar -czf - -C "/var/lib/spine/node-${NODE}" . > "${BACKUP_DIR}/storage_node_${NODE}.tar.gz"
+    tar -czf - -C "/var/lib/spine/node-${NODE}" . > "${STAGING_DIR}/storage_node_${NODE}.tar.gz"
 done
 
 # 4. API storage & host SSH keys
 echo "Capturing API storage & SSH identities..."
 docker compose -f "${COMPOSE_FILE}" exec -T spine-api \
-  tar -czf - -C /var/lib/spine/ssh . > "${BACKUP_DIR}/spine_ssh.tar.gz"
+  tar -czf - -C /var/lib/spine/ssh . > "${STAGING_DIR}/spine_ssh.tar.gz"
 docker compose -f "${COMPOSE_FILE}" exec -T spine-api \
-  tar -czf - -C /var/lib/spine/storage . > "${BACKUP_DIR}/spine_storage.tar.gz"
+  tar -czf - -C /var/lib/spine/storage . > "${STAGING_DIR}/spine_storage.tar.gz"
 
-# 5. Checksum manifest
-echo "Generating SHA-256 checksum manifest..."
-(cd "${BACKUP_DIR}" && sha256sum * > SHA256SUMS)
+# 5. Internal checksum manifest of captured participants
+echo "Generating internal SHA-256 checksum manifest..."
+(cd "${STAGING_DIR}" && sha256sum * > SHA256SUMS)
 
-# 6. Enforce and verify restrictive permissions on all captured backup artifacts
+# 6. Authenticated AEAD Encryption (SPNEBAK v2)
+echo "=== Phase 2b: Packaging & Authenticated AEAD Encryption (SPNEBAK v2) ==="
+ENCRYPTED_ARCHIVE="${BACKUP_DIR}/backup.spnebak"
+PLAINTEXT_TAR="${BACKUP_DIR}/.plaintext_bundle.tar.gz"
+
+echo "Bundling captured snapshot artifacts into temporary bundle..."
+tar -czf "${PLAINTEXT_TAR}" -C "${STAGING_DIR}" .
+
+echo "Encrypting backup bundle into SPNEBAK v2 AEAD envelope (AES-256-GCM)..."
+if command -v spine-api >/dev/null 2>&1; then
+  SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE}" \
+    spine-api backup encrypt --input "${PLAINTEXT_TAR}" --output "${ENCRYPTED_ARCHIVE}"
+else
+  # Encrypt through the spine-api container
+  docker compose -f "${COMPOSE_FILE}" exec -T \
+    -e SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE}" spine-api \
+    spine-api backup encrypt --input - --output - < "${PLAINTEXT_TAR}" > "${ENCRYPTED_ARCHIVE}"
+fi
+
+# Verify the encrypted archive is valid SPNEBAK v2 format
+if [ ! -s "${ENCRYPTED_ARCHIVE}" ]; then
+  echo "FATAL: Encrypted backup archive was not created or is zero-byte empty!" >&2
+  exit 1
+fi
+
+MAGIC_CHECK=$(dd if="${ENCRYPTED_ARCHIVE}" bs=1 count=8 2>/dev/null || true)
+if [ "${MAGIC_CHECK}" != "SPNEBAK"$'\x02' ]; then
+  echo "FATAL: Verification failed: ${ENCRYPTED_ARCHIVE} does not start with SPNEBAK v2 magic!" >&2
+  exit 1
+fi
+
+echo "Encrypted archive verified: ${ENCRYPTED_ARCHIVE} (SPNEBAK v2 AEAD envelope confirmed)."
+
+# STRICT DATA HYGIENE: Securely purge all unencrypted plaintext archives and database dumps!
+echo "Purging unencrypted staging artifacts from disk..."
+rm -rf "${PLAINTEXT_TAR}" "${STAGING_DIR}"
+
+# Generate checksum of final encrypted backup archive
+(cd "${BACKUP_DIR}" && sha256sum backup.spnebak > SHA256SUMS)
+
+# Enforce restrictive permissions on the encrypted archive and manifest
 echo "Enforcing restrictive permissions (0600 files, 0700 dir) on backup artifacts..."
 chmod 600 "${BACKUP_DIR}"/*
 chmod 700 "${BACKUP_DIR}"

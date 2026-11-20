@@ -520,14 +520,28 @@ pub struct RollbackExecutionResult {
 /// Simulates rollback_volumes() logic from scripts/restore_oob.sh.
 pub fn execute_simulated_rollback(
     participants: &[&str],
+    running_services: &[&str],
     corrupted_participant: Option<&str>,
     failed_verification_participant: Option<&str>,
 ) -> RollbackExecutionResult {
     let mut failed_participants = Vec::new();
     let mut verified_participants = Vec::new();
 
+    // Step 1: Mandatory stop and quiescence verification
+    // If any container refuses to stop, DO NOT EXTRACT INTO VOLUMES!
+    if !running_services.is_empty() {
+        failed_participants.push(format!("services_refused_to_stop:{}", running_services.join(",")));
+        return RollbackExecutionResult {
+            success: false,
+            exit_code: 2,
+            failed_participants,
+            services_running: running_services.iter().map(|s| s.to_string()).collect(),
+            verified_participants,
+        };
+    }
+
     for p in participants {
-        // Step 1: Extract archive
+        // Step 2: Extract archive
         if let Some(corrupt) = corrupted_participant {
             if *p == corrupt {
                 failed_participants.push(format!("extraction_failed:{}", p));
@@ -535,7 +549,7 @@ pub fn execute_simulated_rollback(
             }
         }
 
-        // Step 2: Post-extraction verification
+        // Step 3: Post-extraction verification (marker checks across all participants)
         if let Some(unverified) = failed_verification_participant {
             if *p == unverified {
                 failed_participants.push(format!("verification_failed:{}", p));
@@ -546,7 +560,7 @@ pub fn execute_simulated_rollback(
         verified_participants.push(p.to_string());
     }
 
-    let success = failed_participants.is_empty();
+    let success = failed_participants.is_empty() && verified_participants.len() == participants.len();
     let exit_code = if success { 0 } else { 2 };
     // In all rollback cases (success or failure), cluster services remain strictly stopped!
     let services_running = Vec::new();
@@ -561,6 +575,39 @@ pub fn execute_simulated_rollback(
 }
 
 #[test]
+fn test_rollback_fails_and_aborts_extraction_if_services_refuse_to_stop() {
+    let participants = [
+        "coordinator",
+        "storage_node_1",
+        "storage_node_2",
+        "storage_node_3",
+        "spine_ssh",
+        "spine_storage",
+        "postgres_data",
+    ];
+
+    // Case 1: storage-node-2 refused to stop during rollback -> FATAL exit code 2, ZERO extractions performed!
+    let hung_storage = ["storage-node-2"];
+    let result = execute_simulated_rollback(&participants, &hung_storage, None, None);
+    assert!(!result.success);
+    assert_eq!(result.exit_code, 2);
+    assert!(result.failed_participants.iter().any(|f| f.contains("services_refused_to_stop:storage-node-2")));
+    assert!(
+        result.verified_participants.is_empty(),
+        "Must NOT extract into any volumes if a service refused to stop"
+    );
+    assert_eq!(result.services_running, vec!["storage-node-2"]);
+
+    // Case 2: postgres and spine-api failed to stop -> FATAL exit code 2, zero extractions
+    let hung_db = ["postgres", "spine-api"];
+    let result_db = execute_simulated_rollback(&participants, &hung_db, None, None);
+    assert!(!result_db.success);
+    assert_eq!(result_db.exit_code, 2);
+    assert!(result_db.failed_participants.iter().any(|f| f.contains("services_refused_to_stop:postgres,spine-api")));
+    assert!(result_db.verified_participants.is_empty());
+}
+
+#[test]
 fn test_rollback_extraction_failure_is_fatal_and_keeps_cluster_stopped() {
     let participants = [
         "coordinator",
@@ -572,31 +619,140 @@ fn test_rollback_extraction_failure_is_fatal_and_keeps_cluster_stopped() {
         "postgres_data",
     ];
 
-    // Case 1: Clean rollback with all valid archives -> success 0, services stopped
-    let clean = execute_simulated_rollback(&participants, None, None);
+    // Case 1: Clean rollback with all valid archives and all services stopped -> success 0, services stopped
+    let clean = execute_simulated_rollback(&participants, &[], None, None);
     assert!(clean.success);
     assert_eq!(clean.exit_code, 0);
     assert_eq!(clean.verified_participants.len(), 7);
     assert!(clean.services_running.is_empty(), "Cluster must remain stopped after rollback");
 
     // Case 2: Extraction failure on Coordinator -> FATAL exit code 2, services stopped
-    let failed_coord = execute_simulated_rollback(&participants, Some("coordinator"), None);
+    let failed_coord = execute_simulated_rollback(&participants, &[], Some("coordinator"), None);
     assert!(!failed_coord.success);
     assert_eq!(failed_coord.exit_code, 2);
     assert!(failed_coord.failed_participants.contains(&"extraction_failed:coordinator".to_string()));
     assert!(failed_coord.services_running.is_empty(), "Cluster must remain stopped on rollback failure");
 
     // Case 3: Extraction failure on Storage Node 2 -> FATAL exit code 2
-    let failed_node2 = execute_simulated_rollback(&participants, Some("storage_node_2"), None);
+    let failed_node2 = execute_simulated_rollback(&participants, &[], Some("storage_node_2"), None);
     assert!(!failed_node2.success);
     assert_eq!(failed_node2.exit_code, 2);
     assert!(failed_node2.failed_participants.contains(&"extraction_failed:storage_node_2".to_string()));
     assert!(failed_node2.services_running.is_empty());
 
     // Case 4: Extraction passes but verification fails on PostgreSQL (e.g. PG_VERSION missing) -> FATAL exit code 2
-    let failed_pg_verify = execute_simulated_rollback(&participants, None, Some("postgres_data"));
+    let failed_pg_verify = execute_simulated_rollback(&participants, &[], None, Some("postgres_data"));
     assert!(!failed_pg_verify.success);
     assert_eq!(failed_pg_verify.exit_code, 2);
     assert!(failed_pg_verify.failed_participants.contains(&"verification_failed:postgres_data".to_string()));
     assert!(failed_pg_verify.services_running.is_empty());
+
+    // Case 5: Verification fails on API SSH marker -> FATAL exit code 2
+    let failed_ssh_verify = execute_simulated_rollback(&participants, &[], None, Some("spine_ssh"));
+    assert!(!failed_ssh_verify.success);
+    assert_eq!(failed_ssh_verify.exit_code, 2);
+    assert!(failed_ssh_verify.failed_participants.contains(&"verification_failed:spine_ssh".to_string()));
+}
+
+/// Validates that a backup archive starts with the mandatory SPNEBAK v2 magic header.
+pub fn validate_backup_encryption_header(data: &[u8]) -> Result<(), String> {
+    if data.len() < 8 {
+        return Err("FATAL: Backup archive is truncated or empty. Less than 8 bytes.".to_string());
+    }
+    if &data[0..8] != spine_api::backup::v2::MAGIC_V2 {
+        return Err(
+            "FATAL: Backup archive is unencrypted or invalid! Magic header does not match SPNEBAK v2. Under production profile 'core-forge-v1', restoring unencrypted plaintext archives is strictly forbidden."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Authenticates and decrypts a SPNEBAK v2 backup payload using AES-256-GCM streaming decryptor.
+pub fn authenticate_and_decrypt_backup_payload(
+    encrypted: &[u8],
+    passphrase: &str,
+) -> Result<Vec<u8>, String> {
+    validate_backup_encryption_header(encrypted)?;
+    let mut decrypted = Vec::new();
+    spine_api::backup::v2::decrypt_stream(encrypted, &mut decrypted, passphrase)
+        .map_err(|e| format!("FATAL: Backup authentication or decryption failed: {}", e))?;
+    Ok(decrypted)
+}
+
+#[test]
+fn test_unencrypted_backup_rejected_fail_closed() {
+    // Case 1: Plaintext tar archive magic (starts with "ustar" or tar header)
+    let plaintext_tar = b"ustar  \0rootroot000000 000000";
+    let err_tar = validate_backup_encryption_header(plaintext_tar).unwrap_err();
+    assert!(err_tar.contains("Backup archive is unencrypted or invalid! Magic header does not match SPNEBAK v2"));
+
+    // Case 2: Plaintext gzip archive magic (\x1f\x8b)
+    let plaintext_gzip = b"\x1f\x8b\x08\x00\x00\x00\x00\x00";
+    let err_gzip = validate_backup_encryption_header(plaintext_gzip).unwrap_err();
+    assert!(err_gzip.contains("Magic header does not match SPNEBAK v2"));
+
+    // Case 3: Plaintext SQL dump
+    let plaintext_sql = b"CREATE TABLE users (id SERIAL PRIMARY KEY);";
+    let err_sql = validate_backup_encryption_header(plaintext_sql).unwrap_err();
+    assert!(err_sql.contains("Magic header does not match SPNEBAK v2"));
+
+    // Case 4: Truncated header (< 8 bytes)
+    let truncated = b"SPNE";
+    let err_trunc = validate_backup_encryption_header(truncated).unwrap_err();
+    assert!(err_trunc.contains("truncated or empty"));
+}
+
+#[test]
+fn test_tampered_backup_and_passphrase_authentication_rejection() {
+    let passphrase = "Production-Certified-Passphrase-2026!";
+    let original_payload = b"CRITICAL_CLUSTER_STATE: PostgreSQL relational metadata and Ed25519 host keys";
+
+    // 1. Create a valid authenticated SPNEBAK v2 encrypted archive
+    let mut encrypted_archive = Vec::new();
+    spine_api::backup::v2::encrypt_stream(
+        &mut &original_payload[..],
+        &mut encrypted_archive,
+        passphrase,
+        1,
+        spine_api::backup::v2::DEFAULT_CHUNK_SIZE,
+    )
+    .unwrap();
+
+    assert_eq!(&encrypted_archive[0..8], spine_api::backup::v2::MAGIC_V2);
+
+    // 2. Roundtrip: Valid archive with correct passphrase decrypts cleanly
+    let decrypted = authenticate_and_decrypt_backup_payload(&encrypted_archive, passphrase).unwrap();
+    assert_eq!(decrypted, original_payload);
+
+    // 3. Tampering failure injection: Mutate 1 byte in the ciphertext chunk
+    let mut tampered_archive = encrypted_archive.clone();
+    let tamper_idx = tampered_archive.len() - 10;
+    tampered_archive[tamper_idx] ^= 0xFF; // Flip all bits of a ciphertext byte
+
+    let tamper_err = authenticate_and_decrypt_backup_payload(&tampered_archive, passphrase).unwrap_err();
+    assert!(
+        tamper_err.contains("Backup authentication or decryption failed"),
+        "Tampered ciphertext must fail AEAD MAC authentication: {}",
+        tamper_err
+    );
+
+    // 4. Tampering failure injection: Mutate nonce prefix or salt in the header
+    let mut tampered_header = encrypted_archive.clone();
+    tampered_header[20] ^= 0xAA; // Flip salt bit
+    let header_err = authenticate_and_decrypt_backup_payload(&tampered_header, passphrase).unwrap_err();
+    assert!(
+        header_err.contains("Backup authentication or decryption failed"),
+        "Tampered salt/header must fail authentication: {}",
+        header_err
+    );
+
+    // 5. Wrong passphrase: AEAD decryption fails closed
+    let wrong_pass_err =
+        authenticate_and_decrypt_backup_payload(&encrypted_archive, "Wrong-Attacker-Passphrase-999!").unwrap_err();
+    assert!(
+        wrong_pass_err.contains("Backup authentication or decryption failed"),
+        "Wrong passphrase must fail authentication: {}",
+        wrong_pass_err
+    );
 }

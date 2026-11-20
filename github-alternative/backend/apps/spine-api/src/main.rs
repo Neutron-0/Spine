@@ -203,6 +203,40 @@ enum BackupCommands {
         #[arg(long, default_value_t = 2)]
         key_version: u16,
     },
+
+    /// Encrypt a file or stream into SPNEBAK v2 authenticated AEAD format (AES-256-GCM)
+    Encrypt {
+        /// Input plaintext file or archive path (use '-' for stdin)
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Output encrypted archive path (.spnebak, use '-' for stdout)
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Path to file containing AEAD encryption passphrase
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+
+        /// Key rotation version (default: 1)
+        #[arg(long, default_value_t = 1)]
+        key_version: u16,
+    },
+
+    /// Decrypt and authenticate a SPNEBAK v2 AEAD encrypted archive into plaintext
+    Decrypt {
+        /// Input encrypted archive path (.spnebak, use '-' for stdin)
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Output decrypted plaintext path (use '-' for stdout)
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Path to file containing AEAD encryption passphrase
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+    },
 }
 
 pub fn sanitize_db_url(raw: &str) -> String {
@@ -2009,6 +2043,112 @@ async fn main() -> anyhow::Result<()> {
                 println!(
                     "Key rotation completed successfully. New archive written to {}",
                     output.display()
+                );
+                Ok(())
+            }
+            BackupCommands::Encrypt {
+                input,
+                output,
+                passphrase_file,
+                key_version,
+            } => {
+                let pass = read_secret(
+                    None,
+                    passphrase_file.as_deref(),
+                    &["SPINE_BACKUP_PASSPHRASE", "BACKUP_PASSPHRASE"],
+                )?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Passphrase required for backup encryption (--passphrase-file or SPINE_BACKUP_PASSPHRASE)")
+                })?;
+
+                let is_stdin = input == std::path::Path::new("-");
+                let is_stdout = output == std::path::Path::new("-");
+
+                let mut reader: Box<dyn std::io::Read> = if is_stdin {
+                    Box::new(std::io::stdin())
+                } else {
+                    let f = std::fs::File::open(&input)
+                        .map_err(|e| anyhow::anyhow!("Failed to open input file {}: {}", input.display(), e))?;
+                    Box::new(std::io::BufReader::new(f))
+                };
+
+                let mut writer: Box<dyn std::io::Write> = if is_stdout {
+                    Box::new(std::io::stdout())
+                } else {
+                    let f = std::fs::File::create(&output)
+                        .map_err(|e| anyhow::anyhow!("Failed to create output file {}: {}", output.display(), e))?;
+                    Box::new(std::io::BufWriter::new(f))
+                };
+
+                eprintln!(
+                    "Encrypting {} into SPNEBAK v2 AEAD envelope (AES-256-GCM)...",
+                    if is_stdin { "stdin" } else { input.to_str().unwrap_or("file") }
+                );
+                let summary = spine_api::backup::v2::encrypt_stream(
+                    &mut reader,
+                    &mut writer,
+                    &pass,
+                    key_version,
+                    spine_api::backup::v2::DEFAULT_CHUNK_SIZE,
+                )
+                .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
+
+                eprintln!(
+                    "Encryption complete: {} plaintext bytes encrypted into {} chunks (hash: {})",
+                    summary.total_plaintext_bytes,
+                    summary.total_chunks,
+                    hex::encode(summary.stream_sha256)
+                );
+                Ok(())
+            }
+            BackupCommands::Decrypt {
+                input,
+                output,
+                passphrase_file,
+            } => {
+                let pass = read_secret(
+                    None,
+                    passphrase_file.as_deref(),
+                    &["SPINE_BACKUP_PASSPHRASE", "BACKUP_PASSPHRASE"],
+                )?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Passphrase required for backup decryption (--passphrase-file or SPINE_BACKUP_PASSPHRASE)")
+                })?;
+
+                let is_stdin = input == std::path::Path::new("-");
+                let is_stdout = output == std::path::Path::new("-");
+
+                let mut reader: Box<dyn std::io::Read> = if is_stdin {
+                    Box::new(std::io::stdin())
+                } else {
+                    let f = std::fs::File::open(&input)
+                        .map_err(|e| anyhow::anyhow!("Failed to open input file {}: {}", input.display(), e))?;
+                    Box::new(std::io::BufReader::new(f))
+                };
+
+                let mut writer: Box<dyn std::io::Write> = if is_stdout {
+                    Box::new(std::io::stdout())
+                } else {
+                    let f = std::fs::File::create(&output)
+                        .map_err(|e| anyhow::anyhow!("Failed to create output file {}: {}", output.display(), e))?;
+                    Box::new(std::io::BufWriter::new(f))
+                };
+
+                eprintln!(
+                    "Authenticating and decrypting SPNEBAK v2 archive (AES-256-GCM)..."
+                );
+                let summary = spine_api::backup::v2::decrypt_stream(
+                    &mut reader,
+                    &mut writer,
+                    &pass,
+                )
+                .map_err(|e| anyhow::anyhow!("Authentication or decryption failed: {}", e))?;
+
+                eprintln!(
+                    "Authentication and decryption verified [OK]: {} plaintext bytes verified in {} chunks (hash: {})",
+                    summary.total_plaintext_bytes,
+                    summary.total_chunks,
+                    hex::encode(summary.stream_sha256)
                 );
                 Ok(())
             }

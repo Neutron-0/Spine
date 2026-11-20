@@ -111,12 +111,13 @@ With active mutations drained and write permits rejected with HTTP 503, capture 
 > *(For optional cloud hypervisor volume snapshots such as AWS EBS / GCP PD, see Appendix A).*
 
 > [!SECURITY]
-> **POSIX File Permissions & At-Rest Encryption:**
-> All backup artifacts contain sensitive production data (PostgreSQL relational tables, SSH Ed25519 host private keys, and repository chunk stores).
-> - `scripts/backup_oob.sh` sets `umask 077` at initialization.
-> - The backup root and backup directory are created with mode `0700` (`rwx------`, owner-only).
-> - All generated archives and checksum manifests are enforced to mode `0600` (`rw-------`, owner-only).
-> - For off-host replication or remote archival, operators must encrypt backup archives with standard asymmetric encryption (e.g., `age -r <recipient-key>` or `gpg --encrypt`) before transit.
+> **Mandatory Authenticated AEAD Encryption (SPNEBAK v2):**
+> Under production deployment profile `core-forge-v1`, unencrypted plaintext backups containing PostgreSQL relational tables, SSH host private keys, and repository data are **strictly forbidden**.
+> - All backups must be authenticated and encrypted using the platform-supported **SPNEBAK v2** format (`AES-256-GCM`, 100,000 PBKDF2 iterations, per-chunk monotonic nonces, and authenticated manifest).
+> - `SPINE_BACKUP_PASSPHRASE` or `SPINE_BACKUP_PASSPHRASE_FILE` is mandatory.
+> - `scripts/backup_oob.sh` packages the multi-volume snapshot and encrypts it into `backup.spnebak`.
+> - All unencrypted intermediate archives and database dumps are purged immediately upon encryption.
+> - Restrictive permissions (`0700` directory, `0600` encrypted archive) are enforced.
 
 Execute the automated backup script:
 ```bash
@@ -124,6 +125,7 @@ Execute the automated backup script:
 export SPINE_API_URL="http://127.0.0.1:3000"
 export SPINE_ADMIN_TOKEN="<administrative-token>"
 export BACKUP_ROOT="/mnt/backups/spine"
+export SPINE_BACKUP_PASSPHRASE="<production-backup-passphrase>"
 
 ./scripts/backup_oob.sh
 ```
@@ -132,29 +134,38 @@ Or execute the canonical snapshot steps manually:
 ```bash
 umask 077
 BACKUP_DIR="/mnt/backups/spine/$(date +%Y%m%d_%H%M%S)_gen_${GENERATION_TOKEN}"
-mkdir -p "${BACKUP_DIR}"
-chmod 700 "${BACKUP_DIR}"
+STAGING_DIR="${BACKUP_DIR}/.staging"
+mkdir -p "${STAGING_DIR}"
+chmod 700 "${BACKUP_DIR}" "${STAGING_DIR}"
 
 # 0. Record target fencing generation token
-echo "${GENERATION_TOKEN}" > "${BACKUP_DIR}/FENCING_GENERATION"
+echo "${GENERATION_TOKEN}" > "${STAGING_DIR}/FENCING_GENERATION"
 
 # 1. Database snapshot via compose
-docker compose -f docker-compose.prod.yml exec -T postgres pg_dumpall -U spine_admin | gzip > "${BACKUP_DIR}/postgres_dump.sql.gz"
+docker compose -f docker-compose.prod.yml exec -T postgres pg_dumpall -U spine_admin | gzip > "${STAGING_DIR}/postgres_dump.sql.gz"
 
 # 2. Coordinator state
-docker compose -f docker-compose.prod.yml exec -T coordinator tar -czf - -C /var/lib/spine . > "${BACKUP_DIR}/coordinator.tar.gz"
+docker compose -f docker-compose.prod.yml exec -T coordinator tar -czf - -C /var/lib/spine . > "${STAGING_DIR}/coordinator.tar.gz"
 
 # 3. Storage node volumes
 for NODE in 1 2 3; do
-  docker compose -f docker-compose.prod.yml exec -T "storage-node-${NODE}" tar -czf - -C "/var/lib/spine/node-${NODE}" . > "${BACKUP_DIR}/storage_node_${NODE}.tar.gz"
+  docker compose -f docker-compose.prod.yml exec -T "storage-node-${NODE}" tar -czf - -C "/var/lib/spine/node-${NODE}" . > "${STAGING_DIR}/storage_node_${NODE}.tar.gz"
 done
 
 # 4. Host SSH keys & API storage
-docker compose -f docker-compose.prod.yml exec -T spine-api tar -czf - -C /var/lib/spine/ssh . > "${BACKUP_DIR}/spine_ssh.tar.gz"
-docker compose -f docker-compose.prod.yml exec -T spine-api tar -czf - -C /var/lib/spine/storage . > "${BACKUP_DIR}/spine_storage.tar.gz"
+docker compose -f docker-compose.prod.yml exec -T spine-api tar -czf - -C /var/lib/spine/ssh . > "${STAGING_DIR}/spine_ssh.tar.gz"
+docker compose -f docker-compose.prod.yml exec -T spine-api tar -czf - -C /var/lib/spine/storage . > "${STAGING_DIR}/spine_storage.tar.gz"
 
-# 5. Checksum manifest & permission enforcement
-cd "${BACKUP_DIR}" && sha256sum * > SHA256SUMS
+# 5. Checksum manifest of captured participants
+(cd "${STAGING_DIR}" && sha256sum * > SHA256SUMS)
+
+# 6. Authenticated AEAD Encryption (SPNEBAK v2)
+tar -czf "${BACKUP_DIR}/.plaintext_bundle.tar.gz" -C "${STAGING_DIR}" .
+spine-api backup encrypt --input "${BACKUP_DIR}/.plaintext_bundle.tar.gz" --output "${BACKUP_DIR}/backup.spnebak"
+
+# 7. Securely purge unencrypted plaintext staging data
+rm -rf "${BACKUP_DIR}/.plaintext_bundle.tar.gz" "${STAGING_DIR}"
+(cd "${BACKUP_DIR}" && sha256sum backup.spnebak > SHA256SUMS)
 chmod 600 "${BACKUP_DIR}"/*
 chmod 700 "${BACKUP_DIR}"
 ```
@@ -176,6 +187,39 @@ curl -s -f http://127.0.0.1:3000/health/ready || echo "Cluster not ready!"
 ## 5. Point-in-Time Out-of-Band Disaster Recovery Procedure
 
 Follow these steps to restore a Spine Forge cluster from an out-of-band snapshot archive (or execute `./scripts/restore_oob.sh <path-to-backup-dir>`).
+
+### Step 0: Authenticate, Decrypt & Validate Archive (SPNEBAK v2 AEAD Envelope)
+
+All out-of-band backups are stored encrypted using Spine's authenticated backup envelope (`SPNEBAK v2` AES-256-GCM AEAD, 100,000 PBKDF2 iterations). Before stopping services or modifying storage volumes, the incoming archive must be validated and authenticated fail-closed.
+
+1. **Verify Envelope Magic & Integrity (Fail-Closed Gate):**
+   ```bash
+   # Check envelope header magic
+   MAGIC=$(head -c 8 "${BACKUP_DIR}/backup.spnebak" 2>/dev/null || true)
+   if [ "${MAGIC}" != "SPNEBAK"$'\x02' ]; then
+     echo "FATAL: Archive is not an authenticated SPNEBAK v2 backup. Aborting restore."
+     exit 1
+   fi
+
+   # Verify backup checksum
+   (cd "${BACKUP_DIR}" && sha256sum -c SHA256SUMS)
+   ```
+
+2. **Authenticate & Decrypt to Private Staging Directory:**
+   ```bash
+   DECRYPT_DIR="${BACKUP_DIR}/.decrypted_payload_$(date +%s)"
+   mkdir -m 0700 -p "${DECRYPT_DIR}"
+
+   export SPINE_BACKUP_PASSPHRASE  # or provide via SPINE_BACKUP_PASSPHRASE_FILE
+   spine-api backup decrypt --input "${BACKUP_DIR}/backup.spnebak" --output "${DECRYPT_DIR}/payload.tar.gz"
+   tar -xzf "${DECRYPT_DIR}/payload.tar.gz" -C "${DECRYPT_DIR}"
+   rm -f "${DECRYPT_DIR}/payload.tar.gz"
+
+   # Verify inner payload SHA256SUMS
+   (cd "${DECRYPT_DIR}" && sha256sum -c SHA256SUMS)
+   ```
+   > [!IMPORTANT]
+   > Any AEAD authentication tag failure, ciphertext corruption, wrong passphrase, or checksum mismatch aborts restore immediately at Step 0 with zero services stopped and zero storage volumes touched.
 
 ### Step 1: Quiesce Traffic, Stop Containers & Verify Full Quiescence
 
@@ -207,10 +251,11 @@ To prevent old deleted files from persisting after restore, target volumes are n
 > **Automatic Fail-Closed Rollback Handler (`scripts/restore_oob.sh`):**
 > If an unrecoverable failure occurs during volume extraction, post-restore verification, or service startup:
 > 1. `scripts/restore_oob.sh` executes `rollback_volumes()` automatically via bash trap (`EXIT ERR INT TERM`).
-> 2. Rollback extraction commands run **without error suppression** and stream visible output.
-> 3. Following extraction, every volume is checked for critical marker files (`.coordinator_fencing_generation`, `.fencing_generation`, `PG_VERSION`).
-> 4. If any rollback step fails, `restore_oob.sh` logs a `CRITICAL FATAL` alert identifying the failed volume, **strictly leaves all cluster services stopped**, and exits with code 2. It will NEVER report rollback success unless all 7 volumes are confirmed restored and verified.
-> 5. Staged rollback archives in `${ROLLBACK_DIR}` are retained intact for operator emergency triage.
+> 2. **Mandatory Quiescence Verification Before Rollback Extraction:** The handler executes `docker compose stop` without error suppression and verifies that all services are stopped (`RUNNING=0`). If any container is running or refuses to stop, rollback extraction is strictly aborted (`ROLLBACK_FAILED=1`), leaving all volumes untouched and cluster stopped to prevent data tearing.
+> 3. Rollback extraction commands run **without error suppression** and stream visible output.
+> 4. Following extraction, every volume is checked for critical marker files (`.coordinator_fencing_generation`, `.fencing_generation`, `PG_VERSION`).
+> 5. If any rollback step fails or fewer than all 7 participants are verified, `restore_oob.sh` logs a `CRITICAL FATAL` alert identifying the failure, **strictly leaves all cluster services stopped**, and exits with code 2. It will NEVER report rollback success unless all 7 volumes are confirmed restored and verified.
+> 6. Staged rollback archives in `${ROLLBACK_DIR}` are retained intact for operator emergency triage.
 
 1. **Phase 2a: Mandatory Pre-Restore Archiving & Integrity Verification (Volumes Untouched):**
    ```bash
@@ -252,19 +297,19 @@ To prevent old deleted files from persisting after restore, target volumes are n
        -c "rm -rf /var/lib/spine/node-${NODE}/.staged_restore_* /var/lib/spine/node-${NODE}/.old_restore_* 2>/dev/null || true"
    done
 
-   # Empty target volumes and extract incoming backup cleanly
+   # Empty target volumes and extract incoming backup cleanly from authenticated decrypted payload
    docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh coordinator \
-     -c "rm -rf /var/lib/spine/* /var/lib/spine/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine" < "${BACKUP_DIR}/coordinator.tar.gz"
+     -c "rm -rf /var/lib/spine/* /var/lib/spine/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine" < "${DECRYPT_DIR}/coordinator.tar.gz"
 
    for NODE in 1 2 3; do
      docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
-       -c "rm -rf /var/lib/spine/node-${NODE}/* /var/lib/spine/node-${NODE}/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine/node-${NODE}" < "${BACKUP_DIR}/storage_node_${NODE}.tar.gz"
+       -c "rm -rf /var/lib/spine/node-${NODE}/* /var/lib/spine/node-${NODE}/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine/node-${NODE}" < "${DECRYPT_DIR}/storage_node_${NODE}.tar.gz"
    done
 
    docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh spine-api \
-     -c "rm -rf /var/lib/spine/ssh/* /var/lib/spine/ssh/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine/ssh" < "${BACKUP_DIR}/spine_ssh.tar.gz"
+     -c "rm -rf /var/lib/spine/ssh/* /var/lib/spine/ssh/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine/ssh" < "${DECRYPT_DIR}/spine_ssh.tar.gz"
    docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh spine-api \
-     -c "rm -rf /var/lib/spine/storage/* /var/lib/spine/storage/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine/storage" < "${BACKUP_DIR}/spine_storage.tar.gz"
+     -c "rm -rf /var/lib/spine/storage/* /var/lib/spine/storage/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine/storage" < "${DECRYPT_DIR}/spine_storage.tar.gz"
    ```
 
 ### Step 3: Automated Fail-Closed Fencing Generation Verification
@@ -272,7 +317,7 @@ To prevent old deleted files from persisting after restore, target volumes are n
 Run the automated verification script to confirm that all nodes match the target generation token directly inside their respective volumes. **Execution will abort immediately with exit code 1 if any node diverges.**
 
 ```bash
-TARGET_GEN=$(cat "${BACKUP_DIR}/FENCING_GENERATION" | tr -d '[:space:]')
+TARGET_GEN=$(cat "${DECRYPT_DIR}/FENCING_GENERATION" | tr -d '[:space:]')
 FAILED=0
 
 COORD_GEN=$(docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint cat coordinator \
@@ -337,7 +382,7 @@ done
 1. **Preserve Existing PostgreSQL Data to External Rollback Dir & Clear PGDATA:**
    ```bash
    docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint tar postgres \
-     -czf - -C /var/lib/postgresql/data . > "${ROLLBACK_DIR}/postgres_data.tar.gz" || true
+     -czf - -C /var/lib/postgresql/data . > "${ROLLBACK_DIR}/postgres_data.tar.gz"
    docker compose -f docker-compose.prod.yml run --rm --no-deps --entrypoint sh postgres \
      -c "rm -rf /var/lib/postgresql/data/* /var/lib/postgresql/data/.[!.]* 2>/dev/null || true"
    ```
@@ -357,7 +402,7 @@ done
    ```
 4. **Restore Database SQL Dump (with ON_ERROR_STOP=1 & Idempotent Role Adaptation):**
    ```bash
-   gzip -dc "${BACKUP_DIR}/postgres_dump.sql.gz" | \
+   gzip -dc "${DECRYPT_DIR}/postgres_dump.sql.gz" | \
      sed -E 's/^CREATE ROLE ([^;]+);/DO \$\$ BEGIN CREATE ROLE \1; EXCEPTION WHEN duplicate_object THEN NULL; END \$\$;/' | \
      docker compose -f docker-compose.prod.yml exec -T postgres \
      psql -v ON_ERROR_STOP=1 -U spine_admin -d postgres
