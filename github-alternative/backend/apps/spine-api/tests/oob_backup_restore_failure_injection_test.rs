@@ -1774,6 +1774,15 @@ verify_off_site_replication_policy() {
       ;;
   esac
 
+  case "${SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE:-0}" in
+    0|1|false|true)
+      ;;
+    *)
+      echo "FATAL: Invalid SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE value: '${SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE}'" >&2
+      exit 1
+      ;;
+  esac
+
   if [ -n "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
     case "${SPINE_BACKUP_OBJECT_LOCK_MODE}" in
       GOVERNANCE|COMPLIANCE)
@@ -1789,6 +1798,15 @@ verify_off_site_replication_policy() {
         fi
         ;;
       ""|NONE)
+        if [ "${SPINE_BACKUP_REQUIRE_REMOTE}" = "1" ] || [ "${SPINE_BACKUP_REQUIRE_REMOTE}" = "true" ]; then
+          if [ "${SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE:-0}" != "1" ] && [ "${SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE:-0}" != "true" ]; then
+            echo "FATAL: S3 Object Lock retention is MANDATORY when off-site replication is enforced." >&2
+            exit 1
+          fi
+          echo "NON-PRODUCTION WARNING: S3 Object Lock retention is explicitly bypassed via SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=1."
+        else
+          echo "NOTICE: S3 Object Lock retention is not configured."
+        fi
         ;;
       *)
         echo "FATAL: Unsupported SPINE_BACKUP_OBJECT_LOCK_MODE: '${SPINE_BACKUP_OBJECT_LOCK_MODE}'" >&2
@@ -1802,6 +1820,7 @@ verify_off_site_replication_policy() {
 export SPINE_BACKUP_REMOTE_S3_URI="s3://test-bucket/backups"
 export SPINE_BACKUP_OBJECT_LOCK_MODE="GOVERNANCE"
 export SPINE_BACKUP_RETENTION_DAYS="30"
+export SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=0
 
 for invalid_val in "yes" "no" "2" "True" "maybe" " " "disabled" "enabled"; do
   export SPINE_BACKUP_REQUIRE_REMOTE="${invalid_val}"
@@ -1822,6 +1841,25 @@ for bad_mode in "TEMPORARY" "STANDARD" "governance" "compliance" "INVALID" "1" "
   fi
   grep -q "FATAL: Unsupported SPINE_BACKUP_OBJECT_LOCK_MODE" "${WORK_DIR}/mode_err.log"
 done
+
+# 3. Production mode (REQUIRE_REMOTE=1) rejects disabled Object Lock without explicit override
+export SPINE_BACKUP_REQUIRE_REMOTE="1"
+export SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=0
+for disabled_lock in "" "NONE"; do
+  export SPINE_BACKUP_OBJECT_LOCK_MODE="${disabled_lock}"
+  if ( verify_off_site_replication_policy 2>"${WORK_DIR}/prod_unlocked_err.log" ); then
+    echo "FAIL: Production mode accepted disabled Object Lock without override!" >&2
+    exit 3
+  fi
+  grep -q "FATAL: S3 Object Lock retention is MANDATORY" "${WORK_DIR}/prod_unlocked_err.log"
+done
+
+# 4. Explicit non-production override permits disabled Object Lock
+export SPINE_BACKUP_REQUIRE_REMOTE="1"
+export SPINE_BACKUP_OBJECT_LOCK_MODE="NONE"
+export SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=1
+verify_off_site_replication_policy > "${WORK_DIR}/override.log"
+grep -q "NON-PRODUCTION WARNING" "${WORK_DIR}/override.log"
 
 rm -rf "${WORK_DIR}"
 exit 0
@@ -1963,7 +2001,7 @@ MOCK_S3="${WORK_DIR}/s3"
 mkdir -p "${MOCK_S3}"
 
 # Configurable mock behavior
-export MOCK_RETENTION_BEHAVIOR="absent" # "absent", "mismatched", "valid"
+export MOCK_RETENTION_BEHAVIOR="absent_config"
 
 cat <<EOF > "${MOCK_BIN}/aws"
 #!/usr/bin/env bash
@@ -1985,16 +2023,36 @@ elif [ "\$1" = "s3" ] && [ "\$2" = "ls" ]; then
   exit 0
 elif [ "\$1" = "s3api" ] && [ "\$2" = "get-object-retention" ]; then
   case "\${MOCK_RETENTION_BEHAVIOR}" in
-    "absent")
+    "absent_config")
       echo "An error occurred (NoSuchObjectLockConfiguration) when calling the GetObjectRetention operation: The specified object does not have a ObjectLock configuration" >&2
       exit 1
       ;;
-    "mismatched")
-      echo '{"Retention": {"Mode": "COMPLIANCE", "RetainUntilDate": "2026-12-20T12:00:00.000Z"}}'
+    "absent_date")
+      echo '{"Retention": {"Mode": "GOVERNANCE"}}'
+      exit 0
+      ;;
+    "malformed_date")
+      echo '{"Retention": {"Mode": "GOVERNANCE", "RetainUntilDate": "malformed_not_a_date"}}'
+      exit 0
+      ;;
+    "expired_date")
+      echo '{"Retention": {"Mode": "GOVERNANCE", "RetainUntilDate": "2020-01-01T00:00:00.000Z"}}'
+      exit 0
+      ;;
+    "too_short_date")
+      # Compute 1 day in the future (far shorter than 30 days configured)
+      SHORT_DATE=\$(date -u -d "+1 day" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -v "+1d" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "2026-11-21T12:00:00Z")
+      echo "{\"Retention\": {\"Mode\": \"GOVERNANCE\", \"RetainUntilDate\": \"\${SHORT_DATE}\"}}"
+      exit 0
+      ;;
+    "mismatched_mode")
+      VALID_DATE=\$(date -u -d "+35 days" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -v "+35d" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "2027-01-01T12:00:00Z")
+      echo "{\"Retention\": {\"Mode\": \"COMPLIANCE\", \"RetainUntilDate\": \"\${VALID_DATE}\"}}"
       exit 0
       ;;
     "valid")
-      echo '{"Retention": {"Mode": "GOVERNANCE", "RetainUntilDate": "2026-12-20T12:00:00.000Z"}}'
+      VALID_DATE=\$(date -u -d "+35 days" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -v "+35d" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "2027-01-01T12:00:00Z")
+      echo "{\"Retention\": {\"Mode\": \"GOVERNANCE\", \"RetainUntilDate\": \"\${VALID_DATE}\"}}"
       exit 0
       ;;
     *)
@@ -2006,6 +2064,30 @@ EOF
 chmod +x "${MOCK_BIN}/aws"
 export PATH="${MOCK_BIN}:${PATH}"
 
+iso_to_epoch() {
+  local iso_str="${1:-}"
+  if [ -z "${iso_str}" ]; then
+    return 0
+  fi
+  local clean_str
+  clean_str=$(echo "${iso_str}" | sed -E 's/\.[0-9]+Z$/Z/')
+  if ! [[ "${clean_str}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]]; then
+    return 0
+  fi
+  local epoch=""
+  epoch=$(date -u -d "${clean_str}" +%s 2>/dev/null || true)
+  if [ -z "${epoch}" ]; then
+    epoch=$(date -u -d "${iso_str}" +%s 2>/dev/null || true)
+  fi
+  if [ -z "${epoch}" ]; then
+    epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "${clean_str}" +%s 2>/dev/null || true)
+  fi
+  if [ -z "${epoch}" ]; then
+    epoch=$(python3 -c "import datetime, sys; s = sys.argv[1].replace('Z', '+00:00'); print(int(datetime.datetime.fromisoformat(s).timestamp()))" "${iso_str}" 2>/dev/null || true)
+  fi
+  printf "%s" "${epoch}"
+}
+
 LOCAL_FILE="${WORK_DIR}/backup.spnebak"
 echo "AUTHENTICATED_SPNEBAK_DATA_CONTENT" > "${LOCAL_FILE}"
 REMOTE_TARGET="s3://test-vault/spine/backup_test"
@@ -2013,6 +2095,17 @@ REMOTE_TARGET="s3://test-vault/spine/backup_test"
 run_retention_confirmation_gate() {
   local mode="$1"
   local apply_lock="$2"
+  local require_remote="${3:-1}"
+  local allow_unlocked="${4:-0}"
+  local retention_days="${5:-30}"
+
+  # Production mode requires Object Lock unless explicit override is given
+  if [ "${require_remote}" = "1" ] && [ "${apply_lock}" -eq 0 ]; then
+    if [ "${allow_unlocked}" != "1" ] && [ "${allow_unlocked}" != "true" ]; then
+      echo "FATAL: S3 Object Lock retention is mandatory for production remote backups." >&2
+      exit 1
+    fi
+  fi
 
   NO_SCHEME="${REMOTE_TARGET#s3://}"
   S3_BUCKET="${NO_SCHEME%%/*}"
@@ -2028,12 +2121,41 @@ run_retention_confirmation_gate() {
     REMOTE_LOCK_MODE=$(echo "${RETENTION_OUTPUT}" | grep -o '"Mode"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -E 's/.*"Mode"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/' || echo "")
     REMOTE_RETAIN_UNTIL=$(echo "${RETENTION_OUTPUT}" | grep -o '"RetainUntilDate"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -E 's/.*"RetainUntilDate"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/' || echo "")
 
+    # 1. Mode match
     if [ -z "${REMOTE_LOCK_MODE}" ] || [ "${REMOTE_LOCK_MODE}" != "${mode}" ]; then
       echo "FATAL: S3 Object Lock retention verification failed for ${REMOTE_TARGET}/backup.spnebak!" >&2
       echo "  Expected lock mode:   ${mode}" >&2
       echo "  Observed lock mode:   ${REMOTE_LOCK_MODE:-<absent>}" >&2
       exit 1
     fi
+
+    # 2. Date presence
+    if [ -z "${REMOTE_RETAIN_UNTIL}" ]; then
+      echo "FATAL: S3 Object Lock retention verification failed: RetainUntilDate is missing from remote object metadata." >&2
+      exit 1
+    fi
+
+    # 3. Date validity & epoch parsing
+    REMOTE_EPOCH=$(iso_to_epoch "${REMOTE_RETAIN_UNTIL}")
+    if [ -z "${REMOTE_EPOCH}" ]; then
+      echo "FATAL: S3 Object Lock retention verification failed: RetainUntilDate '${REMOTE_RETAIN_UNTIL}' is malformed or unparseable." >&2
+      exit 1
+    fi
+
+    NOW_EPOCH=$(date +%s)
+    # 4. Expired check
+    if [ "${REMOTE_EPOCH}" -le "${NOW_EPOCH}" ]; then
+      echo "FATAL: S3 Object Lock retention verification failed: RetainUntilDate '${REMOTE_RETAIN_UNTIL}' (epoch: ${REMOTE_EPOCH}) is expired or in the past (current epoch: ${NOW_EPOCH})." >&2
+      exit 1
+    fi
+
+    # 5. Too-short date check against configured retention window (300s clock skew buffer)
+    MIN_REQUIRED_EPOCH=$(( NOW_EPOCH + (retention_days * 86400) - 300 ))
+    if [ "${REMOTE_EPOCH}" -lt "${MIN_REQUIRED_EPOCH}" ]; then
+      echo "FATAL: S3 Object Lock retention verification failed: RetainUntilDate '${REMOTE_RETAIN_UNTIL}' is earlier than the configured retention period of ${retention_days} days." >&2
+      exit 1
+    fi
+
     echo "Remote replication cryptographically verified [OK] (immutable retention active: ${REMOTE_LOCK_MODE} until ${REMOTE_RETAIN_UNTIL})."
   else
     echo "Remote replication cryptographically verified [OK] (standard replication without Object Lock)."
@@ -2043,37 +2165,76 @@ run_retention_confirmation_gate() {
 # Upload local file
 aws s3 cp "${LOCAL_FILE}" "${REMOTE_TARGET}/backup.spnebak"
 
-# Scenario A: Object Lock metadata absent -> must FAIL CLOSED and NOT report retention active
-export MOCK_RETENTION_BEHAVIOR="absent"
+# 1. Object Lock configuration absent -> must FAIL CLOSED
+export MOCK_RETENTION_BEHAVIOR="absent_config"
 if ( run_retention_confirmation_gate "GOVERNANCE" 1 2>"${WORK_DIR}/absent.err" ); then
-  echo "FAIL: Gate succeeded despite absent retention metadata!" >&2
+  echo "FAIL: Gate succeeded despite absent retention configuration!" >&2
   exit 1
 fi
 grep -q "FATAL: S3 Object Lock retention verification failed" "${WORK_DIR}/absent.err"
 if grep -q "immutable retention active" "${WORK_DIR}/absent.err"; then
-  echo "FAIL: Erroneously reported immutable retention active when absent!" >&2
+  echo "FAIL: Erroneously reported immutable retention active when configuration absent!" >&2
   exit 2
 fi
 
-# Scenario B: Object Lock metadata mode mismatched (expected GOVERNANCE, got COMPLIANCE) -> must FAIL CLOSED
-export MOCK_RETENTION_BEHAVIOR="mismatched"
+# 2. RetainUntilDate missing -> must FAIL CLOSED
+export MOCK_RETENTION_BEHAVIOR="absent_date"
+if ( run_retention_confirmation_gate "GOVERNANCE" 1 2>"${WORK_DIR}/absent_date.err" ); then
+  echo "FAIL: Gate succeeded despite missing RetainUntilDate!" >&2
+  exit 3
+fi
+grep -q "RetainUntilDate is missing" "${WORK_DIR}/absent_date.err"
+
+# 3. RetainUntilDate malformed -> must FAIL CLOSED
+export MOCK_RETENTION_BEHAVIOR="malformed_date"
+if ( run_retention_confirmation_gate "GOVERNANCE" 1 2>"${WORK_DIR}/malformed_date.err" ); then
+  echo "FAIL: Gate succeeded despite malformed RetainUntilDate!" >&2
+  exit 4
+fi
+grep -q "malformed or unparseable" "${WORK_DIR}/malformed_date.err"
+
+# 4. RetainUntilDate expired -> must FAIL CLOSED
+export MOCK_RETENTION_BEHAVIOR="expired_date"
+if ( run_retention_confirmation_gate "GOVERNANCE" 1 2>"${WORK_DIR}/expired_date.err" ); then
+  echo "FAIL: Gate succeeded despite expired RetainUntilDate!" >&2
+  exit 5
+fi
+grep -q "is expired or in the past" "${WORK_DIR}/expired_date.err"
+
+# 5. RetainUntilDate too short (e.g. 1 day vs 30 days) -> must FAIL CLOSED
+export MOCK_RETENTION_BEHAVIOR="too_short_date"
+if ( run_retention_confirmation_gate "GOVERNANCE" 1 2>"${WORK_DIR}/too_short.err" ); then
+  echo "FAIL: Gate succeeded despite too-short RetainUntilDate!" >&2
+  exit 6
+fi
+grep -q "is earlier than the configured retention period" "${WORK_DIR}/too_short.err"
+
+# 6. Mode mismatch (expected GOVERNANCE, got COMPLIANCE) -> must FAIL CLOSED
+export MOCK_RETENTION_BEHAVIOR="mismatched_mode"
 if ( run_retention_confirmation_gate "GOVERNANCE" 1 2>"${WORK_DIR}/mismatch.err" ); then
   echo "FAIL: Gate succeeded despite mode mismatch!" >&2
-  exit 3
+  exit 7
 fi
 grep -q "FATAL: S3 Object Lock retention verification failed" "${WORK_DIR}/mismatch.err"
 
-# Scenario C: Object Lock metadata confirmed -> succeeds and confirms active retention
+# 7. Confirmed valid metadata meeting retention window -> SUCCEEDS
 export MOCK_RETENTION_BEHAVIOR="valid"
 OUT=$(run_retention_confirmation_gate "GOVERNANCE" 1)
-echo "${OUT}" | grep -q "immutable retention active: GOVERNANCE until 2026-12-20T12:00:00.000Z"
+echo "${OUT}" | grep -q "immutable retention active: GOVERNANCE until"
 
-# Scenario D: Object Lock not applied (standard replication) -> succeeds and does NOT claim immutable retention
-OUT_NO_LOCK=$(run_retention_confirmation_gate "" 0)
-echo "${OUT_NO_LOCK}" | grep -q "standard replication without Object Lock"
-if echo "${OUT_NO_LOCK}" | grep -q "immutable retention active"; then
-  echo "FAIL: Claimed immutable retention active on non-lock backup!" >&2
-  exit 4
+# 8. Production mode with Object Lock omitted WITHOUT override -> must FAIL CLOSED
+if ( run_retention_confirmation_gate "" 0 1 0 2>"${WORK_DIR}/prod_unlocked.err" ); then
+  echo "FAIL: Production mode accepted omitted Object Lock without override!" >&2
+  exit 8
+fi
+grep -q "FATAL: S3 Object Lock retention is mandatory for production" "${WORK_DIR}/prod_unlocked.err"
+
+# 9. Production mode with Object Lock omitted WITH explicit non-production override -> SUCCEEDS without claiming immutable retention
+OUT_OVERRIDE=$(run_retention_confirmation_gate "" 0 1 1)
+echo "${OUT_OVERRIDE}" | grep -q "standard replication without Object Lock"
+if echo "${OUT_OVERRIDE}" | grep -q "immutable retention active"; then
+  echo "FAIL: Claimed immutable retention active under non-lock override!" >&2
+  exit 9
 fi
 
 rm -rf "${WORK_DIR}"

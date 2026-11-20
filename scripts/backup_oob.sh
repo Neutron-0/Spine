@@ -18,6 +18,7 @@ SPINE_BACKUP_REMOTE_S3_URI="${SPINE_BACKUP_REMOTE_S3_URI:-}"
 SPINE_BACKUP_REQUIRE_REMOTE="${SPINE_BACKUP_REQUIRE_REMOTE:-${SPINE_BACKUP_REQUIRE_OFF_SITE:-1}}"
 SPINE_BACKUP_OBJECT_LOCK_MODE="${SPINE_BACKUP_OBJECT_LOCK_MODE:-GOVERNANCE}"
 SPINE_BACKUP_RETENTION_DAYS="${SPINE_BACKUP_RETENTION_DAYS:-30}"
+SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE="${SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE:-0}"
 SPINE_S3_ENDPOINT_URL="${SPINE_S3_ENDPOINT_URL:-}"
 
 if [ -z "${SPINE_ADMIN_TOKEN}" ]; then
@@ -110,6 +111,30 @@ compute_retain_until_date() {
   printf "%s" "${d}"
 }
 
+iso_to_epoch() {
+  local iso_str="${1:-}"
+  if [ -z "${iso_str}" ]; then
+    return 0
+  fi
+  local clean_str
+  clean_str=$(echo "${iso_str}" | sed -E 's/\.[0-9]+Z$/Z/')
+  if ! [[ "${clean_str}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]]; then
+    return 0
+  fi
+  local epoch=""
+  epoch=$(date -u -d "${clean_str}" +%s 2>/dev/null || true)
+  if [ -z "${epoch}" ]; then
+    epoch=$(date -u -d "${iso_str}" +%s 2>/dev/null || true)
+  fi
+  if [ -z "${epoch}" ]; then
+    epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "${clean_str}" +%s 2>/dev/null || true)
+  fi
+  if [ -z "${epoch}" ]; then
+    epoch=$(python3 -c "import datetime, sys; s = sys.argv[1].replace('Z', '+00:00'); print(int(datetime.datetime.fromisoformat(s).timestamp()))" "${iso_str}" 2>/dev/null || true)
+  fi
+  printf "%s" "${epoch}"
+}
+
 verify_off_site_replication_policy() {
   echo "=== Verifying Off-Site Replication Policy ==="
   case "${SPINE_BACKUP_REQUIRE_REMOTE}" in
@@ -145,6 +170,18 @@ verify_off_site_replication_policy() {
       ;;
   esac
 
+  case "${SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE}" in
+    0|1|false|true)
+      ;;
+    *)
+      echo "================================================================================" >&2
+      echo "FATAL: Invalid SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE value: '${SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE}'" >&2
+      echo "Must be strictly '0', '1', 'false', or 'true'." >&2
+      echo "================================================================================" >&2
+      exit 1
+      ;;
+  esac
+
   # Validate remote retention configuration whenever S3 replication is configured
   if [ -n "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
     case "${SPINE_BACKUP_OBJECT_LOCK_MODE}" in
@@ -164,12 +201,32 @@ verify_off_site_replication_policy() {
         echo "S3 Object Lock retention policy verified: mode=${SPINE_BACKUP_OBJECT_LOCK_MODE}, days=${SPINE_BACKUP_RETENTION_DAYS} (sample retain-until: ${test_date})."
         ;;
       ""|NONE)
-        echo "NOTICE: S3 Object Lock retention is not configured (SPINE_BACKUP_OBJECT_LOCK_MODE='${SPINE_BACKUP_OBJECT_LOCK_MODE}')."
+        if [ "${SPINE_BACKUP_REQUIRE_REMOTE}" = "1" ] || [ "${SPINE_BACKUP_REQUIRE_REMOTE}" = "true" ]; then
+          if [ "${SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE}" != "1" ] && [ "${SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE}" != "true" ]; then
+            echo "================================================================================" >&2
+            echo "FATAL: S3 Object Lock retention is MANDATORY when off-site replication is enforced" >&2
+            echo "(SPINE_BACKUP_REQUIRE_REMOTE=${SPINE_BACKUP_REQUIRE_REMOTE}), but SPINE_BACKUP_OBJECT_LOCK_MODE is disabled ('${SPINE_BACKUP_OBJECT_LOCK_MODE}')." >&2
+            echo "Under production profile 'core-forge-v1', backups must be replicated to an" >&2
+            echo "off-host object store with Object Lock retention (GOVERNANCE or COMPLIANCE) to" >&2
+            echo "guarantee immutability and survive total host compromise or ransomware." >&2
+            echo "To explicitly allow un-locked remote replication for non-production testing, set" >&2
+            echo "SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=1." >&2
+            echo "================================================================================" >&2
+            exit 1
+          fi
+          echo "================================================================================"
+          echo "NON-PRODUCTION WARNING: S3 Object Lock retention is explicitly bypassed via"
+          echo "SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=1 while SPINE_BACKUP_REQUIRE_REMOTE=${SPINE_BACKUP_REQUIRE_REMOTE}."
+          echo "OPERATIONAL RISK: Remote archives are not immutable and can be overwritten or deleted."
+          echo "================================================================================"
+        else
+          echo "NOTICE: S3 Object Lock retention is not configured (SPINE_BACKUP_OBJECT_LOCK_MODE='${SPINE_BACKUP_OBJECT_LOCK_MODE}')."
+        fi
         ;;
       *)
         echo "================================================================================" >&2
         echo "FATAL: Unsupported SPINE_BACKUP_OBJECT_LOCK_MODE: '${SPINE_BACKUP_OBJECT_LOCK_MODE}'" >&2
-        echo "Supported S3 Object Lock modes are strictly 'GOVERNANCE' or 'COMPLIANCE' (or ''/NONE to disable)." >&2
+        echo "Supported S3 Object Lock modes are strictly 'GOVERNANCE' or 'COMPLIANCE' (or ''/NONE to disable with non-production override)." >&2
         echo "================================================================================" >&2
         exit 1
         ;;
@@ -454,7 +511,14 @@ if [ -n "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
     echo "Applying S3 Object Lock retention: mode=${SPINE_BACKUP_OBJECT_LOCK_MODE}, retain_until=${RETAIN_UNTIL} (${SPINE_BACKUP_RETENTION_DAYS} days)"
     UPLOAD_ARGS+=(--object-lock-mode "${SPINE_BACKUP_OBJECT_LOCK_MODE}" --object-lock-retain-until-date "${RETAIN_UNTIL}")
     APPLY_OBJECT_LOCK=1
-  elif [ -n "${SPINE_BACKUP_OBJECT_LOCK_MODE}" ] && [ "${SPINE_BACKUP_OBJECT_LOCK_MODE}" != "NONE" ]; then
+  elif [ "${SPINE_BACKUP_OBJECT_LOCK_MODE}" = "" ] || [ "${SPINE_BACKUP_OBJECT_LOCK_MODE}" = "NONE" ]; then
+    if [ "${SPINE_BACKUP_REQUIRE_REMOTE}" = "1" ] || [ "${SPINE_BACKUP_REQUIRE_REMOTE}" = "true" ]; then
+      if [ "${SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE}" != "1" ] && [ "${SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE}" != "true" ]; then
+        echo "FATAL: S3 Object Lock retention is mandatory for production remote backups." >&2
+        exit 1
+      fi
+    fi
+  else
     echo "FATAL: Unsupported SPINE_BACKUP_OBJECT_LOCK_MODE: '${SPINE_BACKUP_OBJECT_LOCK_MODE}'. Must be 'GOVERNANCE' or 'COMPLIANCE'." >&2
     exit 1
   fi
@@ -517,7 +581,43 @@ if [ -n "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
       exit 1
     fi
 
-    echo "Remote Object Lock metadata verified: mode=${REMOTE_LOCK_MODE}, retain_until=${REMOTE_RETAIN_UNTIL}."
+    if [ -z "${REMOTE_RETAIN_UNTIL}" ]; then
+      echo "================================================================================" >&2
+      echo "FATAL: S3 Object Lock retention verification failed: RetainUntilDate is missing from remote object metadata." >&2
+      echo "  s3api raw response:   ${RETENTION_OUTPUT}" >&2
+      echo "================================================================================" >&2
+      exit 1
+    fi
+
+    REMOTE_EPOCH=$(iso_to_epoch "${REMOTE_RETAIN_UNTIL}")
+    if [ -z "${REMOTE_EPOCH}" ]; then
+      echo "================================================================================" >&2
+      echo "FATAL: S3 Object Lock retention verification failed: RetainUntilDate '${REMOTE_RETAIN_UNTIL}' is malformed or unparseable." >&2
+      echo "================================================================================" >&2
+      exit 1
+    fi
+
+    NOW_EPOCH=$(date +%s)
+    if [ "${REMOTE_EPOCH}" -le "${NOW_EPOCH}" ]; then
+      echo "================================================================================" >&2
+      echo "FATAL: S3 Object Lock retention verification failed: RetainUntilDate '${REMOTE_RETAIN_UNTIL}' (epoch: ${REMOTE_EPOCH}) is expired or in the past (current epoch: ${NOW_EPOCH})." >&2
+      echo "================================================================================" >&2
+      exit 1
+    fi
+
+    # Require retention date to meet the requested retention window (allowing 300s clock skew buffer)
+    MIN_REQUIRED_EPOCH=$(( NOW_EPOCH + (SPINE_BACKUP_RETENTION_DAYS * 86400) - 300 ))
+    if [ "${REMOTE_EPOCH}" -lt "${MIN_REQUIRED_EPOCH}" ]; then
+      echo "================================================================================" >&2
+      echo "FATAL: S3 Object Lock retention verification failed: RetainUntilDate '${REMOTE_RETAIN_UNTIL}' is earlier than the configured retention period of ${SPINE_BACKUP_RETENTION_DAYS} days." >&2
+      echo "  Configured retention days: ${SPINE_BACKUP_RETENTION_DAYS}" >&2
+      echo "  Minimum required epoch:    ${MIN_REQUIRED_EPOCH}" >&2
+      echo "  Observed retention epoch:  ${REMOTE_EPOCH}" >&2
+      echo "================================================================================" >&2
+      exit 1
+    fi
+
+    echo "Remote Object Lock metadata verified: mode=${REMOTE_LOCK_MODE}, retain_until=${REMOTE_RETAIN_UNTIL} (epoch: ${REMOTE_EPOCH} >= min: ${MIN_REQUIRED_EPOCH})."
     echo "Remote replication cryptographically verified [OK] (${REMOTE_SIZE} bytes, SHA-256: ${REMOTE_SHA256}, immutable retention active: ${REMOTE_LOCK_MODE} until ${REMOTE_RETAIN_UNTIL})."
   else
     echo "Remote replication cryptographically verified [OK] (${REMOTE_SIZE} bytes, SHA-256: ${REMOTE_SHA256}, standard replication without Object Lock)."

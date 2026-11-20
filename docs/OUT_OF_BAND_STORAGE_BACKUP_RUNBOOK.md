@@ -162,18 +162,28 @@ export SPINE_BACKUP_RETENTION_DAYS="30"
    - If `SPINE_BACKUP_REQUIRE_REMOTE=1` (or `true`) and `SPINE_BACKUP_REMOTE_S3_URI` is not configured or the `aws` CLI is missing, `scripts/backup_oob.sh` **fails closed immediately at pre-flight**.
    - Local-only backups can only be created by explicitly overriding the policy (`SPINE_BACKUP_REQUIRE_REMOTE=0` or `false`), which emits an operational warning acknowledging the disaster recovery limitation.
 
-2. **S3 Object Lock Mode, Retain-Until Date Calculation & Fail-Closed Gate:**
-   When off-host replication is configured:
-   - **Supported Lock Modes:** `SPINE_BACKUP_OBJECT_LOCK_MODE` strictly requires `GOVERNANCE` or `COMPLIANCE` (or `NONE`/`""` to explicitly disable Object Lock). Unsupported modes (e.g. `TEMPORARY`, `STANDARD`) are rejected fail-closed.
+2. **Mandatory Production Object Lock Policy & Non-Production Override:**
+   When off-host replication is configured (`SPINE_BACKUP_REMOTE_S3_URI` is set):
+   - **Mandatory in Production (`SPINE_BACKUP_REQUIRE_REMOTE=1`):** Under production profile `core-forge-v1`, Object Lock is strictly mandatory. Attempting to disable or omit Object Lock (`SPINE_BACKUP_OBJECT_LOCK_MODE=""` or `NONE`) **fails closed immediately at pre-flight** (`exit 1`).
+   - **Explicit Non-Production Override (`SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=1`):** To permit un-locked S3 replication exclusively in non-production, staging, or dev environments whose object storage lacks Object Lock capabilities, operators must explicitly set `SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=1`. The script logs an operational risk warning and runs standard replication without claiming immutability.
+   - **Supported Lock Modes:** `SPINE_BACKUP_OBJECT_LOCK_MODE` strictly requires `GOVERNANCE` or `COMPLIANCE`. All other values (e.g. `TEMPORARY`, `STANDARD`, `invalid`) are rejected fail-closed.
    - **Mandatory Retain-Until Calculation:** Pre-flight and pre-upload gates calculate the retention date (+`SPINE_BACKUP_RETENTION_DAYS` days, e.g. `2026-12-20T12:00:00Z`). If date calculation is unavailable or fails, backup aborts fail-closed before taking snapshots or uploading.
-   - **Remote Object Lock Metadata Confirmation Gate (`aws s3api get-object-retention`):** Following upload, the script queries remote S3 retention metadata to confirm that `Mode` matches the expected mode (`GOVERNANCE` or `COMPLIANCE`) and `RetainUntilDate` is recorded. If remote retention metadata is absent, rejected, or mismatched, the backup aborts fail-closed with exit status 1. The script **never reports immutable retention as active** unless verified by remote object metadata.
 
-3. **Off-Host Replication & Cryptographic Byte-Level Verification:**
+3. **Remote Retention Confirmation Gate (Mode & Retention Window Verification):**
+   Following archive upload, the script queries remote S3 retention metadata via `aws s3api get-object-retention` and enforces five fail-closed checks before declaring backup success:
+   - **Mode Verification:** `Retention.Mode` must match configured `SPINE_BACKUP_OBJECT_LOCK_MODE` (`GOVERNANCE` or `COMPLIANCE`).
+   - **Presence Check:** `Retention.RetainUntilDate` must be present in the remote metadata (absent date fails closed).
+   - **Format & Validity:** `Retention.RetainUntilDate` must be a valid, parseable ISO 8601 UTC timestamp (malformed date fails closed).
+   - **Non-Expired Check:** `Retention.RetainUntilDate` must not be expired or in the past relative to the host epoch time.
+   - **Retention Window Gate:** `Retention.RetainUntilDate` must meet or exceed the full requested retention period (+`SPINE_BACKUP_RETENTION_DAYS` days, with a 300-second buffer for execution clock skew). A remote retain-until date shorter than the configured window (e.g. 7 days when 30 days configured) fails closed with exit status 1.
+   - **No False Claims:** The script **never reports immutable retention as active** unless confirmed by remote object metadata. Under non-production override, it reports standard replication without Object Lock.
+
+4. **Off-Host Replication & Cryptographic Byte-Level Verification:**
    When `SPINE_BACKUP_REMOTE_S3_URI` is configured, `scripts/backup_oob.sh` replicates the encrypted `backup.spnebak` and `SHA256SUMS` manifest to the designated object store:
    - Configures S3 WORM / Object Lock immutability (`--object-lock-mode` and `--object-lock-retain-until-date`) to guarantee tamper-proof and ransomware-resistant retention.
    - **Cryptographic SHA-256 Digest Gate:** Rather than relying solely on file sizes, the script streams the uploaded archive from the remote object store (`aws s3 cp ... - | sha256sum`) and cryptographically compares the remote SHA-256 digest against the local archive before reporting backup success. Any mismatch or corruption immediately fails the backup with exit status 1.
 
-4. **Explicit Disaster Recovery Deployment Scope Limitation:**
+5. **Explicit Disaster Recovery Deployment Scope Limitation:**
    > [!WARNING]
    > **Deployment Limitation for Local-Only Backups:**
    > If `SPINE_BACKUP_REQUIRE_REMOTE=0` is explicitly set to permit local-only backups, archives remain exclusively on host storage under `BACKUP_ROOT`. Local-only backups **do not provide full disaster-recovery readiness** against total host hardware failure, disk controller destruction, or datacenter loss. Production installations must configure an off-host object store with Object Lock retention enabled.
