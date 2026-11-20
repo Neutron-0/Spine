@@ -7,11 +7,11 @@
 
 - **Repository:** `D:\Vault\Spine`
 - **Branch:** `main`
-- **Built Source Commit:** `13f4ab076f0de947f4b8b4d6211ee37b55276045` (source code, migrations, tests, and `docs/sbom.json` compiled into all release artifacts below; this provenance document commit is a `docs/`-only commit immediately following build verification)
-- **Built Source Tree Hash:** `574bdbdd916850ef2392a14fdaf445708a639434`
-- **Build Start Timestamp (UTC):** `2026-11-20T14:50:00Z`
-- **Build Completion Timestamp (UTC):** `2026-11-20T14:54:15Z`
-- **Artifact Staging Timestamp (UTC):** `2026-11-20T14:55:00Z`
+- **Built Source Commit:** `7a75347599a01ac20163bc73b0ce64ec6190138c` (source code, migrations, tests, and `docs/sbom.json` compiled into all release artifacts below; this provenance document commit is a `docs/`-only commit immediately following build verification)
+- **Built Source Tree Hash:** `0c97639dc788807698ebd8c1085545a674208a22`
+- **Build Start Timestamp (UTC):** `2026-11-20T16:25:00Z`
+- **Build Completion Timestamp (UTC):** `2026-11-20T16:28:00Z`
+- **Artifact Staging Timestamp (UTC):** `2026-11-20T16:28:30Z`
 - **Host Target:** `x86_64-pc-windows-msvc`
 - **Compiler (`rustc --version`):** `rustc 1.97.1 (8bab26f4f 2026-07-14)` (commit `8bab26f4f68e0e26f0bb7960be334d5b520ea452`, LLVM `22.1.6`)
 - **Cargo (`cargo --version`):** `cargo 1.97.1 (c980f4866 2026-06-30)`
@@ -29,7 +29,7 @@
 - **Backend API Server:**
   `cargo build --release -j 1 --manifest-path github-alternative/backend/apps/spine-api/Cargo.toml`
   - Output path: `d:\Vault\Spine\github-alternative\backend\target\release\spine-api.exe`
-  - Build duration: 22m 11s (compiled from clean dependency tree)
+  - Build duration: 2m 34s
   - Exit code: `0`
 
 ## 3. Reproducibility & Lockfile Digests
@@ -37,9 +37,9 @@
 Both workspaces build with tracked `Cargo.lock` dependency graphs:
 
 - `git-alternative/Cargo.lock` (SHA-256):
-  `f0be820cc613a6359eb8fa4d68f05a44831fb4c9a4561099be6edb4c33531fdf`
+  `c0315d464810ab80386528d44457275b5df3447afaa623f9d5319127f23fbd7c`
 - `github-alternative/backend/Cargo.lock` (SHA-256):
-  `4f15df88dfeede2d5583d9e73b78a3035f1ac7f96a2f2caa3a3c7c8e3af8feae`
+  `c7cf919e628445fff332a13d003b0b7382d6a33a794fcc51a861ceb5c31365a4`
 
 ## 4. Release Candidate Artifact Inventory & SHA-256 Checksums
 
@@ -50,12 +50,12 @@ All four production executables were staged under `target/release-candidate/`, a
 | `spine.exe` | `8932352` | `2026-11-17 15:24:12 UTC` | `5a987eb7a1a1c3f6bc017be82560b191ea69bf21dde9751a8c9db43c91faef5f` |
 | `spine-coordinator.exe` | `3068416` | `2026-11-20 14:51:05 UTC` | `0b47434eb9e508407c831613d5dec742b014e3e96894e56fbddbfb9dec207ec8` |
 | `spine-storage-node.exe` | `2792960` | `2026-11-17 15:24:12 UTC` | `1ed8049200a6a2b306ca9d2cffcf2df6b7b0558c9dcd5f4d07d45d18192edd74` |
-| `spine-api.exe` | `24722944` | `2026-11-20 14:54:15 UTC` | `d967fce88f583e8a1b0f55e665ad592b2e07e37d999011e1e103b41ad7ab6ebb` |
+| `spine-api.exe` | `24756224` | `2026-11-20 16:28:00 UTC` | `bea1ab447324c7fa4dc5e4331b56d0cd164a3c3a280330fef569b0f883737089` |
 
 Checksums manifest (`target/release-candidate/SHA256SUMS`):
 
 ```text
-d967fce88f583e8a1b0f55e665ad592b2e07e37d999011e1e103b41ad7ab6ebb  spine-api.exe
+bea1ab447324c7fa4dc5e4331b56d0cd164a3c3a280330fef569b0f883737089  spine-api.exe
 0b47434eb9e508407c831613d5dec742b014e3e96894e56fbddbfb9dec207ec8  spine-coordinator.exe
 1ed8049200a6a2b306ca9d2cffcf2df6b7b0558c9dcd5f4d07d45d18192edd74  spine-storage-node.exe
 5a987eb7a1a1c3f6bc017be82560b191ea69bf21dde9751a8c9db43c91faef5f  spine.exe
