@@ -145,29 +145,32 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Fn::If:
-                - IsServicePrincipal
-                - Service: !Ref TrustedPrincipalArn
-                - AWS: !Ref TrustedPrincipalArn
+              Service: !If [IsServicePrincipal, !Ref TrustedPrincipalArn, !Ref 'AWS::NoValue']
+              AWS: !If [IsServicePrincipal, !Ref 'AWS::NoValue', !Ref TrustedPrincipalArn]
             Action: 'sts:AssumeRole'
       Policies:
         - PolicyName: SpineBackupStorageAccess
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Sid: ListAndLocation
+              - Sid: BucketMetadata
                 Effect: Allow
                 Action:
-                  - 's3:ListBucket'
                   - 's3:GetBucketLocation'
                   - 's3:GetBucketVersioning'
                   - 's3:GetObjectLockConfiguration'
+                Resource: !Sub 'arn:aws:s3:::${SpineBackupBucket}'
+              - Sid: ListBackupsPrefixOnly
+                Effect: Allow
+                Action:
+                  - 's3:ListBucket'
                 Resource: !Sub 'arn:aws:s3:::${SpineBackupBucket}'
                 Condition:
                   StringLike:
                     's3:prefix':
                       - 'backups/*'
                       - 'backups'
+                      - ''
               - Sid: BackupWriteAndRead
                 Effect: Allow
                 Action:
