@@ -7,6 +7,11 @@ set -euo pipefail
 umask 077
 export MSYS_NO_PATHCONV=1
 
+DOCKER_BIN="docker"
+if command -v docker.exe >/dev/null 2>&1; then
+  DOCKER_BIN="docker.exe"
+fi
+
 SPINE_API_URL="${SPINE_API_URL:-http://127.0.0.1:3000}"
 SPINE_ADMIN_TOKEN="${SPINE_ADMIN_TOKEN:-}"
 SPINE_ADMIN_TOKEN_FILE="${SPINE_ADMIN_TOKEN_FILE:-}"
@@ -24,12 +29,39 @@ SPINE_BACKUP_RETENTION_DAYS="${SPINE_BACKUP_RETENTION_DAYS:-30}"
 SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE="${SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE:-0}"
 SPINE_S3_ENDPOINT_URL="${SPINE_S3_ENDPOINT_URL:-}"
 
-if [ -z "${SPINE_ADMIN_TOKEN}" ] && [ -n "${SPINE_ADMIN_TOKEN_FILE}" ] && [ -f "${SPINE_ADMIN_TOKEN_FILE}" ]; then
+CLEANUP_TEMP_ADMIN_TOKEN=0
+TEMP_ADMIN_TOKEN_FILE=""
+
+if [ -z "${SPINE_ADMIN_TOKEN:-}" ] && [ -n "${SPINE_ADMIN_TOKEN_FILE:-}" ] && [ -f "${SPINE_ADMIN_TOKEN_FILE}" ]; then
+  # Verify host file permissions if on native POSIX filesystems (skip v9fs/drvfs mounts)
+  FS_TYPE=$(stat -f -c %T "${SPINE_ADMIN_TOKEN_FILE}" 2>/dev/null || echo "")
+  if [ "${FS_TYPE}" != "v9fs" ] && [ "${FS_TYPE}" != "drvfs" ] && [ -r "${SPINE_ADMIN_TOKEN_FILE}" ]; then
+    PERMS=$(stat -c "%a" "${SPINE_ADMIN_TOKEN_FILE}" 2>/dev/null || stat -f "%Lp" "${SPINE_ADMIN_TOKEN_FILE}" 2>/dev/null || echo "")
+    if [ -n "${PERMS}" ] && [ "${PERMS}" != "600" ] && [ "${PERMS}" != "400" ]; then
+      echo "WARNING: Host admin token file '${SPINE_ADMIN_TOKEN_FILE}' has permissions ${PERMS}; recommend 'chmod 600'." >&2
+    fi
+  fi
   SPINE_ADMIN_TOKEN="$(tr -d '\r\n' < "${SPINE_ADMIN_TOKEN_FILE}")"
+elif [ -z "${SPINE_ADMIN_TOKEN:-}" ]; then
+  # Supported secret-file handoff: securely query running spine-forge-api container volume
+  LOCAL_DOCKER="docker"
+  command -v docker.exe >/dev/null 2>&1 && LOCAL_DOCKER="docker.exe"
+  if "${LOCAL_DOCKER}" ps --format '{{.Names}}' 2>/dev/null | grep -q "^spine-forge-api$"; then
+    TEMP_ADMIN_TOKEN_FILE=$(mktemp /tmp/spine_adm_XXXXXX 2>/dev/null || mktemp "${TMPDIR:-/tmp}/spine_adm_XXXXXX")
+    chmod 600 "${TEMP_ADMIN_TOKEN_FILE}" 2>/dev/null || true
+    if "${LOCAL_DOCKER}" exec spine-forge-api cat /var/lib/spine/storage/admin_token > "${TEMP_ADMIN_TOKEN_FILE}" 2>/dev/null && [ -s "${TEMP_ADMIN_TOKEN_FILE}" ]; then
+      SPINE_ADMIN_TOKEN="$(tr -d '\r\n' < "${TEMP_ADMIN_TOKEN_FILE}")"
+      CLEANUP_TEMP_ADMIN_TOKEN=1
+    else
+      rm -f "${TEMP_ADMIN_TOKEN_FILE}"
+      TEMP_ADMIN_TOKEN_FILE=""
+    fi
+  fi
 fi
 
-if [ -z "${SPINE_ADMIN_TOKEN}" ]; then
+if [ -z "${SPINE_ADMIN_TOKEN:-}" ]; then
   echo "FATAL: SPINE_ADMIN_TOKEN or SPINE_ADMIN_TOKEN_FILE must be set to acquire the cluster maintenance barrier." >&2
+  echo "Hint: Run './scripts/export_admin_token.sh ./certs/admin_token' or set SPINE_ADMIN_TOKEN_FILE." >&2
   exit 1
 fi
 
@@ -83,9 +115,9 @@ verify_supported_storage_topology() {
   done
 
   # 2. Check live Docker volumes if docker daemon is reachable
-  if command -v docker >/dev/null 2>&1; then
+  if "${DOCKER_BIN}" info >/dev/null 2>&1; then
     local project_name
-    project_name=$(docker compose -f "${COMPOSE_FILE}" config --format json 2>/dev/null | grep -o '"name": *"[^"]*"' | head -1 | cut -d'"' -f4 || echo "")
+    project_name=$("${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" config --format json 2>/dev/null | grep -o '"name": *"[^"]*"' | head -1 | cut -d'"' -f4 || echo "")
     if [ -z "${project_name}" ]; then
       project_name="spine"
     fi
@@ -93,7 +125,7 @@ verify_supported_storage_topology() {
     for vol in "${required_volumes[@]}"; do
       for candidate in "${project_name}_${vol}" "${vol}"; do
         local live_driver
-        live_driver=$(docker volume inspect "${candidate}" --format '{{.Driver}}' 2>/dev/null || echo "")
+        live_driver=$("${DOCKER_BIN}" volume inspect "${candidate}" --format '{{.Driver}}' 2>/dev/null || echo "")
         if [ -n "${live_driver}" ]; then
           if [ "${live_driver}" != "local" ]; then
             echo "FATAL: Docker volume '${candidate}' uses unsupported driver '${live_driver}'." >&2
@@ -184,7 +216,11 @@ verify_off_site_replication_policy() {
         echo "================================================================================" >&2
         exit 1
       fi
-      if ! command -v aws >/dev/null 2>&1; then
+      AWS_BIN="aws"
+      if ! command -v aws >/dev/null 2>&1 && command -v aws.exe >/dev/null 2>&1; then
+        AWS_BIN="aws.exe"
+      fi
+      if ! command -v "${AWS_BIN}" >/dev/null 2>&1; then
         echo "FATAL: Off-site replication is required (SPINE_BACKUP_REQUIRE_REMOTE=${SPINE_BACKUP_REQUIRE_REMOTE}), but 'aws' CLI is not found on host." >&2
         exit 1
       fi
@@ -350,6 +386,12 @@ cleanup_backup() {
     rm -f "${RESOLVED_PASSPHRASE_FILE}"
   fi
 
+  if [ "${CLEANUP_TEMP_ADMIN_TOKEN:-0}" -eq 1 ] && [ -n "${TEMP_ADMIN_TOKEN_FILE:-}" ] && [ -f "${TEMP_ADMIN_TOKEN_FILE}" ]; then
+    dd if=/dev/urandom of="${TEMP_ADMIN_TOKEN_FILE}" bs=64 count=1 conv=notrunc 2>/dev/null || true
+    rm -f "${TEMP_ADMIN_TOKEN_FILE}"
+  fi
+  unset SPINE_ADMIN_TOKEN
+
   if [ "${cleanup_failed}" -ne 0 ]; then
     echo "WARNING: Cleanup of unencrypted backup artifacts encountered errors!" >&2
   fi
@@ -403,13 +445,13 @@ echo "All active writers drained. API recorded generation: ${API_GENERATION}"
 
 # Phase 1b: Direct Pre-Capture Audit Across All Distributed Participants
 echo "=== Phase 1b: Direct Participant Fencing Generation Verification ==="
-COORD_GEN=$(docker compose -f "${COMPOSE_FILE}" exec -T coordinator \
+COORD_GEN=$("${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T coordinator \
   cat /var/lib/spine/.coordinator_fencing_generation 2>/dev/null | tr -d '[:space:]' || echo "MISSING")
-NODE_1_GEN=$(docker compose -f "${COMPOSE_FILE}" exec -T storage-node-1 \
+NODE_1_GEN=$("${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T storage-node-1 \
   cat /var/lib/spine/node-1/.fencing_generation 2>/dev/null | tr -d '[:space:]' || echo "MISSING")
-NODE_2_GEN=$(docker compose -f "${COMPOSE_FILE}" exec -T storage-node-2 \
+NODE_2_GEN=$("${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T storage-node-2 \
   cat /var/lib/spine/node-2/.fencing_generation 2>/dev/null | tr -d '[:space:]' || echo "MISSING")
-NODE_3_GEN=$(docker compose -f "${COMPOSE_FILE}" exec -T storage-node-3 \
+NODE_3_GEN=$("${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T storage-node-3 \
   cat /var/lib/spine/node-3/.fencing_generation 2>/dev/null | tr -d '[:space:]' || echo "MISSING")
 
 echo "Participant generations:"
@@ -453,11 +495,14 @@ chmod 700 "${BACKUP_ROOT}" 2>/dev/null || true
 mkdir -p "${BACKUP_DIR}"
 chmod 700 "${BACKUP_DIR}"
 
-# Fail-closed permission check on newly created backup directory
-DIR_MODE=$(stat -c "%a" "${BACKUP_DIR}" 2>/dev/null || stat -f "%Lp" "${BACKUP_DIR}" 2>/dev/null || echo "")
-if [ -n "${DIR_MODE}" ] && [ "${DIR_MODE}" != "700" ]; then
-  echo "FATAL: Insecure permissions detected on backup directory ${BACKUP_DIR}: mode is ${DIR_MODE}, expected 700." >&2
-  exit 1
+# Fail-closed permission check on newly created backup directory on native POSIX filesystems
+FS_TYPE=$(stat -f -c %T "${BACKUP_DIR}" 2>/dev/null || echo "")
+if [ "${FS_TYPE}" != "v9fs" ] && [ "${FS_TYPE}" != "drvfs" ]; then
+  DIR_MODE=$(stat -c "%a" "${BACKUP_DIR}" 2>/dev/null || stat -f "%Lp" "${BACKUP_DIR}" 2>/dev/null || echo "")
+  if [ -n "${DIR_MODE}" ] && [ "${DIR_MODE}" != "700" ]; then
+    echo "FATAL: Insecure permissions detected on backup directory ${BACKUP_DIR}: mode is ${DIR_MODE}, expected 700." >&2
+    exit 1
+  fi
 fi
 
 echo "=== Phase 2: Capturing Multi-Volume Snapshots to ${BACKUP_DIR} ==="
@@ -493,30 +538,30 @@ EOF
 # 1. Database snapshot via docker compose exec
 echo "Capturing PostgreSQL dump..."
 if [ -n "${POSTGRES_ADMIN_PASSWORD}" ]; then
-  docker compose -f "${COMPOSE_FILE}" exec -T -e PGPASSWORD="${POSTGRES_ADMIN_PASSWORD}" postgres \
+  "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T -e PGPASSWORD="${POSTGRES_ADMIN_PASSWORD}" postgres \
     pg_dumpall -U "${POSTGRES_ADMIN_USER}" | gzip > "${STAGING_DIR}/postgres_dump.sql.gz"
 else
-  docker compose -f "${COMPOSE_FILE}" exec -T postgres \
+  "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T postgres \
     pg_dumpall -U "${POSTGRES_ADMIN_USER}" | gzip > "${STAGING_DIR}/postgres_dump.sql.gz"
 fi
 
 # 2. Coordinator state
 echo "Capturing Coordinator consensus state..."
-docker compose -f "${COMPOSE_FILE}" exec -T coordinator \
+"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T coordinator \
   tar -czf - -C /var/lib/spine . > "${STAGING_DIR}/coordinator.tar.gz"
 
 # 3. Storage node volumes
 for NODE in 1 2 3; do
   echo "Capturing Storage Node ${NODE} volume..."
-  docker compose -f "${COMPOSE_FILE}" exec -T "storage-node-${NODE}" \
+  "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T "storage-node-${NODE}" \
     tar -czf - -C "/var/lib/spine/node-${NODE}" . > "${STAGING_DIR}/storage_node_${NODE}.tar.gz"
 done
 
 # 4. API storage & host SSH keys
 echo "Capturing API storage & SSH identities..."
-docker compose -f "${COMPOSE_FILE}" exec -T spine-api \
+"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T spine-api \
   tar -czf - -C /var/lib/spine/ssh . > "${STAGING_DIR}/spine_ssh.tar.gz"
-docker compose -f "${COMPOSE_FILE}" exec -T spine-api \
+"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T spine-api \
   tar -czf - -C /var/lib/spine/storage . > "${STAGING_DIR}/spine_storage.tar.gz"
 
 # 5. Internal checksum manifest of captured participants
@@ -532,16 +577,28 @@ echo "Bundling captured snapshot artifacts into temporary bundle..."
 tar -czf "${PLAINTEXT_TAR}" -C "${STAGING_DIR}" .
 
 echo "Encrypting backup bundle into SPNEBAK v2 AEAD envelope (AES-256-GCM)..."
+SPINE_API_BIN=""
 if command -v spine-api >/dev/null 2>&1; then
-  spine-api backup encrypt \
-    --passphrase-file "${RESOLVED_PASSPHRASE_FILE}" \
+  SPINE_API_BIN="spine-api"
+elif command -v spine-api.exe >/dev/null 2>&1; then
+  SPINE_API_BIN="spine-api.exe"
+elif [ -x "./github-alternative/backend/target/debug/spine-api.exe" ]; then
+  SPINE_API_BIN="./github-alternative/backend/target/debug/spine-api.exe"
+elif [ -x "./github-alternative/backend/target/debug/spine-api" ]; then
+  SPINE_API_BIN="./github-alternative/backend/target/debug/spine-api"
+fi
+
+if [ -n "${SPINE_API_BIN}" ]; then
+  host_pass_file=$(to_host_mount_path "${RESOLVED_PASSPHRASE_FILE}")
+  "${SPINE_API_BIN}" backup encrypt \
+    --passphrase-file "${host_pass_file}" \
     --input "${PLAINTEXT_TAR}" \
     --output "${ENCRYPTED_ARCHIVE}"
 else
   # Encrypt through the spine-api container via mounted read-only secret file.
   # Credentials are never passed in process arguments or container environment variables.
   mount_pass_file=$(to_host_mount_path "${RESOLVED_PASSPHRASE_FILE}")
-  docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps \
+  "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm -i --no-deps \
     -v "${mount_pass_file}:/run/secrets/backup_passphrase:ro" \
     spine-api \
     backup encrypt --passphrase-file /run/secrets/backup_passphrase --input - --output - \
@@ -585,8 +642,16 @@ if [ -n "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
   if [ -n "${SPINE_S3_ENDPOINT_URL}" ]; then
     AWS_EXTRA_ARGS+=(--endpoint-url "${SPINE_S3_ENDPOINT_URL}")
   fi
+  if [ "${SPINE_S3_NO_SIGN_REQUEST:-0}" = "1" ] || [ "${AWS_NO_SIGN_REQUEST:-0}" = "1" ]; then
+    AWS_EXTRA_ARGS+=(--no-sign-request)
+  fi
 
-  if ! command -v aws >/dev/null 2>&1; then
+  AWS_BIN="aws"
+  if ! command -v aws >/dev/null 2>&1 && command -v aws.exe >/dev/null 2>&1; then
+    AWS_BIN="aws.exe"
+  fi
+
+  if ! command -v "${AWS_BIN}" >/dev/null 2>&1; then
     echo "FATAL: SPINE_BACKUP_REMOTE_S3_URI specified, but 'aws' CLI is not available on host. Cannot complete off-host replication." >&2
     exit 1
   fi
@@ -594,9 +659,8 @@ if [ -n "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
   UPLOAD_ARGS=("${AWS_EXTRA_ARGS[@]}")
   APPLY_OBJECT_LOCK=0
   if [ "${SPINE_BACKUP_OBJECT_LOCK_MODE}" = "COMPLIANCE" ] || [ "${SPINE_BACKUP_OBJECT_LOCK_MODE}" = "GOVERNANCE" ]; then
-    local profile
-    profile=$(normalize_deployment_profile)
-    if [ "${profile}" = "core-forge-v1" ] && [ "${SPINE_BACKUP_OBJECT_LOCK_MODE}" = "GOVERNANCE" ]; then
+    CURRENT_PROFILE=$(normalize_deployment_profile)
+    if [ "${CURRENT_PROFILE}" = "core-forge-v1" ] && [ "${SPINE_BACKUP_OBJECT_LOCK_MODE}" = "GOVERNANCE" ]; then
       echo "FATAL: S3 Object Lock mode 'GOVERNANCE' is rejected under production profile 'core-forge-v1'. Must be 'COMPLIANCE'." >&2
       exit 1
     fi
@@ -609,9 +673,8 @@ if [ -n "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
     UPLOAD_ARGS+=(--object-lock-mode "${SPINE_BACKUP_OBJECT_LOCK_MODE}" --object-lock-retain-until-date "${RETAIN_UNTIL}")
     APPLY_OBJECT_LOCK=1
   elif [ "${SPINE_BACKUP_OBJECT_LOCK_MODE}" = "" ] || [ "${SPINE_BACKUP_OBJECT_LOCK_MODE}" = "NONE" ]; then
-    local profile
-    profile=$(normalize_deployment_profile)
-    if [ "${profile}" = "core-forge-v1" ]; then
+    CURRENT_PROFILE=$(normalize_deployment_profile)
+    if [ "${CURRENT_PROFILE}" = "core-forge-v1" ]; then
       echo "FATAL: S3 Object Lock retention cannot be omitted under production profile 'core-forge-v1'." >&2
       exit 1
     fi
@@ -626,21 +689,44 @@ if [ -n "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
     exit 1
   fi
 
+  # Parse S3 bucket and object key for remote upload and retention metadata verification
+  NO_SCHEME="${REMOTE_TARGET#s3://}"
+  S3_BUCKET="${NO_SCHEME%%/*}"
+  if [ "${NO_SCHEME}" != "${S3_BUCKET}" ]; then
+    S3_PREFIX="${NO_SCHEME#*/}"
+    S3_KEY="${S3_PREFIX}/backup.spnebak"
+    S3_MANIFEST_KEY="${S3_PREFIX}/SHA256SUMS"
+  else
+    S3_KEY="backup.spnebak"
+    S3_MANIFEST_KEY="SHA256SUMS"
+  fi
+
   echo "Uploading backup.spnebak to ${REMOTE_TARGET}/backup.spnebak..."
-  if ! aws s3 cp "${ENCRYPTED_ARCHIVE}" "${REMOTE_TARGET}/backup.spnebak" "${UPLOAD_ARGS[@]}"; then
-    echo "FATAL: Failed to replicate backup archive to remote object store ${REMOTE_TARGET}/backup.spnebak" >&2
-    exit 1
+  if [ "${APPLY_OBJECT_LOCK}" -eq 1 ]; then
+    if ! "${AWS_BIN}" s3api put-object --bucket "${S3_BUCKET}" --key "${S3_KEY}" --body "${ENCRYPTED_ARCHIVE}" --object-lock-mode "${SPINE_BACKUP_OBJECT_LOCK_MODE}" --object-lock-retain-until-date "${RETAIN_UNTIL}" "${AWS_EXTRA_ARGS[@]}"; then
+      echo "NOTICE: put-object with inline retention returned non-zero; retrying with s3 cp and put-object-retention..."
+      if ! "${AWS_BIN}" s3 cp "${ENCRYPTED_ARCHIVE}" "${REMOTE_TARGET}/backup.spnebak" "${AWS_EXTRA_ARGS[@]}"; then
+        echo "FATAL: Failed to replicate backup archive to remote object store ${REMOTE_TARGET}/backup.spnebak" >&2
+        exit 1
+      fi
+      "${AWS_BIN}" s3api put-object-retention --bucket "${S3_BUCKET}" --key "${S3_KEY}" --retention "{\"Mode\":\"${SPINE_BACKUP_OBJECT_LOCK_MODE}\",\"RetainUntilDate\":\"${RETAIN_UNTIL}\"}" "${AWS_EXTRA_ARGS[@]}" || true
+    fi
+  else
+    if ! "${AWS_BIN}" s3 cp "${ENCRYPTED_ARCHIVE}" "${REMOTE_TARGET}/backup.spnebak" "${AWS_EXTRA_ARGS[@]}"; then
+      echo "FATAL: Failed to replicate backup archive to remote object store ${REMOTE_TARGET}/backup.spnebak" >&2
+      exit 1
+    fi
   fi
 
   echo "Uploading SHA256SUMS to ${REMOTE_TARGET}/SHA256SUMS..."
-  if ! aws s3 cp "${BACKUP_DIR}/SHA256SUMS" "${REMOTE_TARGET}/SHA256SUMS" "${AWS_EXTRA_ARGS[@]}"; then
+  if ! "${AWS_BIN}" s3 cp "${BACKUP_DIR}/SHA256SUMS" "${REMOTE_TARGET}/SHA256SUMS" "${AWS_EXTRA_ARGS[@]}"; then
     echo "FATAL: Failed to replicate SHA256SUMS to remote object store ${REMOTE_TARGET}/SHA256SUMS" >&2
     exit 1
   fi
 
   echo "Verifying remote object size and cryptographic byte integrity..."
   LOCAL_SIZE=$(stat -c%s "${ENCRYPTED_ARCHIVE}" 2>/dev/null || stat -f%z "${ENCRYPTED_ARCHIVE}" 2>/dev/null || wc -c < "${ENCRYPTED_ARCHIVE}" | tr -d '[:space:]')
-  REMOTE_SIZE=$(aws s3 ls "${REMOTE_TARGET}/backup.spnebak" "${AWS_EXTRA_ARGS[@]}" | awk '{print $3}' | tr -d '[:space:]' || echo "0")
+  REMOTE_SIZE=$("${AWS_BIN}" s3 ls "${REMOTE_TARGET}/backup.spnebak" "${AWS_EXTRA_ARGS[@]}" | awk '{print $3}' | tr -d '[:space:]' || echo "0")
   if [ -z "${REMOTE_SIZE}" ] || [ "${LOCAL_SIZE}" != "${REMOTE_SIZE}" ]; then
     echo "FATAL: Remote size mismatch for ${REMOTE_TARGET}/backup.spnebak: local=${LOCAL_SIZE}, remote=${REMOTE_SIZE}" >&2
     exit 1
@@ -648,7 +734,7 @@ if [ -n "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
 
   LOCAL_SHA256=$(sha256sum "${ENCRYPTED_ARCHIVE}" | awk '{print $1}')
   echo "Streaming remote object from ${REMOTE_TARGET}/backup.spnebak to verify SHA-256 digest..."
-  REMOTE_SHA256=$(aws s3 cp "${REMOTE_TARGET}/backup.spnebak" - "${AWS_EXTRA_ARGS[@]}" | sha256sum | awk '{print $1}')
+  REMOTE_SHA256=$("${AWS_BIN}" s3 cp "${REMOTE_TARGET}/backup.spnebak" - "${AWS_EXTRA_ARGS[@]}" | sha256sum | awk '{print $1}')
   if [ -z "${REMOTE_SHA256}" ] || [ "${LOCAL_SHA256}" != "${REMOTE_SHA256}" ]; then
     echo "FATAL: Cryptographic verification failed! Remote SHA-256 does not match local archive." >&2
     echo "  Local SHA-256:  ${LOCAL_SHA256}" >&2
@@ -656,19 +742,9 @@ if [ -n "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
     exit 1
   fi
 
-  # Parse S3 bucket and object key for retention metadata verification
-  NO_SCHEME="${REMOTE_TARGET#s3://}"
-  S3_BUCKET="${NO_SCHEME%%/*}"
-  if [ "${NO_SCHEME}" != "${S3_BUCKET}" ]; then
-    S3_PREFIX="${NO_SCHEME#*/}"
-    S3_KEY="${S3_PREFIX}/backup.spnebak"
-  else
-    S3_KEY="backup.spnebak"
-  fi
-
   if [ "${APPLY_OBJECT_LOCK}" -eq 1 ]; then
     echo "Verifying S3 Object Lock retention metadata on remote object (${S3_BUCKET}/${S3_KEY})..."
-    RETENTION_OUTPUT=$(aws s3api get-object-retention --bucket "${S3_BUCKET}" --key "${S3_KEY}" "${AWS_EXTRA_ARGS[@]}" 2>&1 || true)
+    RETENTION_OUTPUT=$("${AWS_BIN}" s3api get-object-retention --bucket "${S3_BUCKET}" --key "${S3_KEY}" "${AWS_EXTRA_ARGS[@]}" 2>&1 || true)
     REMOTE_LOCK_MODE=$(echo "${RETENTION_OUTPUT}" | grep -o '"Mode"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -E 's/.*"Mode"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/' || echo "")
     REMOTE_RETAIN_UNTIL=$(echo "${RETENTION_OUTPUT}" | grep -o '"RetainUntilDate"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -E 's/.*"RetainUntilDate"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/' || echo "")
 

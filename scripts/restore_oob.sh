@@ -6,6 +6,21 @@
 set -euo pipefail
 umask 077
 export MSYS_NO_PATHCONV=1
+DOCKER_BIN="docker"
+if command -v docker.exe >/dev/null 2>&1; then
+  DOCKER_BIN="docker.exe"
+fi
+
+SPINE_API_BIN=""
+if command -v spine-api >/dev/null 2>&1; then
+  SPINE_API_BIN="spine-api"
+elif command -v spine-api.exe >/dev/null 2>&1; then
+  SPINE_API_BIN="spine-api.exe"
+elif [ -x "./github-alternative/backend/target/debug/spine-api.exe" ]; then
+  SPINE_API_BIN="./github-alternative/backend/target/debug/spine-api.exe"
+elif [ -x "./github-alternative/backend/target/debug/spine-api" ]; then
+  SPINE_API_BIN="./github-alternative/backend/target/debug/spine-api"
+fi
 
 BACKUP_DIR=""
 ENCRYPTED_FILE=""
@@ -13,6 +28,9 @@ TARGET_INPUT="${1:-}"
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
 POSTGRES_ADMIN_USER="${POSTGRES_ADMIN_USER:-spine_admin}"
 POSTGRES_ADMIN_PASSWORD="${POSTGRES_ADMIN_PASSWORD:-}"
+if [ -z "${POSTGRES_ADMIN_PASSWORD}" ] && [ -f .env ]; then
+  POSTGRES_ADMIN_PASSWORD=$(grep -E "^POSTGRES_ADMIN_PASSWORD=" .env | head -n1 | cut -d'=' -f2- | tr -d '[:space:]"' || true)
+fi
 SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE:-}"
 SPINE_BACKUP_PASSPHRASE_FILE="${SPINE_BACKUP_PASSPHRASE_FILE:-}"
 SPINE_S3_ENDPOINT_URL="${SPINE_S3_ENDPOINT_URL:-}"
@@ -29,6 +47,15 @@ resolve_passphrase_file() {
     printf "%s" "${SPINE_BACKUP_PASSPHRASE}" > "${RESOLVED_PASSPHRASE_FILE}"
     CLEANUP_TEMP_PASSPHRASE=1
     unset SPINE_BACKUP_PASSPHRASE
+  elif [ -f .env ] && grep -q -E "^SPINE_BACKUP_PASSPHRASE=" .env; then
+    local env_pass
+    env_pass=$(grep -E "^SPINE_BACKUP_PASSPHRASE=" .env | head -n1 | cut -d'=' -f2- | tr -d '[:space:]"' || true)
+    if [ -n "${env_pass}" ]; then
+      RESOLVED_PASSPHRASE_FILE=$(mktemp /tmp/spine_pass_XXXXXX 2>/dev/null || mktemp "${TMPDIR:-/tmp}/spine_pass_XXXXXX")
+      chmod 600 "${RESOLVED_PASSPHRASE_FILE}"
+      printf "%s" "${env_pass}" > "${RESOLVED_PASSPHRASE_FILE}"
+      CLEANUP_TEMP_PASSPHRASE=1
+    fi
   else
     echo "FATAL: SPINE_BACKUP_PASSPHRASE_FILE or SPINE_BACKUP_PASSPHRASE is required to authenticate and decrypt the backup archive." >&2
     exit 1
@@ -66,9 +93,9 @@ verify_supported_storage_topology() {
   done
 
   # 2. Check live Docker volumes if docker daemon is reachable
-  if command -v docker >/dev/null 2>&1; then
+  if "${DOCKER_BIN}" info >/dev/null 2>&1; then
     local project_name
-    project_name=$(docker compose -f "${COMPOSE_FILE}" config --format json 2>/dev/null | grep -o '"name": *"[^"]*"' | head -1 | cut -d'"' -f4 || echo "")
+    project_name=$("${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" config --format json 2>/dev/null | grep -o '"name": *"[^"]*"' | head -1 | cut -d'"' -f4 || echo "")
     if [ -z "${project_name}" ]; then
       project_name="spine"
     fi
@@ -76,7 +103,7 @@ verify_supported_storage_topology() {
     for vol in "${required_volumes[@]}"; do
       for candidate in "${project_name}_${vol}" "${vol}"; do
         local live_driver
-        live_driver=$(docker volume inspect "${candidate}" --format '{{.Driver}}' 2>/dev/null || echo "")
+        live_driver=$("${DOCKER_BIN}" volume inspect "${candidate}" --format '{{.Driver}}' 2>/dev/null || echo "")
         if [ -n "${live_driver}" ]; then
           if [ "${live_driver}" != "local" ]; then
             echo "FATAL: Docker volume '${candidate}' uses unsupported driver '${live_driver}'." >&2
@@ -115,25 +142,25 @@ ROLLBACK_DIR=""
 REMOTE_RESTORE_DIR=""
 
 encrypt_stream() {
-  if command -v spine-api >/dev/null 2>&1; then
-    spine-api backup encrypt --passphrase-file "${RESOLVED_PASSPHRASE_FILE}" --input - --output -
+  local host_pass_file
+  host_pass_file=$(to_host_mount_path "${RESOLVED_PASSPHRASE_FILE}")
+  if [ -n "${SPINE_API_BIN}" ]; then
+    "${SPINE_API_BIN}" backup encrypt --passphrase-file "${host_pass_file}" --input - --output -
   else
-    local mount_pass_file
-    mount_pass_file=$(to_host_mount_path "${RESOLVED_PASSPHRASE_FILE}")
-    docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps \
-      -v "${mount_pass_file}:/run/secrets/backup_passphrase:ro" spine-api \
+    "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm -i --no-deps \
+      -v "${host_pass_file}:/run/secrets/backup_passphrase:ro" spine-api \
       backup encrypt --passphrase-file /run/secrets/backup_passphrase --input - --output -
   fi
 }
 
 decrypt_stream() {
-  if command -v spine-api >/dev/null 2>&1; then
-    spine-api backup decrypt --passphrase-file "${RESOLVED_PASSPHRASE_FILE}" --input - --output -
+  local host_pass_file
+  host_pass_file=$(to_host_mount_path "${RESOLVED_PASSPHRASE_FILE}")
+  if [ -n "${SPINE_API_BIN}" ]; then
+    "${SPINE_API_BIN}" backup decrypt --passphrase-file "${host_pass_file}" --input - --output -
   else
-    local mount_pass_file
-    mount_pass_file=$(to_host_mount_path "${RESOLVED_PASSPHRASE_FILE}")
-    docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps \
-      -v "${mount_pass_file}:/run/secrets/backup_passphrase:ro" spine-api \
+    "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm -i --no-deps \
+      -v "${host_pass_file}:/run/secrets/backup_passphrase:ro" spine-api \
       backup decrypt --passphrase-file /run/secrets/backup_passphrase --input - --output -
   fi
 }
@@ -141,13 +168,7 @@ decrypt_stream() {
 restore_cleanup() {
   local exit_code=$?
 
-  # 1. Clean up temporary passphrase file if created
-  if [ "${CLEANUP_TEMP_PASSPHRASE}" -eq 1 ] && [ -n "${RESOLVED_PASSPHRASE_FILE:-}" ] && [ -f "${RESOLVED_PASSPHRASE_FILE}" ]; then
-    dd if=/dev/urandom of="${RESOLVED_PASSPHRASE_FILE}" bs=64 count=1 conv=notrunc 2>/dev/null || true
-    rm -f "${RESOLVED_PASSPHRASE_FILE}"
-  fi
-
-  # 2. Clean up temporary remote download staging directory on every exit path (success, failure, signal)
+  # 1. Clean up temporary remote download staging directory on every exit path (success, failure, signal)
   if [ -n "${REMOTE_RESTORE_DIR:-}" ] && [ -e "${REMOTE_RESTORE_DIR}" ]; then
     echo "Purging temporary remote download staging directory: ${REMOTE_RESTORE_DIR}..." >&2
     chmod -R 700 "${REMOTE_RESTORE_DIR}" 2>/dev/null || true
@@ -182,13 +203,13 @@ restore_cleanup() {
 
       # 1. Mandatory stop of any partially started services (NO || true)
       echo "Stopping cluster services before executing rollback extraction..." >&2
-      if ! docker compose -f "${COMPOSE_FILE}" stop ingress spine-api storage-node-1 storage-node-2 storage-node-3 coordinator postgres spine-frontend; then
+      if ! "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" stop ingress spine-api storage-node-1 storage-node-2 storage-node-3 coordinator postgres spine-frontend; then
         echo "ERROR: Failed to stop cluster services during rollback." >&2
         ROLLBACK_FAILED=1
       fi
 
       # 2. Mandatory quiescence verification (Fail-closed: MUST NOT extract if containers still running)
-      RUNNING_ROLLBACK=$(docker compose -f "${COMPOSE_FILE}" ps --services --filter "status=running" 2>/dev/null || echo "CHECK_FAILED")
+      RUNNING_ROLLBACK=$("${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" ps --services --filter "status=running" 2>/dev/null || echo "CHECK_FAILED")
       if [ -n "${RUNNING_ROLLBACK}" ]; then
         echo "CRITICAL FATAL: Cannot execute rollback extraction because containers are still running:" >&2
         echo "${RUNNING_ROLLBACK}" >&2
@@ -211,11 +232,11 @@ restore_cleanup() {
       # 3. Roll back Coordinator from encrypted archive
       if [ -f "${ROLLBACK_DIR}/coordinator.spnebak" ]; then
         echo "Rolling back Coordinator volume from encrypted archive..." >&2
-        if ! decrypt_stream < "${ROLLBACK_DIR}/coordinator.spnebak" | docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps --entrypoint sh coordinator \
+        if ! decrypt_stream < "${ROLLBACK_DIR}/coordinator.spnebak" | "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm -i --no-deps --entrypoint sh coordinator \
           -c "rm -rf /var/lib/spine/* /var/lib/spine/.[!.]* && tar -xzf - -C /var/lib/spine"; then
           echo "ERROR: Failed to extract rollback archive for Coordinator!" >&2
           ROLLBACK_FAILED=1
-        elif ! docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint test coordinator -f /var/lib/spine/.coordinator_fencing_generation; then
+        elif ! "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint test coordinator -f /var/lib/spine/.coordinator_fencing_generation; then
           echo "ERROR: Coordinator volume verification failed after rollback (.coordinator_fencing_generation missing)!" >&2
           ROLLBACK_FAILED=1
         else
@@ -231,11 +252,11 @@ restore_cleanup() {
       for NODE in 1 2 3; do
         if [ -f "${ROLLBACK_DIR}/storage_node_${NODE}.spnebak" ]; then
           echo "Rolling back Storage Node ${NODE} volume from encrypted archive..." >&2
-          if ! decrypt_stream < "${ROLLBACK_DIR}/storage_node_${NODE}.spnebak" | docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps --entrypoint sh "storage-node-${NODE}" \
+          if ! decrypt_stream < "${ROLLBACK_DIR}/storage_node_${NODE}.spnebak" | "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm -i --no-deps --entrypoint sh "storage-node-${NODE}" \
             -c "rm -rf /var/lib/spine/node-${NODE}/* /var/lib/spine/node-${NODE}/.[!.]* && tar -xzf - -C /var/lib/spine/node-${NODE}"; then
             echo "ERROR: Failed to extract rollback archive for Storage Node ${NODE}!" >&2
             ROLLBACK_FAILED=1
-          elif ! docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint test "storage-node-${NODE}" -f "/var/lib/spine/node-${NODE}/.fencing_generation"; then
+          elif ! "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint test "storage-node-${NODE}" -f "/var/lib/spine/node-${NODE}/.fencing_generation"; then
             echo "ERROR: Storage Node ${NODE} volume verification failed after rollback (.fencing_generation missing)!" >&2
             ROLLBACK_FAILED=1
           else
@@ -251,11 +272,11 @@ restore_cleanup() {
       # 5. Roll back API SSH from encrypted archive
       if [ -f "${ROLLBACK_DIR}/spine_ssh.spnebak" ]; then
         echo "Rolling back API SSH volume from encrypted archive..." >&2
-        if ! decrypt_stream < "${ROLLBACK_DIR}/spine_ssh.spnebak" | docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps --entrypoint sh spine-api \
+        if ! decrypt_stream < "${ROLLBACK_DIR}/spine_ssh.spnebak" | "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm -i --no-deps --entrypoint sh spine-api \
           -c "rm -rf /var/lib/spine/ssh/* /var/lib/spine/ssh/.[!.]* && tar -xzf - -C /var/lib/spine/ssh"; then
           echo "ERROR: Failed to extract rollback archive for API SSH!" >&2
           ROLLBACK_FAILED=1
-        elif ! docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint test spine-api -d /var/lib/spine/ssh; then
+        elif ! "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint test spine-api -d /var/lib/spine/ssh; then
           echo "ERROR: API SSH volume verification failed after rollback (/var/lib/spine/ssh missing)!" >&2
           ROLLBACK_FAILED=1
         else
@@ -270,11 +291,11 @@ restore_cleanup() {
       # 6. Roll back API storage from encrypted archive
       if [ -f "${ROLLBACK_DIR}/spine_storage.spnebak" ]; then
         echo "Rolling back API storage volume from encrypted archive..." >&2
-        if ! decrypt_stream < "${ROLLBACK_DIR}/spine_storage.spnebak" | docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps --entrypoint sh spine-api \
+        if ! decrypt_stream < "${ROLLBACK_DIR}/spine_storage.spnebak" | "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm -i --no-deps --entrypoint sh spine-api \
           -c "rm -rf /var/lib/spine/storage/* /var/lib/spine/storage/.[!.]* && tar -xzf - -C /var/lib/spine/storage"; then
           echo "ERROR: Failed to extract rollback archive for API storage!" >&2
           ROLLBACK_FAILED=1
-        elif ! docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint test spine-api -d /var/lib/spine/storage; then
+        elif ! "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint test spine-api -d /var/lib/spine/storage; then
           echo "ERROR: API storage volume verification failed after rollback (/var/lib/spine/storage missing)!" >&2
           ROLLBACK_FAILED=1
         else
@@ -289,11 +310,11 @@ restore_cleanup() {
       # 7. Roll back PostgreSQL from encrypted archive
       if [ -f "${ROLLBACK_DIR}/postgres_data.spnebak" ]; then
         echo "Rolling back PostgreSQL volume from encrypted archive..." >&2
-        if ! decrypt_stream < "${ROLLBACK_DIR}/postgres_data.spnebak" | docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps --entrypoint sh postgres \
+        if ! decrypt_stream < "${ROLLBACK_DIR}/postgres_data.spnebak" | "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm -i --no-deps --entrypoint sh postgres \
           -c "rm -rf /var/lib/postgresql/data/* /var/lib/postgresql/data/.[!.]* && tar -xzf - -C /var/lib/postgresql/data"; then
           echo "ERROR: Failed to extract rollback archive for PostgreSQL!" >&2
           ROLLBACK_FAILED=1
-        elif ! docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint test postgres -f /var/lib/postgresql/data/PG_VERSION; then
+        elif ! "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint test postgres -f /var/lib/postgresql/data/PG_VERSION; then
           echo "ERROR: PostgreSQL volume verification failed after rollback (PG_VERSION missing)!" >&2
           ROLLBACK_FAILED=1
         else
@@ -323,6 +344,12 @@ restore_cleanup() {
       echo "================================================================================" >&2
     fi
   fi
+
+  # Final cleanup: purge temporary passphrase file if created
+  if [ "${CLEANUP_TEMP_PASSPHRASE}" -eq 1 ] && [ -n "${RESOLVED_PASSPHRASE_FILE:-}" ] && [ -f "${RESOLVED_PASSPHRASE_FILE}" ]; then
+    dd if=/dev/urandom of="${RESOLVED_PASSPHRASE_FILE}" bs=64 count=1 conv=notrunc 2>/dev/null || true
+    rm -f "${RESOLVED_PASSPHRASE_FILE}"
+  fi
 }
 handle_signal() {
   local sig="$1"
@@ -346,7 +373,12 @@ verify_supported_storage_topology
 # Handle remote S3 target download if specified
 if [[ "${TARGET_INPUT}" =~ ^s3:// ]]; then
   echo "=== Detected Remote S3 Target: ${TARGET_INPUT} ==="
-  if ! command -v aws >/dev/null 2>&1; then
+  AWS_BIN="aws"
+  if ! command -v aws >/dev/null 2>&1 && command -v aws.exe >/dev/null 2>&1; then
+    AWS_BIN="aws.exe"
+  fi
+
+  if ! command -v "${AWS_BIN}" >/dev/null 2>&1; then
     echo "FATAL: Restoring from S3 URI requires 'aws' CLI on host." >&2
     exit 1
   fi
@@ -358,6 +390,9 @@ if [[ "${TARGET_INPUT}" =~ ^s3:// ]]; then
   if [ -n "${SPINE_S3_ENDPOINT_URL}" ]; then
     AWS_EXTRA_ARGS+=(--endpoint-url "${SPINE_S3_ENDPOINT_URL}")
   fi
+  if [ "${SPINE_S3_NO_SIGN_REQUEST:-0}" = "1" ] || [ "${AWS_NO_SIGN_REQUEST:-0}" = "1" ]; then
+    AWS_EXTRA_ARGS+=(--no-sign-request)
+  fi
 
   if [[ "${TARGET_INPUT}" =~ \.spnebak$ ]]; then
     REMOTE_ARCHIVE_URI="${TARGET_INPUT}"
@@ -367,14 +402,15 @@ if [[ "${TARGET_INPUT}" =~ ^s3:// ]]; then
     REMOTE_MANIFEST_URI="${TARGET_INPUT%/}/SHA256SUMS"
   fi
 
+  host_remote_restore_dir=$(to_host_mount_path "${REMOTE_RESTORE_DIR}")
   echo "Downloading backup archive from ${REMOTE_ARCHIVE_URI}..."
-  if ! aws s3 cp "${REMOTE_ARCHIVE_URI}" "${REMOTE_RESTORE_DIR}/backup.spnebak" "${AWS_EXTRA_ARGS[@]}"; then
+  if ! "${AWS_BIN}" s3 cp "${REMOTE_ARCHIVE_URI}" "${host_remote_restore_dir}/backup.spnebak" "${AWS_EXTRA_ARGS[@]}"; then
     echo "FATAL: Failed to download remote backup archive from ${REMOTE_ARCHIVE_URI}" >&2
     exit 1
   fi
 
   echo "Downloading checksum manifest from ${REMOTE_MANIFEST_URI}..."
-  if aws s3 cp "${REMOTE_MANIFEST_URI}" "${REMOTE_RESTORE_DIR}/SHA256SUMS" "${AWS_EXTRA_ARGS[@]}" 2>/dev/null; then
+  if "${AWS_BIN}" s3 cp "${REMOTE_MANIFEST_URI}" "${host_remote_restore_dir}/SHA256SUMS" "${AWS_EXTRA_ARGS[@]}" 2>/dev/null; then
     echo "Verifying downloaded archive checksum against remote SHA256SUMS..."
     (cd "${REMOTE_RESTORE_DIR}" && sha256sum -c SHA256SUMS)
   else
@@ -415,16 +451,17 @@ mkdir -p "${DECRYPT_DIR}"
 chmod 700 "${DECRYPT_DIR}"
 
 DECRYPT_FAILED=0
-if command -v spine-api >/dev/null 2>&1; then
-  if ! spine-api backup decrypt --passphrase-file "${RESOLVED_PASSPHRASE_FILE}" \
-    --input "${ENCRYPTED_FILE}" --output - | tar -xzf - -C "${DECRYPT_DIR}"; then
+mount_pass_file=$(to_host_mount_path "${RESOLVED_PASSPHRASE_FILE}")
+mount_encrypted_file=$(to_host_mount_path "${ENCRYPTED_FILE}")
+if [ -n "${SPINE_API_BIN}" ]; then
+  if ! "${SPINE_API_BIN}" backup decrypt --passphrase-file "${mount_pass_file}" \
+    --input "${mount_encrypted_file}" --output - | tar -xzf - -C "${DECRYPT_DIR}"; then
     DECRYPT_FAILED=1
   fi
 else
   # Decrypt through spine-api container via read-only mounted secret file.
   # Credentials are never passed in process arguments or container environment variables.
-  mount_pass_file=$(to_host_mount_path "${RESOLVED_PASSPHRASE_FILE}")
-  if ! docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps \
+  if ! "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm -i --no-deps \
     -v "${mount_pass_file}:/run/secrets/backup_passphrase:ro" spine-api \
     backup decrypt --passphrase-file /run/secrets/backup_passphrase --input - --output - < "${ENCRYPTED_FILE}" | tar -xzf - -C "${DECRYPT_DIR}"; then
     DECRYPT_FAILED=1
@@ -455,11 +492,11 @@ echo "=== Step 0b: Verifying Restored Payload SHA-256 Checksum Manifest ==="
 
 echo "=== Step 1: Stopping Cluster Services & Verifying Full Quiescence ==="
 # Stop services; failures here are fatal (no || true)
-docker compose -f "${COMPOSE_FILE}" stop ingress spine-api
-docker compose -f "${COMPOSE_FILE}" stop storage-node-1 storage-node-2 storage-node-3 coordinator postgres spine-frontend
+"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" stop ingress spine-api
+"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" stop storage-node-1 storage-node-2 storage-node-3 coordinator postgres spine-frontend
 
 # Strictly verify no stateful containers are running
-RUNNING=$(docker compose -f "${COMPOSE_FILE}" ps --services --filter "status=running")
+RUNNING=$("${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" ps --services --filter "status=running")
 if [ -n "${RUNNING}" ]; then
   echo "FATAL: The following services failed to stop and are still running:" >&2
   echo "${RUNNING}" >&2
@@ -485,25 +522,25 @@ echo "=== Step 2a: Mandatory Pre-Restore Archiving & Integrity Gate (Volumes Unt
 # Any failure here aborts immediately before a single byte of live volume data is modified.
 
 echo "Archiving Coordinator volume (encrypted)..."
-docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint tar coordinator \
+"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint tar coordinator \
   -czf - -C /var/lib/spine . | encrypt_stream > "${ROLLBACK_DIR}/coordinator.spnebak"
 
 for NODE in 1 2 3; do
   echo "Archiving Storage Node ${NODE} volume (encrypted)..."
-  docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint tar "storage-node-${NODE}" \
+  "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint tar "storage-node-${NODE}" \
     -czf - -C "/var/lib/spine/node-${NODE}" . | encrypt_stream > "${ROLLBACK_DIR}/storage_node_${NODE}.spnebak"
 done
 
 echo "Archiving API SSH identities (encrypted)..."
-docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint tar spine-api \
+"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint tar spine-api \
   -czf - -C /var/lib/spine/ssh . | encrypt_stream > "${ROLLBACK_DIR}/spine_ssh.spnebak"
 
 echo "Archiving API storage cache (encrypted)..."
-docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint tar spine-api \
+"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint tar spine-api \
   -czf - -C /var/lib/spine/storage . | encrypt_stream > "${ROLLBACK_DIR}/spine_storage.spnebak"
 
 echo "Archiving PostgreSQL volume (encrypted)..."
-docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint tar postgres \
+"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint tar postgres \
   -czf - -C /var/lib/postgresql/data . | encrypt_stream > "${ROLLBACK_DIR}/postgres_data.spnebak"
 
 # Restrictive permissions on rollback directory and encrypted archives
@@ -540,33 +577,33 @@ echo "=== Step 2b: Cleaning Target Volumes & Extracting Incoming Backup ==="
 # 1. Clean ephemeral staging in storage nodes (unquoted wildcards inside container shell)
 for NODE in 1 2 3; do
   echo "Cleaning staging directories in storage node ${NODE}..."
-  docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
+  "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
     -c "rm -rf /var/lib/spine/node-${NODE}/.staged_restore_* /var/lib/spine/node-${NODE}/.old_restore_* 2>/dev/null || true"
 done
 
 # 2. Empty target volumes and extract incoming backup cleanly
 echo "Restoring Coordinator volume..."
-docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh coordinator \
+"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh coordinator \
   -c "rm -rf /var/lib/spine/* /var/lib/spine/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine" < "${DECRYPT_DIR}/coordinator.tar.gz"
 
 for NODE in 1 2 3; do
   echo "Restoring Storage Node ${NODE} volume..."
-  docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
+  "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
     -c "rm -rf /var/lib/spine/node-${NODE}/* /var/lib/spine/node-${NODE}/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine/node-${NODE}" < "${DECRYPT_DIR}/storage_node_${NODE}.tar.gz"
 done
 
 echo "Restoring API SSH identities..."
-docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh spine-api \
+"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh spine-api \
   -c "rm -rf /var/lib/spine/ssh/* /var/lib/spine/ssh/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine/ssh" < "${DECRYPT_DIR}/spine_ssh.tar.gz"
 
 echo "Restoring API storage cache..."
-docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh spine-api \
+"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh spine-api \
   -c "rm -rf /var/lib/spine/storage/* /var/lib/spine/storage/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine/storage" < "${DECRYPT_DIR}/spine_storage.tar.gz"
 
 echo "=== Step 3: Automated Fail-Closed Fencing Generation Verification ==="
 FAILED=0
 
-COORD_GEN=$(docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint cat coordinator \
+COORD_GEN=$("${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint cat coordinator \
   /var/lib/spine/.coordinator_fencing_generation 2>/dev/null | tr -d '[:space:]' || echo "MISSING")
 
 if [ "${COORD_GEN}" != "${TARGET_GEN}" ]; then
@@ -577,7 +614,7 @@ else
 fi
 
 for NODE in 1 2 3; do
-  NODE_GEN=$(docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint cat "storage-node-${NODE}" \
+  NODE_GEN=$("${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint cat "storage-node-${NODE}" \
     "/var/lib/spine/node-${NODE}/.fencing_generation" 2>/dev/null | tr -d '[:space:]' || echo "MISSING")
   if [ "${NODE_GEN}" != "${TARGET_GEN}" ]; then
     echo "ERROR: Storage node ${NODE} generation (${NODE_GEN}) does not match target generation (${TARGET_GEN})."
@@ -599,7 +636,7 @@ if [ ${FAILED} -ne 0 ]; then
   echo "1. Re-verify the source backup directory: ${BACKUP_DIR}" >&2
   echo "2. Re-extract the specific diverged volume from the verified archive." >&2
   echo "3. If at least 2 of 3 storage nodes and coordinator match, run anti-entropy repair:" >&2
-  echo "   docker compose -f ${COMPOSE_FILE} run --rm coordinator \\" >&2
+  echo "   "${DOCKER_BIN}" compose -f ${COMPOSE_FILE} run --rm coordinator \\" >&2
   echo "     repair-generation --expected-gen ${TARGET_GEN}" >&2
   echo "   (or flag syntax: --repair-generation --expected-gen ${TARGET_GEN})" >&2
   echo "4. Otherwise, abort and fall back to the previous verified backup." >&2
@@ -612,23 +649,23 @@ echo "All participants match fencing generation ${TARGET_GEN}. Consensus verifie
 echo "=== Step 4: Storage Node Volume Integrity Check ==="
 for NODE in 1 2 3; do
   echo "Verifying storage volume integrity on node ${NODE}..."
-  docker compose -f "${COMPOSE_FILE}" run --rm "storage-node-${NODE}" \
-    /usr/local/bin/spine-storage-node --verify-integrity --data-dir "/var/lib/spine/node-${NODE}"
+  "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm "storage-node-${NODE}" \
+    --verify-integrity --data-dir "/var/lib/spine/node-${NODE}"
 done
 
 echo "=== Step 5: Clean PostgreSQL Restoration & Verification ==="
 # 1. Strictly empty /var/lib/postgresql/data for PostgreSQL initdb
 echo "Preparing strictly empty PGDATA for fresh PostgreSQL initialization..."
-docker compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh postgres \
+"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh postgres \
   -c "rm -rf /var/lib/postgresql/data/* /var/lib/postgresql/data/.[!.]* 2>/dev/null || true"
 
 echo "Starting fresh PostgreSQL container..."
-docker compose -f "${COMPOSE_FILE}" up -d postgres
+"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" up -d postgres
 
 echo "Awaiting PostgreSQL readiness..."
 READY_PG=0
 for i in $(seq 1 30); do
-  if docker compose -f "${COMPOSE_FILE}" exec -T postgres pg_isready -U "${POSTGRES_ADMIN_USER}" >/dev/null 2>&1; then
+  if "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T postgres pg_isready -U "${POSTGRES_ADMIN_USER}" >/dev/null 2>&1; then
     READY_PG=1
     break
   fi
@@ -642,29 +679,26 @@ fi
 
 # 2. Terminate connections and drop empty compose-initialized spine_forge database
 echo "Preparing database cluster for dump import..."
-docker compose -f "${COMPOSE_FILE}" exec -T postgres psql -U "${POSTGRES_ADMIN_USER}" -d postgres -v ON_ERROR_STOP=1 -c "
-  SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'spine_forge' AND pid <> pg_backend_pid();
-  DROP DATABASE IF EXISTS spine_forge;
-"
+PG_EXEC_ARGS=()
+if [ -n "${POSTGRES_ADMIN_PASSWORD}" ]; then
+  PG_EXEC_ARGS+=(-e "PGPASSWORD=${POSTGRES_ADMIN_PASSWORD}")
+fi
+
+"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T "${PG_EXEC_ARGS[@]}" postgres psql -U "${POSTGRES_ADMIN_USER}" -d postgres -v ON_ERROR_STOP=1 \
+  -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'spine_forge' AND pid <> pg_backend_pid();" \
+  -c "DROP DATABASE IF EXISTS spine_forge;"
 
 # 3. Import dump with ON_ERROR_STOP=1, adapting CREATE ROLE statements to handle existing bootstrap roles idempotently
 echo "Importing PostgreSQL database from ${DECRYPT_DIR}/postgres_dump.sql.gz (with ON_ERROR_STOP=1)..."
 # Stream through sed: converts 'CREATE ROLE <name> ...;' into idempotent PL/pgSQL block
 # Catching duplicate_object prevents collision with bootstrap roles while failing closed on any real error
-if [ -n "${POSTGRES_ADMIN_PASSWORD}" ]; then
-  gzip -dc "${DECRYPT_DIR}/postgres_dump.sql.gz" | \
-    sed -E 's/^CREATE ROLE ([^;]+);/DO \$\$ BEGIN CREATE ROLE \1; EXCEPTION WHEN duplicate_object THEN NULL; END \$\$;/' | \
-    docker compose -f "${COMPOSE_FILE}" exec -T -e PGPASSWORD="${POSTGRES_ADMIN_PASSWORD}" postgres \
-    psql -v ON_ERROR_STOP=1 -U "${POSTGRES_ADMIN_USER}" -d postgres
-else
-  gzip -dc "${DECRYPT_DIR}/postgres_dump.sql.gz" | \
-    sed -E 's/^CREATE ROLE ([^;]+);/DO \$\$ BEGIN CREATE ROLE \1; EXCEPTION WHEN duplicate_object THEN NULL; END \$\$;/' | \
-    docker compose -f "${COMPOSE_FILE}" exec -T postgres \
-    psql -v ON_ERROR_STOP=1 -U "${POSTGRES_ADMIN_USER}" -d postgres
-fi
+gzip -dc "${DECRYPT_DIR}/postgres_dump.sql.gz" | \
+  sed -E 's/^CREATE ROLE ([^;]+);/DO \$\$ BEGIN CREATE ROLE \1; EXCEPTION WHEN duplicate_object THEN NULL; END \$\$;/' | \
+  "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T "${PG_EXEC_ARGS[@]}" postgres \
+  psql -v ON_ERROR_STOP=1 -U "${POSTGRES_ADMIN_USER}" -d postgres
 
 echo "Verifying restored PostgreSQL schema..."
-TABLE_COUNT=$(docker compose -f "${COMPOSE_FILE}" exec -T postgres \
+TABLE_COUNT=$("${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T "${PG_EXEC_ARGS[@]}" postgres \
   psql -U "${POSTGRES_ADMIN_USER}" -d spine_forge -t -A -c \
   "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public';" 2>/dev/null || echo "0")
 
@@ -674,16 +708,34 @@ if [ "${TABLE_COUNT}" -eq 0 ]; then
 fi
 echo "PostgreSQL restoration verified (${TABLE_COUNT} public tables present in spine_forge)."
 
+echo "Synchronizing PostgreSQL restore generation and barrier state to target generation ${TARGET_GEN}..."
+"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T "${PG_EXEC_ARGS[@]}" postgres \
+  psql -U "${POSTGRES_ADMIN_USER}" -d spine_forge -v ON_ERROR_STOP=1 -c "
+    INSERT INTO _restore_generation (id, generation_token, backup_id, restored_at_nanos, status)
+    VALUES (1, '${TARGET_GEN}', 'oob-restore-${TARGET_GEN}', (EXTRACT(EPOCH FROM NOW()) * 1000000000)::bigint, 'COMMITTED')
+    ON CONFLICT (id) DO UPDATE SET
+      generation_token = EXCLUDED.generation_token,
+      backup_id = EXCLUDED.backup_id,
+      restored_at_nanos = EXCLUDED.restored_at_nanos,
+      status = EXCLUDED.status;
+    UPDATE _cluster_maintenance_barrier
+    SET is_active = FALSE,
+        lease_expires_at_nanos = 0,
+        owner_token = '',
+        fencing_generation = ${TARGET_GEN}
+    WHERE id = 1;
+  "
+
 echo "=== Step 6: Starting Core Infrastructure & Application Control Plane ==="
 echo "Starting coordinator and storage nodes..."
-docker compose -f "${COMPOSE_FILE}" up -d coordinator storage-node-1 storage-node-2 storage-node-3
+"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" up -d coordinator storage-node-1 storage-node-2 storage-node-3
 
 echo "Awaiting core infrastructure health..."
 sleep 5
-docker compose -f "${COMPOSE_FILE}" ps
+"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" ps
 
 echo "Starting API, frontend, and ingress..."
-docker compose -f "${COMPOSE_FILE}" up -d spine-api spine-frontend ingress
+"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" up -d spine-api spine-frontend ingress
 
 echo "=== Step 7: Readiness Health Check & Rollback Purge Gate ==="
 sleep 3
