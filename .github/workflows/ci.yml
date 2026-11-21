@@ -107,11 +107,34 @@ jobs:
           done
           sh docker/postgres/01-init-roles.sh
 
-      - name: Run Disposable DB Backup Cleanup Fault Injection Tests
-        run: cargo test --manifest-path github-alternative/backend/Cargo.toml --test backup_cleanup_fault_injection_test --jobs 2 -- --ignored --nocapture
+      - name: Run Disposable DB Backup Cleanup Fault Injection Tests (Pure Database Tests)
+        run: |
+          for t in \
+            test_pre_helper_db_maintenance_entry_and_dump_failure_paths \
+            test_uncertain_barrier_write_committed_server_side_then_response_lost \
+            test_concurrent_startup_reconciliation_racing_with_new_backup_entry \
+            test_acquire_write_permit_attempting_to_clear_expired_lease_while_new_backup_beginning \
+            test_stale_lease_record_alongside_fresh_database_barrier_owner \
+            test_lease_expiry_while_backup_alive_but_db_connection_lost \
+            test_recovery_attempting_to_exit_participants_while_current_backup_owns_lease \
+            test_multi_heartbeat_lease_renewal_and_startup_recovery \
+            test_archive_publication_aborted_on_lock_loss
+          do
+            echo "Running disposable DB test: $t"
+            cargo test --manifest-path github-alternative/backend/Cargo.toml --test backup_cleanup_fault_injection_test "$t" -- --ignored --exact --nocapture
+          done
 
-      - name: Run Combined Production Restore DB Test
-        run: cargo test --manifest-path github-alternative/backend/Cargo.toml --test combined_production_restore_test --jobs 2 -- --ignored --nocapture
+      - name: Report External Infrastructure Tests (Skipped in Disposable DB CI)
+        run: |
+          echo "================================================================================"
+          echo "EXTERNAL INFRASTRUCTURE TEST INVENTORY:"
+          echo "The following tests require external release-candidate binaries (spine-coordinator"
+          echo "and spine-storage-node staged in target/release-candidate) and are intentionally"
+          echo "marked NOT RUN in disposable database CI:"
+          echo "  - backup_cleanup_fault_injection_test::test_backup_cleanup_live_processes_and_postgres_guard_release"
+          echo "  - backup_cleanup_fault_injection_test::test_backup_cancellation_and_abrupt_termination_recovery"
+          echo "  - combined_production_restore_test::test_combined_production_shaped_postgres_and_cluster_recovery"
+          echo "================================================================================"
 
       - name: Run Disposable DB Safety Contract Test
         run: cargo test --manifest-path github-alternative/backend/Cargo.toml --test test_database_safety_test --jobs 2 -- --nocapture
@@ -224,8 +247,7 @@ jobs:
         uses: gitleaks/gitleaks-action@f586c14365d4643c6aa59d472ae6e984bf47bb34 # v2.3.8
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          args: detect --verbose --redact --config .gitleaks.toml
+          GITLEAKS_CONFIG: .gitleaks.toml
 
   # ----------------------------------------------------------------------------
   # 6. Infrastructure Template Validation (CloudFormation)

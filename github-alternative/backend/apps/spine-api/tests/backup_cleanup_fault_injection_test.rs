@@ -394,7 +394,7 @@ async fn wait_for_node(addr: &str) {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated SPINE_TEST_DATABASE_URL; run with -- --ignored in release gate"]
+#[ignore = "requires pre-built release candidate binaries in target/release-candidate and isolated SPINE_TEST_DATABASE_URL"]
 async fn test_backup_cleanup_live_processes_and_postgres_guard_release() {
     let db_url = std::env::var("SPINE_TEST_DATABASE_URL").unwrap_or_default();
     assert!(
@@ -507,7 +507,7 @@ async fn test_backup_cleanup_live_processes_and_postgres_guard_release() {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated SPINE_TEST_DATABASE_URL; run with -- --ignored in release gate"]
+#[ignore = "requires isolated SPINE_TEST_DATABASE_URL"]
 async fn test_pre_helper_db_maintenance_entry_and_dump_failure_paths() {
     use spine_api::backup::{capture_encrypted_pg_dump, SPINE_CLUSTER_MAINTENANCE_LOCK_ID};
     use sqlx::postgres::PgConnectOptions;
@@ -793,7 +793,7 @@ async fn spawn_pg_fault_proxy(
 }
 
 #[tokio::test]
-#[ignore = "requires isolated SPINE_TEST_DATABASE_URL; run with -- --ignored in release gate"]
+#[ignore = "requires isolated SPINE_TEST_DATABASE_URL"]
 async fn test_uncertain_barrier_write_committed_server_side_then_response_lost() {
     let db_url = std::env::var("SPINE_TEST_DATABASE_URL").unwrap_or_default();
     assert!(
@@ -887,7 +887,7 @@ async fn test_uncertain_barrier_write_committed_server_side_then_response_lost()
 }
 
 #[tokio::test]
-#[ignore = "requires isolated SPINE_TEST_DATABASE_URL; run with -- --ignored in release gate"]
+#[ignore = "requires pre-built release candidate binaries in target/release-candidate and isolated SPINE_TEST_DATABASE_URL"]
 async fn test_backup_cancellation_and_abrupt_termination_recovery() {
     use spine_api::backup::{
         reconcile_backup_maintenance_on_startup, run_backup_with_maintenance_cleanup_with_lease,

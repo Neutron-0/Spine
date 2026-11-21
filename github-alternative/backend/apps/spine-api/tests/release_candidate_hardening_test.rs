@@ -797,16 +797,8 @@ fn test_bounded_memory_encrypted_streaming_backup_large_payload() {
 
     // Stream an additional 12 MiB database JSONL payload through EphemeralEncryptedTemp with 256 KiB chunking
     let chunk_size = 256 * 1024u32;
-    let baseline_ws = {
-        #[cfg(windows)]
-        {
-            current_working_set_bytes()
-        }
-        #[cfg(not(windows))]
-        {
-            0usize
-        }
-    };
+    #[cfg(windows)]
+    let baseline_ws = current_working_set_bytes();
 
     let (pg_tmp, pg_key, mut pg_enc_writer) = EphemeralEncryptedTemp::begin(chunk_size).unwrap();
     use std::io::Write;

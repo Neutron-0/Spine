@@ -128,7 +128,7 @@ async fn wait_for_node(addr: &str) {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated SPINE_TEST_DATABASE_URL; run with -- --ignored in release gate"]
+#[ignore = "requires pre-built release candidate binaries in target/release-candidate and isolated SPINE_TEST_DATABASE_URL"]
 async fn test_combined_production_shaped_postgres_and_cluster_recovery() {
     let db_url = std::env::var("SPINE_TEST_DATABASE_URL").unwrap_or_default();
     assert!(
