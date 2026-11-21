@@ -150,7 +150,10 @@ pub async fn get_run(
         .await?
         .ok_or_else(|| ForgeError::NotFound("Workflow run not found".into()))?;
     let caller_id = user.as_ref().map(|Extension(u)| u.id.as_str());
-    state.permissions.require_repo_read(caller_id, &run.repo_id).await?;
+    state
+        .permissions
+        .require_repo_read(caller_id, &run.repo_id)
+        .await?;
     Ok(Json(run))
 }
 
@@ -192,7 +195,10 @@ pub async fn list_jobs(
         .await?
         .ok_or_else(|| ForgeError::NotFound("Workflow run not found".into()))?;
     let caller_id = user.as_ref().map(|Extension(u)| u.id.as_str());
-    state.permissions.require_repo_read(caller_id, &run.repo_id).await?;
+    state
+        .permissions
+        .require_repo_read(caller_id, &run.repo_id)
+        .await?;
     let jobs = state.workflows.list_jobs(&id).await?;
     Ok(Json(jobs))
 }
@@ -208,7 +214,10 @@ pub async fn get_job(
         .await?
         .ok_or_else(|| ForgeError::NotFound("Job not found".into()))?;
     let caller_id = user.as_ref().map(|Extension(u)| u.id.as_str());
-    state.permissions.require_repo_read(caller_id, &job.repo_id).await?;
+    state
+        .permissions
+        .require_repo_read(caller_id, &job.repo_id)
+        .await?;
     Ok(Json(job))
 }
 
@@ -223,7 +232,10 @@ pub async fn list_steps(
         .await?
         .ok_or_else(|| ForgeError::NotFound("Job not found".into()))?;
     let caller_id = user.as_ref().map(|Extension(u)| u.id.as_str());
-    state.permissions.require_repo_read(caller_id, &job.repo_id).await?;
+    state
+        .permissions
+        .require_repo_read(caller_id, &job.repo_id)
+        .await?;
     let steps = state.workflows.list_steps(&id).await?;
     Ok(Json(steps))
 }
@@ -239,7 +251,10 @@ pub async fn list_logs(
         .await?
         .ok_or_else(|| ForgeError::NotFound("Job not found".into()))?;
     let caller_id = user.as_ref().map(|Extension(u)| u.id.as_str());
-    state.permissions.require_repo_read(caller_id, &job.repo_id).await?;
+    state
+        .permissions
+        .require_repo_read(caller_id, &job.repo_id)
+        .await?;
     let logs = state.workflows.list_logs(&id).await?;
     Ok(Json(logs))
 }

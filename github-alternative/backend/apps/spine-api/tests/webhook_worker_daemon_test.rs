@@ -1,13 +1,13 @@
+use chrono::Utc;
 use std::sync::Arc;
 use std::time::Duration;
-use chrono::Utc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::sleep;
 
 use spine_api::core::types::*;
 use spine_api::db::{Database, InMemoryDatabase};
-use spine_api::webhook::{WebhookOutboxWorker, SsrfValidator};
+use spine_api::webhook::{SsrfValidator, WebhookOutboxWorker};
 use spine_api::workflow::WorkflowScheduler;
 
 #[tokio::test]
@@ -34,7 +34,10 @@ async fn test_webhook_worker_lifecycle_and_processing() {
     db.enqueue_webhook_outbox(item).await.unwrap();
 
     // Verify item is pending
-    assert_eq!(db.count_pending_webhook_outbox(now + 1000).await.unwrap(), 1);
+    assert_eq!(
+        db.count_pending_webhook_outbox(now + 1000).await.unwrap(),
+        1
+    );
 
     // Spawn worker
     let worker_clone = Arc::clone(&worker);
@@ -52,7 +55,10 @@ async fn test_webhook_worker_lifecycle_and_processing() {
         }
     }
 
-    assert!(processed, "WebhookOutboxWorker daemon loop failed to process pending outbox item");
+    assert!(
+        processed,
+        "WebhookOutboxWorker daemon loop failed to process pending outbox item"
+    );
 
     // Verify shutdown stops the loop
     worker.shutdown();
@@ -65,8 +71,10 @@ async fn test_webhook_worker_lifecycle_and_processing() {
 #[tokio::test]
 async fn test_webhook_worker_delivers_over_https() {
     // 1. Generate self-signed certificate for localhost
-    let (cert_der, key_der) = spine_net::tls::generate_self_signed_cert_der(&["localhost", "127.0.0.1"]).unwrap();
-    let server_tls_config = Arc::new(spine_net::tls::build_server_tls_config(vec![cert_der.clone()], key_der).unwrap());
+    let (cert_der, key_der) =
+        spine_net::tls::generate_self_signed_cert_der(&["localhost", "127.0.0.1"]).unwrap();
+    let server_tls_config =
+        Arc::new(spine_net::tls::build_server_tls_config(vec![cert_der.clone()], key_der).unwrap());
 
     // 2. Start mock HTTPS server on loopback
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -123,8 +131,7 @@ async fn test_webhook_worker_delivers_over_https() {
 
     // 4. Create worker configured with custom root cert (our self-signed cert)
     let ssrf = SsrfValidator::new(true);
-    let worker = WebhookOutboxWorker::new(Arc::clone(&db), ssrf)
-        .with_root_certs(vec![cert_der]);
+    let worker = WebhookOutboxWorker::new(Arc::clone(&db), ssrf).with_root_certs(vec![cert_der]);
 
     // 5. Process batch
     let processed = worker.process_batch(10).await.unwrap();

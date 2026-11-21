@@ -142,10 +142,9 @@ pub async fn authenticate_git_user(
             }
         } else if let Some(remote_token) = auth_str.strip_prefix("RemoteAuth ") {
             let salt = crate::api::routes_lfs::resolve_lfs_secret_salt();
-            if let Some(tok) = crate::api::routes_lfs::verify_remote_auth_token(
-                &salt,
-                remote_token.trim(),
-            ) {
+            if let Some(tok) =
+                crate::api::routes_lfs::verify_remote_auth_token(&salt, remote_token.trim())
+            {
                 if let Ok(Some(u)) = state.db.get_user_by_id(&tok.user_id).await {
                     return Some(u);
                 }
@@ -494,7 +493,10 @@ fn flatten_tree_recursive_inner<S: spine_object_store::ObjectStore>(
 ) -> anyhow::Result<()> {
     const MAX_TREE_DEPTH: usize = 128;
     if depth > MAX_TREE_DEPTH {
-        anyhow::bail!("Tree nesting exceeds maximum allowable depth ({})", MAX_TREE_DEPTH);
+        anyhow::bail!(
+            "Tree nesting exceeds maximum allowable depth ({})",
+            MAX_TREE_DEPTH
+        );
     }
     if !active_ancestors.insert(*tree_id) {
         anyhow::bail!("Cyclic tree reference detected at object {}", tree_id);
@@ -513,7 +515,14 @@ fn flatten_tree_recursive_inner<S: spine_object_store::ObjectStore>(
                 format!("{}/{}", prefix, entry.name)
             };
             if entry.mode == spine_core::FileMode::Directory {
-                flatten_tree_recursive_inner(store, &entry.object_id, &full_path, out, active_ancestors, depth + 1)?;
+                flatten_tree_recursive_inner(
+                    store,
+                    &entry.object_id,
+                    &full_path,
+                    out,
+                    active_ancestors,
+                    depth + 1,
+                )?;
             } else {
                 out.insert(full_path, (entry.mode, entry.object_id));
             }
@@ -550,8 +559,7 @@ pub fn collect_changed_paths_from_commits<S: spine_object_store::ObjectStore>(
                         "",
                         &mut parent_tree_files,
                     )?;
-                    let diff =
-                        spine_diff::compare_trees(&parent_tree_files, &commit_tree_files);
+                    let diff = spine_diff::compare_trees(&parent_tree_files, &commit_tree_files);
                     for change in diff {
                         paths.insert(change.path().to_string());
                     }
@@ -646,7 +654,10 @@ pub async fn process_git_receive_pack(
         Err(e) => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                format!("Failed to verify changed commit trees during lock check: {}\n", e),
+                format!(
+                    "Failed to verify changed commit trees during lock check: {}\n",
+                    e
+                ),
             ));
         }
     };

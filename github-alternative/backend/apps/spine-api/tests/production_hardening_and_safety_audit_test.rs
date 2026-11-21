@@ -19,9 +19,12 @@ async fn test_migration_endpoints_reject_unauthenticated_and_path_traversal() {
         .method("POST")
         .uri("/api/v1/migration/inspect")
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_vec(&serde_json::json!({
-            "source_path": "/var/tmp/repo"
-        })).unwrap()))
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "source_path": "/var/tmp/repo"
+            }))
+            .unwrap(),
+        ))
         .unwrap();
 
     let res = app.clone().oneshot(req).await.unwrap();
@@ -56,7 +59,9 @@ async fn test_migration_endpoints_reject_unauthenticated_and_path_traversal() {
         created_at_nanos: now,
         expires_at_nanos: now + 3600 * 1_000_000_000,
         revoked: false,
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
     // 2. Authenticated inspect attempt with directory traversal ('..') must be rejected with 400 Bad Request
     let req_traversal = Request::builder()
@@ -64,9 +69,12 @@ async fn test_migration_endpoints_reject_unauthenticated_and_path_traversal() {
         .uri("/api/v1/migration/inspect")
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::COOKIE, format!("spine_session={}", session_token))
-        .body(Body::from(serde_json::to_vec(&serde_json::json!({
-            "source_path": "../../etc/shadow"
-        })).unwrap()))
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "source_path": "../../etc/shadow"
+            }))
+            .unwrap(),
+        ))
         .unwrap();
 
     let res_traversal = app.clone().oneshot(req_traversal).await.unwrap();
@@ -78,9 +86,12 @@ async fn test_migration_endpoints_reject_unauthenticated_and_path_traversal() {
         .uri("/api/v1/migration/inspect")
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::COOKIE, format!("spine_session={}", session_token))
-        .body(Body::from(serde_json::to_vec(&serde_json::json!({
-            "source_path": if cfg!(windows) { "C:\\Windows\\System32" } else { "/etc/shadow" }
-        })).unwrap()))
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "source_path": if cfg!(windows) { "C:\\Windows\\System32" } else { "/etc/shadow" }
+            }))
+            .unwrap(),
+        ))
         .unwrap();
 
     let res_outside = app.clone().oneshot(req_outside).await.unwrap();
@@ -92,10 +103,13 @@ async fn test_migration_endpoints_reject_unauthenticated_and_path_traversal() {
         .uri("/api/v1/migration/run")
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::COOKIE, format!("spine_session={}", session_token))
-        .body(Body::from(serde_json::to_vec(&serde_json::json!({
-            "source_path": "valid_import_repo",
-            "target_name": "../escaped_repo"
-        })).unwrap()))
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "source_path": "valid_import_repo",
+                "target_name": "../escaped_repo"
+            }))
+            .unwrap(),
+        ))
         .unwrap();
 
     let res_target = app.clone().oneshot(req_target_traversal).await.unwrap();
@@ -107,10 +121,13 @@ async fn test_migration_endpoints_reject_unauthenticated_and_path_traversal() {
         .uri("/api/v1/migration/export")
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::COOKIE, format!("spine_session={}", session_token))
-        .body(Body::from(serde_json::to_vec(&serde_json::json!({
-            "repo_name": "otheruser/secret-repo",
-            "target_path": "exported_git"
-        })).unwrap()))
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "repo_name": "otheruser/secret-repo",
+                "target_path": "exported_git"
+            }))
+            .unwrap(),
+        ))
         .unwrap();
 
     let res_export = app.clone().oneshot(req_export_unauth).await.unwrap();
@@ -266,7 +283,9 @@ async fn test_private_workflows_and_logs_enforce_read_authorization() {
         created_at_nanos: now,
         expires_at_nanos: now + 3600 * 1_000_000_000,
         revoked: false,
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
     let req_alice_logs = Request::builder()
         .method("GET")
@@ -341,14 +360,14 @@ async fn test_tree_flattening_rejects_cycles_without_stack_overflow() {
     use spine_format::serialize_tree;
     use spine_object_store::{ObjectStore, ObjectStoreError};
 
-    let cyclic_id = ObjectId::from_hex("3333333333333333333333333333333333333333333333333333333333333333").unwrap();
-    let entries = vec![
-        TreeEntry {
-            mode: FileMode::Directory,
-            name: "self_loop".to_string(),
-            object_id: cyclic_id,
-        }
-    ];
+    let cyclic_id =
+        ObjectId::from_hex("3333333333333333333333333333333333333333333333333333333333333333")
+            .unwrap();
+    let entries = vec![TreeEntry {
+        mode: FileMode::Directory,
+        name: "self_loop".to_string(),
+        object_id: cyclic_id,
+    }];
     let payload = serialize_tree(&entries);
 
     struct MockCyclicStore {
@@ -364,7 +383,11 @@ async fn test_tree_flattening_rejects_cycles_without_stack_overflow() {
                 Err(ObjectStoreError::NotFound(*id))
             }
         }
-        fn write_object(&self, _object_type: ObjectType, _payload: &[u8]) -> Result<ObjectId, ObjectStoreError> {
+        fn write_object(
+            &self,
+            _object_type: ObjectType,
+            _payload: &[u8],
+        ) -> Result<ObjectId, ObjectStoreError> {
             Ok(self.cyclic_id)
         }
         fn has_object(&self, id: &ObjectId) -> bool {
@@ -375,18 +398,23 @@ async fn test_tree_flattening_rejects_cycles_without_stack_overflow() {
         }
     }
 
-    let store = MockCyclicStore {
-        cyclic_id,
-        payload,
-    };
+    let store = MockCyclicStore { cyclic_id, payload };
 
     let mut out = std::collections::BTreeMap::new();
-    let result = spine_api::api::routes_git_http::flatten_tree_recursive(&store, &cyclic_id, "", &mut out);
+    let result =
+        spine_api::api::routes_git_http::flatten_tree_recursive(&store, &cyclic_id, "", &mut out);
 
     // It must return an Error detecting cyclic reference, NOT loop forever or stack overflow!
-    assert!(result.is_err(), "Cyclic tree must return an error and not stack overflow");
+    assert!(
+        result.is_err(),
+        "Cyclic tree must return an error and not stack overflow"
+    );
     let err_str = result.err().unwrap().to_string();
-    assert!(err_str.contains("Cyclic tree reference detected"), "Error should report cycle: {}", err_str);
+    assert!(
+        err_str.contains("Cyclic tree reference detected"),
+        "Error should report cycle: {}",
+        err_str
+    );
 }
 
 #[tokio::test]
@@ -396,19 +424,22 @@ async fn test_tree_flattening_allows_shared_subtrees_in_valid_dag() {
     use spine_object_store::{FileSystemObjectStore, ObjectStore};
 
     let temp_dir = tempfile::tempdir().unwrap();
-    let store = FileSystemObjectStore::new(temp_dir.path(), spine_core::HashAlgorithm::Blake3, 3).unwrap();
+    let store =
+        FileSystemObjectStore::new(temp_dir.path(), spine_core::HashAlgorithm::Blake3, 3).unwrap();
 
     // 1. Create a leaf blob and shared subtree
-    let dummy_blob_id = ObjectId::from_hex("2222222222222222222222222222222222222222222222222222222222222222").unwrap();
-    let shared_entries = vec![
-        TreeEntry {
-            mode: FileMode::Regular,
-            name: "readme.txt".to_string(),
-            object_id: dummy_blob_id,
-        }
-    ];
+    let dummy_blob_id =
+        ObjectId::from_hex("2222222222222222222222222222222222222222222222222222222222222222")
+            .unwrap();
+    let shared_entries = vec![TreeEntry {
+        mode: FileMode::Regular,
+        name: "readme.txt".to_string(),
+        object_id: dummy_blob_id,
+    }];
     let payload_shared = serialize_tree(&shared_entries);
-    let shared_subtree_id = store.write_object(ObjectType::Tree, &payload_shared).unwrap();
+    let shared_subtree_id = store
+        .write_object(ObjectType::Tree, &payload_shared)
+        .unwrap();
 
     // 2. Create root tree containing TWO different directory entries ("dir_a" and "dir_b")
     // both pointing to the SAME shared_subtree_id (standard Git / CAS deduplication DAG)
@@ -429,16 +460,35 @@ async fn test_tree_flattening_allows_shared_subtrees_in_valid_dag() {
 
     // 3. Flatten tree via routes_git_http::flatten_tree_recursive
     let mut out_http = std::collections::BTreeMap::new();
-    let res_http = spine_api::api::routes_git_http::flatten_tree_recursive(&store, &root_tree_id, "", &mut out_http);
-    assert!(res_http.is_ok(), "Shared subtrees across sibling directories in a DAG must succeed: {:?}", res_http.err());
-    assert!(out_http.contains_key("dir_a/readme.txt"), "dir_a/readme.txt must be flattened");
-    assert!(out_http.contains_key("dir_b/readme.txt"), "dir_b/readme.txt must be flattened");
+    let res_http = spine_api::api::routes_git_http::flatten_tree_recursive(
+        &store,
+        &root_tree_id,
+        "",
+        &mut out_http,
+    );
+    assert!(
+        res_http.is_ok(),
+        "Shared subtrees across sibling directories in a DAG must succeed: {:?}",
+        res_http.err()
+    );
+    assert!(
+        out_http.contains_key("dir_a/readme.txt"),
+        "dir_a/readme.txt must be flattened"
+    );
+    assert!(
+        out_http.contains_key("dir_b/readme.txt"),
+        "dir_b/readme.txt must be flattened"
+    );
 
     // 4. Flatten tree via NativeVcsService::flatten_tree
     let vcs = spine_api::storage::vcs::NativeVcsService::new(temp_dir.path());
     let mut out_vcs = std::collections::BTreeMap::new();
     let res_vcs = vcs.flatten_tree(&store, &root_tree_id, "", &mut out_vcs);
-    assert!(res_vcs.is_ok(), "NativeVcsService must successfully flatten shared subtrees: {:?}", res_vcs.err());
+    assert!(
+        res_vcs.is_ok(),
+        "NativeVcsService must successfully flatten shared subtrees: {:?}",
+        res_vcs.err()
+    );
     assert!(out_vcs.contains_key("dir_a/readme.txt"));
     assert!(out_vcs.contains_key("dir_b/readme.txt"));
 
@@ -456,8 +506,13 @@ async fn test_tree_flattening_allows_shared_subtrees_in_valid_dag() {
     };
     let dummy_goid = spine_migration::git_format::oid::GitOid::zero();
     let new_commits = vec![(dummy_goid, ObjectId::from_bytes([0u8; 32]), commit)];
-    let paths_res = spine_api::api::routes_git_http::collect_changed_paths_from_commits(&store, &new_commits);
-    assert!(paths_res.is_ok(), "collect_changed_paths_from_commits must succeed: {:?}", paths_res.err());
+    let paths_res =
+        spine_api::api::routes_git_http::collect_changed_paths_from_commits(&store, &new_commits);
+    assert!(
+        paths_res.is_ok(),
+        "collect_changed_paths_from_commits must succeed: {:?}",
+        paths_res.err()
+    );
     let paths = paths_res.unwrap();
     assert!(paths.contains(&"dir_a/readme.txt".to_string()));
     assert!(paths.contains(&"dir_b/readme.txt".to_string()));

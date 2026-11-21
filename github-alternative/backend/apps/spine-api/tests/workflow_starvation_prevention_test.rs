@@ -83,7 +83,11 @@ async fn test_workflow_scheduler_does_not_starve_older_runs() {
     scheduler.tick(repo_id).await.unwrap();
 
     // 4. Verify that old_run was advanced and not starved out by the 110 newer runs!
-    let updated_old = db.get_workflow_run("run_old_active").await.unwrap().expect("run must exist");
+    let updated_old = db
+        .get_workflow_run("run_old_active")
+        .await
+        .unwrap()
+        .expect("run must exist");
     assert_ne!(
         updated_old.status, "PENDING",
         "Older active run must be picked up and transitioned by scheduler, not starved"

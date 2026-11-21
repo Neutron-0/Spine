@@ -138,9 +138,14 @@ async fn check_webhook_admin_access(
             .check_admin_access(Some(caller), &repo)
             .await?;
     } else if sub.owner_type == "ORG" {
-        state.permissions.check_org_admin(caller, &sub.owner_id).await?;
+        state
+            .permissions
+            .check_org_admin(caller, &sub.owner_id)
+            .await?;
     } else {
-        return Err(ForgeError::Forbidden("Unauthorized access to webhook".into()));
+        return Err(ForgeError::Forbidden(
+            "Unauthorized access to webhook".into(),
+        ));
     }
     Ok(())
 }

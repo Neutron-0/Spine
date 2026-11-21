@@ -1144,9 +1144,10 @@ impl StorageBackend for FileSystemStorageBackend {
             );
         }
         let gen_str = fs::read_to_string(&fencing_path)?;
-        let gen = gen_str.trim().parse::<u64>().map_err(|e| {
-            anyhow::anyhow!("Corrupt fencing generation record: {}", e)
-        })?;
+        let gen = gen_str
+            .trim()
+            .parse::<u64>()
+            .map_err(|e| anyhow::anyhow!("Corrupt fencing generation record: {}", e))?;
         if gen == 0 {
             bail!("Integrity check failed: invalid fencing generation 0");
         }
@@ -1208,8 +1209,7 @@ impl StorageBackend for FileSystemStorageBackend {
                     for manifest_entry in fs::read_dir(prefix_entry.path())? {
                         let manifest_entry = manifest_entry?;
                         if manifest_entry.file_type()?.is_file() {
-                            let fname =
-                                manifest_entry.file_name().to_string_lossy().to_string();
+                            let fname = manifest_entry.file_name().to_string_lossy().to_string();
                             if fname.ends_with(".json") {
                                 let expected_id = fname.trim_end_matches(".json");
                                 let bytes = fs::read(manifest_entry.path())?;
@@ -1394,8 +1394,13 @@ mod tests {
 
         // Verify restored contents exist and are bit-for-bit identical
         for i in 0..4 {
-            let restored_chunk =
-                fs::read(restore_tmp.path().join("chunks").join(format!("chunk_{}.pack", i))).unwrap();
+            let restored_chunk = fs::read(
+                restore_tmp
+                    .path()
+                    .join("chunks")
+                    .join(format!("chunk_{}.pack", i)),
+            )
+            .unwrap();
             assert_eq!(restored_chunk, chunk_data);
         }
     }
@@ -1439,7 +1444,11 @@ mod tests {
             expected_chunk_hashes.push((file_name.clone(), hash));
             fs::write(chunks_dir.join(&file_name), &file_buf).unwrap();
         }
-        fs::write(manifests_dir.join("root.manifest"), b"oob_manifest_generation_50").unwrap();
+        fs::write(
+            manifests_dir.join("root.manifest"),
+            b"oob_manifest_generation_50",
+        )
+        .unwrap();
 
         // 2. Verify in-band single-frame RPC backup aborts immediately to protect memory
         let err = backend
@@ -1460,12 +1469,8 @@ mod tests {
             let mut tar_builder = Builder::new(encoder);
 
             // Archive chunks, repos, manifests, and .fencing_generation
-            tar_builder
-                .append_dir_all("chunks", &chunks_dir)
-                .unwrap();
-            tar_builder
-                .append_dir_all("repos", &repos_dir)
-                .unwrap();
+            tar_builder.append_dir_all("chunks", &chunks_dir).unwrap();
+            tar_builder.append_dir_all("repos", &repos_dir).unwrap();
             tar_builder
                 .append_dir_all("manifests", &manifests_dir)
                 .unwrap();
@@ -1507,7 +1512,8 @@ mod tests {
 
         // Verify all 18 MiB chunks match expected SHA-256 digests bit-for-bit
         for (file_name, expected_sha256) in &expected_chunk_hashes {
-            let restored_data = fs::read(restore_tmp.path().join("chunks").join(file_name)).unwrap();
+            let restored_data =
+                fs::read(restore_tmp.path().join("chunks").join(file_name)).unwrap();
             let actual_sha256 = format!("{:x}", sha2::Sha256::digest(&restored_data));
             assert_eq!(
                 &actual_sha256, expected_sha256,
@@ -1517,7 +1523,8 @@ mod tests {
         }
 
         // Verify manifests
-        let restored_manifest = fs::read(restore_tmp.path().join("manifests").join("root.manifest")).unwrap();
+        let restored_manifest =
+            fs::read(restore_tmp.path().join("manifests").join("root.manifest")).unwrap();
         assert_eq!(restored_manifest, b"oob_manifest_generation_50");
 
         // Verify writer permits can be acquired and writes resume cleanly on restored volume

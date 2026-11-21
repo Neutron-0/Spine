@@ -570,7 +570,14 @@ impl NativeVcsService {
                     format!("{}/{}", prefix, entry.name)
                 };
                 if entry.mode == FileMode::Directory {
-                    self.flatten_tree_inner(store, &entry.object_id, &path, out, active_ancestors, depth + 1)?;
+                    self.flatten_tree_inner(
+                        store,
+                        &entry.object_id,
+                        &path,
+                        out,
+                        active_ancestors,
+                        depth + 1,
+                    )?;
                 } else {
                     out.insert(path, (entry.mode, entry.object_id));
                 }

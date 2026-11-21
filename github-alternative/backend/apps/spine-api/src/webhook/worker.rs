@@ -133,7 +133,10 @@ impl WebhookOutboxWorker {
                 .await?;
             if !extended {
                 // Lost lease or item completed elsewhere; skip to prevent duplicate delivery!
-                tracing::warn!("Webhook outbox item {} lost lease; skipping delivery", event.id);
+                tracing::warn!(
+                    "Webhook outbox item {} lost lease; skipping delivery",
+                    event.id
+                );
                 continue;
             }
 
@@ -146,7 +149,8 @@ impl WebhookOutboxWorker {
                     .db
                     .extend_webhook_outbox_lease(
                         &event.id,
-                        current_now + (self.timeout_duration.as_secs().max(5) + 30) as i64 * 1_000_000_000,
+                        current_now
+                            + (self.timeout_duration.as_secs().max(5) + 30) as i64 * 1_000_000_000,
                     )
                     .await;
 
@@ -345,6 +349,11 @@ impl WebhookOutboxWorker {
             Ok((status_code, body))
         })
         .await
-        .map_err(|_| anyhow::anyhow!("Webhook delivery timed out after {:?}", self.timeout_duration))?
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Webhook delivery timed out after {:?}",
+                self.timeout_duration
+            )
+        })?
     }
 }

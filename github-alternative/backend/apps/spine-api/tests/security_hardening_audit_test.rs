@@ -1,4 +1,6 @@
-use spine_api::api::routes_lfs::{generate_scoped_token, verify_scoped_token, resolve_lfs_secret_salt};
+use spine_api::api::routes_lfs::{
+    generate_scoped_token, resolve_lfs_secret_salt, verify_scoped_token,
+};
 use spine_api::security::service::resolve_fingerprint_secret;
 use spine_api::webhook::SsrfValidator;
 
@@ -26,7 +28,16 @@ fn test_fingerprint_secret_configurable_from_env() {
 async fn test_ssrf_prohibits_spine_cluster_ports() {
     let validator = SsrfValidator::new(false);
     // Port 8400 (coordinator), 8401 (storage-node), and 2222 (SSH) must be prohibited
-    assert!(validator.validate_and_resolve("http://example.com:8400/rpc").await.is_err());
-    assert!(validator.validate_and_resolve("http://example.com:8401/storage").await.is_err());
-    assert!(validator.validate_and_resolve("http://example.com:2222/").await.is_err());
+    assert!(validator
+        .validate_and_resolve("http://example.com:8400/rpc")
+        .await
+        .is_err());
+    assert!(validator
+        .validate_and_resolve("http://example.com:8401/storage")
+        .await
+        .is_err());
+    assert!(validator
+        .validate_and_resolve("http://example.com:2222/")
+        .await
+        .is_err());
 }

@@ -160,7 +160,10 @@ fn test_fencing_generation_persistence_and_restore_finalization() {
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            stdout.contains(&format!("Storage node 'node-test' fencing generation: {}", fencing_gen)),
+            stdout.contains(&format!(
+                "Storage node 'node-test' fencing generation: {}",
+                fencing_gen
+            )),
             "stdout was: {}",
             stdout
         );

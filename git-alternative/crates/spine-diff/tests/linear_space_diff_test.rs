@@ -26,7 +26,11 @@ fn test_large_diff_efficiency() {
     let duration = start.elapsed();
 
     // Must finish quickly (< 500ms) without allocating huge matrices
-    assert!(duration.as_millis() < 500, "Diff took too long: {:?}", duration);
+    assert!(
+        duration.as_millis() < 500,
+        "Diff took too long: {:?}",
+        duration
+    );
 
     let has_add = ops.iter().any(|op| match op {
         DiffOp::Addition(s) => s == "replaced middle line 1",

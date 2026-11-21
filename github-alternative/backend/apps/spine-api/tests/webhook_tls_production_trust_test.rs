@@ -31,8 +31,8 @@ async fn test_webhook_delivery_full_timeout_on_hanging_tls_handshake() {
 
     let db: Arc<dyn Database> = Arc::new(InMemoryDatabase::new());
     let ssrf = SsrfValidator::new(true); // Allow localhost for unit test
-    let worker = WebhookOutboxWorker::new(Arc::clone(&db), ssrf)
-        .with_timeout(Duration::from_millis(200)); // Short 200ms timeout
+    let worker =
+        WebhookOutboxWorker::new(Arc::clone(&db), ssrf).with_timeout(Duration::from_millis(200)); // Short 200ms timeout
 
     let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
     let sub = WebhookSubscription {

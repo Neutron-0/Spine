@@ -2427,8 +2427,11 @@ impl Database for InMemoryDatabase {
             .collect();
         // Deterministic FIFO order matching PostgreSQL's ORDER BY next_attempt_at_nanos ASC, id ASC
         eligible_items.sort_by(|a, b| {
-            (a.next_attempt_at_nanos, a.created_at_nanos, &a.id)
-                .cmp(&(b.next_attempt_at_nanos, b.created_at_nanos, &b.id))
+            (a.next_attempt_at_nanos, a.created_at_nanos, &a.id).cmp(&(
+                b.next_attempt_at_nanos,
+                b.created_at_nanos,
+                &b.id,
+            ))
         });
         eligible_items.truncate(limit as usize);
 

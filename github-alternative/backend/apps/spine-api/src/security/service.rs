@@ -296,7 +296,10 @@ impl SecurityService {
         status: &str, // "FIXED" or "DISMISSED"
     ) -> Result<(), ForgeError> {
         self.perms.require_repo_write(actor_id, repo_id).await?;
-        let vulns = self.db.list_dependency_vulnerabilities(repo_id, None).await?;
+        let vulns = self
+            .db
+            .list_dependency_vulnerabilities(repo_id, None)
+            .await?;
         if !vulns.iter().any(|v| v.id == vuln_id) {
             return Err(ForgeError::NotFound(
                 "Dependency vulnerability not found for this repository".into(),
@@ -692,11 +695,7 @@ pub fn compute_keyed_safe_fingerprint(raw_secret: &str, key_id: &str, key_bytes:
 
 pub fn compute_safe_fingerprint(raw_secret: &str) -> String {
     let secret = resolve_fingerprint_secret();
-    compute_keyed_safe_fingerprint(
-        raw_secret,
-        DEFAULT_FINGERPRINT_KEY_ID,
-        &secret,
-    )
+    compute_keyed_safe_fingerprint(raw_secret, DEFAULT_FINGERPRINT_KEY_ID, &secret)
 }
 
 // -----------------------------------------------------------------------------

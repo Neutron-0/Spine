@@ -24,7 +24,9 @@ static EPHEMERAL_SALT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new()
 /// Resolves LFS secret salt from environment, falling back to a cryptographically secure
 /// random ephemeral salt generated at process startup if unset (preventing offline token forgery).
 pub fn resolve_lfs_secret_salt() -> Vec<u8> {
-    if let Ok(val) = std::env::var("SPINE_LFS_SECRET").or_else(|_| std::env::var("SPINE_AUTH_SECRET_KEY")) {
+    if let Ok(val) =
+        std::env::var("SPINE_LFS_SECRET").or_else(|_| std::env::var("SPINE_AUTH_SECRET_KEY"))
+    {
         let trimmed = val.trim();
         if !trimmed.is_empty() {
             return trimmed.as_bytes().to_vec();

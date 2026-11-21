@@ -57,7 +57,9 @@ impl PgDatabase {
         sqlx::postgres::PgPoolOptions::new()
             .max_connections(settings.max_connections)
             .min_connections(settings.min_connections)
-            .acquire_timeout(std::time::Duration::from_secs(settings.acquire_timeout_secs))
+            .acquire_timeout(std::time::Duration::from_secs(
+                settings.acquire_timeout_secs,
+            ))
             .idle_timeout(std::time::Duration::from_secs(settings.idle_timeout_secs))
             .max_lifetime(std::time::Duration::from_secs(settings.max_lifetime_secs))
     }
@@ -66,14 +68,18 @@ impl PgDatabase {
         Self::pool_options_from_env()
             .connect(url)
             .await
-            .map_err(|e| ForgeError::ServiceUnavailable(format!("PostgreSQL connect failed: {}", e)))
+            .map_err(|e| {
+                ForgeError::ServiceUnavailable(format!("PostgreSQL connect failed: {}", e))
+            })
     }
 
     pub async fn connect(url: &str) -> Result<Self, ForgeError> {
         let pool = Self::pool_options_from_env()
             .connect(url)
             .await
-            .map_err(|e| ForgeError::ServiceUnavailable(format!("PostgreSQL connect failed: {}", e)))?;
+            .map_err(|e| {
+                ForgeError::ServiceUnavailable(format!("PostgreSQL connect failed: {}", e))
+            })?;
         Ok(Self { pool })
     }
 
@@ -3847,10 +3853,7 @@ impl Database for PgDatabase {
             .await
             .map_err(|e| ForgeError::Internal(e.to_string()))?;
 
-        let list = rows
-            .into_iter()
-            .map(|r| r.get(0))
-            .collect();
+        let list = rows.into_iter().map(|r| r.get(0)).collect();
         Ok(list)
     }
 

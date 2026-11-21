@@ -175,7 +175,11 @@ pub async fn list_artifact_versions(
 
     if ns.is_private {
         let current_user = user
-            .ok_or_else(|| ForgeError::Unauthorized("Authentication required for private namespace".to_string()))?
+            .ok_or_else(|| {
+                ForgeError::Unauthorized(
+                    "Authentication required for private namespace".to_string(),
+                )
+            })?
             .0;
         if ns.owner_id != current_user.id {
             return Err(ForgeError::Forbidden(
@@ -219,7 +223,11 @@ pub async fn download_artifact_version(
 
     if ns.is_private {
         let current_user = user
-            .ok_or_else(|| ForgeError::Unauthorized("Authentication required for private namespace".to_string()))?
+            .ok_or_else(|| {
+                ForgeError::Unauthorized(
+                    "Authentication required for private namespace".to_string(),
+                )
+            })?
             .0;
         if ns.owner_id != current_user.id {
             return Err(ForgeError::Forbidden(

@@ -46,9 +46,7 @@ pub fn build_router(state: AppState) -> Router {
                 .allow_methods(Any)
                 .allow_headers(Any)
         } else {
-            CorsLayer::new()
-                .allow_methods(Any)
-                .allow_headers(Any)
+            CorsLayer::new().allow_methods(Any).allow_headers(Any)
         }
     } else {
         CorsLayer::new()

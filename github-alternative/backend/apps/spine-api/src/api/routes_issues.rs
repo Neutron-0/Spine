@@ -596,7 +596,9 @@ pub async fn update_milestone(
         .ok_or_else(|| ForgeError::NotFound("Milestone not found".into()))?;
 
     if milestone.repo_id != repo.id {
-        return Err(ForgeError::NotFound("Milestone not found in repository".into()));
+        return Err(ForgeError::NotFound(
+            "Milestone not found in repository".into(),
+        ));
     }
 
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -648,7 +650,9 @@ pub async fn delete_milestone(
         .ok_or_else(|| ForgeError::NotFound("Milestone not found".into()))?;
 
     if milestone.repo_id != repo.id {
-        return Err(ForgeError::NotFound("Milestone not found in repository".into()));
+        return Err(ForgeError::NotFound(
+            "Milestone not found in repository".into(),
+        ));
     }
 
     state.db.delete_milestone(&milestone_id).await?;

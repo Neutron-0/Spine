@@ -244,7 +244,9 @@ fn find_middle_snake(a: &[&str], b: &[&str]) -> (usize, usize) {
 
     for d in 0..=max_d {
         for k in (-d..=d).step_by(2) {
-            let mut x = if k == -d || (k != d && vf[offset + (k - 1) as usize] < vf[offset + (k + 1) as usize]) {
+            let mut x = if k == -d
+                || (k != d && vf[offset + (k - 1) as usize] < vf[offset + (k + 1) as usize])
+            {
                 vf[offset + (k + 1) as usize]
             } else {
                 vf[offset + (k - 1) as usize] + 1
@@ -258,14 +260,19 @@ fn find_middle_snake(a: &[&str], b: &[&str]) -> (usize, usize) {
 
             vf[offset + k as usize] = x;
 
-            if odd && (k - delta).abs() <= (d - 1) && vf[offset + k as usize] >= vr[offset + k as usize] {
+            if odd
+                && (k - delta).abs() <= (d - 1)
+                && vf[offset + k as usize] >= vr[offset + k as usize]
+            {
                 return (x as usize, y as usize);
             }
         }
 
         for k in (-d..=d).step_by(2) {
             let kr = k + delta;
-            let mut x = if k == -d || (k != d && vr[offset + (kr + 1) as usize] <= vr[offset + (kr - 1) as usize]) {
+            let mut x = if k == -d
+                || (k != d && vr[offset + (kr + 1) as usize] <= vr[offset + (kr - 1) as usize])
+            {
                 vr[offset + (kr - 1) as usize]
             } else {
                 vr[offset + (kr + 1) as usize] - 1

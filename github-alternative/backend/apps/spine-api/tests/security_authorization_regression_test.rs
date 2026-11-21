@@ -396,7 +396,9 @@ async fn test_security_authorization_and_cross_tenant_isolation_regression() {
                 .uri("/api/v1/repos/bob/bobs-project/milestones/ms_alice_v1")
                 .header(header::AUTHORIZATION, format!("Bearer {}", pat_bob_plain))
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(json!({"title": "Hijacked Milestone"}).to_string()))
+                .body(Body::from(
+                    json!({"title": "Hijacked Milestone"}).to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -556,9 +558,12 @@ async fn test_security_authorization_and_cross_tenant_isolation_regression() {
         .unwrap();
     let create_hook_res = router.clone().oneshot(create_hook_req).await.unwrap();
     assert_eq!(create_hook_res.status(), StatusCode::CREATED);
-    let hook_body: serde_json::Value =
-        serde_json::from_slice(&to_bytes(create_hook_res.into_body(), usize::MAX).await.unwrap())
-            .unwrap();
+    let hook_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(create_hook_res.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     let webhook_id = hook_body["id"].as_str().unwrap();
 
     // Bob attempts to read Alice's webhook -> 404 / 403 Forbidden

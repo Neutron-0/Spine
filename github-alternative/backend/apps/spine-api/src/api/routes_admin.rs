@@ -67,7 +67,9 @@ async fn verify_admin_auth(
     }
 
     // 2. Check database Personal Access Token with explicit admin scope
-    if !raw_token.is_empty() && (raw_token.starts_with("sp_pat_") || raw_token.starts_with("spine_pat_")) {
+    if !raw_token.is_empty()
+        && (raw_token.starts_with("sp_pat_") || raw_token.starts_with("spine_pat_"))
+    {
         let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let p_hash = hash_pat(raw_token);
         if let Ok(Some(pat)) = state.db.get_pat_by_hash(&p_hash).await {
@@ -167,7 +169,9 @@ pub async fn acquire_maintenance(
                 if let Err(rb_err) = rb_client.exit_maintenance(fencing_generation).await {
                     tracing::error!(
                         "Failed to compensate/exit storage node {} ({}) during rollback: {}",
-                        rollback_id, rollback_addr, rb_err
+                        rollback_id,
+                        rollback_addr,
+                        rb_err
                     );
                 }
             }
@@ -267,15 +271,12 @@ pub async fn release_maintenance(
     verify_admin_auth(&state, &headers, caller.as_ref()).await?;
 
     let req = payload.map(|Json(p)| p).unwrap_or_default();
-    let provided_owner_token = req
-        .owner_token
-        .as_deref()
-        .or_else(|| {
-            headers
-                .get("x-spine-owner-token")
-                .or_else(|| headers.get("x-owner-token"))
-                .and_then(|v| v.to_str().ok())
-        });
+    let provided_owner_token = req.owner_token.as_deref().or_else(|| {
+        headers
+            .get("x-spine-owner-token")
+            .or_else(|| headers.get("x-owner-token"))
+            .and_then(|v| v.to_str().ok())
+    });
 
     let mut active_lock = state.active_maintenance.lock().await;
 
@@ -364,9 +365,7 @@ pub async fn release_maintenance(
         "Cluster maintenance barrier released"
     );
 
-    let resp = ReleaseMaintenanceResponse {
-        status: "released",
-    };
+    let resp = ReleaseMaintenanceResponse { status: "released" };
 
     Ok((StatusCode::OK, Json(resp)))
 }

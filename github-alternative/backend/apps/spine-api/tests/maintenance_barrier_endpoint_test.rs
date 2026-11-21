@@ -35,7 +35,9 @@ async fn test_maintenance_barrier_endpoint_lifecycle_and_authorization() {
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let diag: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(diag["in_maintenance"], false);
     assert_eq!(diag["active_writers"], 0);
@@ -66,13 +68,20 @@ async fn test_maintenance_barrier_endpoint_lifecycle_and_authorization() {
     let req = Request::builder()
         .uri("/api/v1/admin/maintenance/acquire")
         .method("POST")
-        .header(header::AUTHORIZATION, "Bearer test-secret-admin-token-12345")
+        .header(
+            header::AUTHORIZATION,
+            "Bearer test-secret-admin-token-12345",
+        )
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"reason":"Scheduled OOB Backup","timeout_seconds":120}"#))
+        .body(Body::from(
+            r#"{"reason":"Scheduled OOB Backup","timeout_seconds":120}"#,
+        ))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let acquire_json: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(acquire_json["status"], "acquired");
     let gen = acquire_json["fencing_generation"].as_u64().unwrap();
@@ -87,7 +96,9 @@ async fn test_maintenance_barrier_endpoint_lifecycle_and_authorization() {
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let diag: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(diag["in_maintenance"], true);
     assert_eq!(diag["current_fencing_generation"], gen);
@@ -96,7 +107,10 @@ async fn test_maintenance_barrier_endpoint_lifecycle_and_authorization() {
     let req = Request::builder()
         .uri("/api/v1/admin/maintenance/acquire")
         .method("POST")
-        .header(header::AUTHORIZATION, "Bearer test-secret-admin-token-12345")
+        .header(
+            header::AUTHORIZATION,
+            "Bearer test-secret-admin-token-12345",
+        )
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(r#"{"reason":"Concurrent backup"}"#))
         .unwrap();
@@ -118,7 +132,10 @@ async fn test_maintenance_barrier_endpoint_lifecycle_and_authorization() {
     let req = Request::builder()
         .uri("/api/v1/admin/maintenance/release")
         .method("POST")
-        .header(header::AUTHORIZATION, "Bearer test-secret-admin-token-12345")
+        .header(
+            header::AUTHORIZATION,
+            "Bearer test-secret-admin-token-12345",
+        )
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -128,7 +145,10 @@ async fn test_maintenance_barrier_endpoint_lifecycle_and_authorization() {
     let req = Request::builder()
         .uri("/api/v1/admin/maintenance/release")
         .method("POST")
-        .header(header::AUTHORIZATION, "Bearer test-secret-admin-token-12345")
+        .header(
+            header::AUTHORIZATION,
+            "Bearer test-secret-admin-token-12345",
+        )
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(r#"{"owner_token":"wrong-owner-token"}"#))
         .unwrap();
@@ -143,7 +163,9 @@ async fn test_maintenance_barrier_endpoint_lifecycle_and_authorization() {
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let diag: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(diag["in_maintenance"], true);
     assert_eq!(diag["current_fencing_generation"], gen);
@@ -152,13 +174,21 @@ async fn test_maintenance_barrier_endpoint_lifecycle_and_authorization() {
     let req = Request::builder()
         .uri("/api/v1/admin/maintenance/release")
         .method("POST")
-        .header(header::AUTHORIZATION, "Bearer test-secret-admin-token-12345")
+        .header(
+            header::AUTHORIZATION,
+            "Bearer test-secret-admin-token-12345",
+        )
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(format!(r#"{{"owner_token":"{}"}}"#, owner_token)))
+        .body(Body::from(format!(
+            r#"{{"owner_token":"{}"}}"#,
+            owner_token
+        )))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let release_json: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(release_json["status"], "released");
 
@@ -170,7 +200,9 @@ async fn test_maintenance_barrier_endpoint_lifecycle_and_authorization() {
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let diag: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(diag["in_maintenance"], false);
 }
@@ -313,11 +345,17 @@ async fn test_admin_authorization_username_denial() {
     db.create_pat(pat_ops_lead).await.unwrap();
 
     // Assert DENIAL for 'admin-dev'
-    for uri in ["/api/v1/admin/maintenance/acquire", "/api/v1/admin/maintenance/release"] {
+    for uri in [
+        "/api/v1/admin/maintenance/acquire",
+        "/api/v1/admin/maintenance/release",
+    ] {
         let req = Request::builder()
             .uri(uri)
             .method("POST")
-            .header(header::AUTHORIZATION, format!("Bearer {}", pat_admin_dev_plain))
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", pat_admin_dev_plain),
+            )
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(r#"{"reason":"unauthorized attempt"}"#))
             .unwrap();
@@ -331,11 +369,17 @@ async fn test_admin_authorization_username_denial() {
     }
 
     // Assert DENIAL for 'notadmin'
-    for uri in ["/api/v1/admin/maintenance/acquire", "/api/v1/admin/maintenance/release"] {
+    for uri in [
+        "/api/v1/admin/maintenance/acquire",
+        "/api/v1/admin/maintenance/release",
+    ] {
         let req = Request::builder()
             .uri(uri)
             .method("POST")
-            .header(header::AUTHORIZATION, format!("Bearer {}", pat_notadmin_plain))
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", pat_notadmin_plain),
+            )
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(r#"{"reason":"unauthorized attempt"}"#))
             .unwrap();
@@ -349,11 +393,17 @@ async fn test_admin_authorization_username_denial() {
     }
 
     // Assert DENIAL for user named 'admin' but lacking 'admin' scope
-    for uri in ["/api/v1/admin/maintenance/acquire", "/api/v1/admin/maintenance/release"] {
+    for uri in [
+        "/api/v1/admin/maintenance/acquire",
+        "/api/v1/admin/maintenance/release",
+    ] {
         let req = Request::builder()
             .uri(uri)
             .method("POST")
-            .header(header::AUTHORIZATION, format!("Bearer {}", pat_plain_admin_plain))
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", pat_plain_admin_plain),
+            )
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(r#"{"reason":"unauthorized attempt"}"#))
             .unwrap();
@@ -370,22 +420,33 @@ async fn test_admin_authorization_username_denial() {
     let req = Request::builder()
         .uri("/api/v1/admin/maintenance/acquire")
         .method("POST")
-        .header(header::AUTHORIZATION, format!("Bearer {}", pat_ops_lead_plain))
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", pat_ops_lead_plain),
+        )
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(r#"{"reason":"Authorized maintenance"}"#))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let acq_json: Value = serde_json::from_slice(&body_bytes).unwrap();
     let ops_owner_token = acq_json["owner_token"].as_str().unwrap();
 
     let req = Request::builder()
         .uri("/api/v1/admin/maintenance/release")
         .method("POST")
-        .header(header::AUTHORIZATION, format!("Bearer {}", pat_ops_lead_plain))
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", pat_ops_lead_plain),
+        )
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(format!(r#"{{"owner_token":"{}"}}"#, ops_owner_token)))
+        .body(Body::from(format!(
+            r#"{{"owner_token":"{}"}}"#,
+            ops_owner_token
+        )))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -395,7 +456,10 @@ async fn test_admin_authorization_username_denial() {
     let req = Request::builder()
         .uri("/api/v1/admin/maintenance/acquire")
         .method("POST")
-        .header(header::AUTHORIZATION, format!("Bearer {}", pat_ops_lead_plain))
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", pat_ops_lead_plain),
+        )
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(r#"{"reason":"Revoked attempt"}"#))
         .unwrap();
@@ -469,7 +533,9 @@ async fn spawn_mock_participant(fail_enter: bool, fail_exit: bool) -> MockPartic
                         ClusterRpcRequest::EnterMaintenanceBarrier { fencing_generation } => {
                             ec.fetch_add(1, Ordering::SeqCst);
                             if fe.load(Ordering::SeqCst) {
-                                ClusterRpcResponse::Error("Injected failure on enter maintenance".to_string())
+                                ClusterRpcResponse::Error(
+                                    "Injected failure on enter maintenance".to_string(),
+                                )
                             } else {
                                 in_maint.store(true, Ordering::SeqCst);
                                 fgen.store(fencing_generation, Ordering::SeqCst);
@@ -479,7 +545,9 @@ async fn spawn_mock_participant(fail_enter: bool, fail_exit: bool) -> MockPartic
                         ClusterRpcRequest::ExitMaintenanceBarrier { fencing_generation } => {
                             xc.fetch_add(1, Ordering::SeqCst);
                             if fx.load(Ordering::SeqCst) {
-                                ClusterRpcResponse::Error("Injected failure on exit maintenance".to_string())
+                                ClusterRpcResponse::Error(
+                                    "Injected failure on exit maintenance".to_string(),
+                                )
                             } else {
                                 in_maint.store(false, Ordering::SeqCst);
                                 fgen.store(fencing_generation, Ordering::SeqCst);
@@ -552,34 +620,30 @@ async fn test_maintenance_acquire_storage_node_failure_compensates_earlier_parti
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Verify coordinator was compensated and is NOT in maintenance
-    assert_eq!(
-        coord.in_maintenance.load(Ordering::SeqCst),
-        false,
+    assert!(
+        !coord.in_maintenance.load(Ordering::SeqCst),
         "Coordinator must have been exited from maintenance via compensation"
     );
     assert_eq!(coord.enter_count.load(Ordering::SeqCst), 1);
     assert_eq!(coord.exit_count.load(Ordering::SeqCst), 1);
 
     // Verify node-1 was compensated and is NOT in maintenance
-    assert_eq!(
-        node1.in_maintenance.load(Ordering::SeqCst),
-        false,
+    assert!(
+        !node1.in_maintenance.load(Ordering::SeqCst),
         "Node 1 must have been exited from maintenance via compensation"
     );
     assert_eq!(node1.enter_count.load(Ordering::SeqCst), 1);
     assert_eq!(node1.exit_count.load(Ordering::SeqCst), 1);
 
     // Verify node-2 was never entered
-    assert_eq!(
-        node2.in_maintenance.load(Ordering::SeqCst),
-        false,
+    assert!(
+        !node2.in_maintenance.load(Ordering::SeqCst),
         "Node 2 must not be in maintenance"
     );
 
     // Verify local barrier is NOT held
-    assert_eq!(
-        consistency_barrier.is_in_maintenance(),
-        false,
+    assert!(
+        !consistency_barrier.is_in_maintenance(),
         "Local consistency barrier must have been released on failure"
     );
     assert!(
@@ -614,7 +678,9 @@ async fn test_maintenance_release_participant_failure_reports_degraded_error() {
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let acq_json: Value = serde_json::from_slice(&body_bytes).unwrap();
     let owner_token = acq_json["owner_token"].as_str().unwrap();
 
@@ -624,7 +690,10 @@ async fn test_maintenance_release_participant_failure_reports_degraded_error() {
         .method("POST")
         .header(header::AUTHORIZATION, "Bearer test-admin-token")
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(format!(r#"{{"owner_token":"{}"}}"#, owner_token)))
+        .body(Body::from(format!(
+            r#"{{"owner_token":"{}"}}"#,
+            owner_token
+        )))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
 
@@ -634,7 +703,9 @@ async fn test_maintenance_release_participant_failure_reports_degraded_error() {
         "Release must fail and report degraded/failed status if any participant fails to exit"
     );
 
-    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let err_str = String::from_utf8_lossy(&body_bytes);
     assert!(
         err_str.contains("Cluster maintenance release failed or degraded"),
@@ -749,13 +820,20 @@ async fn test_barrier_ownership_and_unacquired_backup_cleanup_isolation() {
     let req = Request::builder()
         .uri("/api/v1/admin/maintenance/acquire")
         .method("POST")
-        .header(header::AUTHORIZATION, "Bearer test-admin-secret-ownership-123")
+        .header(
+            header::AUTHORIZATION,
+            "Bearer test-admin-secret-ownership-123",
+        )
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"reason":"Operation A migration","timeout_seconds":300}"#))
+        .body(Body::from(
+            r#"{"reason":"Operation A migration","timeout_seconds":300}"#,
+        ))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let acq_json: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(acq_json["status"], "acquired");
     let original_generation = acq_json["fencing_generation"].as_u64().unwrap();
@@ -768,7 +846,9 @@ async fn test_barrier_ownership_and_unacquired_backup_cleanup_isolation() {
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
-    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let diag: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(diag["in_maintenance"], true);
     assert_eq!(diag["current_fencing_generation"], original_generation);
@@ -777,9 +857,14 @@ async fn test_barrier_ownership_and_unacquired_backup_cleanup_isolation() {
     let req = Request::builder()
         .uri("/api/v1/admin/maintenance/release")
         .method("POST")
-        .header(header::AUTHORIZATION, "Bearer test-admin-secret-ownership-123")
+        .header(
+            header::AUTHORIZATION,
+            "Bearer test-admin-secret-ownership-123",
+        )
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"owner_token":"impostor-operation-token-999"}"#))
+        .body(Body::from(
+            r#"{"owner_token":"impostor-operation-token-999"}"#,
+        ))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(
@@ -792,7 +877,10 @@ async fn test_barrier_ownership_and_unacquired_backup_cleanup_isolation() {
     let req = Request::builder()
         .uri("/api/v1/admin/maintenance/release")
         .method("POST")
-        .header(header::AUTHORIZATION, "Bearer test-admin-secret-ownership-123")
+        .header(
+            header::AUTHORIZATION,
+            "Bearer test-admin-secret-ownership-123",
+        )
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -809,7 +897,9 @@ async fn test_barrier_ownership_and_unacquired_backup_cleanup_isolation() {
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
-    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let diag: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(diag["in_maintenance"], true);
     assert_eq!(diag["current_fencing_generation"], original_generation);
@@ -867,7 +957,8 @@ async fn test_barrier_ownership_and_unacquired_backup_cleanup_isolation() {
 
     // Provide a temporary passphrase file in an isolated unique temporary directory
     // so a failed test cannot leave any file in the workspace or repository.
-    let pass_temp_dir = tempfile::tempdir().expect("Failed to create temporary directory for passphrase");
+    let pass_temp_dir =
+        tempfile::tempdir().expect("Failed to create temporary directory for passphrase");
     let temp_pass_file = pass_temp_dir.path().join("backup_passphrase.txt");
     std::fs::write(
         &temp_pass_file,
@@ -967,9 +1058,13 @@ exit ${{EXIT_CODE}}
 
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
-        stdin.write_all(runner_script.as_bytes()).expect("Failed to write to bash stdin");
+        stdin
+            .write_all(runner_script.as_bytes())
+            .expect("Failed to write to bash stdin");
     }
-    let output = child.wait_with_output().expect("Failed to wait on bash child");
+    let output = child
+        .wait_with_output()
+        .expect("Failed to wait on bash child");
 
     assert!(
         !output.status.success(),
@@ -979,7 +1074,8 @@ exit ${{EXIT_CODE}}
     let stderr_str = String::from_utf8_lossy(&output.stderr);
 
     assert!(
-        stderr_str.contains("Local-only backup (SPINE_BACKUP_REQUIRE_REMOTE=0) is strictly FORBIDDEN"),
+        stderr_str
+            .contains("Local-only backup (SPINE_BACKUP_REQUIRE_REMOTE=0) is strictly FORBIDDEN"),
         "Stderr must contain policy rejection: {}",
         stderr_str
     );
@@ -1055,7 +1151,9 @@ exit ${{EXIT_CODE}}
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
-    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let diag: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(
         diag["in_maintenance"], true,
@@ -1070,7 +1168,10 @@ exit ${{EXIT_CODE}}
     let req = Request::builder()
         .uri("/api/v1/admin/maintenance/release")
         .method("POST")
-        .header(header::AUTHORIZATION, "Bearer test-admin-secret-ownership-123")
+        .header(
+            header::AUTHORIZATION,
+            "Bearer test-admin-secret-ownership-123",
+        )
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(format!(
             r#"{{"owner_token":"{}"}}"#,
@@ -1095,7 +1196,9 @@ exit ${{EXIT_CODE}}
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
-    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let diag: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(diag["in_maintenance"], false);
 }
@@ -1157,9 +1260,13 @@ echo "Maintenance barrier acquired: status=${{ACQUIRE_STATUS}}, fencing_generati
 
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
-        stdin.write_all(test_script.as_bytes()).expect("failed to write test_script to bash stdin");
+        stdin
+            .write_all(test_script.as_bytes())
+            .expect("failed to write test_script to bash stdin");
     }
-    let output = child.wait_with_output().expect("failed to wait on bash child");
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait on bash child");
 
     if !output.status.success() {
         panic!(

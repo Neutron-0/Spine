@@ -108,7 +108,10 @@ async fn test_cargo_registry_sparse_index_and_publish_protocol() {
     let unauthorized_yank = cargo
         .set_yanked("spine-test-crate", "0.1.0", true, "attacker_user")
         .await;
-    assert!(unauthorized_yank.is_err(), "Non-owner must be forbidden from yanking crate");
+    assert!(
+        unauthorized_yank.is_err(),
+        "Non-owner must be forbidden from yanking crate"
+    );
 
     // 7b. Owner can yank
     cargo
@@ -129,7 +132,10 @@ async fn test_cargo_registry_sparse_index_and_publish_protocol() {
     let unauthorized_unyank = cargo
         .set_yanked("spine-test-crate", "0.1.0", false, "attacker_user")
         .await;
-    assert!(unauthorized_unyank.is_err(), "Non-owner must be forbidden from unyanking crate");
+    assert!(
+        unauthorized_unyank.is_err(),
+        "Non-owner must be forbidden from unyanking crate"
+    );
 
     // 7d. Owner can unyank
     cargo
@@ -162,5 +168,8 @@ async fn test_cargo_registry_sparse_index_and_publish_protocol() {
     payload_v2.extend_from_slice(fake_crate_tarball);
 
     let hijack_err = cargo.publish(&payload_v2, "attacker_user").await;
-    assert!(hijack_err.is_err(), "Non-owner must be forbidden from publishing new versions to existing package");
+    assert!(
+        hijack_err.is_err(),
+        "Non-owner must be forbidden from publishing new versions to existing package"
+    );
 }

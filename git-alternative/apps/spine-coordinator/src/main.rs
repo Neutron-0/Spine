@@ -203,16 +203,20 @@ async fn main() -> Result<()> {
                 None => (format!("node-{}", i + 1), part),
             };
             let (listen_addr, zone) = match rest.split_once(':') {
-                Some((host, port_and_zone)) => {
-                    match port_and_zone.split_once(':') {
-                        Some((port, z)) => (
-                            format!("{}:{}", host.trim(), port.trim()),
-                            z.trim().to_string(),
-                        ),
-                        None => (rest.to_string(), format!("zone-{}", (b'a' + (i % 26) as u8) as char)),
-                    }
-                }
-                None => (rest.to_string(), format!("zone-{}", (b'a' + (i % 26) as u8) as char)),
+                Some((host, port_and_zone)) => match port_and_zone.split_once(':') {
+                    Some((port, z)) => (
+                        format!("{}:{}", host.trim(), port.trim()),
+                        z.trim().to_string(),
+                    ),
+                    None => (
+                        rest.to_string(),
+                        format!("zone-{}", (b'a' + (i % 26) as u8) as char),
+                    ),
+                },
+                None => (
+                    rest.to_string(),
+                    format!("zone-{}", (b'a' + (i % 26) as u8) as char),
+                ),
             };
 
             if store.get_node(&node_id)?.is_none() {

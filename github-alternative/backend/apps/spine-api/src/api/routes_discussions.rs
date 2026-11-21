@@ -72,7 +72,10 @@ pub async fn list_categories(
 ) -> Result<impl IntoResponse, ForgeError> {
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
     let caller_id = user.as_ref().map(|Extension(u)| u.id.as_str());
-    state.permissions.require_repo_read(caller_id, &repo_id).await?;
+    state
+        .permissions
+        .require_repo_read(caller_id, &repo_id)
+        .await?;
     let cats = state.discussions.list_categories(&repo_id).await?;
     Ok(Json(cats))
 }
@@ -243,9 +246,15 @@ pub async fn toggle_comment_reaction(
     let Extension(user) =
         user.ok_or_else(|| ForgeError::Unauthorized("Authentication required".into()))?;
     let repo_id = resolve_repo(&state, &owner, &repo_name).await?;
-    state.permissions.require_repo_read(Some(&user.id), &repo_id).await?;
+    state
+        .permissions
+        .require_repo_read(Some(&user.id), &repo_id)
+        .await?;
 
-    let comments = state.discussions.list_comments(Some(&user.id), &repo_id, number).await?;
+    let comments = state
+        .discussions
+        .list_comments(Some(&user.id), &repo_id, number)
+        .await?;
     if !comments.iter().any(|c| c.id == comment_id) {
         return Err(ForgeError::NotFound(
             "Comment not found on this discussion".into(),

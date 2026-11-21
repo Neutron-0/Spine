@@ -91,7 +91,9 @@ pub async fn get_release(
 
     let rel = state.releases.get_release(&release_id).await?;
     if rel.repo_id != repo.id {
-        return Err(ForgeError::NotFound("Release not found in repository".into()));
+        return Err(ForgeError::NotFound(
+            "Release not found in repository".into(),
+        ));
     }
     Ok(Json(rel))
 }
@@ -139,7 +141,9 @@ pub async fn update_release(
 
     let existing = state.releases.get_release(&release_id).await?;
     if existing.repo_id != repo.id {
-        return Err(ForgeError::NotFound("Release not found in repository".into()));
+        return Err(ForgeError::NotFound(
+            "Release not found in repository".into(),
+        ));
     }
 
     let updated = state.releases.update_release(&release_id, payload).await?;
@@ -170,7 +174,9 @@ pub async fn delete_release(
 
     let existing = state.releases.get_release(&release_id).await?;
     if existing.repo_id != repo.id {
-        return Err(ForgeError::NotFound("Release not found in repository".into()));
+        return Err(ForgeError::NotFound(
+            "Release not found in repository".into(),
+        ));
     }
 
     state.releases.delete_release(&release_id).await?;
@@ -203,7 +209,9 @@ pub async fn upload_release_asset(
 
     let rel = state.releases.get_release(&release_id).await?;
     if rel.repo_id != repo.id {
-        return Err(ForgeError::NotFound("Release not found in repository".into()));
+        return Err(ForgeError::NotFound(
+            "Release not found in repository".into(),
+        ));
     }
 
     let content_type = query
@@ -234,7 +242,9 @@ pub async fn download_release_asset(
 
     let rel = state.releases.get_release(&release_id).await?;
     if rel.repo_id != repo.id {
-        return Err(ForgeError::NotFound("Release not found in repository".into()));
+        return Err(ForgeError::NotFound(
+            "Release not found in repository".into(),
+        ));
     }
 
     let (asset, bytes) = state.releases.download_asset(&asset_id).await?;
@@ -280,7 +290,9 @@ pub async fn delete_release_asset(
 
     let rel = state.releases.get_release(&release_id).await?;
     if rel.repo_id != repo.id {
-        return Err(ForgeError::NotFound("Release not found in repository".into()));
+        return Err(ForgeError::NotFound(
+            "Release not found in repository".into(),
+        ));
     }
 
     let (asset, _) = state.releases.download_asset(&asset_id).await?;

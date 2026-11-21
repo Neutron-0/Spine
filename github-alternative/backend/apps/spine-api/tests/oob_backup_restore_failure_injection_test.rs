@@ -129,7 +129,10 @@ pub fn commit_restore_volume(rollback_dir: &Path) -> Result<(), std::io::Error> 
 }
 
 /// Rolls back by clearing failed extraction and restoring preserved files from external rollback dir.
-pub fn rollback_restore_volume(volume_root: &Path, rollback_dir: &Path) -> Result<(), std::io::Error> {
+pub fn rollback_restore_volume(
+    volume_root: &Path,
+    rollback_dir: &Path,
+) -> Result<(), std::io::Error> {
     // Clear failed extraction from volume_root
     if volume_root.exists() {
         for entry in fs::read_dir(volume_root)? {
@@ -187,7 +190,11 @@ fn test_postgres_fresh_data_directory_must_be_strictly_empty() {
     // Case 2: Clean pgdata by moving contents to external rollback directory
     let external_rollback = temp.path().join("external_rollback");
     fs::create_dir_all(&external_rollback).unwrap();
-    fs::rename(pgdata.join(".rollback_snapshot"), external_rollback.join(".rollback_snapshot")).unwrap();
+    fs::rename(
+        pgdata.join(".rollback_snapshot"),
+        external_rollback.join(".rollback_snapshot"),
+    )
+    .unwrap();
 
     // Now pgdata is strictly empty -> initdb verification SUCCEEDS
     assert!(verify_pgdata_is_strictly_empty(&pgdata).is_ok());
@@ -209,7 +216,11 @@ INSERT INTO users (username) VALUES ('admin');
     assert!(adapted_dump.contains("DO $$ BEGIN CREATE ROLE spine_migrator WITH CREATEROLE; EXCEPTION WHEN duplicate_object THEN NULL; END $$;"));
 
     // Simulate SQL runner executing against a database that already has bootstrap roles
-    let existing_roles = vec!["spine_admin".to_string(), "spine_migrator".to_string(), "spine_app".to_string()];
+    let existing_roles = vec![
+        "spine_admin".to_string(),
+        "spine_migrator".to_string(),
+        "spine_app".to_string(),
+    ];
 
     struct SqlSimulator {
         existing_roles: Vec<String>,
@@ -298,25 +309,38 @@ fn test_automated_rollback_reverts_all_volumes_on_failure() {
     ];
 
     // Restore with external rollback directory
-    let rollback_dir = restore_volume_clean(&volume_root, &rollback_parent, "node_1", &archive_contents).unwrap();
+    let rollback_dir =
+        restore_volume_clean(&volume_root, &rollback_parent, "node_1", &archive_contents).unwrap();
 
     // Active volume has new files and NO stale files
     assert!(volume_root.join("pack_002.pack").exists());
     assert!(!volume_root.join("pack_001.pack").exists());
-    assert_eq!(fs::read_to_string(volume_root.join(".fencing_generation")).unwrap(), "42");
+    assert_eq!(
+        fs::read_to_string(volume_root.join(".fencing_generation")).unwrap(),
+        "42"
+    );
 
     // Simulate post-restore failure (e.g. generation check or integrity check failed) -> TRIGGER ROLLBACK!
     rollback_restore_volume(&volume_root, &rollback_dir).unwrap();
 
     // CRITICAL ASSERTION: Volume must be reverted exactly to original pre-restore state!
-    assert!(volume_root.join("pack_001.pack").exists(), "Original packfile must be restored");
-    assert!(!volume_root.join("pack_002.pack").exists(), "Corrupted extraction must be purged");
+    assert!(
+        volume_root.join("pack_001.pack").exists(),
+        "Original packfile must be restored"
+    );
+    assert!(
+        !volume_root.join("pack_002.pack").exists(),
+        "Corrupted extraction must be purged"
+    );
     assert_eq!(
         fs::read_to_string(volume_root.join(".fencing_generation")).unwrap(),
         "40",
         "Original fencing generation must be restored"
     );
-    assert!(!rollback_dir.exists(), "Rollback directory purged after rollback completion");
+    assert!(
+        !rollback_dir.exists(),
+        "Rollback directory purged after rollback completion"
+    );
 }
 
 #[test]
@@ -439,7 +463,8 @@ fn test_pre_restore_archive_failure_aborts_before_modifying_any_volume() {
             .map(|(name, path)| (*name, path.as_path()))
             .collect();
 
-        let result = execute_pre_restore_archiving(&volumes_ref, &rollback_dir, "Passphrase-2026!", Some(p));
+        let result =
+            execute_pre_restore_archiving(&volumes_ref, &rollback_dir, "Passphrase-2026!", Some(p));
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains(p));
@@ -466,7 +491,10 @@ fn test_pre_restore_archive_failure_aborts_before_modifying_any_volume() {
 
 /// Helper to validate POSIX-style permissions for backup directories and archives.
 /// Checks that directory has mode 0700 (owner-only) and files have mode 0600 (owner-only rw).
-pub fn validate_backup_permissions(dir_mode: u32, file_modes: &[(&str, u32)]) -> Result<(), String> {
+pub fn validate_backup_permissions(
+    dir_mode: u32,
+    file_modes: &[(&str, u32)],
+) -> Result<(), String> {
     // 0o077 represents group and other read/write/execute bits
     if dir_mode & 0o077 != 0 || (dir_mode & 0o700 != 0o700) {
         return Err(format!(
@@ -544,7 +572,10 @@ pub fn execute_simulated_rollback(
     // Step 1: Mandatory stop and quiescence verification
     // If any container refuses to stop, DO NOT EXTRACT INTO VOLUMES!
     if !running_services.is_empty() {
-        failed_participants.push(format!("services_refused_to_stop:{}", running_services.join(",")));
+        failed_participants.push(format!(
+            "services_refused_to_stop:{}",
+            running_services.join(",")
+        ));
         return RollbackExecutionResult {
             success: false,
             exit_code: 2,
@@ -574,7 +605,8 @@ pub fn execute_simulated_rollback(
         verified_participants.push(p.to_string());
     }
 
-    let success = failed_participants.is_empty() && verified_participants.len() == participants.len();
+    let success =
+        failed_participants.is_empty() && verified_participants.len() == participants.len();
     let exit_code = if success { 0 } else { 2 };
     // In all rollback cases (success or failure), cluster services remain strictly stopped!
     let services_running = Vec::new();
@@ -605,7 +637,10 @@ fn test_rollback_fails_and_aborts_extraction_if_services_refuse_to_stop() {
     let result = execute_simulated_rollback(&participants, &hung_storage, None, None);
     assert!(!result.success);
     assert_eq!(result.exit_code, 2);
-    assert!(result.failed_participants.iter().any(|f| f.contains("services_refused_to_stop:storage-node-2")));
+    assert!(result
+        .failed_participants
+        .iter()
+        .any(|f| f.contains("services_refused_to_stop:storage-node-2")));
     assert!(
         result.verified_participants.is_empty(),
         "Must NOT extract into any volumes if a service refused to stop"
@@ -617,7 +652,10 @@ fn test_rollback_fails_and_aborts_extraction_if_services_refuse_to_stop() {
     let result_db = execute_simulated_rollback(&participants, &hung_db, None, None);
     assert!(!result_db.success);
     assert_eq!(result_db.exit_code, 2);
-    assert!(result_db.failed_participants.iter().any(|f| f.contains("services_refused_to_stop:postgres,spine-api")));
+    assert!(result_db
+        .failed_participants
+        .iter()
+        .any(|f| f.contains("services_refused_to_stop:postgres,spine-api")));
     assert!(result_db.verified_participants.is_empty());
 }
 
@@ -638,34 +676,49 @@ fn test_rollback_extraction_failure_is_fatal_and_keeps_cluster_stopped() {
     assert!(clean.success);
     assert_eq!(clean.exit_code, 0);
     assert_eq!(clean.verified_participants.len(), 7);
-    assert!(clean.services_running.is_empty(), "Cluster must remain stopped after rollback");
+    assert!(
+        clean.services_running.is_empty(),
+        "Cluster must remain stopped after rollback"
+    );
 
     // Case 2: Extraction failure on Coordinator -> FATAL exit code 2, services stopped
     let failed_coord = execute_simulated_rollback(&participants, &[], Some("coordinator"), None);
     assert!(!failed_coord.success);
     assert_eq!(failed_coord.exit_code, 2);
-    assert!(failed_coord.failed_participants.contains(&"extraction_failed:coordinator".to_string()));
-    assert!(failed_coord.services_running.is_empty(), "Cluster must remain stopped on rollback failure");
+    assert!(failed_coord
+        .failed_participants
+        .contains(&"extraction_failed:coordinator".to_string()));
+    assert!(
+        failed_coord.services_running.is_empty(),
+        "Cluster must remain stopped on rollback failure"
+    );
 
     // Case 3: Extraction failure on Storage Node 2 -> FATAL exit code 2
     let failed_node2 = execute_simulated_rollback(&participants, &[], Some("storage_node_2"), None);
     assert!(!failed_node2.success);
     assert_eq!(failed_node2.exit_code, 2);
-    assert!(failed_node2.failed_participants.contains(&"extraction_failed:storage_node_2".to_string()));
+    assert!(failed_node2
+        .failed_participants
+        .contains(&"extraction_failed:storage_node_2".to_string()));
     assert!(failed_node2.services_running.is_empty());
 
     // Case 4: Extraction passes but verification fails on PostgreSQL (e.g. PG_VERSION missing) -> FATAL exit code 2
-    let failed_pg_verify = execute_simulated_rollback(&participants, &[], None, Some("postgres_data"));
+    let failed_pg_verify =
+        execute_simulated_rollback(&participants, &[], None, Some("postgres_data"));
     assert!(!failed_pg_verify.success);
     assert_eq!(failed_pg_verify.exit_code, 2);
-    assert!(failed_pg_verify.failed_participants.contains(&"verification_failed:postgres_data".to_string()));
+    assert!(failed_pg_verify
+        .failed_participants
+        .contains(&"verification_failed:postgres_data".to_string()));
     assert!(failed_pg_verify.services_running.is_empty());
 
     // Case 5: Verification fails on API SSH marker -> FATAL exit code 2
     let failed_ssh_verify = execute_simulated_rollback(&participants, &[], None, Some("spine_ssh"));
     assert!(!failed_ssh_verify.success);
     assert_eq!(failed_ssh_verify.exit_code, 2);
-    assert!(failed_ssh_verify.failed_participants.contains(&"verification_failed:spine_ssh".to_string()));
+    assert!(failed_ssh_verify
+        .failed_participants
+        .contains(&"verification_failed:spine_ssh".to_string()));
 }
 
 /// Validates that a backup archive starts with the mandatory SPNEBAK v2 magic header.
@@ -699,7 +752,9 @@ fn test_unencrypted_backup_rejected_fail_closed() {
     // Case 1: Plaintext tar archive magic (starts with "ustar" or tar header)
     let plaintext_tar = b"ustar  \0rootroot000000 000000";
     let err_tar = validate_backup_encryption_header(plaintext_tar).unwrap_err();
-    assert!(err_tar.contains("Backup archive is unencrypted or invalid! Magic header does not match SPNEBAK v2"));
+    assert!(err_tar.contains(
+        "Backup archive is unencrypted or invalid! Magic header does not match SPNEBAK v2"
+    ));
 
     // Case 2: Plaintext gzip archive magic (\x1f\x8b)
     let plaintext_gzip = b"\x1f\x8b\x08\x00\x00\x00\x00\x00";
@@ -720,7 +775,8 @@ fn test_unencrypted_backup_rejected_fail_closed() {
 #[test]
 fn test_tampered_backup_and_passphrase_authentication_rejection() {
     let passphrase = "Production-Certified-Passphrase-2026!";
-    let original_payload = b"CRITICAL_CLUSTER_STATE: PostgreSQL relational metadata and Ed25519 host keys";
+    let original_payload =
+        b"CRITICAL_CLUSTER_STATE: PostgreSQL relational metadata and Ed25519 host keys";
 
     // 1. Create a valid authenticated SPNEBAK v2 encrypted archive
     let mut encrypted_archive = Vec::new();
@@ -736,7 +792,8 @@ fn test_tampered_backup_and_passphrase_authentication_rejection() {
     assert_eq!(&encrypted_archive[0..8], spine_api::backup::v2::MAGIC_V2);
 
     // 2. Roundtrip: Valid archive with correct passphrase decrypts cleanly
-    let decrypted = authenticate_and_decrypt_backup_payload(&encrypted_archive, passphrase).unwrap();
+    let decrypted =
+        authenticate_and_decrypt_backup_payload(&encrypted_archive, passphrase).unwrap();
     assert_eq!(decrypted, original_payload);
 
     // 3. Tampering failure injection: Mutate 1 byte in the ciphertext chunk
@@ -744,7 +801,8 @@ fn test_tampered_backup_and_passphrase_authentication_rejection() {
     let tamper_idx = tampered_archive.len() - 10;
     tampered_archive[tamper_idx] ^= 0xFF; // Flip all bits of a ciphertext byte
 
-    let tamper_err = authenticate_and_decrypt_backup_payload(&tampered_archive, passphrase).unwrap_err();
+    let tamper_err =
+        authenticate_and_decrypt_backup_payload(&tampered_archive, passphrase).unwrap_err();
     assert!(
         tamper_err.contains("Backup authentication or decryption failed"),
         "Tampered ciphertext must fail AEAD MAC authentication: {}",
@@ -754,7 +812,8 @@ fn test_tampered_backup_and_passphrase_authentication_rejection() {
     // 4. Tampering failure injection: Mutate nonce prefix or salt in the header
     let mut tampered_header = encrypted_archive.clone();
     tampered_header[20] ^= 0xAA; // Flip salt bit
-    let header_err = authenticate_and_decrypt_backup_payload(&tampered_header, passphrase).unwrap_err();
+    let header_err =
+        authenticate_and_decrypt_backup_payload(&tampered_header, passphrase).unwrap_err();
     assert!(
         header_err.contains("Backup authentication or decryption failed"),
         "Tampered salt/header must fail authentication: {}",
@@ -762,8 +821,11 @@ fn test_tampered_backup_and_passphrase_authentication_rejection() {
     );
 
     // 5. Wrong passphrase: AEAD decryption fails closed
-    let wrong_pass_err =
-        authenticate_and_decrypt_backup_payload(&encrypted_archive, "Wrong-Attacker-Passphrase-999!").unwrap_err();
+    let wrong_pass_err = authenticate_and_decrypt_backup_payload(
+        &encrypted_archive,
+        "Wrong-Attacker-Passphrase-999!",
+    )
+    .unwrap_err();
     assert!(
         wrong_pass_err.contains("Backup authentication or decryption failed"),
         "Wrong passphrase must fail authentication: {}",
@@ -792,7 +854,15 @@ fn test_container_backup_decrypt_command_invocation() {
     // In container mode with ENTRYPOINT ["/usr/local/bin/spine-api"], passing `spine-api backup decrypt ...`
     // results in `/usr/local/bin/spine-api spine-api backup decrypt ...`, which fails with unrecognized subcommand.
     let mut bad_cmd = Command::new(binary);
-    bad_cmd.args(&["spine-api", "backup", "decrypt", "--input", "-", "--output", "-"]);
+    bad_cmd.args([
+        "spine-api",
+        "backup",
+        "decrypt",
+        "--input",
+        "-",
+        "--output",
+        "-",
+    ]);
     bad_cmd.env("SPINE_BACKUP_PASSPHRASE", passphrase);
     bad_cmd.stdin(std::process::Stdio::piped());
     bad_cmd.stdout(std::process::Stdio::piped());
@@ -803,10 +873,15 @@ fn test_container_backup_decrypt_command_invocation() {
         let _ = stdin.write_all(&encrypted);
     }
     let output = child.wait_with_output().expect("failed to wait on child");
-    assert!(!output.status.success(), "Duplicate CLI invocation must fail");
+    assert!(
+        !output.status.success(),
+        "Duplicate CLI invocation must fail"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("unrecognized subcommand") || stderr.contains("error:") || stderr.contains("unexpected argument"),
+        stderr.contains("unrecognized subcommand")
+            || stderr.contains("error:")
+            || stderr.contains("unexpected argument"),
         "stderr should indicate invalid argument: {}",
         stderr
     );
@@ -814,7 +889,7 @@ fn test_container_backup_decrypt_command_invocation() {
     // 3. Case 2: Fixed container command form
     // When ENTRYPOINT is `/usr/local/bin/spine-api`, arguments should be `["backup", "decrypt", "--input", "-", "--output", "-"]`
     let mut good_cmd = Command::new(binary);
-    good_cmd.args(&["backup", "decrypt", "--input", "-", "--output", "-"]);
+    good_cmd.args(["backup", "decrypt", "--input", "-", "--output", "-"]);
     good_cmd.env("SPINE_BACKUP_PASSPHRASE", passphrase);
     good_cmd.stdin(std::process::Stdio::piped());
     good_cmd.stdout(std::process::Stdio::piped());
@@ -822,15 +897,22 @@ fn test_container_backup_decrypt_command_invocation() {
 
     let mut child = good_cmd.spawn().expect("failed to spawn good command");
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(&encrypted).expect("failed to write encrypted payload to stdin");
+        stdin
+            .write_all(&encrypted)
+            .expect("failed to write encrypted payload to stdin");
     }
-    let output = child.wait_with_output().expect("failed to wait on good child");
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait on good child");
     assert!(
         output.status.success(),
         "Container command form must succeed, stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(output.stdout, test_payload, "Decrypted stdout must match original plaintext");
+    assert_eq!(
+        output.stdout, test_payload,
+        "Decrypted stdout must match original plaintext"
+    );
 }
 
 #[test]
@@ -843,10 +925,26 @@ fn test_backup_failure_cleanup_purges_plaintext_staging_and_retains_encrypted_ar
 
     fs::create_dir_all(&staging_dir).unwrap();
     // Simulate staging sensitive database dump and SSH keys
-    fs::write(staging_dir.join("postgres_dump.sql.gz"), b"CONFIDENTIAL_PG_DUMP_PLAINTEXT").unwrap();
-    fs::write(staging_dir.join("spine_ssh.tar.gz"), b"CONFIDENTIAL_SSH_PRIVATE_KEY_PLAINTEXT").unwrap();
-    fs::write(&plaintext_bundle, b"CONFIDENTIAL_PLAINTEXT_TAR_ARCHIVE_BUNDLE").unwrap();
-    fs::write(&encrypted_archive, b"SPNEBAK\x02_VALID_AUTHENTICATED_ENCRYPTED_RESULT").unwrap();
+    fs::write(
+        staging_dir.join("postgres_dump.sql.gz"),
+        b"CONFIDENTIAL_PG_DUMP_PLAINTEXT",
+    )
+    .unwrap();
+    fs::write(
+        staging_dir.join("spine_ssh.tar.gz"),
+        b"CONFIDENTIAL_SSH_PRIVATE_KEY_PLAINTEXT",
+    )
+    .unwrap();
+    fs::write(
+        &plaintext_bundle,
+        b"CONFIDENTIAL_PLAINTEXT_TAR_ARCHIVE_BUNDLE",
+    )
+    .unwrap();
+    fs::write(
+        &encrypted_archive,
+        b"SPNEBAK\x02_VALID_AUTHENTICATED_ENCRYPTED_RESULT",
+    )
+    .unwrap();
 
     // Verify all files exist before failure simulation
     assert!(staging_dir.exists());
@@ -888,10 +986,22 @@ fn test_backup_failure_cleanup_purges_plaintext_staging_and_retains_encrypted_ar
     }
 
     let result = run_simulated_backup_cleanup(&staging_dir, &plaintext_bundle, &encrypted_archive);
-    assert!(result.staging_purged, "Staging directory with plaintext DB and SSH keys must be purged");
-    assert!(result.plaintext_bundle_purged, "Temporary plaintext bundle must be purged");
-    assert!(result.encrypted_archive_retained, "Encrypted backup archive must be retained");
-    assert!(result.cleanup_failures.is_empty(), "No cleanup failures on normal deletion");
+    assert!(
+        result.staging_purged,
+        "Staging directory with plaintext DB and SSH keys must be purged"
+    );
+    assert!(
+        result.plaintext_bundle_purged,
+        "Temporary plaintext bundle must be purged"
+    );
+    assert!(
+        result.encrypted_archive_retained,
+        "Encrypted backup archive must be retained"
+    );
+    assert!(
+        result.cleanup_failures.is_empty(),
+        "No cleanup failures on normal deletion"
+    );
 
     // Bash trap execution test (if bash is available)
     if let Ok(bash_check) = Command::new("bash").arg("-c").arg("echo ok").output() {
@@ -940,9 +1050,13 @@ exit 42
                 .expect("failed to spawn bash");
 
             if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(script.as_bytes()).expect("failed to write script to stdin");
+                stdin
+                    .write_all(script.as_bytes())
+                    .expect("failed to write script to stdin");
             }
-            let bash_test = child.wait_with_output().expect("failed to wait on bash child");
+            let bash_test = child
+                .wait_with_output()
+                .expect("failed to wait on bash child");
 
             assert_eq!(
                 bash_test.status.code(),
@@ -962,10 +1076,22 @@ fn test_restore_cleanup_trap_purges_decrypted_payload_on_checksum_failure() {
     fs::create_dir_all(&decrypt_dir).unwrap();
 
     // Populate with sensitive decrypted files
-    fs::write(decrypt_dir.join("postgres_dump.sql.gz"), b"DECRYPTED_PLAINTEXT_PG_DUMP").unwrap();
-    fs::write(decrypt_dir.join("spine_ssh.tar.gz"), b"DECRYPTED_PLAINTEXT_SSH_KEYS").unwrap();
+    fs::write(
+        decrypt_dir.join("postgres_dump.sql.gz"),
+        b"DECRYPTED_PLAINTEXT_PG_DUMP",
+    )
+    .unwrap();
+    fs::write(
+        decrypt_dir.join("spine_ssh.tar.gz"),
+        b"DECRYPTED_PLAINTEXT_SSH_KEYS",
+    )
+    .unwrap();
     fs::write(decrypt_dir.join("FENCING_GENERATION"), b"42").unwrap();
-    fs::write(decrypt_dir.join("SHA256SUMS"), b"badhash  postgres_dump.sql.gz\nbadhash  spine_ssh.tar.gz\n").unwrap();
+    fs::write(
+        decrypt_dir.join("SHA256SUMS"),
+        b"badhash  postgres_dump.sql.gz\nbadhash  spine_ssh.tar.gz\n",
+    )
+    .unwrap();
 
     assert!(decrypt_dir.exists());
     assert!(decrypt_dir.join("postgres_dump.sql.gz").exists());
@@ -976,10 +1102,8 @@ fn test_restore_cleanup_trap_purges_decrypted_payload_on_checksum_failure() {
         let restore_success = false;
 
         // Simulated validation logic
-        let validation_result = (|| -> Result<(), String> {
-            // Checksum verification failure: mismatch injected
-            Err("SHA256 checksum verification failed: postgres_dump.sql.gz FAILED".to_string())
-        })();
+        let validation_result: Result<(), String> =
+            Err("SHA256 checksum verification failed: postgres_dump.sql.gz FAILED".to_string());
 
         // Cleanup trap execution on failure
         if !restore_success && dir.exists() {
@@ -991,7 +1115,10 @@ fn test_restore_cleanup_trap_purges_decrypted_payload_on_checksum_failure() {
 
     let err = run_restore_validation_with_cleanup(&decrypt_dir).unwrap_err();
     assert!(err.contains("checksum verification failed"));
-    assert!(!decrypt_dir.exists(), "Decrypted restore directory MUST be completely purged on checksum failure");
+    assert!(
+        !decrypt_dir.exists(),
+        "Decrypted restore directory MUST be completely purged on checksum failure"
+    );
 
     // Bash trap test: execute actual trap in bash to prove early trap catches checksum failure
     if let Ok(bash_check) = Command::new("bash").arg("-c").arg("echo ok").output() {
@@ -1034,11 +1161,18 @@ sha256sum -c SHA256SUMS
                 .expect("failed to spawn bash");
 
             if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(script.as_bytes()).expect("failed to write script to stdin");
+                stdin
+                    .write_all(script.as_bytes())
+                    .expect("failed to write script to stdin");
             }
-            let bash_test = child.wait_with_output().expect("failed to wait on bash child");
+            let bash_test = child
+                .wait_with_output()
+                .expect("failed to wait on bash child");
 
-            assert!(!bash_test.status.success(), "Checksum failure must fail closed");
+            assert!(
+                !bash_test.status.success(),
+                "Checksum failure must fail closed"
+            );
         }
     }
 }
@@ -1074,7 +1208,8 @@ fn test_pre_restore_rollback_archives_are_encrypted_and_verified() {
         .collect();
 
     // 1. Generate encrypted pre-restore rollback archives
-    let archives = execute_pre_restore_archiving(&volumes_ref, &rollback_dir, passphrase, None).unwrap();
+    let archives =
+        execute_pre_restore_archiving(&volumes_ref, &rollback_dir, passphrase, None).unwrap();
     assert_eq!(archives.len(), 7);
 
     // 2. Verify all archives are encrypted SPNEBAK v2 and NO plaintext archives exist
@@ -1082,18 +1217,34 @@ fn test_pre_restore_rollback_archives_are_encrypted_and_verified() {
         let enc_file = rollback_dir.join(format!("{}.spnebak", p));
         let plain_tar = rollback_dir.join(format!("{}.tar.gz", p));
 
-        assert!(enc_file.exists(), "Encrypted rollback archive {}.spnebak must exist", p);
-        assert!(!plain_tar.exists(), "Plaintext archive {}.tar.gz must NOT exist", p);
+        assert!(
+            enc_file.exists(),
+            "Encrypted rollback archive {}.spnebak must exist",
+            p
+        );
+        assert!(
+            !plain_tar.exists(),
+            "Plaintext archive {}.tar.gz must NOT exist",
+            p
+        );
 
         let data = fs::read(&enc_file).unwrap();
         assert!(data.len() > 8);
-        assert_eq!(&data[0..8], spine_api::backup::v2::MAGIC_V2, "{}.spnebak must start with SPNEBAK v2 magic", p);
+        assert_eq!(
+            &data[0..8],
+            spine_api::backup::v2::MAGIC_V2,
+            "{}.spnebak must start with SPNEBAK v2 magic",
+            p
+        );
 
         // Verify AEAD authentication and decrypt stream
         let mut decrypted = Vec::new();
         spine_api::backup::v2::decrypt_stream(&data[..], &mut decrypted, passphrase)
             .expect("Decryption must succeed with valid passphrase");
-        assert_eq!(decrypted, format!("valid authenticated payload for {}", p).as_bytes());
+        assert_eq!(
+            decrypted,
+            format!("valid authenticated payload for {}", p).as_bytes()
+        );
     }
 
     // 3. Verify tampering detection on rollback archives
@@ -1103,12 +1254,18 @@ fn test_pre_restore_rollback_archives_are_encrypted_and_verified() {
     tampered_bytes[last] ^= 0x55; // Tamper MAC / ciphertext byte
 
     let mut out = Vec::new();
-    let decrypt_err = spine_api::backup::v2::decrypt_stream(&tampered_bytes[..], &mut out, passphrase);
-    assert!(decrypt_err.is_err(), "Tampered rollback archive must fail AEAD MAC verification");
+    let decrypt_err =
+        spine_api::backup::v2::decrypt_stream(&tampered_bytes[..], &mut out, passphrase);
+    assert!(
+        decrypt_err.is_err(),
+        "Tampered rollback archive must fail AEAD MAC verification"
+    );
 }
 
 /// Helper to verify supported storage topology: fails closed if non-local driver is detected.
-pub fn verify_storage_topology_driver(volume_drivers: &HashMap<String, String>) -> Result<(), String> {
+pub fn verify_storage_topology_driver(
+    volume_drivers: &HashMap<String, String>,
+) -> Result<(), String> {
     for (vol, driver) in volume_drivers {
         if driver != "local" {
             return Err(format!(
@@ -1198,9 +1355,13 @@ fi
                 .expect("failed to spawn bash");
 
             if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(script.as_bytes()).expect("failed to write script to stdin");
+                stdin
+                    .write_all(script.as_bytes())
+                    .expect("failed to write script to stdin");
             }
-            let res = child.wait_with_output().expect("failed to wait on bash child");
+            let res = child
+                .wait_with_output()
+                .expect("failed to wait on bash child");
             assert!(
                 res.status.success(),
                 "Storage topology driver verification must fail closed on nfs. Stderr: {}",
@@ -1306,9 +1467,13 @@ exit 0
                 .expect("failed to spawn bash");
 
             if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(script.as_bytes()).expect("failed to write script to stdin");
+                stdin
+                    .write_all(script.as_bytes())
+                    .expect("failed to write script to stdin");
             }
-            let res = child.wait_with_output().expect("failed to wait on bash child");
+            let res = child
+                .wait_with_output()
+                .expect("failed to wait on bash child");
             assert!(
                 res.status.success(),
                 "Credential non-exposure test failed. Stderr: {}, Stdout: {}",
@@ -1423,9 +1588,13 @@ exit 0
                 .expect("failed to spawn bash");
 
             if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(script.as_bytes()).expect("failed to write script to stdin");
+                stdin
+                    .write_all(script.as_bytes())
+                    .expect("failed to write script to stdin");
             }
-            let res = child.wait_with_output().expect("failed to wait on bash child");
+            let res = child
+                .wait_with_output()
+                .expect("failed to wait on bash child");
             assert!(
                 res.status.success(),
                 "Off-host S3 replication and restore gate test failed. Stderr: {}, Stdout: {}",
@@ -1561,9 +1730,13 @@ exit 0
                 .expect("failed to spawn bash");
 
             if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(script.as_bytes()).expect("failed to write script to stdin");
+                stdin
+                    .write_all(script.as_bytes())
+                    .expect("failed to write script to stdin");
             }
-            let res = child.wait_with_output().expect("failed to wait on bash child");
+            let res = child
+                .wait_with_output()
+                .expect("failed to wait on bash child");
             assert!(
                 res.status.success(),
                 "Off-site policy enforcement test failed. Stderr: {}, Stdout: {}",
@@ -1662,9 +1835,13 @@ exit 0
                 .expect("failed to spawn bash");
 
             if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(script.as_bytes()).expect("failed to write script to stdin");
+                stdin
+                    .write_all(script.as_bytes())
+                    .expect("failed to write script to stdin");
             }
-            let res = child.wait_with_output().expect("failed to wait on bash child");
+            let res = child
+                .wait_with_output()
+                .expect("failed to wait on bash child");
             assert!(
                 res.status.success(),
                 "Cryptographic SHA-256 verification and tampering rejection test failed. Stderr: {}, Stdout: {}",
@@ -1741,9 +1918,13 @@ exit 0
                 .expect("failed to spawn bash");
 
             if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(script.as_bytes()).expect("failed to write script to stdin");
+                stdin
+                    .write_all(script.as_bytes())
+                    .expect("failed to write script to stdin");
             }
-            let res = child.wait_with_output().expect("failed to wait on bash child");
+            let res = child
+                .wait_with_output()
+                .expect("failed to wait on bash child");
             assert!(
                 res.status.success(),
                 "Remote restore download cleanup test failed. Stderr: {}, Stdout: {}",
@@ -1997,9 +2178,13 @@ exit 0
                 .expect("failed to spawn bash");
 
             if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(script.as_bytes()).expect("failed to write script to stdin");
+                stdin
+                    .write_all(script.as_bytes())
+                    .expect("failed to write script to stdin");
             }
-            let res = child.wait_with_output().expect("failed to wait on bash child");
+            let res = child
+                .wait_with_output()
+                .expect("failed to wait on bash child");
             assert!(
                 res.status.success(),
                 "Invalid policy values rejection test failed. Stderr: {}, Stdout: {}",
@@ -2095,9 +2280,13 @@ exit 0
                 .expect("failed to spawn bash");
 
             if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(script.as_bytes()).expect("failed to write script to stdin");
+                stdin
+                    .write_all(script.as_bytes())
+                    .expect("failed to write script to stdin");
             }
-            let res = child.wait_with_output().expect("failed to wait on bash child");
+            let res = child
+                .wait_with_output()
+                .expect("failed to wait on bash child");
             assert!(
                 res.status.success(),
                 "Unavailable date calculation fail-closed test failed. Stderr: {}, Stdout: {}",
@@ -2378,9 +2567,13 @@ exit 0
                 .expect("failed to spawn bash");
 
             if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(script.as_bytes()).expect("failed to write script to stdin");
+                stdin
+                    .write_all(script.as_bytes())
+                    .expect("failed to write script to stdin");
             }
-            let res = child.wait_with_output().expect("failed to wait on bash child");
+            let res = child
+                .wait_with_output()
+                .expect("failed to wait on bash child");
             assert!(
                 res.status.success(),
                 "Remote Object Lock metadata absent/mismatched failure test failed. Stderr: {}, Stdout: {}",

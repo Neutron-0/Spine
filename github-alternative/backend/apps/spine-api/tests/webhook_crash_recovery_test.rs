@@ -30,7 +30,10 @@ async fn test_webhook_outbox_lease_expiry_reclaims_stranded_processing_items() {
 
     // 2. Before lease expires (e.g. +10s), subsequent claim must NOT return the item (it is still locked by the lease)
     let ten_secs_later = now + 10 * 1_000_000_000;
-    let premature_claim = db.claim_pending_webhook_outbox(10, ten_secs_later).await.unwrap();
+    let premature_claim = db
+        .claim_pending_webhook_outbox(10, ten_secs_later)
+        .await
+        .unwrap();
     assert_eq!(
         premature_claim.len(),
         0,
@@ -40,7 +43,10 @@ async fn test_webhook_outbox_lease_expiry_reclaims_stranded_processing_items() {
     // 3. After lease expires (e.g. +65s) due to worker crash / interruption,
     // the stranded PROCESSING item MUST be reclaimed!
     let sixty_five_secs_later = now + 65 * 1_000_000_000;
-    let reclaimed = db.claim_pending_webhook_outbox(10, sixty_five_secs_later).await.unwrap();
+    let reclaimed = db
+        .claim_pending_webhook_outbox(10, sixty_five_secs_later)
+        .await
+        .unwrap();
     assert_eq!(
         reclaimed.len(),
         1,
@@ -86,7 +92,10 @@ async fn test_webhook_outbox_lease_renewal_prevents_duplicate_reclaim_during_lon
 
     // Check that Worker 2 calling claim_pending_webhook_outbox at t = 70s does NOT reclaim any items
     // because item 1 was actively extended, and items 2 & 3 have buffer leases (90s and 120s)
-    let worker_2_claim = db.claim_pending_webhook_outbox(3, seventy_secs_later).await.unwrap();
+    let worker_2_claim = db
+        .claim_pending_webhook_outbox(3, seventy_secs_later)
+        .await
+        .unwrap();
     assert_eq!(
         worker_2_claim.len(),
         0,

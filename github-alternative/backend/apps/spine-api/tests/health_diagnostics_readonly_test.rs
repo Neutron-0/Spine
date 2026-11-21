@@ -25,7 +25,9 @@ async fn test_health_diagnostics_does_not_mutate_outbox_queue() {
         created_at_nanos: now,
         next_attempt_at_nanos: now,
     };
-    Database::enqueue_webhook_outbox(db.as_ref(), item).await.unwrap();
+    Database::enqueue_webhook_outbox(db.as_ref(), item)
+        .await
+        .unwrap();
 
     let state = AppState::new_with_defaults(db.clone(), temp_dir.path(), None).unwrap();
 
@@ -35,8 +37,14 @@ async fn test_health_diagnostics_does_not_mutate_outbox_queue() {
     }
 
     // Verify outbox item is STILL PENDING and attempts == 0
-    let claimed = Database::claim_pending_webhook_outbox(db.as_ref(), 10, now).await.unwrap();
-    assert_eq!(claimed.len(), 1, "Outbox item must not have been claimed or abandoned by health_diagnostics");
+    let claimed = Database::claim_pending_webhook_outbox(db.as_ref(), 10, now)
+        .await
+        .unwrap();
+    assert_eq!(
+        claimed.len(),
+        1,
+        "Outbox item must not have been claimed or abandoned by health_diagnostics"
+    );
     assert_eq!(claimed[0].id, "outbox_test_1");
     // Since claim_pending_webhook_outbox increments attempts from 0 to 1:
     assert_eq!(claimed[0].attempts, 1);

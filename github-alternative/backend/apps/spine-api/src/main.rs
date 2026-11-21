@@ -632,10 +632,14 @@ async fn main() -> anyhow::Result<()> {
             db.create_pat(pat).await?;
 
             let target_token_file = token_out_file.or_else(|| {
-                std::env::var("SPINE_ADMIN_TOKEN_FILE").ok().map(PathBuf::from)
+                std::env::var("SPINE_ADMIN_TOKEN_FILE")
+                    .ok()
+                    .map(PathBuf::from)
             });
             let mut resolved_password_file = password_out_file.or_else(|| {
-                std::env::var("SPINE_ADMIN_PASSWORD_FILE").ok().map(PathBuf::from)
+                std::env::var("SPINE_ADMIN_PASSWORD_FILE")
+                    .ok()
+                    .map(PathBuf::from)
             });
             if resolved_password_file.is_none() {
                 if let Some(ref tp) = target_token_file {
@@ -788,7 +792,10 @@ async fn main() -> anyhow::Result<()> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&token_out_file, std::fs::Permissions::from_mode(0o600));
+                let _ = std::fs::set_permissions(
+                    &token_out_file,
+                    std::fs::Permissions::from_mode(0o600),
+                );
             }
 
             println!(
@@ -2250,22 +2257,28 @@ async fn main() -> anyhow::Result<()> {
                 let mut reader: Box<dyn std::io::Read> = if is_stdin {
                     Box::new(std::io::stdin())
                 } else {
-                    let f = std::fs::File::open(&input)
-                        .map_err(|e| anyhow::anyhow!("Failed to open input file {}: {}", input.display(), e))?;
+                    let f = std::fs::File::open(&input).map_err(|e| {
+                        anyhow::anyhow!("Failed to open input file {}: {}", input.display(), e)
+                    })?;
                     Box::new(std::io::BufReader::new(f))
                 };
 
                 let mut writer: Box<dyn std::io::Write> = if is_stdout {
                     Box::new(std::io::stdout())
                 } else {
-                    let f = std::fs::File::create(&output)
-                        .map_err(|e| anyhow::anyhow!("Failed to create output file {}: {}", output.display(), e))?;
+                    let f = std::fs::File::create(&output).map_err(|e| {
+                        anyhow::anyhow!("Failed to create output file {}: {}", output.display(), e)
+                    })?;
                     Box::new(std::io::BufWriter::new(f))
                 };
 
                 eprintln!(
                     "Encrypting {} into SPNEBAK v2 AEAD envelope (AES-256-GCM)...",
-                    if is_stdin { "stdin" } else { input.to_str().unwrap_or("file") }
+                    if is_stdin {
+                        "stdin"
+                    } else {
+                        input.to_str().unwrap_or("file")
+                    }
                 );
                 let summary = spine_api::backup::v2::encrypt_stream(
                     &mut reader,
@@ -2304,28 +2317,27 @@ async fn main() -> anyhow::Result<()> {
                 let mut reader: Box<dyn std::io::Read> = if is_stdin {
                     Box::new(std::io::stdin())
                 } else {
-                    let f = std::fs::File::open(&input)
-                        .map_err(|e| anyhow::anyhow!("Failed to open input file {}: {}", input.display(), e))?;
+                    let f = std::fs::File::open(&input).map_err(|e| {
+                        anyhow::anyhow!("Failed to open input file {}: {}", input.display(), e)
+                    })?;
                     Box::new(std::io::BufReader::new(f))
                 };
 
                 let mut writer: Box<dyn std::io::Write> = if is_stdout {
                     Box::new(std::io::stdout())
                 } else {
-                    let f = std::fs::File::create(&output)
-                        .map_err(|e| anyhow::anyhow!("Failed to create output file {}: {}", output.display(), e))?;
+                    let f = std::fs::File::create(&output).map_err(|e| {
+                        anyhow::anyhow!("Failed to create output file {}: {}", output.display(), e)
+                    })?;
                     Box::new(std::io::BufWriter::new(f))
                 };
 
-                eprintln!(
-                    "Authenticating and decrypting SPNEBAK v2 archive (AES-256-GCM)..."
-                );
-                let summary = spine_api::backup::v2::decrypt_stream(
-                    &mut reader,
-                    &mut writer,
-                    &pass,
-                )
-                .map_err(|e| anyhow::anyhow!("Authentication or decryption failed: {}", e))?;
+                eprintln!("Authenticating and decrypting SPNEBAK v2 archive (AES-256-GCM)...");
+                let summary =
+                    spine_api::backup::v2::decrypt_stream(&mut reader, &mut writer, &pass)
+                        .map_err(|e| {
+                            anyhow::anyhow!("Authentication or decryption failed: {}", e)
+                        })?;
 
                 eprintln!(
                     "Authentication and decryption verified [OK]: {} plaintext bytes verified in {} chunks (hash: {})",
