@@ -1463,6 +1463,7 @@ async fn test_rpc_max_payload_worst_case_high_entropy_fits_frame_and_overlimit_r
 }
 
 #[tokio::test]
+#[ignore = "requires pre-built release candidate binaries in target/release-candidate"]
 async fn test_live_coordinator_and_storage_node_processes_restore_and_restart() {
     use spine_api::backup::{CommitDecisionRecord, RestoreJournal, RestorePhase};
     use spine_api::coordinator::{ClusterNodeClient, CoordinatorClient};
