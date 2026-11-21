@@ -1,0 +1,151 @@
+name: Continuous Integration & Verification
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # 1. Rust Workspace Checks (git-alternative & github-alternative/backend)
+  # ----------------------------------------------------------------------------
+  rust-checks:
+    name: Rust Checks & Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rustfmt Check (git-alternative)
+        run: cargo fmt --manifest-path git-alternative/Cargo.toml --all -- --check
+
+      - name: Rustfmt Check (github-alternative/backend)
+        run: cargo fmt --manifest-path github-alternative/backend/Cargo.toml --all -- --check
+
+      - name: Cargo Check (git-alternative)
+        run: cargo check --manifest-path git-alternative/Cargo.toml --all-targets
+
+      - name: Cargo Check (github-alternative/backend)
+        run: cargo check --manifest-path github-alternative/backend/Cargo.toml --all-targets
+
+      - name: Cargo Clippy (git-alternative)
+        run: cargo clippy --manifest-path git-alternative/Cargo.toml --all-targets -- -D warnings
+
+      - name: Cargo Clippy (github-alternative/backend)
+        run: cargo clippy --manifest-path github-alternative/backend/Cargo.toml --all-targets -- -D warnings
+
+      - name: Cargo Test (git-alternative)
+        run: cargo test --manifest-path git-alternative/Cargo.toml
+
+      - name: Cargo Test (github-alternative/backend)
+        run: cargo test --manifest-path github-alternative/backend/Cargo.toml --jobs 2
+
+  # ----------------------------------------------------------------------------
+  # 2. Frontend Checks (github-alternative/frontend)
+  # ----------------------------------------------------------------------------
+  frontend-checks:
+    name: Frontend Lint & Build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: github-alternative/frontend
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: github-alternative/frontend/package-lock.json
+
+      - name: Install dependencies from lockfile
+        run: npm ci
+
+      - name: Typecheck and Build
+        run: npm run build
+
+  # ----------------------------------------------------------------------------
+  # 3. Shell Script, Deployment & Compose Validation
+  # ----------------------------------------------------------------------------
+  scripts-and-compose:
+    name: Shell Scripts & Compose Config
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Syntax Check All Operational Scripts (bash -n)
+        run: |
+          for script in docker/postgres/01-init-roles.sh scripts/*.sh; do
+            bash -n "$script" && echo "[PASS] bash -n $script"
+          done
+
+      - name: Lint Operational Scripts (ShellCheck)
+        run: |
+          shellcheck -S warning -e SC1091 docker/postgres/01-init-roles.sh scripts/*.sh
+
+      - name: Validate Production Docker Compose Specification
+        run: |
+          cp .env.example .env 2>/dev/null || touch .env
+          docker compose --env-file .env -f docker-compose.prod.yml config --quiet
+          echo "[PASS] docker-compose.prod.yml interpolated cleanly"
+
+  # ----------------------------------------------------------------------------
+  # 4. Secret Scanning & Sensitive Pattern Auditing
+  # ----------------------------------------------------------------------------
+  secret-scan:
+    name: Secret Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan Commit History for Credentials
+        run: |
+          # Prohibit unredacted admin PATs and real AWS access keys from appearing in commits
+          if git log -p --all | grep -E "(\+.*sp_pat_[a-zA-Z0-9]{20,}|\+.*AKIA[0-9A-Z]{16})" | grep -v "AKIAIOSFODNN7EXAMPLE"; then
+            echo "ERROR: Potential unredacted secret found in commit history!" >&2
+            exit 1
+          fi
+          echo "[PASS] Zero unredacted secret tokens detected across history."
+
+  # ----------------------------------------------------------------------------
+  # 5. Infrastructure Template Validation (CloudFormation)
+  # ----------------------------------------------------------------------------
+  infrastructure-template:
+    name: Infrastructure CloudFormation Template Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install YAML parser & cfn-lint
+        run: pip install pyyaml cfn-lint
+
+      - name: Validate CloudFormation Template Structure & Security Rules
+        run: python scripts/validate_cfn_template.py
+
+      - name: Run cfn-lint Validator
+        run: cfn-lint deploy/aws/staging-object-lock-storage.yaml --ignore-checks W
