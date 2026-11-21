@@ -28,12 +28,21 @@ def validate_template(filepath):
     resources = template.get('Resources', {})
     conditions = template.get('Conditions', {})
     outputs = template.get('Outputs', {})
+    rules = template.get('Rules', {})
 
     print(f"  [OK] Format Version: {template['AWSTemplateFormatVersion']}")
     print(f"  [OK] Parameters: {len(params)} ({', '.join(params.keys())})")
     print(f"  [OK] Resources: {len(resources)} ({', '.join(resources.keys())})")
     print(f"  [OK] Conditions: {len(conditions)} ({', '.join(conditions.keys())})")
     print(f"  [OK] Outputs: {len(outputs)} ({', '.join(outputs.keys())})")
+    print(f"  [OK] Rules: {len(rules)} ({', '.join(rules.keys())})")
+
+    # 1b. Rule Enforcement Validation
+    assert 'ProductionRequiresComplianceMode' in rules, "Template missing ProductionRequiresComplianceMode rule"
+    prod_rule = rules['ProductionRequiresComplianceMode']
+    assert '!Equals' in prod_rule['RuleCondition']
+    assert any('!Equals' in a.get('Assert', {}) for a in prod_rule.get('Assertions', []))
+    print("  [OK] Rule: ProductionRequiresComplianceMode rule structure validated")
 
     # 2. Parameters validation
     for p_name, p_body in params.items():
@@ -94,7 +103,61 @@ def validate_template(filepath):
         assert 'Value' in o_body, f"Output {o_name} missing Value"
     print("  [OK] All Outputs reference valid properties")
 
+    # 7. Regression test for Production Governance mode rejection
+    test_production_governance_rejection(template)
+
     print("\n[SUCCESS] CloudFormation template validated successfully with zero errors!")
+
+def test_production_governance_rejection(template):
+    print("  Testing Rule: Production Environment with Governance Mode Rejection...")
+    rules = template.get('Rules', {})
+    prod_rule = rules.get('ProductionRequiresComplianceMode')
+    assert prod_rule, "ProductionRequiresComplianceMode rule missing"
+
+    def eval_expr(expr, env_name, lock_mode):
+        if isinstance(expr, dict) and '!Equals' in expr:
+            operands = expr['!Equals']
+            def resolve(op):
+                if isinstance(op, dict) and '!Ref' in op:
+                    ref = op['!Ref']
+                    if ref == 'EnvironmentName':
+                        return env_name
+                    if ref == 'ObjectLockMode':
+                        return lock_mode
+                return op
+            return resolve(operands[0]) == resolve(operands[1])
+        return True
+
+    def check_combination(env_name, lock_mode):
+        cond_active = eval_expr(prod_rule['RuleCondition'], env_name, lock_mode)
+        if not cond_active:
+            return True, "Condition inactive; rule passes"
+        for a in prod_rule.get('Assertions', []):
+            passed = eval_expr(a.get('Assert'), env_name, lock_mode)
+            if not passed:
+                return False, a.get('AssertDescription')
+        return True, "Assertion passed"
+
+    # Test staging + GOVERNANCE -> Allowed
+    ok, msg = check_combination('staging', 'GOVERNANCE')
+    assert ok, f"staging + GOVERNANCE should be allowed: {msg}"
+    print("  [OK] Valid combination allowed: EnvironmentName=staging, ObjectLockMode=GOVERNANCE")
+
+    # Test staging + COMPLIANCE -> Allowed
+    ok, msg = check_combination('staging', 'COMPLIANCE')
+    assert ok, f"staging + COMPLIANCE should be allowed: {msg}"
+    print("  [OK] Valid combination allowed: EnvironmentName=staging, ObjectLockMode=COMPLIANCE")
+
+    # Test production + COMPLIANCE -> Allowed
+    ok, msg = check_combination('production', 'COMPLIANCE')
+    assert ok, f"production + COMPLIANCE should be allowed: {msg}"
+    print("  [OK] Valid combination allowed: EnvironmentName=production, ObjectLockMode=COMPLIANCE")
+
+    # Test production + GOVERNANCE -> MUST BE REJECTED
+    ok, msg = check_combination('production', 'GOVERNANCE')
+    assert not ok, "production + GOVERNANCE must be rejected by rule assertion!"
+    assert "Production environment strictly requires ObjectLockMode to be COMPLIANCE" in msg
+    print(f"  [OK] Invalid combination successfully rejected: EnvironmentName=production, ObjectLockMode=GOVERNANCE -> '{msg}'")
 
 if __name__ == '__main__':
     validate_template('deploy/aws/staging-object-lock-storage.yaml')

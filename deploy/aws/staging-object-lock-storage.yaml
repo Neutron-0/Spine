@@ -65,6 +65,13 @@ Parameters:
     Default: ''
     Description: Trusted IAM principal ARN (e.g. arn:aws:iam::123456789012:role/MyStagingRole). If left empty with PrincipalType=AWS, defaults to the current AWS account root.
 
+Rules:
+  ProductionRequiresComplianceMode:
+    RuleCondition: !Equals [!Ref EnvironmentName, 'production']
+    Assertions:
+      - Assert: !Equals [!Ref ObjectLockMode, 'COMPLIANCE']
+        AssertDescription: Production environment strictly requires ObjectLockMode to be COMPLIANCE. GOVERNANCE mode is prohibited in production.
+
 Resources:
   # ----------------------------------------------------------------------------
   # S3 Bucket with Mandatory Object Lock (WORM) and Default Server-Side Encryption
