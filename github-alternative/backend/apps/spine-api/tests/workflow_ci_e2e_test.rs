@@ -260,10 +260,12 @@ jobs:
     assert_eq!(job2.job_key, "test");
 
     let mut step_scripts2 = HashMap::new();
-    step_scripts2.insert(
-        0,
-        "echo Testing Spine with secret %SPINE_API_SECRET%".to_string(),
-    );
+    let script = if cfg!(windows) {
+        "echo Testing Spine with secret %SPINE_API_SECRET%".to_string()
+    } else {
+        "echo Testing Spine with secret $SPINE_API_SECRET".to_string()
+    };
+    step_scripts2.insert(0, script);
     let trust_token2 = AuthoritativeTrustToken::from_database(db.as_ref(), &job2)
         .await
         .unwrap();
