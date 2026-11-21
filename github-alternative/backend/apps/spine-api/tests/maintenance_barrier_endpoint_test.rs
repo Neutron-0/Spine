@@ -103,6 +103,8 @@ async fn test_maintenance_barrier_endpoint_lifecycle_and_authorization() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 
+    let owner_token = acquire_json["owner_token"].as_str().unwrap();
+
     // 7. Release without auth fails
     let req = Request::builder()
         .uri("/api/v1/admin/maintenance/release")
@@ -112,12 +114,47 @@ async fn test_maintenance_barrier_endpoint_lifecycle_and_authorization() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-    // 8. Release with valid admin token succeeds
+    // 7b. Release with valid auth but missing owner_token fails with 403 Forbidden
     let req = Request::builder()
         .uri("/api/v1/admin/maintenance/release")
         .method("POST")
         .header(header::AUTHORIZATION, "Bearer test-secret-admin-token-12345")
         .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // 7c. Release with valid auth but mismatched owner_token fails with 403 Forbidden
+    let req = Request::builder()
+        .uri("/api/v1/admin/maintenance/release")
+        .method("POST")
+        .header(header::AUTHORIZATION, "Bearer test-secret-admin-token-12345")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"owner_token":"wrong-owner-token"}"#))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // 7d. Diagnostics confirms barrier is STILL actively held after failed release attempts
+    let req = Request::builder()
+        .uri("/health/diagnostics")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let diag: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(diag["in_maintenance"], true);
+    assert_eq!(diag["current_fencing_generation"], gen);
+
+    // 8. Release with valid admin token and matching owner_token succeeds
+    let req = Request::builder()
+        .uri("/api/v1/admin/maintenance/release")
+        .method("POST")
+        .header(header::AUTHORIZATION, "Bearer test-secret-admin-token-12345")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(format!(r#"{{"owner_token":"{}"}}"#, owner_token)))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -339,12 +376,16 @@ async fn test_admin_authorization_username_denial() {
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let acq_json: Value = serde_json::from_slice(&body_bytes).unwrap();
+    let ops_owner_token = acq_json["owner_token"].as_str().unwrap();
 
     let req = Request::builder()
         .uri("/api/v1/admin/maintenance/release")
         .method("POST")
         .header(header::AUTHORIZATION, format!("Bearer {}", pat_ops_lead_plain))
-        .body(Body::empty())
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(format!(r#"{{"owner_token":"{}"}}"#, ops_owner_token)))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -573,13 +614,17 @@ async fn test_maintenance_release_participant_failure_reports_degraded_error() {
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let acq_json: Value = serde_json::from_slice(&body_bytes).unwrap();
+    let owner_token = acq_json["owner_token"].as_str().unwrap();
 
-    // Release fails because node1 fails to exit
+    // Release fails because node1 fails to exit (mismatched token would fail earlier with 403, here valid token passes ownership gate)
     let req = Request::builder()
         .uri("/api/v1/admin/maintenance/release")
         .method("POST")
         .header(header::AUTHORIZATION, "Bearer test-admin-token")
-        .body(Body::empty())
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(format!(r#"{{"owner_token":"{}"}}"#, owner_token)))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
 
@@ -688,4 +733,168 @@ fn test_bootstrap_admin_secret_suppression() {
         let pass_meta = std::fs::metadata(&password_file).unwrap();
         assert_eq!(pass_meta.permissions().mode() & 0o777, 0o600);
     }
+}
+
+#[tokio::test]
+async fn test_barrier_ownership_and_unacquired_backup_cleanup_isolation() {
+    let _guard = TEST_MUTEX.lock().await;
+    std::env::set_var("SPINE_ADMIN_TOKEN", "test-admin-secret-ownership-123");
+
+    let db = Arc::new(InMemoryDatabase::new());
+    let temp_dir = tempfile::tempdir().unwrap();
+    let state = AppState::new_with_defaults(db.clone(), temp_dir.path(), None).unwrap();
+    let app = build_router(state);
+
+    // 1. Operation A acquires maintenance barrier
+    let req = Request::builder()
+        .uri("/api/v1/admin/maintenance/acquire")
+        .method("POST")
+        .header(header::AUTHORIZATION, "Bearer test-admin-secret-ownership-123")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"reason":"Operation A migration","timeout_seconds":300}"#))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let acq_json: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(acq_json["status"], "acquired");
+    let original_generation = acq_json["fencing_generation"].as_u64().unwrap();
+    let original_owner_token = acq_json["owner_token"].as_str().unwrap().to_string();
+
+    // Verify diagnostics: active maintenance held at original_generation
+    let req = Request::builder()
+        .uri("/health/diagnostics")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let diag: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(diag["in_maintenance"], true);
+    assert_eq!(diag["current_fencing_generation"], original_generation);
+
+    // 2. Mismatched owner token CANNOT release Operation A's barrier
+    let req = Request::builder()
+        .uri("/api/v1/admin/maintenance/release")
+        .method("POST")
+        .header(header::AUTHORIZATION, "Bearer test-admin-secret-ownership-123")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"owner_token":"impostor-operation-token-999"}"#))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "Mismatched owner token must be rejected with 403 Forbidden"
+    );
+
+    // Missing owner token CANNOT release Operation A's barrier
+    let req = Request::builder()
+        .uri("/api/v1/admin/maintenance/release")
+        .method("POST")
+        .header(header::AUTHORIZATION, "Bearer test-admin-secret-ownership-123")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "Missing owner token must be rejected with 403 Forbidden"
+    );
+
+    // Diagnostics confirms barrier is still actively held by Operation A
+    let req = Request::builder()
+        .uri("/health/diagnostics")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let diag: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(diag["in_maintenance"], true);
+    assert_eq!(diag["current_fencing_generation"], original_generation);
+
+    // 3. Run production local-only backup script invocation that fails before acquisition
+    // It must exit 1, and its cleanup trap must NOT release Operation A's barrier
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(3)
+        .unwrap();
+    let script_path = workspace_root.join("scripts").join("backup_oob.sh");
+
+    if script_path.exists() {
+        let output = std::process::Command::new("bash")
+            .arg(script_path.to_str().unwrap())
+            .env("MSYS_NO_PATHCONV", "1")
+            .env("SPINE_DEPLOYMENT_PROFILE", "core-forge-v1")
+            .env("SPINE_BACKUP_REQUIRE_REMOTE", "0")
+            .env("SPINE_ADMIN_TOKEN", "test-admin-secret-ownership-123")
+            .output();
+
+        if let Ok(out) = output {
+            assert!(
+                !out.status.success(),
+                "Production local-only backup must fail closed with exit code 1"
+            );
+            let stderr_str = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr_str.contains("Local-only backup (SPINE_BACKUP_REQUIRE_REMOTE=0) is strictly FORBIDDEN"),
+                "Stderr must contain policy rejection: {}",
+                stderr_str
+            );
+            // Must NOT contain cleanup release attempt for barrier it did not acquire
+            assert!(
+                !stderr_str.contains("releasing acquired cluster maintenance barrier"),
+                "Unacquired backup must not attempt to release barrier: {}",
+                stderr_str
+            );
+        }
+    }
+
+    // Diagnostics confirms barrier is STILL actively held by Operation A with unchanged generation
+    let req = Request::builder()
+        .uri("/health/diagnostics")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let diag: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(
+        diag["in_maintenance"], true,
+        "Operation A's barrier must remain active after failed unacquired backup"
+    );
+    assert_eq!(
+        diag["current_fencing_generation"], original_generation,
+        "Fencing generation must remain completely unchanged"
+    );
+
+    // 4. Operation A cleanly releases its own barrier with its matching owner_token
+    let req = Request::builder()
+        .uri("/api/v1/admin/maintenance/release")
+        .method("POST")
+        .header(header::AUTHORIZATION, "Bearer test-admin-secret-ownership-123")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(format!(
+            r#"{{"owner_token":"{}"}}"#,
+            original_owner_token
+        )))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "Matching owner token must release the barrier"
+    );
+
+    // Diagnostics confirms maintenance is now released
+    let req = Request::builder()
+        .uri("/health/diagnostics")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let diag: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(diag["in_maintenance"], false);
 }

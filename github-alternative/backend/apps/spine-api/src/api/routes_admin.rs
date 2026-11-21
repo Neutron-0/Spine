@@ -252,15 +252,60 @@ pub async fn acquire_maintenance(
     Ok((StatusCode::OK, Json(resp)))
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct ReleaseMaintenanceRequest {
+    pub owner_token: Option<String>,
+}
+
 pub async fn release_maintenance(
     State(state): State<AppState>,
     user: Option<Extension<User>>,
     headers: HeaderMap,
+    payload: Option<Json<ReleaseMaintenanceRequest>>,
 ) -> Result<impl IntoResponse, ForgeError> {
     let caller = user.map(|Extension(u)| u);
     verify_admin_auth(&state, &headers, caller.as_ref()).await?;
 
+    let req = payload.map(|Json(p)| p).unwrap_or_default();
+    let provided_owner_token = req
+        .owner_token
+        .as_deref()
+        .or_else(|| {
+            headers
+                .get("x-spine-owner-token")
+                .or_else(|| headers.get("x-owner-token"))
+                .and_then(|v| v.to_str().ok())
+        });
+
     let mut active_lock = state.active_maintenance.lock().await;
+
+    // If an active guard is held, require a matching owner token.
+    // Reject mismatched or missing tokens without taking or releasing the guard.
+    if let Some(guard) = active_lock.as_ref() {
+        let expected_owner_token = guard.owner_token();
+        match provided_owner_token {
+            Some(token) if token == expected_owner_token => {
+                // Owner token matches; proceed to release below
+            }
+            Some(_) => {
+                tracing::warn!(
+                    "Rejected maintenance release: mismatched owner token. Active barrier remains held."
+                );
+                return Err(ForgeError::Forbidden(
+                    "Mismatched maintenance barrier owner token. Only the acquiring operation can release this barrier.".into(),
+                ));
+            }
+            None => {
+                tracing::warn!(
+                    "Rejected maintenance release: missing required owner token for active barrier. Active barrier remains held."
+                );
+                return Err(ForgeError::Forbidden(
+                    "Missing required maintenance barrier owner token. An active barrier requires ownership verification to release.".into(),
+                ));
+            }
+        }
+    }
+
     let guard_opt = active_lock.take();
 
     let fencing_gen = if let Some(guard) = guard_opt {

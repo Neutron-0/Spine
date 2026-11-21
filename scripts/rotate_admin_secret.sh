@@ -105,17 +105,18 @@ echo "Verified: Revoked credential #1 rejected with HTTP ${STATUS_1} Unauthorize
 echo "Verified: Revoked credential #2 rejected with HTTP ${STATUS_2} Unauthorized [OK]."
 
 echo "=== Step 5: Verifying Acceptance of Newly Rotated Administrative Token ==="
-STATUS_NEW=$("${CURL_BIN}" -k -s -o "${NULL_DEV}" -w "%{http_code}" -X POST -H "Authorization: Bearer ${NEW_TOKEN}" https://127.0.0.1/api/v1/admin/maintenance/acquire | tr -d '\r\n')
+ACQUIRE_OUT=$("${CURL_BIN}" -k -s -X POST -H "Authorization: Bearer ${NEW_TOKEN}" https://127.0.0.1/api/v1/admin/maintenance/acquire)
+PROBE_OWNER_TOKEN=$(echo "${ACQUIRE_OUT}" | grep -o '"owner_token":"[^"]*"' | cut -d'"' -f4 || true)
 
-if [ "${STATUS_NEW}" != "200" ]; then
-  echo "FATAL: Newly rotated administrative token was rejected! HTTP status: ${STATUS_NEW}" >&2
+if [ -z "${PROBE_OWNER_TOKEN}" ]; then
+  echo "FATAL: Newly rotated administrative token was rejected or missing owner token! Output: ${ACQUIRE_OUT}" >&2
   unset NEW_TOKEN
   exit 1
 fi
 
-# Release the probe maintenance barrier
-"${CURL_BIN}" -k -s -o "${NULL_DEV}" -X POST -H "Authorization: Bearer ${NEW_TOKEN}" https://127.0.0.1/api/v1/admin/maintenance/release
-unset NEW_TOKEN
+# Release the probe maintenance barrier with the acquired owner token
+"${CURL_BIN}" -k -s -o "${NULL_DEV}" -X POST -H "Authorization: Bearer ${NEW_TOKEN}" -H "Content-Type: application/json" -d "{\"owner_token\": \"${PROBE_OWNER_TOKEN}\"}" https://127.0.0.1/api/v1/admin/maintenance/release
+unset NEW_TOKEN PROBE_OWNER_TOKEN
 
 # Synchronize authoritative database restore generation with new fencing token
 CURRENT_GEN=$("${CURL_BIN}" -k -s https://127.0.0.1/health/diagnostics | grep -o '"current_fencing_generation":[0-9]*' | cut -d':' -f2 || true)

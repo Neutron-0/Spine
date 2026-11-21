@@ -364,15 +364,21 @@ verify_off_site_replication_policy() {
 }
 
 RELEASED=0
+BARRIER_ACQUIRED=0
+BARRIER_OWNER_TOKEN=""
 STAGING_DIR=""
 PLAINTEXT_TAR=""
 
 cleanup_backup() {
   local exit_code=$?
-  if [ "${RELEASED}" -eq 0 ] && [ -n "${SPINE_ADMIN_TOKEN:-}" ]; then
-    echo "NOTICE: Cleaning up — ensuring cluster maintenance barrier is released..." >&2
+  # Only release if this specific invocation successfully acquired the barrier
+  # and has a verified owner token. Never attempt to release someone else's barrier.
+  if [ "${BARRIER_ACQUIRED}" -eq 1 ] && [ "${RELEASED}" -eq 0 ] && [ -n "${SPINE_ADMIN_TOKEN:-}" ] && [ -n "${BARRIER_OWNER_TOKEN:-}" ]; then
+    echo "NOTICE: Cleaning up — releasing acquired cluster maintenance barrier with owner token..." >&2
     curl -s -X POST "${SPINE_API_URL}/api/v1/admin/maintenance/release" \
-      -H "Authorization: Bearer ${SPINE_ADMIN_TOKEN}" > /dev/null 2>&1 || true
+      -H "Authorization: Bearer ${SPINE_ADMIN_TOKEN}" \
+      -H "Content-Type: application/json" \
+      -d "{\"owner_token\": \"${BARRIER_OWNER_TOKEN}\"}" > /dev/null 2>&1 || true
   fi
 
   local cleanup_failed=0
@@ -427,6 +433,13 @@ ACQUIRE_RESP=$(curl -s -f -X POST "${SPINE_API_URL}/api/v1/admin/maintenance/acq
   -H "Authorization: Bearer ${SPINE_ADMIN_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{"reason": "Scheduled Out-of-Band Multi-Volume Backup", "timeout_seconds": 300}')
+
+BARRIER_OWNER_TOKEN=$(echo "${ACQUIRE_RESP}" | grep -o '"owner_token":"[^"]*"' | cut -d'"' -f4 || true)
+if [ -z "${BARRIER_OWNER_TOKEN}" ]; then
+  echo "FATAL: Acquire response did not contain an owner_token. Ambiguous acquire failure: aborting without claiming barrier ownership." >&2
+  exit 1
+fi
+BARRIER_ACQUIRED=1
 
 echo "Maintenance barrier acquired: ${ACQUIRE_RESP}"
 
@@ -841,7 +854,9 @@ fi
 
 echo "=== Phase 3: Releasing Maintenance Barrier & Verifying Cluster Health ==="
 curl -s -f -X POST "${SPINE_API_URL}/api/v1/admin/maintenance/release" \
-  -H "Authorization: Bearer ${SPINE_ADMIN_TOKEN}"
+  -H "Authorization: Bearer ${SPINE_ADMIN_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d "{\"owner_token\": \"${BARRIER_OWNER_TOKEN}\"}"
 RELEASED=1
 
 # Synchronize database restore generation with the released fencing generation
