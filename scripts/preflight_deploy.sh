@@ -110,13 +110,18 @@ else
 fi
 
 # 4. Check Compose specification syntax
-if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+DOCKER_BIN="docker"
+if command -v docker.exe >/dev/null 2>&1; then
+  DOCKER_BIN="docker.exe"
+fi
+
+if "${DOCKER_BIN}" compose version >/dev/null 2>&1; then
   echo "Validating Docker Compose interpolation..."
-  if docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" config --quiet >/dev/null 2>&1; then
+  if "${DOCKER_BIN}" compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" config --quiet >/dev/null 2>&1; then
     echo "[PASS] Docker Compose configuration interpolated cleanly."
   else
     echo "[FAIL] Docker Compose configuration validation failed for '${COMPOSE_FILE}'." >&2
-    docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" config || true
+    "${DOCKER_BIN}" compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" config || true
     FAILED=1
   fi
 else

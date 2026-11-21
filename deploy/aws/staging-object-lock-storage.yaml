@@ -1,0 +1,217 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Spine Forge - Parameterized AWS S3 Object Lock (Compliance Mode) Storage & Least-Privilege IAM Infrastructure.
+  Enforces immutable WORM retention, mandatory TLS 1.2+, default SSE-S3 encryption, and least-privilege IAM scoping.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Storage Configuration
+        Parameters:
+          - EnvironmentName
+          - BucketPrefix
+          - RetentionDays
+          - ObjectLockMode
+      - Label:
+          default: Access Control & IAM
+        Parameters:
+          - PrincipalType
+          - TrustedPrincipalArn
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: staging
+    AllowedValues:
+      - staging
+      - production
+      - dr-standby
+    Description: Deployment target environment name.
+
+  BucketPrefix:
+    Type: String
+    Default: spine-forge-backups
+    AllowedPattern: ^[a-z0-9][a-z0-9.-]{1,50}[a-z0-9]$
+    Description: Prefix for S3 bucket name. Must be lowercase alphanumeric.
+
+  RetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 3650
+    Description: WORM compliance retention period in days. Objects cannot be deleted or modified during this period.
+
+  ObjectLockMode:
+    Type: String
+    Default: COMPLIANCE
+    AllowedValues:
+      - COMPLIANCE
+      - GOVERNANCE
+    Description: >
+      Object Lock retention mode. COMPLIANCE mode cannot be bypassed by any user (including root)
+      until retention expires. GOVERNANCE allows privileged overrides.
+
+  PrincipalType:
+    Type: String
+    Default: Service
+    AllowedValues:
+      - Service
+      - AWS
+    Description: Type of principal that will assume the backup execution role.
+
+  TrustedPrincipalArn:
+    Type: String
+    Default: ec2.amazonaws.com
+    Description: Trusted service domain (e.g. ec2.amazonaws.com) or IAM Role/User ARN that assumes this role.
+
+Resources:
+  # ----------------------------------------------------------------------------
+  # S3 Bucket with Mandatory Object Lock (WORM) and Default Server-Side Encryption
+  # ----------------------------------------------------------------------------
+  SpineBackupBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${BucketPrefix}-${EnvironmentName}-${AWS::AccountId}'
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Mode: !Ref ObjectLockMode
+            Days: !Ref RetentionDays
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Service
+          Value: SpineForge
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: ComplianceRetention
+          Value: !Sub '${RetentionDays}Days-${ObjectLockMode}'
+
+  # ----------------------------------------------------------------------------
+  # S3 Bucket Policy: Enforce In-Transit Encryption (TLS 1.2+) & Deny Non-SSL
+  # ----------------------------------------------------------------------------
+  SpineBackupBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SpineBackupBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnforceSecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub 'arn:aws:s3:::${SpineBackupBucket}'
+              - !Sub 'arn:aws:s3:::${SpineBackupBucket}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: EnforceTls12OrHigher
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub 'arn:aws:s3:::${SpineBackupBucket}'
+              - !Sub 'arn:aws:s3:::${SpineBackupBucket}/*'
+            Condition:
+              NumericLessThan:
+                's3:TlsVersion': 1.2
+
+  # ----------------------------------------------------------------------------
+  # Least-Privilege IAM Role for Spine Forge Backup & Restore
+  # ----------------------------------------------------------------------------
+  SpineBackupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'SpineForge-BackupRole-${EnvironmentName}-${AWS::Region}'
+      Description: Least-privilege role for Spine Forge backup agent to read/write encrypted archives
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Fn::If:
+                - IsServicePrincipal
+                - Service: !Ref TrustedPrincipalArn
+                - AWS: !Ref TrustedPrincipalArn
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: SpineBackupStorageAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListAndLocation
+                Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                  - 's3:GetBucketLocation'
+                  - 's3:GetBucketVersioning'
+                  - 's3:GetObjectLockConfiguration'
+                Resource: !Sub 'arn:aws:s3:::${SpineBackupBucket}'
+                Condition:
+                  StringLike:
+                    's3:prefix':
+                      - 'backups/*'
+                      - 'backups'
+              - Sid: BackupWriteAndRead
+                Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                  - 's3:GetObjectRetention'
+                  - 's3:PutObjectRetention'
+                  - 's3:GetObjectLegalHold'
+                  - 's3:PutObjectLegalHold'
+                Resource: !Sub 'arn:aws:s3:::${SpineBackupBucket}/backups/*'
+              - Sid: ExplicitDenyDeletionsDuringRetention
+                Effect: Deny
+                Action:
+                  - 's3:DeleteObject'
+                  - 's3:DeleteObjectVersion'
+                  - 's3:BypassGovernanceRetention'
+                Resource: !Sub 'arn:aws:s3:::${SpineBackupBucket}/*'
+
+Conditions:
+  IsServicePrincipal: !Equals [!Ref PrincipalType, 'Service']
+
+Outputs:
+  BackupBucketName:
+    Description: Name of the provisioned Object Lock S3 bucket
+    Value: !Ref SpineBackupBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupBucketName'
+
+  BackupBucketArn:
+    Description: ARN of the provisioned Object Lock S3 bucket
+    Value: !GetAtt SpineBackupBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupBucketArn'
+
+  BackupRoleArn:
+    Description: ARN of the least-privilege IAM execution role
+    Value: !GetAtt SpineBackupRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupRoleArn'
+
+  StagingS3UriExample:
+    Description: Target URI format for scripts/backup_oob.sh and scripts/restore_oob.sh
+    Value: !Sub 's3://${SpineBackupBucket}/backups/'
+
+  ComplianceModeConfigured:
+    Description: Configured Object Lock mode and retention duration
+    Value: !Sub '${ObjectLockMode} (${RetentionDays} days)'
