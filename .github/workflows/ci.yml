@@ -12,10 +12,10 @@ concurrency:
 
 jobs:
   # ----------------------------------------------------------------------------
-  # 1. Rust Workspace Checks (git-alternative & github-alternative/backend)
+  # 1a. Rust Workspace Checks (git-alternative)
   # ----------------------------------------------------------------------------
-  rust-checks:
-    name: Rust Workspace Checks & Unit/Integration Tests
+  rust-git-alternative:
+    name: Rust Workspace Checks & Tests (git-alternative)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -30,23 +30,53 @@ jobs:
       - name: Rustfmt Check (git-alternative)
         run: cargo fmt --manifest-path git-alternative/Cargo.toml --all -- --check
 
-      - name: Rustfmt Check (github-alternative/backend)
-        run: cargo fmt --manifest-path github-alternative/backend/Cargo.toml --all -- --check
-
       - name: Cargo Check (git-alternative)
         run: cargo check --manifest-path git-alternative/Cargo.toml --all-targets
-
-      - name: Cargo Check (github-alternative/backend)
-        run: cargo check --manifest-path github-alternative/backend/Cargo.toml --all-targets --jobs 2
 
       - name: Cargo Clippy (git-alternative)
         run: cargo clippy --manifest-path git-alternative/Cargo.toml --all-targets -- -D warnings
 
-      - name: Cargo Clippy (github-alternative/backend)
-        run: cargo clippy --manifest-path github-alternative/backend/Cargo.toml --all-targets --jobs 2 -- -D warnings
-
       - name: Cargo Test (git-alternative)
         run: cargo test --manifest-path git-alternative/Cargo.toml
+
+  # ----------------------------------------------------------------------------
+  # 1b. Rust Workspace Checks (github-alternative/backend)
+  # ----------------------------------------------------------------------------
+  rust-github-backend:
+    name: Rust Workspace Checks & Tests (github-alternative/backend)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Free Runner Disk Space
+        run: |
+          echo "Disk space before cleanup:"
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force 2>/dev/null || true
+          echo "Disk space after cleanup:"
+          df -h
+
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: "1.97.1"
+          components: rustfmt, clippy
+
+      - name: Rustfmt Check (github-alternative/backend)
+        run: cargo fmt --manifest-path github-alternative/backend/Cargo.toml --all -- --check
+
+      - name: Cargo Check (github-alternative/backend)
+        run: cargo check --manifest-path github-alternative/backend/Cargo.toml --all-targets --jobs 2
+
+      - name: Cargo Clippy (github-alternative/backend)
+        run: cargo clippy --manifest-path github-alternative/backend/Cargo.toml --all-targets --jobs 2 -- -D warnings
 
       - name: Cargo Test (github-alternative/backend standard suite)
         run: cargo test --manifest-path github-alternative/backend/Cargo.toml --jobs 2
