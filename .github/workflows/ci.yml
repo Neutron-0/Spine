@@ -62,8 +62,8 @@ jobs:
         image: postgres:16-alpine
         env:
           POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgrespassword
-          POSTGRES_DB: postgres
+          POSTGRES_PASSWORD: test_admin_password
+          POSTGRES_DB: spine_test_base
         ports:
           - 5432:5432
         options: >-
@@ -72,8 +72,21 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
-      SPINE_TEST_DATABASE_URL: postgres://postgres:postgrespassword@localhost:5432/postgres
+      PGHOST: 127.0.0.1
+      PGPORT: 5432
+      PGPASSWORD: test_admin_password
+      POSTGRES_USER: postgres
+      POSTGRES_DB: spine_test_base
+      POSTGRES_MIGRATOR_USER: spine_migrator
+      POSTGRES_APP_USER: spine_app
+      POSTGRES_MIGRATOR_PASSWORD: test_migrator_password
+      POSTGRES_APP_PASSWORD: test_app_password
+      SPINE_TEST_DATABASE_URL: postgres://postgres:test_admin_password@127.0.0.1:5432/spine_test_base
       SPINE_ALLOW_DESTRUCTIVE_TESTS: "1"
+      SPINE_MIGRATOR_PASSWORD: test_migrator_password
+      SPINE_TEST_MIGRATOR_PASSWORD: test_migrator_password
+      SPINE_APP_PASSWORD: test_app_password
+      SPINE_TEST_APP_PASSWORD: test_app_password
     steps:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -83,16 +96,51 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Ensure PostgreSQL Client Available
+        run: which psql || (sudo apt-get update && sudo apt-get install -y postgresql-client)
+
+      - name: Initialize PostgreSQL Roles and Base Database via Repository Script
+        run: |
+          until pg_isready -h 127.0.0.1 -p 5432 -U postgres; do
+            echo "Waiting for PostgreSQL service to be ready..."
+            sleep 1
+          done
+          sh docker/postgres/01-init-roles.sh
+
       - name: Run Disposable DB Backup Cleanup Fault Injection Tests
-        run: cargo test --manifest-path github-alternative/backend/Cargo.toml --test backup_cleanup_fault_injection_test -- --ignored --nocapture
+        run: cargo test --manifest-path github-alternative/backend/Cargo.toml --test backup_cleanup_fault_injection_test --jobs 2 -- --ignored --nocapture
 
       - name: Run Combined Production Restore DB Test
-        run: cargo test --manifest-path github-alternative/backend/Cargo.toml --test combined_production_restore_test -- --ignored --nocapture
+        run: cargo test --manifest-path github-alternative/backend/Cargo.toml --test combined_production_restore_test --jobs 2 -- --ignored --nocapture
 
-      - name: Run Postgres Least-Privilege & Safety Contract Tests
+      - name: Run Disposable DB Safety Contract Test
+        run: cargo test --manifest-path github-alternative/backend/Cargo.toml --test test_database_safety_test --jobs 2 -- --nocapture
+
+      - name: Run Postgres Least-Privilege Role Test
+        run: cargo test --manifest-path github-alternative/backend/Cargo.toml --test postgres_least_privilege_test --jobs 2 -- --nocapture
+
+      - name: Run Postgres Backup and Restore Tests
+        run: cargo test --manifest-path github-alternative/backend/Cargo.toml --test postgres_backup_restore_test --jobs 2 -- --nocapture
+
+      - name: Run Advisory Lock Migration Cancellation Tests
+        run: cargo test --manifest-path github-alternative/backend/Cargo.toml --test advisory_lock_test --jobs 2 -- --nocapture
+
+      - name: Run Cross-Process Barrier Coordination Tests
+        run: cargo test --manifest-path github-alternative/backend/Cargo.toml --test cross_process_coordination_test --jobs 2 -- --nocapture
+
+      - name: Run Postgres Live Migrations and Lifecycle Tests
+        run: cargo test --manifest-path github-alternative/backend/Cargo.toml --test postgres_live_test --jobs 2 -- --nocapture
+
+      - name: Verify Zero Leaked Disposable Databases
         run: |
-          cargo test --manifest-path github-alternative/backend/Cargo.toml --test postgres_least_privilege_test -- --nocapture
-          cargo test --manifest-path github-alternative/backend/Cargo.toml --test test_database_safety_test -- --nocapture
+          echo "Verifying no orphaned disposable databases (spine_disp_*) remain..."
+          LEAKED=$(psql -U postgres -d postgres -t -A -c "SELECT datname FROM pg_database WHERE datname LIKE 'spine_disp_%';")
+          if [ -n "$LEAKED" ]; then
+            echo "ERROR: Orphaned disposable databases found in PostgreSQL:"
+            echo "$LEAKED"
+            exit 1
+          fi
+          echo "PASS: Zero leaked disposable databases found. Only base databases remain."
 
   # ----------------------------------------------------------------------------
   # 3. Frontend Checks (github-alternative/frontend)
