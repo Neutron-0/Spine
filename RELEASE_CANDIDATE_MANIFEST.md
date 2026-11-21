@@ -3,8 +3,8 @@
 
 **Target Milestone:** Batch 21J Distributed Restore Convergence & Batch 21K Production Hardening  
 **Target Profile:** `core-forge-v1` (Mandatory PostgreSQL, TLS Ingress, Strict Role Separation)  
-**Source Commit Revision:** `daffd17a25e1015c65f65de12812c5c9428bace1`  
-**Source Tree Revision:** `812d0a94834d0721e65cfaf7ba9db12190e363b2`  
+**Source Commit Revision:** `23d1de4549dec7fd6918b5e7257ed90ff282e438`  
+**Source Tree Revision:** `b0d7f75092040008f148902de1bbf9970a346271`  
 
 ---
 

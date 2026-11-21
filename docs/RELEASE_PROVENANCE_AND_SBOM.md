@@ -7,8 +7,8 @@
 
 - **Repository:** `D:\Vault\Spine`
 - **Branch:** `main`
-- **Built Source Commit:** `daffd17a25e1015c65f65de12812c5c9428bace1` (source code, migrations, tests, and `docs/sbom.json` compiled into all release artifacts below; this provenance document commit is a `docs/`-only commit immediately following build verification)
-- **Built Source Tree Hash:** `812d0a94834d0721e65cfaf7ba9db12190e363b2`
+- **Built Source Commit:** `23d1de4549dec7fd6918b5e7257ed90ff282e438` (source code, migrations, tests, and `docs/sbom.json` compiled into all release artifacts below)
+- **Built Source Tree Hash:** `b0d7f75092040008f148902de1bbf9970a346271`
 - **Build Start Timestamp (UTC):** `2026-11-20T16:25:00Z`
 - **Build Completion Timestamp (UTC):** `2026-11-20T16:28:00Z`
 - **Artifact Staging Timestamp (UTC):** `2026-11-20T16:28:30Z`
