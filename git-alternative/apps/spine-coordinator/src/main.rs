@@ -281,9 +281,13 @@ mod tests {
     #[test]
     fn test_coordinator_config_env_overrides() {
         let _guard = ENV_LOCK.lock().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state_path = temp_dir.path().join("coordinator.state");
+        let state_path_str = state_path.to_str().unwrap().to_string();
+
         std::env::set_var("SPINE_COORDINATOR_PORT", "8400");
         std::env::set_var("SPINE_BIND", "0.0.0.0");
-        std::env::set_var("SPINE_STORE_PATH", "/var/lib/spine/coordinator.state");
+        std::env::set_var("SPINE_STORE_PATH", &state_path_str);
         std::env::set_var("SPINE_CLUSTER_ID", "prod-cluster");
 
         let cli = Cli {
@@ -297,10 +301,7 @@ mod tests {
         let cfg = CoordinatorConfig::resolve(&cli).unwrap();
         assert_eq!(cfg.cluster_id, "prod-cluster");
         assert_eq!(cfg.listen_addr, "0.0.0.0:8400");
-        assert_eq!(
-            cfg.store_file,
-            PathBuf::from("/var/lib/spine/coordinator.state")
-        );
+        assert_eq!(cfg.store_file, state_path);
 
         std::env::remove_var("SPINE_COORDINATOR_PORT");
         std::env::remove_var("SPINE_BIND");
