@@ -1,0 +1,42 @@
+# Gitleaks Configuration for Spine Repository
+title = "Spine Secret Scanning Rules"
+
+[extend]
+useDefault = true
+
+[redact]
+# Redact any detected secret values in output logs
+redact = true
+
+# Custom Rules for Spine Personal Access Tokens
+[[rules]]
+id = "spine-personal-access-token"
+description = "Spine Forge Personal Access Token"
+regex = '''(?i)(?:sp_pat_|spine_pat_)[a-zA-Z0-9_-]{20,}'''
+keywords = ["sp_pat_", "spine_pat_"]
+secretGroup = 0
+
+# Custom Rules for AWS Credentials
+[[rules]]
+id = "aws-access-token"
+description = "AWS Access Key ID"
+regex = '''(?i)\b(AKIA[0-9A-Z]{16})\b'''
+keywords = ["AKIA"]
+secretGroup = 1
+
+# Allow known RFC/AWS documentation example keys used in test fixtures
+[rules.allowlist]
+description = "AWS Documentation standard example key"
+regexes = [
+    '''AKIAIOSFODNN7EXAMPLE''',
+]
+
+[allowlist]
+description = "Global allowlist for build artifacts, locks, and reference sources"
+paths = [
+    '''(^|/)Cargo\.lock$''',
+    '''(^|/)package-lock\.json$''',
+    '''(^|/)references/''',
+    '''(^|/)target/''',
+    '''(^|/)dist/''',
+]
