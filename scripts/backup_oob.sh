@@ -227,6 +227,17 @@ verify_off_site_replication_policy() {
       echo "Off-site replication policy verified [ENFORCED] -> Target: ${SPINE_BACKUP_REMOTE_S3_URI}"
       ;;
     0|false)
+      if [ "${profile}" = "core-forge-v1" ]; then
+        echo "================================================================================" >&2
+        echo "FATAL: Local-only backup (SPINE_BACKUP_REQUIRE_REMOTE=0) is strictly FORBIDDEN" >&2
+        echo "under production profile 'core-forge-v1'." >&2
+        echo "Production backups must be replicated to an off-host object store with Object Lock" >&2
+        echo "retention to survive total host destruction and meet DR compliance requirements." >&2
+        echo "Local-only backups are only permitted under non-production profiles ('development' or 'test')." >&2
+        echo "To run a local backup rehearsal, set SPINE_DEPLOYMENT_PROFILE=test or development." >&2
+        echo "================================================================================" >&2
+        exit 1
+      fi
       echo "Off-site replication policy: INTENTIONALLY LOCAL-ONLY (SPINE_BACKUP_REQUIRE_REMOTE=${SPINE_BACKUP_REQUIRE_REMOTE})."
       echo "OPERATIONAL NOTICE: Local-only backups do not protect against total host loss."
       ;;
@@ -802,12 +813,17 @@ if [ -n "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
     echo "Remote replication cryptographically verified [OK] (${REMOTE_SIZE} bytes, SHA-256: ${REMOTE_SHA256}, standard replication without Object Lock)."
   fi
 else
+  ACTUAL_PROFILE=$(normalize_deployment_profile)
   case "${SPINE_BACKUP_REQUIRE_REMOTE}" in
     1|true)
       echo "FATAL: Off-site replication policy is ENFORCED (SPINE_BACKUP_REQUIRE_REMOTE=${SPINE_BACKUP_REQUIRE_REMOTE}), but upload was not configured." >&2
       exit 1
       ;;
     0|false)
+      if [ "${ACTUAL_PROFILE}" = "core-forge-v1" ]; then
+        echo "FATAL: Local-only backup is forbidden under production profile 'core-forge-v1'." >&2
+        exit 1
+      fi
       echo "================================================================================"
       echo "NOTICE: Off-host backup replication (SPINE_BACKUP_REMOTE_S3_URI) is not configured."
       echo "Operating in INTENTIONALLY LOCAL-ONLY mode (SPINE_BACKUP_REQUIRE_REMOTE=${SPINE_BACKUP_REQUIRE_REMOTE})."

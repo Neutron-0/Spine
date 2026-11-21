@@ -1484,6 +1484,7 @@ compute_retain_until_date() {
 }
 
 verify_off_site_replication_policy() {
+  local profile="${SPINE_DEPLOYMENT_PROFILE:-development}"
   case "${SPINE_BACKUP_REQUIRE_REMOTE}" in
     1|true)
       if [ -z "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
@@ -1492,6 +1493,10 @@ verify_off_site_replication_policy() {
       fi
       ;;
     0|false)
+      if [ "${profile}" = "core-forge-v1" ]; then
+        echo "FATAL: Local-only backup (SPINE_BACKUP_REQUIRE_REMOTE=0) is strictly FORBIDDEN under production profile 'core-forge-v1'." >&2
+        exit 1
+      fi
       echo "NOTICE: Operating in INTENTIONALLY LOCAL-ONLY mode."
       ;;
     *)
@@ -1510,7 +1515,8 @@ if ( verify_off_site_replication_policy 2>"${WORK_DIR}/enforce.log" ); then
 fi
 grep -q "FATAL: Off-site replication policy is ENFORCED" "${WORK_DIR}/enforce.log"
 
-# 2. Local-only mode (overridden with 0 or false) must exit 0 and emit notice
+# 2. Local-only mode under non-production profile (development) must exit 0 and emit notice
+export SPINE_DEPLOYMENT_PROFILE=development
 export SPINE_BACKUP_REQUIRE_REMOTE=0
 export SPINE_BACKUP_REMOTE_S3_URI=""
 verify_off_site_replication_policy > "${WORK_DIR}/local_only.log"
@@ -1519,6 +1525,16 @@ grep -q "INTENTIONALLY LOCAL-ONLY" "${WORK_DIR}/local_only.log"
 export SPINE_BACKUP_REQUIRE_REMOTE=false
 verify_off_site_replication_policy > "${WORK_DIR}/local_false.log"
 grep -q "INTENTIONALLY LOCAL-ONLY" "${WORK_DIR}/local_false.log"
+
+# 2b. Local-only mode under production profile (core-forge-v1) must FAIL CLOSED
+export SPINE_DEPLOYMENT_PROFILE=core-forge-v1
+export SPINE_BACKUP_REQUIRE_REMOTE=0
+if ( verify_off_site_replication_policy 2>"${WORK_DIR}/local_prod_err.log" ); then
+  echo "FAIL: Production profile accepted local-only mode!" >&2
+  exit 97
+fi
+grep -q "FATAL: Local-only backup (SPINE_BACKUP_REQUIRE_REMOTE=0) is strictly FORBIDDEN under production profile 'core-forge-v1'" "${WORK_DIR}/local_prod_err.log"
+export SPINE_DEPLOYMENT_PROFILE=development
 
 # 3. Invalid values (such as 'yes', '2', 'maybe') must fail closed
 for bad_val in "yes" "2" "maybe" "no"; do
@@ -1790,6 +1806,10 @@ verify_off_site_replication_policy() {
       fi
       ;;
     0|false)
+      if [ "${profile}" = "core-forge-v1" ]; then
+        echo "FATAL: Local-only backup (SPINE_BACKUP_REQUIRE_REMOTE=0) is strictly FORBIDDEN under production profile 'core-forge-v1'." >&2
+        exit 1
+      fi
       echo "NOTICE: Operating in INTENTIONALLY LOCAL-ONLY mode."
       ;;
     *)
@@ -1928,6 +1948,15 @@ export SPINE_BACKUP_OBJECT_LOCK_MODE="COMPLIANCE"
 export SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE=0
 verify_off_site_replication_policy > "${WORK_DIR}/prod_success.log"
 
+# d) Local-only mode (SPINE_BACKUP_REQUIRE_REMOTE=0) is strictly FORBIDDEN under production profile 'core-forge-v1'
+export SPINE_BACKUP_REQUIRE_REMOTE=0
+if ( verify_off_site_replication_policy 2>"${WORK_DIR}/prod_local_only_err.log" ); then
+  echo "FAIL: Production profile accepted local-only backup (SPINE_BACKUP_REQUIRE_REMOTE=0)!" >&2
+  exit 7
+fi
+grep -q "FATAL: Local-only backup (SPINE_BACKUP_REQUIRE_REMOTE=0) is strictly FORBIDDEN under production profile 'core-forge-v1'" "${WORK_DIR}/prod_local_only_err.log"
+export SPINE_BACKUP_REQUIRE_REMOTE=1
+
 # 5. Under non-production profile 'development':
 export SPINE_DEPLOYMENT_PROFILE="development"
 # a) GOVERNANCE mode is accepted
@@ -1947,6 +1976,11 @@ if ( verify_off_site_replication_policy 2>"${WORK_DIR}/dev_no_override_err.log" 
   exit 6
 fi
 grep -q "FATAL: S3 Object Lock retention is MANDATORY" "${WORK_DIR}/dev_no_override_err.log"
+
+# d) Local-only mode (SPINE_BACKUP_REQUIRE_REMOTE=0) is PERMITTED under non-production profile 'development'
+export SPINE_BACKUP_REQUIRE_REMOTE=0
+verify_off_site_replication_policy > "${WORK_DIR}/dev_local_only.log"
+grep -q "INTENTIONALLY LOCAL-ONLY" "${WORK_DIR}/dev_local_only.log"
 
 rm -rf "${WORK_DIR}"
 exit 0
