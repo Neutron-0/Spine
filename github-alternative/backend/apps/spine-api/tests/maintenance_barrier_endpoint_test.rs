@@ -3,12 +3,23 @@ use axum::http::{header, Request, StatusCode};
 use serde_json::Value;
 use spine_api::api::build_router;
 use spine_api::api::middleware::AppState;
+use spine_api::coordinator::client::CoordinatorClient;
 use spine_api::db::InMemoryDatabase;
+use spine_api::Database;
+use spine_cluster::protocol::{ClusterRpcRequest, ClusterRpcResponse};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use tower::ServiceExt;
+
+static TEST_MUTEX: Mutex<()> = Mutex::const_new(());
 
 #[tokio::test]
 async fn test_maintenance_barrier_endpoint_lifecycle_and_authorization() {
+    let _guard = TEST_MUTEX.lock().await;
     std::env::set_var("SPINE_ADMIN_TOKEN", "test-secret-admin-token-12345");
 
     let db = Arc::new(InMemoryDatabase::new());
@@ -125,4 +136,556 @@ async fn test_maintenance_barrier_endpoint_lifecycle_and_authorization() {
     let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
     let diag: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(diag["in_maintenance"], false);
+}
+
+#[tokio::test]
+async fn test_admin_authorization_username_denial() {
+    let _guard = TEST_MUTEX.lock().await;
+    std::env::remove_var("SPINE_ADMIN_TOKEN");
+    std::env::remove_var("ADMIN_TOKEN");
+    std::env::remove_var("SPINE_ADMIN_TOKEN_FILE");
+
+    let db = Arc::new(InMemoryDatabase::new());
+    let temp_dir = tempfile::tempdir().unwrap();
+    let state = AppState::new_with_defaults(db.clone(), temp_dir.path(), None).unwrap();
+    let app = build_router(state);
+    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+    // 1. User 'admin-dev' with ordinary scopes (MUST NOT be treated as admin despite username containing 'admin')
+    let user_admin_dev = spine_api::core::types::User {
+        id: "usr_admin_dev".to_string(),
+        username: "admin-dev".to_string(),
+        normalized_username: "admin-dev".to_string(),
+        email: "admin-dev@spineforge.local".to_string(),
+        normalized_email: "admin-dev@spineforge.local".to_string(),
+        display_name: "Developer with Admin in name".to_string(),
+        password_hash: "hash_test".to_string(),
+        account_status: "ACTIVE".to_string(),
+        avatar_url: None,
+        created_at_nanos: now,
+        updated_at_nanos: now,
+        last_login_nanos: None,
+    };
+    db.create_user(user_admin_dev).await.unwrap();
+
+    let pat_admin_dev_plain = "sp_pat_admin_dev_1234567890abcdef12345";
+    let pat_admin_dev = spine_api::core::types::PersonalAccessToken {
+        id: "pat_admin_dev".to_string(),
+        user_id: "usr_admin_dev".to_string(),
+        name: "dev_token".to_string(),
+        token_hash: spine_api::auth::pat::hash_pat(pat_admin_dev_plain),
+        scopes: vec!["repo:read".to_string(), "repo:write".to_string()],
+        expires_at_nanos: now + 86400 * 1_000_000_000,
+        revoked: false,
+        created_at_nanos: now,
+        last_used_at_nanos: None,
+    };
+    db.create_pat(pat_admin_dev).await.unwrap();
+
+    // 2. User 'notadmin' (contains neither admin nor root, standard user)
+    let user_notadmin = spine_api::core::types::User {
+        id: "usr_notadmin".to_string(),
+        username: "notadmin".to_string(),
+        normalized_username: "notadmin".to_string(),
+        email: "notadmin@spineforge.local".to_string(),
+        normalized_email: "notadmin@spineforge.local".to_string(),
+        display_name: "Standard Dev".to_string(),
+        password_hash: "hash_test".to_string(),
+        account_status: "ACTIVE".to_string(),
+        avatar_url: None,
+        created_at_nanos: now,
+        updated_at_nanos: now,
+        last_login_nanos: None,
+    };
+    db.create_user(user_notadmin).await.unwrap();
+
+    let pat_notadmin_plain = "sp_pat_notadmin_1234567890abcdef12345";
+    let pat_notadmin = spine_api::core::types::PersonalAccessToken {
+        id: "pat_notadmin".to_string(),
+        user_id: "usr_notadmin".to_string(),
+        name: "notadmin_token".to_string(),
+        token_hash: spine_api::auth::pat::hash_pat(pat_notadmin_plain),
+        scopes: vec!["repo:read".to_string()],
+        expires_at_nanos: now + 86400 * 1_000_000_000,
+        revoked: false,
+        created_at_nanos: now,
+        last_used_at_nanos: None,
+    };
+    db.create_pat(pat_notadmin).await.unwrap();
+
+    // 3. User 'admin' but WITHOUT admin PAT scope (username is 'admin', but token only has 'repo')
+    let user_plain_admin = spine_api::core::types::User {
+        id: "usr_admin_plain".to_string(),
+        username: "admin".to_string(),
+        normalized_username: "admin".to_string(),
+        email: "admin@spineforge.local".to_string(),
+        normalized_email: "admin@spineforge.local".to_string(),
+        display_name: "Admin Username Only".to_string(),
+        password_hash: "hash_test".to_string(),
+        account_status: "ACTIVE".to_string(),
+        avatar_url: None,
+        created_at_nanos: now,
+        updated_at_nanos: now,
+        last_login_nanos: None,
+    };
+    db.create_user(user_plain_admin).await.unwrap();
+
+    let pat_plain_admin_plain = "sp_pat_plain_admin_no_scope_12345678";
+    let pat_plain_admin = spine_api::core::types::PersonalAccessToken {
+        id: "pat_plain_admin".to_string(),
+        user_id: "usr_admin_plain".to_string(),
+        name: "unprivileged_token".to_string(),
+        token_hash: spine_api::auth::pat::hash_pat(pat_plain_admin_plain),
+        scopes: vec!["repo".to_string()],
+        expires_at_nanos: now + 86400 * 1_000_000_000,
+        revoked: false,
+        created_at_nanos: now,
+        last_used_at_nanos: None,
+    };
+    db.create_pat(pat_plain_admin).await.unwrap();
+
+    // 4. User 'ops-lead' with explicit 'admin' scope
+    let user_ops_lead = spine_api::core::types::User {
+        id: "usr_ops_lead".to_string(),
+        username: "ops-lead".to_string(),
+        normalized_username: "ops-lead".to_string(),
+        email: "ops-lead@spineforge.local".to_string(),
+        normalized_email: "ops-lead@spineforge.local".to_string(),
+        display_name: "Real Cluster Operator".to_string(),
+        password_hash: "hash_test".to_string(),
+        account_status: "ACTIVE".to_string(),
+        avatar_url: None,
+        created_at_nanos: now,
+        updated_at_nanos: now,
+        last_login_nanos: None,
+    };
+    db.create_user(user_ops_lead).await.unwrap();
+
+    let pat_ops_lead_plain = "sp_pat_ops_lead_legit_admin_scope_123";
+    let pat_ops_lead = spine_api::core::types::PersonalAccessToken {
+        id: "pat_ops_lead".to_string(),
+        user_id: "usr_ops_lead".to_string(),
+        name: "ops_admin_token".to_string(),
+        token_hash: spine_api::auth::pat::hash_pat(pat_ops_lead_plain),
+        scopes: vec!["admin".to_string(), "repo".to_string()],
+        expires_at_nanos: now + 86400 * 1_000_000_000,
+        revoked: false,
+        created_at_nanos: now,
+        last_used_at_nanos: None,
+    };
+    db.create_pat(pat_ops_lead).await.unwrap();
+
+    // Assert DENIAL for 'admin-dev'
+    for uri in ["/api/v1/admin/maintenance/acquire", "/api/v1/admin/maintenance/release"] {
+        let req = Request::builder()
+            .uri(uri)
+            .method("POST")
+            .header(header::AUTHORIZATION, format!("Bearer {}", pat_admin_dev_plain))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"reason":"unauthorized attempt"}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "User 'admin-dev' without admin scope must be denied on {}",
+            uri
+        );
+    }
+
+    // Assert DENIAL for 'notadmin'
+    for uri in ["/api/v1/admin/maintenance/acquire", "/api/v1/admin/maintenance/release"] {
+        let req = Request::builder()
+            .uri(uri)
+            .method("POST")
+            .header(header::AUTHORIZATION, format!("Bearer {}", pat_notadmin_plain))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"reason":"unauthorized attempt"}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "User 'notadmin' without admin scope must be denied on {}",
+            uri
+        );
+    }
+
+    // Assert DENIAL for user named 'admin' but lacking 'admin' scope
+    for uri in ["/api/v1/admin/maintenance/acquire", "/api/v1/admin/maintenance/release"] {
+        let req = Request::builder()
+            .uri(uri)
+            .method("POST")
+            .header(header::AUTHORIZATION, format!("Bearer {}", pat_plain_admin_plain))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"reason":"unauthorized attempt"}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "User 'admin' without admin scope must be denied on {}",
+            uri
+        );
+    }
+
+    // Assert SUCCESS for 'ops-lead' who possesses explicit 'admin' scope
+    let req = Request::builder()
+        .uri("/api/v1/admin/maintenance/acquire")
+        .method("POST")
+        .header(header::AUTHORIZATION, format!("Bearer {}", pat_ops_lead_plain))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"reason":"Authorized maintenance"}"#))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = Request::builder()
+        .uri("/api/v1/admin/maintenance/release")
+        .method("POST")
+        .header(header::AUTHORIZATION, format!("Bearer {}", pat_ops_lead_plain))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Revoke 'ops-lead' token -> must be denied with 401
+    db.revoke_pat("pat_ops_lead", "usr_ops_lead").await.unwrap();
+    let req = Request::builder()
+        .uri("/api/v1/admin/maintenance/acquire")
+        .method("POST")
+        .header(header::AUTHORIZATION, format!("Bearer {}", pat_ops_lead_plain))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"reason":"Revoked attempt"}"#))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[allow(dead_code)]
+struct MockParticipantServer {
+    pub addr: String,
+    pub in_maintenance: Arc<AtomicBool>,
+    pub fencing_generation: Arc<AtomicU64>,
+    pub fail_enter: Arc<AtomicBool>,
+    pub fail_exit: Arc<AtomicBool>,
+    pub enter_count: Arc<AtomicU64>,
+    pub exit_count: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for MockParticipantServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+async fn spawn_mock_participant(fail_enter: bool, fail_exit: bool) -> MockParticipantServer {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let in_maintenance = Arc::new(AtomicBool::new(false));
+    let fencing_generation = Arc::new(AtomicU64::new(0));
+    let fail_enter = Arc::new(AtomicBool::new(fail_enter));
+    let fail_exit = Arc::new(AtomicBool::new(fail_exit));
+    let enter_count = Arc::new(AtomicU64::new(0));
+    let exit_count = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let in_maint_c = Arc::clone(&in_maintenance);
+    let fgen_c = Arc::clone(&fencing_generation);
+    let f_enter_c = Arc::clone(&fail_enter);
+    let f_exit_c = Arc::clone(&fail_exit);
+    let ent_c = Arc::clone(&enter_count);
+    let ext_c = Arc::clone(&exit_count);
+    let stop_c = Arc::clone(&stop);
+
+    tokio::spawn(async move {
+        while !stop_c.load(Ordering::SeqCst) {
+            if let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_millis(50), listener.accept()).await
+            {
+                let in_maint = Arc::clone(&in_maint_c);
+                let fgen = Arc::clone(&fgen_c);
+                let fe = Arc::clone(&f_enter_c);
+                let fx = Arc::clone(&f_exit_c);
+                let ec = Arc::clone(&ent_c);
+                let xc = Arc::clone(&ext_c);
+
+                tokio::spawn(async move {
+                    let mut len_buf = [0u8; 4];
+                    if stream.read_exact(&mut len_buf).await.is_err() {
+                        return;
+                    }
+                    let len = u32::from_be_bytes(len_buf) as usize;
+                    let mut body = vec![0u8; len];
+                    if stream.read_exact(&mut body).await.is_err() {
+                        return;
+                    }
+                    let Ok(req) = ClusterRpcRequest::from_bytes(&body) else {
+                        return;
+                    };
+                    let resp = match req {
+                        ClusterRpcRequest::EnterMaintenanceBarrier { fencing_generation } => {
+                            ec.fetch_add(1, Ordering::SeqCst);
+                            if fe.load(Ordering::SeqCst) {
+                                ClusterRpcResponse::Error("Injected failure on enter maintenance".to_string())
+                            } else {
+                                in_maint.store(true, Ordering::SeqCst);
+                                fgen.store(fencing_generation, Ordering::SeqCst);
+                                ClusterRpcResponse::MaintenanceBarrierAck { success: true }
+                            }
+                        }
+                        ClusterRpcRequest::ExitMaintenanceBarrier { fencing_generation } => {
+                            xc.fetch_add(1, Ordering::SeqCst);
+                            if fx.load(Ordering::SeqCst) {
+                                ClusterRpcResponse::Error("Injected failure on exit maintenance".to_string())
+                            } else {
+                                in_maint.store(false, Ordering::SeqCst);
+                                fgen.store(fencing_generation, Ordering::SeqCst);
+                                ClusterRpcResponse::MaintenanceBarrierAck { success: true }
+                            }
+                        }
+                        _ => ClusterRpcResponse::Error("Unsupported mock RPC".to_string()),
+                    };
+                    if let Ok(rb) = resp.to_bytes() {
+                        let _ = stream.write_all(&(rb.len() as u32).to_be_bytes()).await;
+                        let _ = stream.write_all(&rb).await;
+                        let _ = stream.flush().await;
+                    }
+                });
+            }
+        }
+    });
+
+    MockParticipantServer {
+        addr,
+        in_maintenance,
+        fencing_generation,
+        fail_enter,
+        fail_exit,
+        enter_count,
+        exit_count,
+        stop,
+    }
+}
+
+#[tokio::test]
+async fn test_maintenance_acquire_storage_node_failure_compensates_earlier_participants() {
+    let _guard = TEST_MUTEX.lock().await;
+    std::env::set_var("SPINE_ADMIN_TOKEN", "test-admin-token");
+
+    let coord = spawn_mock_participant(false, false).await;
+    let node1 = spawn_mock_participant(false, false).await;
+    let node2 = spawn_mock_participant(true, false).await; // Injected enter failure!
+
+    let db = Arc::new(InMemoryDatabase::new());
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut state = AppState::new_with_defaults(db.clone(), temp_dir.path(), None).unwrap();
+    state.coordinator = Some(CoordinatorClient::new(coord.addr.clone()));
+    state.storage_nodes = vec![
+        ("node-1".to_string(), node1.addr.clone()),
+        ("node-2".to_string(), node2.addr.clone()),
+    ];
+
+    let consistency_barrier = Arc::clone(&state.consistency_barrier);
+    let active_maint = Arc::clone(&state.active_maintenance);
+    let app = build_router(state);
+
+    // Call acquire -> node-2 will fail, which must compensate node-1 and coordinator
+    let req = Request::builder()
+        .uri("/api/v1/admin/maintenance/acquire")
+        .method("POST")
+        .header(header::AUTHORIZATION, "Bearer test-admin-token")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"reason":"Test compensation"}"#))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Acquisition must fail closed when a participant fails to enter"
+    );
+
+    // Wait a brief moment for RPC rollback rounds to finish
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Verify coordinator was compensated and is NOT in maintenance
+    assert_eq!(
+        coord.in_maintenance.load(Ordering::SeqCst),
+        false,
+        "Coordinator must have been exited from maintenance via compensation"
+    );
+    assert_eq!(coord.enter_count.load(Ordering::SeqCst), 1);
+    assert_eq!(coord.exit_count.load(Ordering::SeqCst), 1);
+
+    // Verify node-1 was compensated and is NOT in maintenance
+    assert_eq!(
+        node1.in_maintenance.load(Ordering::SeqCst),
+        false,
+        "Node 1 must have been exited from maintenance via compensation"
+    );
+    assert_eq!(node1.enter_count.load(Ordering::SeqCst), 1);
+    assert_eq!(node1.exit_count.load(Ordering::SeqCst), 1);
+
+    // Verify node-2 was never entered
+    assert_eq!(
+        node2.in_maintenance.load(Ordering::SeqCst),
+        false,
+        "Node 2 must not be in maintenance"
+    );
+
+    // Verify local barrier is NOT held
+    assert_eq!(
+        consistency_barrier.is_in_maintenance(),
+        false,
+        "Local consistency barrier must have been released on failure"
+    );
+    assert!(
+        active_maint.lock().await.is_none(),
+        "Active maintenance guard must be None after failure compensation"
+    );
+}
+
+#[tokio::test]
+async fn test_maintenance_release_participant_failure_reports_degraded_error() {
+    let _guard = TEST_MUTEX.lock().await;
+    std::env::set_var("SPINE_ADMIN_TOKEN", "test-admin-token");
+
+    let coord = spawn_mock_participant(false, false).await;
+    let node1 = spawn_mock_participant(false, true).await; // Injected exit failure!
+
+    let db = Arc::new(InMemoryDatabase::new());
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut state = AppState::new_with_defaults(db.clone(), temp_dir.path(), None).unwrap();
+    state.coordinator = Some(CoordinatorClient::new(coord.addr.clone()));
+    state.storage_nodes = vec![("node-1".to_string(), node1.addr.clone())];
+
+    let app = build_router(state);
+
+    // Acquire succeeds
+    let req = Request::builder()
+        .uri("/api/v1/admin/maintenance/acquire")
+        .method("POST")
+        .header(header::AUTHORIZATION, "Bearer test-admin-token")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"reason":"Test release failure"}"#))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Release fails because node1 fails to exit
+    let req = Request::builder()
+        .uri("/api/v1/admin/maintenance/release")
+        .method("POST")
+        .header(header::AUTHORIZATION, "Bearer test-admin-token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Release must fail and report degraded/failed status if any participant fails to exit"
+    );
+
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let err_str = String::from_utf8_lossy(&body_bytes);
+    assert!(
+        err_str.contains("Cluster maintenance release failed or degraded"),
+        "Error message must specify degraded release status: {}",
+        err_str
+    );
+    assert!(
+        err_str.contains("node-1"),
+        "Error message must name the failed participant node: {}",
+        err_str
+    );
+}
+
+#[test]
+fn test_bootstrap_admin_secret_suppression() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let token_file = temp_dir.path().join("admin_token");
+    let password_file = temp_dir.path().join("admin_password");
+
+    let bin_path = env!("CARGO_BIN_EXE_spine-api");
+    let output = std::process::Command::new(bin_path)
+        .arg("bootstrap-admin")
+        .arg("--username")
+        .arg("testbootstrap")
+        .arg("--email")
+        .arg("testbootstrap@spineforge.local")
+        .arg("--token-out-file")
+        .arg(&token_file)
+        .arg("--password-out-file")
+        .arg(&password_file)
+        .arg("--in-memory-db")
+        .arg("--profile")
+        .arg("test")
+        .output()
+        .expect("Failed to execute spine-api binary");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "Bootstrap admin process failed: stdout: {}, stderr: {}",
+        stdout,
+        stderr
+    );
+
+    // Verify token and password files exist and are not empty
+    assert!(token_file.exists(), "Token file was not created");
+    assert!(password_file.exists(), "Password file was not created");
+
+    let raw_token = std::fs::read_to_string(&token_file).unwrap();
+    let raw_token = raw_token.trim();
+    assert!(
+        raw_token.starts_with("sp_pat_"),
+        "Generated PAT has invalid format: {}",
+        raw_token
+    );
+
+    let raw_password = std::fs::read_to_string(&password_file).unwrap();
+    let raw_password = raw_password.trim();
+    assert_eq!(
+        raw_password.len(),
+        32,
+        "Generated password length should be 32 chars: {}",
+        raw_password
+    );
+
+    // CRITICAL: Assert neither secret appears anywhere in captured output!
+    assert!(
+        !stdout.contains(raw_token),
+        "CRITICAL LEAK: Admin token appeared in stdout!"
+    );
+    assert!(
+        !stdout.contains(raw_password),
+        "CRITICAL LEAK: Admin password appeared in stdout!"
+    );
+    assert!(
+        !stderr.contains(raw_token),
+        "CRITICAL LEAK: Admin token appeared in stderr!"
+    );
+    assert!(
+        !stderr.contains(raw_password),
+        "CRITICAL LEAK: Admin password appeared in stderr!"
+    );
+
+    // Assert file delivery banner is present
+    assert!(stdout.contains("SUPPRESSED FROM STDOUT"));
+    assert!(stdout.contains("Token File:"));
+    assert!(stdout.contains("Password File:"));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let token_meta = std::fs::metadata(&token_file).unwrap();
+        assert_eq!(token_meta.permissions().mode() & 0o777, 0o600);
+        let pass_meta = std::fs::metadata(&password_file).unwrap();
+        assert_eq!(pass_meta.permissions().mode() & 0o777, 0o600);
+    }
 }
