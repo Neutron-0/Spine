@@ -21,4 +21,16 @@ references/sources/
 # TLS Certificates and private keys
 *.crt
 *.key
+*.pem
+certs/
 deploy/nginx/certs/
+admin_token
+certs/admin_token
+*.token
+
+# Backups and Database Dumps
+tmp_backups/
+*.spnebak
+*.dump
+*.sql
+
