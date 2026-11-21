@@ -281,25 +281,6 @@ impl RestoreJournal {
         backup_id: &str,
     ) -> Result<(), ForgeError> {
         let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let create_sql = r#"
-            CREATE TABLE IF NOT EXISTS _restore_generation (
-                id INT PRIMARY KEY DEFAULT 1,
-                generation_token VARCHAR(128) NOT NULL,
-                backup_id VARCHAR(128) NOT NULL,
-                restored_at_nanos BIGINT NOT NULL,
-                status VARCHAR(32) NOT NULL DEFAULT 'COMMITTED'
-            )
-        "#;
-        sqlx::query(create_sql)
-            .execute(&mut **tx)
-            .await
-            .map_err(|e| {
-                ForgeError::Internal(format!(
-                    "Failed to create _restore_generation table in transaction: {}",
-                    e
-                ))
-            })?;
-
         let insert_sql = r#"
             INSERT INTO _restore_generation (id, generation_token, backup_id, restored_at_nanos, status)
             VALUES (1, $1, $2, $3, 'COMMITTED')
@@ -309,18 +290,38 @@ impl RestoreJournal {
                 restored_at_nanos = EXCLUDED.restored_at_nanos,
                 status = EXCLUDED.status
         "#;
-        sqlx::query(insert_sql)
+        if let Err(e) = sqlx::query(insert_sql)
             .bind(generation)
             .bind(backup_id)
             .bind(now_nanos)
             .execute(&mut **tx)
             .await
-            .map_err(|e| {
-                ForgeError::Internal(format!(
-                    "Failed to record database restore generation in transaction: {}",
-                    e
-                ))
-            })?;
+        {
+            // Fallback if table does not exist: attempt creation and retry insert
+            let create_sql = r#"
+                CREATE TABLE IF NOT EXISTS _restore_generation (
+                    id INT PRIMARY KEY DEFAULT 1,
+                    generation_token VARCHAR(128) NOT NULL,
+                    backup_id VARCHAR(128) NOT NULL,
+                    restored_at_nanos BIGINT NOT NULL,
+                    status VARCHAR(32) NOT NULL DEFAULT 'COMMITTED'
+                )
+            "#;
+            let _ = sqlx::query(create_sql).execute(&mut **tx).await;
+
+            sqlx::query(insert_sql)
+                .bind(generation)
+                .bind(backup_id)
+                .bind(now_nanos)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e2| {
+                    ForgeError::Internal(format!(
+                        "Failed to record database restore generation in transaction (attempt 1: {}, attempt 2: {})",
+                        e, e2
+                    ))
+                })?;
+        }
         Ok(())
     }
 
