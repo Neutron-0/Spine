@@ -5,9 +5,11 @@
 # ==============================================================================
 set -euo pipefail
 umask 077
+export MSYS_NO_PATHCONV=1
 
 SPINE_API_URL="${SPINE_API_URL:-http://127.0.0.1:3000}"
 SPINE_ADMIN_TOKEN="${SPINE_ADMIN_TOKEN:-}"
+SPINE_ADMIN_TOKEN_FILE="${SPINE_ADMIN_TOKEN_FILE:-}"
 BACKUP_ROOT="${BACKUP_ROOT:-/mnt/backups/spine}"
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
 POSTGRES_ADMIN_USER="${POSTGRES_ADMIN_USER:-spine_admin}"
@@ -22,8 +24,12 @@ SPINE_BACKUP_RETENTION_DAYS="${SPINE_BACKUP_RETENTION_DAYS:-30}"
 SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE="${SPINE_BACKUP_ALLOW_UNLOCKED_REMOTE:-0}"
 SPINE_S3_ENDPOINT_URL="${SPINE_S3_ENDPOINT_URL:-}"
 
+if [ -z "${SPINE_ADMIN_TOKEN}" ] && [ -n "${SPINE_ADMIN_TOKEN_FILE}" ] && [ -f "${SPINE_ADMIN_TOKEN_FILE}" ]; then
+  SPINE_ADMIN_TOKEN="$(tr -d '\r\n' < "${SPINE_ADMIN_TOKEN_FILE}")"
+fi
+
 if [ -z "${SPINE_ADMIN_TOKEN}" ]; then
-  echo "FATAL: SPINE_ADMIN_TOKEN must be set to acquire the cluster maintenance barrier." >&2
+  echo "FATAL: SPINE_ADMIN_TOKEN or SPINE_ADMIN_TOKEN_FILE must be set to acquire the cluster maintenance barrier." >&2
   exit 1
 fi
 
@@ -350,6 +356,14 @@ cleanup_backup() {
 }
 trap cleanup_backup EXIT ERR INT TERM
 
+to_host_mount_path() {
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -w "$1"
+  else
+    printf "%s" "$1"
+  fi
+}
+
 # Resolve passphrase, verify supported storage topology, and enforce off-site policy before acquiring barrier
 resolve_passphrase_file
 verify_supported_storage_topology
@@ -526,8 +540,9 @@ if command -v spine-api >/dev/null 2>&1; then
 else
   # Encrypt through the spine-api container via mounted read-only secret file.
   # Credentials are never passed in process arguments or container environment variables.
+  mount_pass_file=$(to_host_mount_path "${RESOLVED_PASSPHRASE_FILE}")
   docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps \
-    -v "${RESOLVED_PASSPHRASE_FILE}:/run/secrets/backup_passphrase:ro" \
+    -v "${mount_pass_file}:/run/secrets/backup_passphrase:ro" \
     spine-api \
     backup encrypt --passphrase-file /run/secrets/backup_passphrase --input - --output - \
     < "${PLAINTEXT_TAR}" > "${ENCRYPTED_ARCHIVE}"

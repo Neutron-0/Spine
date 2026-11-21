@@ -96,6 +96,10 @@ impl ConsistencyBarrier {
         self.fencing_generation.load(Ordering::SeqCst)
     }
 
+    pub fn in_flight_writes(&self) -> usize {
+        self.in_flight_writes.load(Ordering::SeqCst)
+    }
+
     /// Check whether the cluster or node is currently in a maintenance barrier window.
     pub fn is_maintenance_active(&self) -> bool {
         self.in_maintenance.load(Ordering::SeqCst)
