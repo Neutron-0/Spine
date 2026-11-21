@@ -7,7 +7,7 @@ use spine_api::coordinator::client::CoordinatorClient;
 use spine_api::db::InMemoryDatabase;
 use spine_api::Database;
 use spine_cluster::protocol::{ClusterRpcRequest, ClusterRpcResponse};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -814,8 +814,41 @@ async fn test_barrier_ownership_and_unacquired_backup_cleanup_isolation() {
     assert_eq!(diag["in_maintenance"], true);
     assert_eq!(diag["current_fencing_generation"], original_generation);
 
-    // 3. Run production local-only backup script invocation that fails before acquisition
-    // It must exit 1, and its cleanup trap must NOT release Operation A's barrier
+    // 3. Bind a local HTTP test server backed by the exact same AppState
+    // with recording middleware to PROVE the backup script makes zero release requests.
+    let release_endpoint_call_count = Arc::new(AtomicUsize::new(0));
+    let release_count_middleware = release_endpoint_call_count.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind ephemeral listener for isolated test server");
+    let server_port = listener.local_addr().unwrap().port();
+    let server_url = format!("http://127.0.0.1:{}", server_port);
+
+    let recorded_app = app.clone().layer(axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let path = req.uri().path().to_string();
+            let count = release_count_middleware.clone();
+            async move {
+                if path == "/api/v1/admin/maintenance/release" {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+                next.run(req).await
+            }
+        },
+    ));
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, recorded_app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    // Run production local-only backup script invocation that fails before acquisition.
+    // It must exit 1, and its cleanup trap must NOT make any release request.
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut workspace_root = manifest_dir;
     while let Some(parent) = workspace_root.parent() {
@@ -855,15 +888,42 @@ fi
 if [ ! -f "$P" ]; then
   if command -v wslpath >/dev/null 2>&1; then P=$(wslpath -u "$P"); elif command -v cygpath >/dev/null 2>&1; then P=$(cygpath -u "$P"); fi
 fi
+
+# Set up recording curl stub to log all curl invocations
+STUB_DIR=$(mktemp -d /tmp/curl_stub_XXXXXX 2>/dev/null || mktemp -d "${{TMPDIR:-/tmp}}/curl_stub_XXXXXX")
+CURL_LOG="${{STUB_DIR}}/curl_calls.log"
+touch "${{CURL_LOG}}"
+REAL_CURL=$(command -v curl || echo "/usr/bin/curl")
+
+cat <<EOF > "${{STUB_DIR}}/curl"
+#!/usr/bin/env bash
+echo "\$@" >> "${{CURL_LOG}}"
+exec "${{REAL_CURL}}" "\$@"
+EOF
+chmod +x "${{STUB_DIR}}/curl"
+export PATH="${{STUB_DIR}}:${{PATH}}"
+
 export MSYS_NO_PATHCONV=1
 cd "$(dirname "$S")/.."
+export SPINE_API_URL="{}"
 export SPINE_DEPLOYMENT_PROFILE=core-forge-v1
 export SPINE_BACKUP_REQUIRE_REMOTE=0
 export SPINE_ADMIN_TOKEN=test-admin-secret-ownership-123
 export SPINE_BACKUP_PASSPHRASE_FILE="$P"
-exec bash "$S"
+
+set +e
+bash "$S"
+EXIT_CODE=$?
+set -e
+
+# Echo recorded curl calls into stderr for test assertions
+echo "=== RECORDED CURL CALLS START ===" >&2
+cat "${{CURL_LOG}}" >&2
+echo "=== RECORDED CURL CALLS END ===" >&2
+rm -rf "${{STUB_DIR}}"
+exit ${{EXIT_CODE}}
 "#,
-        script_str, pass_path_str
+        script_str, pass_path_str, server_url
     );
 
     let mut child = std::process::Command::new("bash")
@@ -894,6 +954,20 @@ exec bash "$S"
         "Stderr must contain policy rejection: {}",
         stderr_str
     );
+
+    // PROOF: Assert recording curl stub captured zero calls to release endpoint
+    assert!(
+        !stderr_str.contains("maintenance/release"),
+        "Recording curl stub proved a release request was made! Stderr: {}",
+        stderr_str
+    );
+    // PROOF: Assert local HTTP server backed by AppState received ZERO release requests from failed backup
+    assert_eq!(
+        release_endpoint_call_count.load(Ordering::SeqCst),
+        0,
+        "Local HTTP server backed by AppState must have received ZERO release requests from unacquired backup"
+    );
+
     // Must NOT contain cleanup release attempt for barrier it did not acquire
     assert!(
         !stderr_str.contains("releasing acquired cluster maintenance barrier"),
@@ -957,6 +1031,10 @@ exec bash "$S"
         StatusCode::OK,
         "Matching owner token must release the barrier"
     );
+
+    // Shutdown isolated background test server
+    let _ = shutdown_tx.send(());
+    let _ = server_task.await;
 
     // Diagnostics confirms maintenance is now released
     let req = Request::builder()
