@@ -828,6 +828,15 @@ curl -s -f -X POST "${SPINE_API_URL}/api/v1/admin/maintenance/release" \
   -H "Authorization: Bearer ${SPINE_ADMIN_TOKEN}"
 RELEASED=1
 
+# Synchronize database restore generation with the released fencing generation
+PG_EXEC_ARGS=()
+if [ -n "${POSTGRES_ADMIN_PASSWORD:-}" ]; then
+  PG_EXEC_ARGS+=(-e "PGPASSWORD=${POSTGRES_ADMIN_PASSWORD}")
+fi
+"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T "${PG_EXEC_ARGS[@]}" postgres \
+  psql -U "${POSTGRES_ADMIN_USER:-spine_admin}" -d "${POSTGRES_DB:-spine_forge}" -v ON_ERROR_STOP=1 -c \
+  "UPDATE _restore_generation SET generation_token = '${GENERATION_TOKEN}' WHERE id = 1;" >/dev/null 2>&1 || true
+
 # Verify health
 echo "Awaiting cluster ready state..."
 READY=0

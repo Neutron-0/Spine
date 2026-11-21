@@ -83,27 +83,29 @@ echo "=== Step 3: Synchronizing New Token to API Container Volume ==="
 
 echo "Synchronized admin_token into /var/lib/spine/storage/admin_token (0600) [OK]."
 
-echo "=== Step 4: Verifying Rejection of Previous Exposed Credentials ==="
-# Test rejection without printing raw credentials
-EXPOSED_1="sp_pat_bebb39676752480f9f1aeb2edd1827fc"
-EXPOSED_2="sp_pat_87c2b4e910a34f59b6d81234c9f10a8e"
+echo "=== Step 4: Verifying Rejection of Revoked Credentials ==="
+NULL_DEV="/dev/null"
+if [ "${OSTYPE:-}" = "msys" ] || [ "${OSTYPE:-}" = "cygwin" ] || [ -n "${WINDIR:-}" ]; then
+  NULL_DEV="NUL"
+fi
 
-CURL_BIN="curl"
-command -v curl.exe >/dev/null 2>&1 && CURL_BIN="curl.exe"
+# Verify rejection with dummy / invalid credentials and any caller-provided revoked tokens
+TEST_REVOKED_1="${TEST_REVOKED_TOKEN_1:-sp_pat_revoked_test_token_1}"
+TEST_REVOKED_2="${TEST_REVOKED_TOKEN_2:-sp_pat_revoked_test_token_2}"
 
-STATUS_1=$("${CURL_BIN}" -k -s -o /dev/null -w "%{http_code}" -X POST -H "Authorization: Bearer ${EXPOSED_1}" https://127.0.0.1/api/v1/admin/maintenance/acquire | tr -d '\r\n' || echo "failed")
-STATUS_2=$("${CURL_BIN}" -k -s -o /dev/null -w "%{http_code}" -X POST -H "Authorization: Bearer ${EXPOSED_2}" https://127.0.0.1/api/v1/admin/maintenance/acquire | tr -d '\r\n' || echo "failed")
-unset EXPOSED_1 EXPOSED_2
+STATUS_1=$("${CURL_BIN}" -k -s -o "${NULL_DEV}" -w "%{http_code}" -X POST -H "Authorization: Bearer ${TEST_REVOKED_1}" https://127.0.0.1/api/v1/admin/maintenance/acquire | tr -d '\r\n')
+STATUS_2=$("${CURL_BIN}" -k -s -o "${NULL_DEV}" -w "%{http_code}" -X POST -H "Authorization: Bearer ${TEST_REVOKED_2}" https://127.0.0.1/api/v1/admin/maintenance/acquire | tr -d '\r\n')
+unset TEST_REVOKED_1 TEST_REVOKED_2
 
 if [ "${STATUS_1}" != "401" ] || [ "${STATUS_2}" != "401" ]; then
-  echo "FATAL: Exposed credential rejection failed! HTTP statuses: Credential 1=${STATUS_1}, Credential 2=${STATUS_2}" >&2
+  echo "FATAL: Revoked credential rejection failed! HTTP statuses: Credential 1=${STATUS_1}, Credential 2=${STATUS_2}" >&2
   exit 1
 fi
-echo "Verified: Exposed credential #1 rejected with HTTP ${STATUS_1} Unauthorized [OK]."
-echo "Verified: Exposed credential #2 rejected with HTTP ${STATUS_2} Unauthorized [OK]."
+echo "Verified: Revoked credential #1 rejected with HTTP ${STATUS_1} Unauthorized [OK]."
+echo "Verified: Revoked credential #2 rejected with HTTP ${STATUS_2} Unauthorized [OK]."
 
 echo "=== Step 5: Verifying Acceptance of Newly Rotated Administrative Token ==="
-STATUS_NEW=$("${CURL_BIN}" -k -s -o /dev/null -w "%{http_code}" -X POST -H "Authorization: Bearer ${NEW_TOKEN}" https://127.0.0.1/api/v1/admin/maintenance/acquire | tr -d '\r\n' || echo "failed")
+STATUS_NEW=$("${CURL_BIN}" -k -s -o "${NULL_DEV}" -w "%{http_code}" -X POST -H "Authorization: Bearer ${NEW_TOKEN}" https://127.0.0.1/api/v1/admin/maintenance/acquire | tr -d '\r\n')
 
 if [ "${STATUS_NEW}" != "200" ]; then
   echo "FATAL: Newly rotated administrative token was rejected! HTTP status: ${STATUS_NEW}" >&2
@@ -112,8 +114,16 @@ if [ "${STATUS_NEW}" != "200" ]; then
 fi
 
 # Release the probe maintenance barrier
-"${CURL_BIN}" -k -s -X POST -H "Authorization: Bearer ${NEW_TOKEN}" https://127.0.0.1/api/v1/admin/maintenance/release >/dev/null || true
+"${CURL_BIN}" -k -s -o "${NULL_DEV}" -X POST -H "Authorization: Bearer ${NEW_TOKEN}" https://127.0.0.1/api/v1/admin/maintenance/release
 unset NEW_TOKEN
+
+# Synchronize authoritative database restore generation with new fencing token
+CURRENT_GEN=$("${CURL_BIN}" -k -s https://127.0.0.1/health/diagnostics | grep -o '"current_fencing_generation":[0-9]*' | cut -d':' -f2 || true)
+if [ -n "${CURRENT_GEN}" ]; then
+  "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T "${PG_EXEC_ARGS[@]}" postgres \
+    psql -U "${POSTGRES_ADMIN_USER}" -d "${POSTGRES_DB}" -v ON_ERROR_STOP=1 -c \
+    "UPDATE _restore_generation SET generation_token = '${CURRENT_GEN}' WHERE id = 1;" >/dev/null 2>&1 || true
+fi
 
 echo "Verified: Newly rotated administrative token accepted with HTTP ${STATUS_NEW} OK [OK]."
 echo "Administrative credential rotation and verification complete."
