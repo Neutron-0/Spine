@@ -816,40 +816,111 @@ async fn test_barrier_ownership_and_unacquired_backup_cleanup_isolation() {
 
     // 3. Run production local-only backup script invocation that fails before acquisition
     // It must exit 1, and its cleanup trap must NOT release Operation A's barrier
-    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(3)
-        .unwrap();
-    let script_path = workspace_root.join("scripts").join("backup_oob.sh");
-
-    if script_path.exists() {
-        let output = std::process::Command::new("bash")
-            .arg(script_path.to_str().unwrap())
-            .env("MSYS_NO_PATHCONV", "1")
-            .env("SPINE_DEPLOYMENT_PROFILE", "core-forge-v1")
-            .env("SPINE_BACKUP_REQUIRE_REMOTE", "0")
-            .env("SPINE_ADMIN_TOKEN", "test-admin-secret-ownership-123")
-            .output();
-
-        if let Ok(out) = output {
-            assert!(
-                !out.status.success(),
-                "Production local-only backup must fail closed with exit code 1"
-            );
-            let stderr_str = String::from_utf8_lossy(&out.stderr);
-            assert!(
-                stderr_str.contains("Local-only backup (SPINE_BACKUP_REQUIRE_REMOTE=0) is strictly FORBIDDEN"),
-                "Stderr must contain policy rejection: {}",
-                stderr_str
-            );
-            // Must NOT contain cleanup release attempt for barrier it did not acquire
-            assert!(
-                !stderr_str.contains("releasing acquired cluster maintenance barrier"),
-                "Unacquired backup must not attempt to release barrier: {}",
-                stderr_str
-            );
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut workspace_root = manifest_dir;
+    while let Some(parent) = workspace_root.parent() {
+        if parent.join("scripts").join("backup_oob.sh").exists() {
+            workspace_root = parent;
+            break;
         }
+        workspace_root = parent;
     }
+    let script_path = workspace_root.join("scripts").join("backup_oob.sh");
+    assert!(
+        script_path.exists(),
+        "scripts/backup_oob.sh must exist at {:?}",
+        script_path
+    );
+
+    // Provide a temporary passphrase file for deterministic execution inside workspace
+    let temp_pass_file = workspace_root.join(".test_passphrase_barrier.tmp");
+    std::fs::write(
+        &temp_pass_file,
+        "test-backup-encryption-passphrase-at-least-32-chars-entropy!\n",
+    )
+    .expect("Failed to write temporary passphrase file");
+
+    // Fail the test if the script or Bash cannot run instead of silently skipping assertions.
+    let script_str = script_path.to_str().unwrap().replace('\\', "/");
+    let pass_path_str = temp_pass_file.to_str().unwrap().replace('\\', "/");
+
+    let runner_script = format!(
+        r#"
+set -euo pipefail
+S="{}"
+P="{}"
+if [ ! -f "$S" ]; then
+  if command -v wslpath >/dev/null 2>&1; then S=$(wslpath -u "$S"); elif command -v cygpath >/dev/null 2>&1; then S=$(cygpath -u "$S"); fi
+fi
+if [ ! -f "$P" ]; then
+  if command -v wslpath >/dev/null 2>&1; then P=$(wslpath -u "$P"); elif command -v cygpath >/dev/null 2>&1; then P=$(cygpath -u "$P"); fi
+fi
+export MSYS_NO_PATHCONV=1
+cd "$(dirname "$S")/.."
+export SPINE_DEPLOYMENT_PROFILE=core-forge-v1
+export SPINE_BACKUP_REQUIRE_REMOTE=0
+export SPINE_ADMIN_TOKEN=test-admin-secret-ownership-123
+export SPINE_BACKUP_PASSPHRASE_FILE="$P"
+exec bash "$S"
+"#,
+        script_str, pass_path_str
+    );
+
+    let mut child = std::process::Command::new("bash")
+        .arg("-s")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn bash for backup_oob.sh: bash must be available and runnable");
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        stdin.write_all(runner_script.as_bytes()).expect("Failed to write to bash stdin");
+    }
+    let output = child.wait_with_output().expect("Failed to wait on bash child");
+
+    let _ = std::fs::remove_file(&temp_pass_file);
+
+    assert!(
+        !output.status.success(),
+        "Production local-only backup must fail closed with exit code 1"
+    );
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stderr_str.contains("Local-only backup (SPINE_BACKUP_REQUIRE_REMOTE=0) is strictly FORBIDDEN"),
+        "Stderr must contain policy rejection: {}",
+        stderr_str
+    );
+    // Must NOT contain cleanup release attempt for barrier it did not acquire
+    assert!(
+        !stderr_str.contains("releasing acquired cluster maintenance barrier"),
+        "Unacquired backup must not attempt to release barrier: {}",
+        stderr_str
+    );
+    assert!(
+        !stdout_str.contains("releasing acquired cluster maintenance barrier"),
+        "Unacquired backup must not attempt to release barrier in stdout: {}",
+        stdout_str
+    );
+    // CRITICAL: Owner token must never appear anywhere in captured stdout or stderr
+    assert!(
+        !stdout_str.contains(&original_owner_token),
+        "CRITICAL LEAK: Owner token appeared in stdout: {}",
+        stdout_str
+    );
+    assert!(
+        !stderr_str.contains(&original_owner_token),
+        "CRITICAL LEAK: Owner token appeared in stderr: {}",
+        stderr_str
+    );
+    assert!(
+        !stdout_str.contains("owner_token"),
+        "CRITICAL LEAK: raw 'owner_token' key appeared in stdout: {}",
+        stdout_str
+    );
 
     // Diagnostics confirms barrier is STILL actively held by Operation A with unchanged generation
     let req = Request::builder()
@@ -897,4 +968,98 @@ async fn test_barrier_ownership_and_unacquired_backup_cleanup_isolation() {
     let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
     let diag: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(diag["in_maintenance"], false);
+}
+
+#[test]
+fn test_backup_script_acquire_output_redacts_owner_token() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut workspace_root = manifest_dir;
+    while let Some(parent) = workspace_root.parent() {
+        if parent.join("scripts").join("backup_oob.sh").exists() {
+            workspace_root = parent;
+            break;
+        }
+        workspace_root = parent;
+    }
+    let script_path = workspace_root.join("scripts").join("backup_oob.sh");
+    assert!(
+        script_path.exists(),
+        "scripts/backup_oob.sh must exist at {:?}",
+        script_path
+    );
+    let content = std::fs::read_to_string(&script_path).expect("failed to read backup_oob.sh");
+
+    // Ensure raw ACQUIRE_RESP is not printed anywhere in the script
+    assert!(
+        !content.contains("echo \"Maintenance barrier acquired: ${ACQUIRE_RESP}\""),
+        "CRITICAL LEAK: backup_oob.sh must not echo raw ACQUIRE_RESP containing owner_token"
+    );
+    assert!(
+        !content.contains("echo ${ACQUIRE_RESP}"),
+        "CRITICAL LEAK: backup_oob.sh must not echo $ACQUIRE_RESP"
+    );
+
+    // Execute the exact acquire logging logic in Bash and verify stdout and stderr
+    let test_token = "secret_barrier_owner_token_999888777";
+    let test_script = format!(
+        r#"
+set -euo pipefail
+ACQUIRE_RESP='{{"status":"acquired","fencing_generation":105,"owner_token":"{}","lease_expires_at_nanos":17777777777}}'
+BARRIER_OWNER_TOKEN=$(echo "${{ACQUIRE_RESP}}" | grep -o '"owner_token":"[^"]*"' | cut -d'"' -f4 || true)
+if [ -z "${{BARRIER_OWNER_TOKEN}}" ]; then
+  exit 1
+fi
+BARRIER_ACQUIRED=1
+ACQUIRE_STATUS=$(echo "${{ACQUIRE_RESP}}" | grep -o '"status":"[^"]*"' | cut -d'"' -f4 || echo "acquired")
+ACQUIRE_FENCING_GEN=$(echo "${{ACQUIRE_RESP}}" | grep -o '"fencing_generation":[0-9]*' | cut -d: -f2 || echo "unknown")
+echo "Maintenance barrier acquired: status=${{ACQUIRE_STATUS}}, fencing_generation=${{ACQUIRE_FENCING_GEN}}"
+"#,
+        test_token
+    );
+
+    let mut child = std::process::Command::new("bash")
+        .arg("-s")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("bash must run");
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        stdin.write_all(test_script.as_bytes()).expect("failed to write test_script to bash stdin");
+    }
+    let output = child.wait_with_output().expect("failed to wait on bash child");
+
+    if !output.status.success() {
+        panic!(
+            "Bash execution failed with code {:?}. Stderr: {}, Stdout: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stdout.contains("Maintenance barrier acquired: status=acquired, fencing_generation=105"),
+        "Stdout must log status and fencing generation: {}",
+        stdout
+    );
+    assert!(
+        !stdout.contains(test_token),
+        "CRITICAL LEAK: Owner token appeared in stdout: {}",
+        stdout
+    );
+    assert!(
+        !stderr.contains(test_token),
+        "CRITICAL LEAK: Owner token appeared in stderr: {}",
+        stderr
+    );
+    assert!(
+        !stdout.contains("owner_token"),
+        "Raw field name owner_token should not appear in log output: {}",
+        stdout
+    );
 }

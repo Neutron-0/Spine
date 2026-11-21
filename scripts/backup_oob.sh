@@ -32,6 +32,14 @@ SPINE_S3_ENDPOINT_URL="${SPINE_S3_ENDPOINT_URL:-}"
 CLEANUP_TEMP_ADMIN_TOKEN=0
 TEMP_ADMIN_TOKEN_FILE=""
 
+if [ -n "${SPINE_ADMIN_TOKEN_FILE:-}" ] && [ ! -f "${SPINE_ADMIN_TOKEN_FILE}" ]; then
+  if command -v wslpath >/dev/null 2>&1; then
+    SPINE_ADMIN_TOKEN_FILE=$(wslpath -u "${SPINE_ADMIN_TOKEN_FILE}" 2>/dev/null || echo "${SPINE_ADMIN_TOKEN_FILE}")
+  elif command -v cygpath >/dev/null 2>&1; then
+    SPINE_ADMIN_TOKEN_FILE=$(cygpath -u "${SPINE_ADMIN_TOKEN_FILE}" 2>/dev/null || echo "${SPINE_ADMIN_TOKEN_FILE}")
+  fi
+fi
+
 if [ -z "${SPINE_ADMIN_TOKEN:-}" ] && [ -n "${SPINE_ADMIN_TOKEN_FILE:-}" ] && [ -f "${SPINE_ADMIN_TOKEN_FILE}" ]; then
   # Verify host file permissions if on native POSIX filesystems (skip v9fs/drvfs mounts)
   FS_TYPE=$(stat -f -c %T "${SPINE_ADMIN_TOKEN_FILE}" 2>/dev/null || echo "")
@@ -69,6 +77,14 @@ RESOLVED_PASSPHRASE_FILE=""
 CLEANUP_TEMP_PASSPHRASE=0
 
 resolve_passphrase_file() {
+  if [ -n "${SPINE_BACKUP_PASSPHRASE_FILE:-}" ] && [ ! -f "${SPINE_BACKUP_PASSPHRASE_FILE}" ]; then
+    if command -v wslpath >/dev/null 2>&1; then
+      SPINE_BACKUP_PASSPHRASE_FILE=$(wslpath -u "${SPINE_BACKUP_PASSPHRASE_FILE}" 2>/dev/null || echo "${SPINE_BACKUP_PASSPHRASE_FILE}")
+    elif command -v cygpath >/dev/null 2>&1; then
+      SPINE_BACKUP_PASSPHRASE_FILE=$(cygpath -u "${SPINE_BACKUP_PASSPHRASE_FILE}" 2>/dev/null || echo "${SPINE_BACKUP_PASSPHRASE_FILE}")
+    fi
+  fi
+
   if [ -n "${SPINE_BACKUP_PASSPHRASE_FILE:-}" ] && [ -f "${SPINE_BACKUP_PASSPHRASE_FILE}" ]; then
     RESOLVED_PASSPHRASE_FILE="${SPINE_BACKUP_PASSPHRASE_FILE}"
   elif [ -n "${SPINE_BACKUP_PASSPHRASE:-}" ]; then
@@ -441,7 +457,9 @@ if [ -z "${BARRIER_OWNER_TOKEN}" ]; then
 fi
 BARRIER_ACQUIRED=1
 
-echo "Maintenance barrier acquired: ${ACQUIRE_RESP}"
+ACQUIRE_STATUS=$(echo "${ACQUIRE_RESP}" | grep -o '"status":"[^"]*"' | cut -d'"' -f4 || echo "acquired")
+ACQUIRE_FENCING_GEN=$(echo "${ACQUIRE_RESP}" | grep -o '"fencing_generation":[0-9]*' | cut -d: -f2 || echo "unknown")
+echo "Maintenance barrier acquired: status=${ACQUIRE_STATUS}, fencing_generation=${ACQUIRE_FENCING_GEN}"
 
 # Poll diagnostics until active_writers == 0
 echo "Awaiting writer drain..."
@@ -853,10 +871,12 @@ else
 fi
 
 echo "=== Phase 3: Releasing Maintenance Barrier & Verifying Cluster Health ==="
-curl -s -f -X POST "${SPINE_API_URL}/api/v1/admin/maintenance/release" \
+RELEASE_RESP=$(curl -s -f -X POST "${SPINE_API_URL}/api/v1/admin/maintenance/release" \
   -H "Authorization: Bearer ${SPINE_ADMIN_TOKEN}" \
   -H "Content-Type: application/json" \
-  -d "{\"owner_token\": \"${BARRIER_OWNER_TOKEN}\"}"
+  -d "{\"owner_token\": \"${BARRIER_OWNER_TOKEN}\"}")
+RELEASED_GEN=$(echo "${RELEASE_RESP}" | grep -o '"fencing_generation":[0-9]*' | cut -d: -f2 || echo "unknown")
+echo "Maintenance barrier released: fencing_generation=${RELEASED_GEN}"
 RELEASED=1
 
 # Synchronize database restore generation with the released fencing generation
