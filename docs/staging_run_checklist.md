@@ -47,38 +47,59 @@ aws --profile spine-staging cloudformation deploy \
 
 ## 2. Staging Execution Procedures
 
-### Step 1: Backup Execution & Off-Site S3 Replication
-Export staging environment parameters:
-```bash
-export AWS_PROFILE=spine-staging
-export SPINE_DEPLOYMENT_PROFILE=core-forge-v1
-export SPINE_BACKUP_REQUIRE_REMOTE=1
-export SPINE_BACKUP_OBJECT_LOCK_MODE=COMPLIANCE
-export SPINE_BACKUP_RETENTION_DAYS=30
-export SPINE_BACKUP_REMOTE_S3_URI="s3://<staging-bucket-name>/backups/production-rehearsal/"
-export SPINE_BACKUP_PASSPHRASE_FILE="/path/to/secure/staging_passphrase.txt"
-export SPINE_ADMIN_TOKEN_FILE="/path/to/secure/staging_admin_token.txt"
-```
+### Step 1: Least-Privilege Role Assumption & Backup Execution
+1. **Assume Least-Privilege SpineBackupRole:**
+   ```bash
+   # Retrieve BackupRoleArn from CloudFormation stack outputs:
+   BACKUP_ROLE_ARN=$(aws --profile spine-staging cloudformation describe-stacks \
+     --stack-name spine-staging-storage \
+     --query "Stacks[0].Outputs[?OutputKey=='BackupRoleArn'].OutputValue" \
+     --output text)
 
-Execute out-of-band backup:
-```bash
-bash scripts/backup_oob.sh
-```
+   # Assume role to obtain temporary credentials:
+   BACKUP_SESSION=$(aws --profile spine-staging sts assume-role \
+     --role-arn "${BACKUP_ROLE_ARN}" \
+     --role-session-name "spine-backup-agent-session" \
+     --duration-seconds 3600 \
+     --query "Credentials.[AccessKeyId,SecretAccessKey,SessionToken]" \
+     --output text)
 
-- Confirm exit code is `0`.
-- Verify stdout logs:
-  - `status=acquired, fencing_generation=<G>` (owner token redacted)
-  - Pre-capture storage audit across all participants matches `<G>`.
-  - Authenticated encryption succeeded.
-  - S3 upload completed and remote SHA-256 matched local hash.
-  - Barrier released cleanly: `fencing_generation=<G>`.
+   # Export temporary credentials (never print or log secrets):
+   export AWS_ACCESS_KEY_ID=$(echo "${BACKUP_SESSION}" | awk '{print $1}')
+   export AWS_SECRET_ACCESS_KEY=$(echo "${BACKUP_SESSION}" | awk '{print $2}')
+   export AWS_SESSION_TOKEN=$(echo "${BACKUP_SESSION}" | awk '{print $3}')
+   ```
+
+2. **Configure Staging Environment Parameters:**
+   ```bash
+   export SPINE_DEPLOYMENT_PROFILE=core-forge-v1
+   export SPINE_BACKUP_REQUIRE_REMOTE=1
+   export SPINE_BACKUP_OBJECT_LOCK_MODE=COMPLIANCE
+   export SPINE_BACKUP_RETENTION_DAYS=30
+   export SPINE_BACKUP_REMOTE_S3_URI="s3://<staging-bucket-name>/backups/production-rehearsal/"
+   export SPINE_BACKUP_PASSPHRASE_FILE="/path/to/secure/staging_passphrase.txt"
+   export SPINE_ADMIN_TOKEN_FILE="/path/to/secure/staging_admin_token.txt"
+   ```
+
+3. **Execute Out-of-Band Backup:**
+   ```bash
+   bash scripts/backup_oob.sh
+   ```
+
+   - Confirm exit code is `0`.
+   - Verify stdout logs:
+     - `status=acquired, fencing_generation=<G>` (owner token redacted)
+     - Pre-capture storage audit across all participants matches `<G>`.
+     - Authenticated encryption succeeded.
+     - S3 upload completed and remote SHA-256 matched local hash.
+     - Barrier released cleanly: `fencing_generation=<G>`.
 
 ---
 
 ### Step 2: S3 Object Lock & Cryptographic Verification
-1. **Query Remote Object Retention Mode:**
+1. **Query Remote Object Retention Mode (using SpineBackupRole or Auditor Role):**
    ```bash
-   aws --profile spine-staging s3api get-object-retention \
+   aws s3api get-object-retention \
      --bucket <staging-bucket-name> \
      --key backups/production-rehearsal/<backup-archive-filename>.spnebak
    ```
@@ -88,20 +109,48 @@ bash scripts/backup_oob.sh
 
 2. **Download Archive and Verify Cryptographic Integrity:**
    ```bash
-   aws --profile spine-staging s3 cp \
+   aws s3 cp \
      s3://<staging-bucket-name>/backups/production-rehearsal/<backup-archive-filename>.spnebak \
      ./staging_verify.spnebak
    sha256sum ./staging_verify.spnebak
    ```
    - Verify computed SHA-256 matches manifest `SHA256SUMS`.
 
-3. **Attempt Mutation/Deletion to Confirm Fail-Closed WORM Protection:**
+3. **Attempt Mutation/Deletion with Staging Auditor Identity:**
+   > [!IMPORTANT]
+   > Testing deletion using `SpineBackupRole` only proves IAM Deny, not S3 Object Lock Compliance retention. To verify S3 WORM enforcement, assume `SpineAuditVerificationRole`, which **allows** `s3:DeleteObject` and has no retention bypass permissions.
+
    ```bash
-   aws --profile spine-staging s3api delete-object \
+   # Retrieve AuditRoleArn from CloudFormation stack outputs:
+   AUDIT_ROLE_ARN=$(aws --profile spine-staging cloudformation describe-stacks \
+     --stack-name spine-staging-storage \
+     --query "Stacks[0].Outputs[?OutputKey=='AuditRoleArn'].OutputValue" \
+     --output text)
+
+   # Assume auditor role:
+   AUDIT_SESSION=$(aws --profile spine-staging sts assume-role \
+     --role-arn "${AUDIT_ROLE_ARN}" \
+     --role-session-name "spine-auditor-worm-verification" \
+     --duration-seconds 900 \
+     --query "Credentials.[AccessKeyId,SecretAccessKey,SessionToken]" \
+     --output text)
+
+   AUDIT_ACCESS_KEY=$(echo "${AUDIT_SESSION}" | awk '{print $1}')
+   AUDIT_SECRET_KEY=$(echo "${AUDIT_SESSION}" | awk '{print $2}')
+   AUDIT_TOKEN=$(echo "${AUDIT_SESSION}" | awk '{print $3}')
+
+   # Attempt object deletion with auditor identity:
+   AWS_ACCESS_KEY_ID="${AUDIT_ACCESS_KEY}" \
+   AWS_SECRET_ACCESS_KEY="${AUDIT_SECRET_KEY}" \
+   AWS_SESSION_TOKEN="${AUDIT_TOKEN}" \
+   aws s3api delete-object \
      --bucket <staging-bucket-name> \
      --key backups/production-rehearsal/<backup-archive-filename>.spnebak
    ```
-   - Confirm deletion is rejected by AWS with `AccessDenied: Object is protected by Compliance retention`.
+   - Confirm deletion is rejected by the AWS S3 engine with:
+     `An error occurred (AccessDenied) when calling the DeleteObject operation: The operation is not valid for the object's storage class or object lock configuration`
+     (or with `--version-id`: `AccessDenied: Object is protected by Compliance retention`).
+   - This proves that retention is enforced by AWS S3 WORM controls, not IAM permission absence.
 
 ---
 

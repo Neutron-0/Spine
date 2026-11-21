@@ -5,7 +5,7 @@ import yaml
 class CfnLoader(yaml.SafeLoader):
     pass
 
-for tag in ['!Ref', '!Sub', '!GetAtt', '!Equals', '!If', '!Condition']:
+for tag in ['!Ref', '!Sub', '!GetAtt', '!Equals', '!Not', '!If', '!Condition']:
     CfnLoader.add_constructor(
         tag,
         lambda loader, node, t=tag: {
@@ -77,7 +77,17 @@ def validate_template(filepath):
     assert any(s.get('Sid') == 'BucketMetadata' and 's3:GetBucketObjectLockConfiguration' in s.get('Action') for s in role_policies)
     assert any(s.get('Sid') == 'ListBackupsPrefixOnly' and s.get('Effect') == 'Allow' for s in role_policies)
     assert any(s.get('Sid') == 'BackupWriteAndRead' and s.get('Effect') == 'Allow' for s in role_policies)
-    print("  [OK] IAM Role: Least-privilege actions, prefix scoping, and explicit deletion denial validated")
+    assert not any('LegalHold' in str(s.get('Action', [])) for s in role_policies), "Legal hold permissions should not be granted"
+    print("  [OK] IAM Role: Least-privilege actions, prefix scoping, no legal-hold, and explicit deletion denial validated")
+
+    # 5b. Auditor Role Validation
+    audit_role = resources.get('SpineAuditVerificationRole')
+    assert audit_role, "SpineAuditVerificationRole missing"
+    assert audit_role['Type'] == 'AWS::IAM::Role'
+    audit_policies = audit_role['Properties']['Policies'][0]['PolicyDocument']['Statement']
+    assert any('s3:DeleteObject' in s.get('Action', []) and s.get('Effect') == 'Allow' for s in audit_policies), "Auditor must have s3:DeleteObject allowed to test Object Lock"
+    assert not any('BypassGovernanceRetention' in str(s.get('Action', [])) for s in audit_policies), "Auditor must not bypass retention"
+    print("  [OK] Auditor Role: DeleteObject allowed without retention bypass to prove S3 WORM enforcement")
 
     # 6. Outputs reference check
     for o_name, o_body in outputs.items():
