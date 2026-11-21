@@ -1,6 +1,5 @@
 use super::middleware::AppState;
 use crate::auth::pat::hash_pat;
-use crate::auth::session::hash_session_token;
 use crate::core::error::ForgeError;
 use crate::core::types::User;
 use axum::{
@@ -32,13 +31,15 @@ pub struct ReleaseMaintenanceResponse {
 }
 
 /// Helper to authenticate an administrative caller.
-/// Supports:
+/// Requires either:
 /// 1. Direct configured SPINE_ADMIN_TOKEN or SPINE_ADMIN_TOKEN_FILE match.
-/// 2. Valid authenticated User session or PAT whose username is 'admin' or has administrative rights.
+/// 2. Valid active Personal Access Token (PAT) with explicit "admin", "system:admin", or "*" scope.
+///
+/// Plain usernames (such as "admin", "admin-dev", or "notadmin") do NOT grant administrative access.
 async fn verify_admin_auth(
     state: &AppState,
     headers: &HeaderMap,
-    caller: Option<&User>,
+    _caller: Option<&User>,
 ) -> Result<(), ForgeError> {
     let auth_header = headers
         .get(header::AUTHORIZATION)
@@ -50,7 +51,7 @@ async fn verify_admin_auth(
         .map(|s| s.trim())
         .unwrap_or("");
 
-    // 1. Check direct SPINE_ADMIN_TOKEN / SPINE_ADMIN_TOKEN_FILE
+    // 1. Check direct configured SPINE_ADMIN_TOKEN / SPINE_ADMIN_TOKEN_FILE
     let env_token = std::env::var("SPINE_ADMIN_TOKEN")
         .or_else(|_| std::env::var("ADMIN_TOKEN"))
         .ok();
@@ -65,36 +66,19 @@ async fn verify_admin_auth(
         }
     }
 
-    // 2. Check resolved user from auth_middleware
-    if let Some(user) = caller {
-        if user.username.to_lowercase().contains("admin") {
-            return Ok(());
-        }
-    }
-
-    // 3. Fallback: check raw_token against database PATs or Sessions directly if not already resolved
-    if !raw_token.is_empty() {
+    // 2. Check database Personal Access Token with explicit admin scope
+    if !raw_token.is_empty() && (raw_token.starts_with("sp_pat_") || raw_token.starts_with("spine_pat_")) {
         let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        if raw_token.starts_with("sp_pat_") || raw_token.starts_with("spine_pat_") {
-            let p_hash = hash_pat(raw_token);
-            if let Ok(Some(pat)) = state.db.get_pat_by_hash(&p_hash).await {
-                if !pat.revoked && pat.expires_at_nanos >= now {
-                    if pat.scopes.iter().any(|s| s == "admin" || s == "*") {
-                        return Ok(());
-                    }
+        let p_hash = hash_pat(raw_token);
+        if let Ok(Some(pat)) = state.db.get_pat_by_hash(&p_hash).await {
+            if !pat.revoked && pat.expires_at_nanos >= now {
+                let has_admin_scope = pat
+                    .scopes
+                    .iter()
+                    .any(|s| s == "admin" || s == "system:admin" || s == "*");
+                if has_admin_scope {
                     if let Ok(Some(u)) = state.db.get_user_by_id(&pat.user_id).await {
-                        if u.username.to_lowercase().contains("admin") {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-        } else {
-            let s_hash = hash_session_token(raw_token);
-            if let Ok(Some(sess)) = state.db.get_session_by_hash(&s_hash).await {
-                if !sess.revoked && sess.expires_at_nanos >= now {
-                    if let Ok(Some(u)) = state.db.get_user_by_id(&sess.user_id).await {
-                        if u.username.to_lowercase().contains("admin") {
+                        if u.account_status.to_uppercase() == "ACTIVE" {
                             return Ok(());
                         }
                     }
@@ -104,7 +88,8 @@ async fn verify_admin_auth(
     }
 
     Err(ForgeError::Unauthorized(
-        "Administrative authorization required".into(),
+        "Administrative authorization required: valid admin credential or PAT with 'admin' scope required"
+            .into(),
     ))
 }
 
@@ -147,7 +132,8 @@ pub async fn acquire_maintenance(
     let owner_token = guard.owner_token().to_string();
     let lease_expires_at_nanos = guard.current_lease_expiry();
 
-    // Propagate generation and maintenance state to consensus coordinator
+    // 1. Propagate generation and maintenance state to consensus coordinator
+    let mut coordinator_entered = false;
     if let Some(coord) = &state.coordinator {
         if let Err(e) = coord.enter_maintenance(fencing_generation).await {
             tracing::error!(
@@ -155,27 +141,41 @@ pub async fn acquire_maintenance(
                 fencing_generation,
                 e
             );
-            // Release local barrier before failing
             let _ = guard.release().await;
             return Err(ForgeError::Internal(format!(
                 "Coordinator failed to enter maintenance: {}",
                 e
             )));
         }
+        coordinator_entered = true;
     }
 
-    // Propagate generation and maintenance state to storage nodes
+    // 2. Propagate generation and maintenance state to storage nodes, tracking entered nodes for rollback
+    let mut entered_storage_nodes: Vec<(String, String)> = Vec::new();
     for (node_id, node_addr) in &state.storage_nodes {
         let client = crate::ClusterNodeClient::new(node_addr.clone());
         if let Err(e) = client.enter_maintenance(fencing_generation).await {
             tracing::error!(
-                "Storage node {} ({}) failed to enter maintenance: {}",
+                "Storage node {} ({}) failed to enter maintenance: {}. Compensating entered participants...",
                 node_id,
                 node_addr,
                 e
             );
-            if let Some(coord) = &state.coordinator {
-                let _ = coord.exit_maintenance(fencing_generation).await;
+            // Roll back all previously entered storage nodes
+            for (rollback_id, rollback_addr) in entered_storage_nodes.iter().rev() {
+                let rb_client = crate::ClusterNodeClient::new(rollback_addr.clone());
+                if let Err(rb_err) = rb_client.exit_maintenance(fencing_generation).await {
+                    tracing::error!(
+                        "Failed to compensate/exit storage node {} ({}) during rollback: {}",
+                        rollback_id, rollback_addr, rb_err
+                    );
+                }
+            }
+            // Roll back coordinator
+            if coordinator_entered {
+                if let Some(coord) = &state.coordinator {
+                    let _ = coord.exit_maintenance(fencing_generation).await;
+                }
             }
             let _ = guard.release().await;
             return Err(ForgeError::Internal(format!(
@@ -183,9 +183,11 @@ pub async fn acquire_maintenance(
                 node_id, e
             )));
         }
+        entered_storage_nodes.push((node_id.clone(), node_addr.clone()));
     }
 
-    // Synchronize generation token to database and storage root so cluster participants remain unanimous
+    // 3. Synchronize generation token to database and storage root so cluster participants remain unanimous.
+    // If generation persistence fails, fail closed: compensate all entered participants and abort acquisition.
     if let Some(pool) = state.consistency_barrier.pool() {
         if let Err(e) = crate::backup::journal::RestoreJournal::record_db_generation(
             pool,
@@ -194,14 +196,48 @@ pub async fn acquire_maintenance(
         )
         .await
         {
-            tracing::warn!("Failed to record advanced fencing generation in _restore_generation: {}", e);
+            tracing::error!(
+                "Failed to record advanced fencing generation in database: {}. Compensating entered participants...",
+                e
+            );
+            for (_rollback_id, rollback_addr) in entered_storage_nodes.iter().rev() {
+                let rb_client = crate::ClusterNodeClient::new(rollback_addr.clone());
+                let _ = rb_client.exit_maintenance(fencing_generation).await;
+            }
+            if coordinator_entered {
+                if let Some(coord) = &state.coordinator {
+                    let _ = coord.exit_maintenance(fencing_generation).await;
+                }
+            }
+            let _ = guard.release().await;
+            return Err(ForgeError::Internal(format!(
+                "Database fencing generation persistence failed: {}",
+                e
+            )));
         }
     }
     if let Err(e) = crate::backup::journal::RestoreJournal::write_storage_generation(
         state.storage_root(),
         &fencing_generation.to_string(),
     ) {
-        tracing::warn!("Failed to record advanced fencing generation in storage root: {}", e);
+        tracing::error!(
+            "Failed to record advanced fencing generation in storage root: {}. Compensating entered participants...",
+            e
+        );
+        for (_rollback_id, rollback_addr) in entered_storage_nodes.iter().rev() {
+            let rb_client = crate::ClusterNodeClient::new(rollback_addr.clone());
+            let _ = rb_client.exit_maintenance(fencing_generation).await;
+        }
+        if coordinator_entered {
+            if let Some(coord) = &state.coordinator {
+                let _ = coord.exit_maintenance(fencing_generation).await;
+            }
+        }
+        let _ = guard.release().await;
+        return Err(ForgeError::Internal(format!(
+            "Storage root fencing generation persistence failed: {}",
+            e
+        )));
     }
 
     *active_lock = Some(guard);
@@ -243,14 +279,17 @@ pub async fn release_maintenance(
         state.consistency_barrier.current_fencing_generation()
     };
 
+    let mut participant_errors = Vec::new();
+
     // Propagate release to consensus coordinator
     if let Some(coord) = &state.coordinator {
         if let Err(e) = coord.exit_maintenance(fencing_gen).await {
-            tracing::warn!(
+            tracing::error!(
                 "Coordinator failed to exit maintenance at generation {}: {}",
                 fencing_gen,
                 e
             );
+            participant_errors.push(format!("Coordinator exit failed: {}", e));
         }
     }
 
@@ -258,13 +297,21 @@ pub async fn release_maintenance(
     for (node_id, node_addr) in &state.storage_nodes {
         let client = crate::ClusterNodeClient::new(node_addr.clone());
         if let Err(e) = client.exit_maintenance(fencing_gen).await {
-            tracing::warn!(
+            tracing::error!(
                 "Storage node {} ({}) failed to exit maintenance: {}",
                 node_id,
                 node_addr,
                 e
             );
+            participant_errors.push(format!("Storage node {} exit failed: {}", node_id, e));
         }
+    }
+
+    if !participant_errors.is_empty() {
+        return Err(ForgeError::ServiceUnavailable(format!(
+            "Cluster maintenance release failed or degraded: participants failed to exit maintenance [{}]",
+            participant_errors.join("; ")
+        )));
     }
 
     tracing::info!(

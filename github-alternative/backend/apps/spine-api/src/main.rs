@@ -101,10 +101,36 @@ enum Commands {
         #[arg(long)]
         token_out_file: Option<PathBuf>,
 
+        /// Path to file to write generated administrative initial password
+        #[arg(long)]
+        password_out_file: Option<PathBuf>,
+
         /// Use in-memory database (for testing)
         #[arg(long, default_value_t = false)]
         in_memory_db: bool,
     },
+
+    /// Rotate administrative personal access token securely
+    RotateAdminToken {
+        /// Administrator username
+        #[arg(short, long)]
+        username: String,
+
+        /// Path to file containing PostgreSQL Database URL
+        #[arg(long)]
+        database_url_file: Option<PathBuf>,
+
+        /// Deployment profile
+        #[arg(long)]
+        profile: Option<String>,
+
+        /// Path to file to write rotated administrative token
+        #[arg(long)]
+        token_out_file: PathBuf,
+    },
+
+    /// Compute cryptographic BLAKE3 hash of a token from stdin
+    HashToken,
 
     /// Coordinated backup and disaster recovery commands
     Backup {
@@ -478,6 +504,7 @@ async fn main() -> anyhow::Result<()> {
             database_url_file,
             profile,
             token_out_file,
+            password_out_file,
             in_memory_db,
         }) => {
             let raw_prof = profile
@@ -607,12 +634,34 @@ async fn main() -> anyhow::Result<()> {
             let target_token_file = token_out_file.or_else(|| {
                 std::env::var("SPINE_ADMIN_TOKEN_FILE").ok().map(PathBuf::from)
             });
+            let mut resolved_password_file = password_out_file.or_else(|| {
+                std::env::var("SPINE_ADMIN_PASSWORD_FILE").ok().map(PathBuf::from)
+            });
+            if resolved_password_file.is_none() {
+                if let Some(ref tp) = target_token_file {
+                    resolved_password_file = Some(tp.with_file_name("admin_password"));
+                }
+            }
+
+            let is_file_delivery = target_token_file.is_some() || resolved_password_file.is_some();
 
             if let Some(ref path) = target_token_file {
                 if let Some(parent) = path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
                 std::fs::write(path, &raw_admin_token)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                }
+            }
+
+            if let Some(ref path) = resolved_password_file {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                std::fs::write(path, &raw_password)?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
@@ -647,20 +696,115 @@ async fn main() -> anyhow::Result<()> {
             );
             println!("Administrator account bootstrapped successfully.");
             println!();
-            println!("  User ID:      {}", user_id);
-            println!("  Username:     {}", username);
-            println!("  Email:        {}", email);
-            println!("  Password:     {}", raw_password);
-            println!("  Admin Token:  {}", raw_admin_token);
+            println!("  User ID:       {}", user_id);
+            println!("  Username:      {}", username);
+            println!("  Email:         {}", email);
+            if is_file_delivery {
+                println!("  Password:      [SECURELY WRITTEN TO FILE - SUPPRESSED FROM STDOUT]");
+                println!("  Admin Token:   [SECURELY WRITTEN TO FILE - SUPPRESSED FROM STDOUT]");
+            } else {
+                println!("  Password:      {}", raw_password);
+                println!("  Admin Token:   {}", raw_admin_token);
+            }
             if let Some(ref p) = target_token_file {
-                println!("  Token File:   {:?}", p);
+                println!("  Token File:    {:?}", p);
+            }
+            if let Some(ref p) = resolved_password_file {
+                println!("  Password File: {:?}", p);
             }
             println!();
-            println!("CRITICAL: Save this temporary generated password & token securely now.");
-            println!("They will NOT be displayed again and bootstrap cannot be re-executed.");
+            if is_file_delivery {
+                println!("CRITICAL: Administrative credentials written to protected output files.");
+                println!("Verify file permissions (0600) and intake securely.");
+            } else {
+                println!("CRITICAL: Save this temporary generated password & token securely now.");
+                println!("They will NOT be displayed again and bootstrap cannot be re-executed.");
+            }
             println!(
                 "================================================================================"
             );
+            Ok(())
+        }
+        Some(Commands::RotateAdminToken {
+            username,
+            database_url_file,
+            profile,
+            token_out_file,
+        }) => {
+            let raw_prof = profile
+                .or_else(|| std::env::var("SPINE_DEPLOYMENT_PROFILE").ok())
+                .unwrap_or_else(|| "core-forge-v1".to_string());
+            let prof = spine_api::DeploymentProfile::from_str_relaxed(&raw_prof)
+                .map_err(|e| anyhow::anyhow!(e))?;
+
+            let db_url = resolve_postgres_url(
+                None,
+                database_url_file.as_deref(),
+                &["DATABASE_URL", "SPINE_DATABASE_URL"],
+                Some("POSTGRES_APP_USER"),
+                Some("POSTGRES_APP_PASSWORD"),
+                Some("POSTGRES_APP_PASSWORD_FILE"),
+            )?;
+
+            let db: Arc<dyn Database> = if prof.requires_persistent_database() {
+                let active_url = db_url.ok_or_else(|| {
+                    anyhow::anyhow!("PostgreSQL DATABASE_URL required for profile '{}'", prof)
+                })?;
+                Arc::new(PgDatabase::connect(&active_url).await?)
+            } else {
+                anyhow::bail!("RotateAdminToken requires a persistent database");
+            };
+
+            let user = db
+                .get_user_by_username(&username)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("User '{}' not found", username))?;
+
+            // Revoke all existing tokens for this user
+            let pats = db.list_user_pats(&user.id).await?;
+            for pat in pats {
+                let _ = db.revoke_pat(&pat.id, &user.id).await;
+            }
+
+            let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+            let raw_admin_token = format!("sp_pat_{}", uuid::Uuid::new_v4().simple());
+            let pat = PersonalAccessToken {
+                id: format!("pat_{}", uuid::Uuid::new_v4().simple()),
+                user_id: user.id.clone(),
+                name: "rotated-admin-token".to_string(),
+                token_hash: spine_api::auth::pat::hash_pat(&raw_admin_token),
+                scopes: vec!["admin".to_string(), "repo".to_string(), "write".to_string()],
+                expires_at_nanos: i64::MAX,
+                created_at_nanos: now,
+                last_used_at_nanos: None,
+                revoked: false,
+            };
+            db.create_pat(pat).await?;
+
+            if let Some(parent) = token_out_file.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(&token_out_file, &raw_admin_token)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&token_out_file, std::fs::Permissions::from_mode(0o600));
+            }
+
+            println!(
+                "Admin token successfully rotated for user '{}'. Token securely written to '{}'. [SECRET SUPPRESSED FROM STDOUT]",
+                username,
+                token_out_file.display()
+            );
+            Ok(())
+        }
+        Some(Commands::HashToken) => {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            let trimmed = buf.trim();
+            let hash = spine_api::auth::pat::hash_pat(trimmed);
+            println!("{}", hash);
             Ok(())
         }
         Some(Commands::Backup { action }) => match action {
