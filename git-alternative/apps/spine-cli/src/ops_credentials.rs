@@ -59,6 +59,7 @@ impl Default for WindowsCredentialStorage {
     }
 }
 
+#[cfg(windows)]
 impl WindowsCredentialStorage {
     pub fn new() -> Self {
         Self

@@ -662,7 +662,7 @@ echo "Starting fresh PostgreSQL container..."
 
 echo "Awaiting PostgreSQL readiness..."
 READY_PG=0
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
   if "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T postgres pg_isready -U "${POSTGRES_ADMIN_USER}" >/dev/null 2>&1; then
     READY_PG=1
     break

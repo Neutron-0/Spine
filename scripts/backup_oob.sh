@@ -464,7 +464,7 @@ echo "Maintenance barrier acquired: status=${ACQUIRE_STATUS}, fencing_generation
 echo "Awaiting writer drain..."
 DRAINED=0
 API_GENERATION=""
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
   DIAG=$(curl -s -f "${SPINE_API_URL}/health/diagnostics")
   WRITERS=$(echo "${DIAG}" | grep -o '"active_writers":[0-9]*' | cut -d: -f2 || echo "999")
   IN_MAINT=$(echo "${DIAG}" | grep -o '"in_maintenance":true' || echo "")
