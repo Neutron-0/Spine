@@ -3,7 +3,7 @@ use rand::Rng;
 use spine_api::{
     auth::{hash_password, DevMailCatcher, RateLimiter},
     build_router,
-    core::types::{AuditEvent, User},
+    core::types::{AuditEvent, PersonalAccessToken, User},
     AppState, ArtifactService, CargoRegistryAdapter, CoordinatorClient, Database, InMemoryDatabase,
     IsolatedRunnerExecutor, NativeVcsService, PackageService, PermissionService, PgDatabase,
     ProvisioningWorker, ReleaseService, RepositoryService, RunnerService, SsrfValidator,
@@ -96,6 +96,10 @@ enum Commands {
         /// Deployment profile
         #[arg(long)]
         profile: Option<String>,
+
+        /// Path to file to write generated administrative token
+        #[arg(long)]
+        token_out_file: Option<PathBuf>,
 
         /// Use in-memory database (for testing)
         #[arg(long, default_value_t = false)]
@@ -473,6 +477,7 @@ async fn main() -> anyhow::Result<()> {
             email,
             database_url_file,
             profile,
+            token_out_file,
             in_memory_db,
         }) => {
             let raw_prof = profile
@@ -585,6 +590,36 @@ async fn main() -> anyhow::Result<()> {
 
             db.create_user(admin_user).await?;
 
+            let raw_admin_token = format!("sp_pat_{}", uuid::Uuid::new_v4().simple());
+            let pat = PersonalAccessToken {
+                id: format!("pat_{}", uuid::Uuid::new_v4().simple()),
+                user_id: user_id.clone(),
+                name: "bootstrap-admin-token".to_string(),
+                token_hash: spine_api::auth::pat::hash_pat(&raw_admin_token),
+                scopes: vec!["admin".to_string(), "repo".to_string(), "write".to_string()],
+                expires_at_nanos: i64::MAX,
+                created_at_nanos: now,
+                last_used_at_nanos: None,
+                revoked: false,
+            };
+            db.create_pat(pat).await?;
+
+            let target_token_file = token_out_file.or_else(|| {
+                std::env::var("SPINE_ADMIN_TOKEN_FILE").ok().map(PathBuf::from)
+            });
+
+            if let Some(ref path) = target_token_file {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                std::fs::write(path, &raw_admin_token)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                }
+            }
+
             let audit = AuditEvent {
                 id: 0,
                 user_id: Some(user_id.clone()),
@@ -612,13 +647,17 @@ async fn main() -> anyhow::Result<()> {
             );
             println!("Administrator account bootstrapped successfully.");
             println!();
-            println!("  User ID:   {}", user_id);
-            println!("  Username:  {}", username);
-            println!("  Email:     {}", email);
-            println!("  Password:  {}", raw_password);
+            println!("  User ID:      {}", user_id);
+            println!("  Username:     {}", username);
+            println!("  Email:        {}", email);
+            println!("  Password:     {}", raw_password);
+            println!("  Admin Token:  {}", raw_admin_token);
+            if let Some(ref p) = target_token_file {
+                println!("  Token File:   {:?}", p);
+            }
             println!();
-            println!("CRITICAL: Save this temporary generated password securely now.");
-            println!("It will NOT be displayed again and bootstrap cannot be re-executed.");
+            println!("CRITICAL: Save this temporary generated password & token securely now.");
+            println!("They will NOT be displayed again and bootstrap cannot be re-executed.");
             println!(
                 "================================================================================"
             );
@@ -2550,6 +2589,7 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
         public_origin,
         consistency_barrier: Arc::clone(&consistency_barrier),
         storage_nodes,
+        active_maintenance: Arc::new(tokio::sync::Mutex::new(None)),
     };
 
     // 4. Spawn background workers

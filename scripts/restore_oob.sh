@@ -5,6 +5,7 @@
 # ==============================================================================
 set -euo pipefail
 umask 077
+export MSYS_NO_PATHCONV=1
 
 BACKUP_DIR=""
 ENCRYPTED_FILE=""
@@ -101,6 +102,14 @@ fi
 # State variables for cleanup and rollback handling
 RESTORE_SUCCESS=0
 VOLUMES_MODIFIED=0
+to_host_mount_path() {
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -w "$1"
+  else
+    printf "%s" "$1"
+  fi
+}
+
 DECRYPT_DIR=""
 ROLLBACK_DIR=""
 REMOTE_RESTORE_DIR=""
@@ -109,8 +118,10 @@ encrypt_stream() {
   if command -v spine-api >/dev/null 2>&1; then
     spine-api backup encrypt --passphrase-file "${RESOLVED_PASSPHRASE_FILE}" --input - --output -
   else
+    local mount_pass_file
+    mount_pass_file=$(to_host_mount_path "${RESOLVED_PASSPHRASE_FILE}")
     docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps \
-      -v "${RESOLVED_PASSPHRASE_FILE}:/run/secrets/backup_passphrase:ro" spine-api \
+      -v "${mount_pass_file}:/run/secrets/backup_passphrase:ro" spine-api \
       backup encrypt --passphrase-file /run/secrets/backup_passphrase --input - --output -
   fi
 }
@@ -119,8 +130,10 @@ decrypt_stream() {
   if command -v spine-api >/dev/null 2>&1; then
     spine-api backup decrypt --passphrase-file "${RESOLVED_PASSPHRASE_FILE}" --input - --output -
   else
+    local mount_pass_file
+    mount_pass_file=$(to_host_mount_path "${RESOLVED_PASSPHRASE_FILE}")
     docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps \
-      -v "${RESOLVED_PASSPHRASE_FILE}:/run/secrets/backup_passphrase:ro" spine-api \
+      -v "${mount_pass_file}:/run/secrets/backup_passphrase:ro" spine-api \
       backup decrypt --passphrase-file /run/secrets/backup_passphrase --input - --output -
   fi
 }
@@ -410,8 +423,9 @@ if command -v spine-api >/dev/null 2>&1; then
 else
   # Decrypt through spine-api container via read-only mounted secret file.
   # Credentials are never passed in process arguments or container environment variables.
+  mount_pass_file=$(to_host_mount_path "${RESOLVED_PASSPHRASE_FILE}")
   if ! docker compose -f "${COMPOSE_FILE}" run --rm -i --no-deps \
-    -v "${RESOLVED_PASSPHRASE_FILE}:/run/secrets/backup_passphrase:ro" spine-api \
+    -v "${mount_pass_file}:/run/secrets/backup_passphrase:ro" spine-api \
     backup decrypt --passphrase-file /run/secrets/backup_passphrase --input - --output - < "${ENCRYPTED_FILE}" | tar -xzf - -C "${DECRYPT_DIR}"; then
     DECRYPT_FAILED=1
   fi

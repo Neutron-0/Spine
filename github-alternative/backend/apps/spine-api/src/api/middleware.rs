@@ -47,6 +47,7 @@ pub struct AppState {
     pub public_origin: String,
     pub consistency_barrier: Arc<crate::backup::ConsistencyBarrier>,
     pub storage_nodes: Vec<(String, String)>,
+    pub active_maintenance: Arc<tokio::sync::Mutex<Option<crate::backup::MaintenanceGuard>>>,
 }
 
 impl AppState {
@@ -176,6 +177,7 @@ impl AppState {
             public_origin,
             consistency_barrier,
             storage_nodes: Vec::new(),
+            active_maintenance: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 }

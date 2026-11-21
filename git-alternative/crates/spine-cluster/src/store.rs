@@ -505,7 +505,10 @@ impl CoordinatorStore for FileBackedCoordinatorStore {
                 node.capacity = heartbeat.capacity;
                 node.active_tasks = heartbeat.active_replication_tasks;
                 node.error_count = heartbeat.error_counter;
-                if node.status == NodeStatus::Suspect || node.status == NodeStatus::Joining {
+                if node.status == NodeStatus::Suspect
+                    || node.status == NodeStatus::Joining
+                    || node.status == NodeStatus::Offline
+                {
                     node.status = NodeStatus::Healthy;
                 }
             }

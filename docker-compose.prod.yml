@@ -24,7 +24,7 @@ services:
   # 1. Edge HTTPS Reverse Proxy / TLS Termination Gateway
   # ----------------------------------------------------------------------------
   ingress:
-    image: nginx:alpine
+    image: nginx:alpine@sha256:fb4658584bd9a916ffb6f6e365f97c25cfdb2923801f551ea08356e695f14ff7
     container_name: spine-edge-ingress
     restart: unless-stopped
     networks:
@@ -65,7 +65,7 @@ services:
   # 2. Database - PostgreSQL (No Host Port Exposure)
   # ----------------------------------------------------------------------------
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:1d5b02d3a9941fbd52437db4107f8c52d6297dac553ca1e5c299ebb3756b4857
     container_name: spine-forge-postgres
     restart: unless-stopped
     networks:
@@ -101,7 +101,7 @@ services:
   # 3. State Coordinator - Raft Consensus (No Host Port Exposure)
   # ----------------------------------------------------------------------------
   coordinator:
-    image: spine-coordinator:latest
+    image: spine-coordinator:v0.1.0-rc3
     build:
       context: .
       dockerfile: git-alternative/Dockerfile.coordinator
@@ -113,6 +113,7 @@ services:
       SPINE_BIND: "0.0.0.0"
       SPINE_COORDINATOR_PORT: "8400"
       SPINE_STORE_PATH: "/var/lib/spine/coordinator.state"
+      SPINE_STORAGE_NODES: "node-1=storage-node-1:8401:zone-a,node-2=storage-node-2:8401:zone-b,node-3=storage-node-3:8401:zone-c"
     volumes:
       - coordinator_data:/var/lib/spine
     read_only: true
@@ -132,7 +133,7 @@ services:
   # 4. Storage Nodes (No Host Port Exposure)
   # ----------------------------------------------------------------------------
   storage-node-1:
-    image: spine-storage-node:latest
+    image: spine-storage-node:v0.1.0-rc3
     build:
       context: .
       dockerfile: git-alternative/Dockerfile.storage-node
@@ -167,7 +168,7 @@ services:
       - ALL
 
   storage-node-2:
-    image: spine-storage-node:latest
+    image: spine-storage-node:v0.1.0-rc3
     build:
       context: .
       dockerfile: git-alternative/Dockerfile.storage-node
@@ -202,7 +203,7 @@ services:
       - ALL
 
   storage-node-3:
-    image: spine-storage-node:latest
+    image: spine-storage-node:v0.1.0-rc3
     build:
       context: .
       dockerfile: git-alternative/Dockerfile.storage-node
@@ -240,7 +241,7 @@ services:
   # 5. Core Application Server - Spine Forge API & Native SSH Daemon
   # ----------------------------------------------------------------------------
   spine-api:
-    image: spine-api:latest
+    image: spine-api:v0.1.0-rc3
     build:
       context: .
       dockerfile: github-alternative/backend/Dockerfile.api
@@ -250,9 +251,10 @@ services:
       - spine-internal
       - spine-ingress-proxy
       - spine-public
-    # Only SSH port is published to host; HTTP is routed exclusively via internal ingress
+    # Only SSH port is published to host; HTTP is routed via ingress and localhost loopback for OOB administration
     ports:
       - "2222:2222"
+      - "127.0.0.1:3000:3000"
     environment:
       BIND: "0.0.0.0"
       PORT: "3000"
@@ -272,6 +274,7 @@ services:
       STORAGE_NODE_ADDRS: "node-1=storage-node-1:8401,node-2=storage-node-2:8401,node-3=storage-node-3:8401"
       STORAGE_ROOT: "/var/lib/spine/storage"
       SPINE_STORAGE_ROOT: "/var/lib/spine/storage"
+      SPINE_ADMIN_TOKEN_FILE: "/var/lib/spine/storage/admin_token"
       SSH_DIR: "/var/lib/spine/ssh"
       FORGE_PUBLIC_ORIGIN: "${FORGE_PUBLIC_ORIGIN:?FORGE_PUBLIC_ORIGIN_required_must_be_https_URL}"
       SPINE_AUTH_SECRET_KEY: "${SPINE_AUTH_SECRET_KEY:?SPINE_AUTH_SECRET_KEY_required_min_32_chars}"
@@ -308,7 +311,7 @@ services:
   # 6. Web User Interface - Internal Static Asset Server
   # ----------------------------------------------------------------------------
   spine-frontend:
-    image: spine-frontend:latest
+    image: spine-frontend:v0.1.0-rc3
     build:
       context: github-alternative/frontend
       dockerfile: Dockerfile

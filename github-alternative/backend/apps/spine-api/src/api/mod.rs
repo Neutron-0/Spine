@@ -1,5 +1,6 @@
 pub mod middleware;
 pub mod routes_activity;
+pub mod routes_admin;
 pub mod routes_artifacts;
 pub mod routes_auth;
 pub mod routes_discovery;
@@ -68,6 +69,15 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/health/diagnostics",
             get(routes_health::health_diagnostics),
+        )
+        // Admin & Maintenance endpoints
+        .route(
+            "/api/v1/admin/maintenance/acquire",
+            post(routes_admin::acquire_maintenance),
+        )
+        .route(
+            "/api/v1/admin/maintenance/release",
+            post(routes_admin::release_maintenance),
         )
         // Auth endpoints
         .route("/api/v1/auth/register", post(routes_auth::register))

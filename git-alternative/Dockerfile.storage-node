@@ -1,10 +1,10 @@
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS builder
 RUN rustup toolchain install 1.89.0 && rustup default 1.89.0
 WORKDIR /usr/src/spine
 COPY git-alternative ./git-alternative
 RUN cargo build --release --manifest-path git-alternative/Cargo.toml -p spine-storage-node
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \

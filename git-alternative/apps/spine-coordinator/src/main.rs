@@ -188,6 +188,58 @@ async fn main() -> Result<()> {
     println!("Store Path:   {}", config.store_file.display());
     println!("===========================================================");
 
+    if let Ok(nodes_str) = std::env::var("SPINE_STORAGE_NODES")
+        .or_else(|_| std::env::var("STORAGE_NODES"))
+        .or_else(|_| std::env::var("STORAGE_NODE_ADDRS"))
+    {
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        for (i, part) in nodes_str.split(',').enumerate() {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let (node_id, rest) = match part.split_once('=') {
+                Some((id, r)) => (id.trim().to_string(), r.trim()),
+                None => (format!("node-{}", i + 1), part),
+            };
+            let (listen_addr, zone) = match rest.split_once(':') {
+                Some((host, port_and_zone)) => {
+                    match port_and_zone.split_once(':') {
+                        Some((port, z)) => (
+                            format!("{}:{}", host.trim(), port.trim()),
+                            z.trim().to_string(),
+                        ),
+                        None => (rest.to_string(), format!("zone-{}", (b'a' + (i % 26) as u8) as char)),
+                    }
+                }
+                None => (rest.to_string(), format!("zone-{}", (b'a' + (i % 26) as u8) as char)),
+            };
+
+            if store.get_node(&node_id)?.is_none() {
+                let mut info = spine_cluster::node::StorageNodeInfo::new(
+                    node_id.clone(),
+                    format!("pk-{}", node_id),
+                    format!("fp:{}", node_id),
+                    listen_addr.clone(),
+                    format!("/var/lib/spine/{}", node_id),
+                    spine_cluster::node::FailureDomain {
+                        region: "local".into(),
+                        zone,
+                        host: format!("host-{}", node_id),
+                    },
+                    107_374_182_400,
+                    now,
+                );
+                info.status = spine_cluster::node::NodeStatus::Healthy;
+                store.register_node(info)?;
+                println!(
+                    "Coordinator seeded storage node '{}' ({}) into cluster state",
+                    node_id, listen_addr
+                );
+            }
+        }
+    }
+
     let server = server::CoordinatorServer::new(config.cluster_id, config.listen_addr, store);
     server.run().await?;
     Ok(())
