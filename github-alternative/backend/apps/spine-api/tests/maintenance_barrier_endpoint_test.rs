@@ -865,8 +865,10 @@ async fn test_barrier_ownership_and_unacquired_backup_cleanup_isolation() {
         script_path
     );
 
-    // Provide a temporary passphrase file for deterministic execution inside workspace
-    let temp_pass_file = workspace_root.join(".test_passphrase_barrier.tmp");
+    // Provide a temporary passphrase file in an isolated unique temporary directory
+    // so a failed test cannot leave any file in the workspace or repository.
+    let pass_temp_dir = tempfile::tempdir().expect("Failed to create temporary directory for passphrase");
+    let temp_pass_file = pass_temp_dir.path().join("backup_passphrase.txt");
     std::fs::write(
         &temp_pass_file,
         "test-backup-encryption-passphrase-at-least-32-chars-entropy!\n",
@@ -889,8 +891,10 @@ if [ ! -f "$P" ]; then
   if command -v wslpath >/dev/null 2>&1; then P=$(wslpath -u "$P"); elif command -v cygpath >/dev/null 2>&1; then P=$(cygpath -u "$P"); fi
 fi
 
-# Set up recording curl stub to log all curl invocations
-STUB_DIR=$(mktemp -d /tmp/curl_stub_XXXXXX 2>/dev/null || mktemp -d "${{TMPDIR:-/tmp}}/curl_stub_XXXXXX")
+# Set up temporary stub directory prepended to PATH
+STUB_DIR=$(mktemp -d /tmp/test_stubs_XXXXXX 2>/dev/null || mktemp -d "${{TMPDIR:-/tmp}}/test_stubs_XXXXXX")
+
+# 1. Recording curl stub to log all curl invocations
 CURL_LOG="${{STUB_DIR}}/curl_calls.log"
 touch "${{CURL_LOG}}"
 REAL_CURL=$(command -v curl || echo "/usr/bin/curl")
@@ -901,6 +905,27 @@ echo "\$@" >> "${{CURL_LOG}}"
 exec "${{REAL_CURL}}" "\$@"
 EOF
 chmod +x "${{STUB_DIR}}/curl"
+
+# 2. Recording docker and docker.exe stubs returning "daemon unavailable" for info
+DOCKER_LOG="${{STUB_DIR}}/docker_calls.log"
+touch "${{DOCKER_LOG}}"
+
+cat <<EOF > "${{STUB_DIR}}/docker"
+#!/usr/bin/env bash
+echo "\$@" >> "${{DOCKER_LOG}}"
+for arg in "\$@"; do
+  if [ "\$arg" = "info" ]; then
+    echo "daemon unavailable" >&2
+    exit 1
+  fi
+done
+echo "daemon unavailable" >&2
+exit 1
+EOF
+chmod +x "${{STUB_DIR}}/docker"
+cp "${{STUB_DIR}}/docker" "${{STUB_DIR}}/docker.exe"
+chmod +x "${{STUB_DIR}}/docker.exe"
+
 export PATH="${{STUB_DIR}}:${{PATH}}"
 
 export MSYS_NO_PATHCONV=1
@@ -920,6 +945,12 @@ set -e
 echo "=== RECORDED CURL CALLS START ===" >&2
 cat "${{CURL_LOG}}" >&2
 echo "=== RECORDED CURL CALLS END ===" >&2
+
+# Echo recorded docker calls into stderr for test assertions
+echo "=== RECORDED DOCKER CALLS START ===" >&2
+cat "${{DOCKER_LOG}}" >&2
+echo "=== RECORDED DOCKER CALLS END ===" >&2
+
 rm -rf "${{STUB_DIR}}"
 exit ${{EXIT_CODE}}
 "#,
@@ -940,8 +971,6 @@ exit ${{EXIT_CODE}}
     }
     let output = child.wait_with_output().expect("Failed to wait on bash child");
 
-    let _ = std::fs::remove_file(&temp_pass_file);
-
     assert!(
         !output.status.success(),
         "Production local-only backup must fail closed with exit code 1"
@@ -952,6 +981,29 @@ exit ${{EXIT_CODE}}
     assert!(
         stderr_str.contains("Local-only backup (SPINE_BACKUP_REQUIRE_REMOTE=0) is strictly FORBIDDEN"),
         "Stderr must contain policy rejection: {}",
+        stderr_str
+    );
+
+    // PROOF: Assert recording docker stub recorded info and returned daemon unavailable
+    assert!(
+        stderr_str.contains("=== RECORDED DOCKER CALLS START ==="),
+        "Docker stub output block must be present in stderr: {}",
+        stderr_str
+    );
+    assert!(
+        stderr_str.contains("info"),
+        "Docker stub must record info invocation: {}",
+        stderr_str
+    );
+    // Assert no real Docker command or mutation was reached
+    assert!(
+        !stderr_str.contains("compose"),
+        "No docker compose command must be reached: {}",
+        stderr_str
+    );
+    assert!(
+        !stderr_str.contains("exec"),
+        "No docker exec command must be reached: {}",
         stderr_str
     );
 
