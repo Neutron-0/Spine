@@ -1751,7 +1751,6 @@ async fn test_archive_publication_aborted_on_lock_loss() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn test_archive_streaming_aborted_on_lock_loss() {
     let tmp = tempfile::tempdir().unwrap();
     let storage_root = tmp.path().join("storage");
