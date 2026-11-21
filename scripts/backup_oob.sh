@@ -386,7 +386,6 @@ STAGING_DIR=""
 PLAINTEXT_TAR=""
 
 cleanup_backup() {
-  local exit_code=$?
   # Only release if this specific invocation successfully acquired the barrier
   # and has a verified owner token. Never attempt to release someone else's barrier.
   if [ "${BARRIER_ACQUIRED}" -eq 1 ] && [ "${RELEASED}" -eq 0 ] && [ -n "${SPINE_ADMIN_TOKEN:-}" ] && [ -n "${BARRIER_OWNER_TOKEN:-}" ]; then
@@ -737,10 +736,8 @@ if [ -n "${SPINE_BACKUP_REMOTE_S3_URI}" ]; then
   if [ "${NO_SCHEME}" != "${S3_BUCKET}" ]; then
     S3_PREFIX="${NO_SCHEME#*/}"
     S3_KEY="${S3_PREFIX}/backup.spnebak"
-    S3_MANIFEST_KEY="${S3_PREFIX}/SHA256SUMS"
   else
     S3_KEY="backup.spnebak"
-    S3_MANIFEST_KEY="SHA256SUMS"
   fi
 
   echo "Uploading backup.spnebak to ${REMOTE_TARGET}/backup.spnebak..."
@@ -891,7 +888,7 @@ fi
 # Verify health
 echo "Awaiting cluster ready state..."
 READY=0
-for i in $(seq 1 15); do
+for _ in $(seq 1 15); do
   if curl -s -f "${SPINE_API_URL}/health/ready" > /dev/null; then
     READY=1
     break

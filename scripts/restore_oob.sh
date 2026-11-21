@@ -166,8 +166,6 @@ decrypt_stream() {
 }
 
 restore_cleanup() {
-  local exit_code=$?
-
   # 1. Clean up temporary remote download staging directory on every exit path (success, failure, signal)
   if [ -n "${REMOTE_RESTORE_DIR:-}" ] && [ -e "${REMOTE_RESTORE_DIR}" ]; then
     echo "Purging temporary remote download staging directory: ${REMOTE_RESTORE_DIR}..." >&2
@@ -636,7 +634,7 @@ if [ ${FAILED} -ne 0 ]; then
   echo "1. Re-verify the source backup directory: ${BACKUP_DIR}" >&2
   echo "2. Re-extract the specific diverged volume from the verified archive." >&2
   echo "3. If at least 2 of 3 storage nodes and coordinator match, run anti-entropy repair:" >&2
-  echo "   "${DOCKER_BIN}" compose -f ${COMPOSE_FILE} run --rm coordinator \\" >&2
+  echo "   ${DOCKER_BIN} compose -f ${COMPOSE_FILE} run --rm coordinator \\" >&2
   echo "     repair-generation --expected-gen ${TARGET_GEN}" >&2
   echo "   (or flag syntax: --repair-generation --expected-gen ${TARGET_GEN})" >&2
   echo "4. Otherwise, abort and fall back to the previous verified backup." >&2
@@ -740,7 +738,7 @@ echo "Starting API, frontend, and ingress..."
 echo "=== Step 7: Readiness Health Check & Rollback Purge Gate ==="
 sleep 3
 READY_APP=0
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
   if curl -s -f http://127.0.0.1:3000/health/ready > /dev/null 2>&1; then
     READY_APP=1
     break
