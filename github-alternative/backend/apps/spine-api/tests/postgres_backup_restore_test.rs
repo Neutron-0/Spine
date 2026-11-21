@@ -51,6 +51,8 @@ async fn test_postgres_dump_and_empty_check() {
         "Error message must specify non-empty database rejection: {}",
         err_str
     );
+
+    disp_db.cleanup().await.unwrap();
 }
 
 #[tokio::test]
@@ -136,6 +138,8 @@ async fn test_full_archive_backup_restore_roundtrip_with_db_snapshot() {
             || extracted_json.contains("\"version\":\"2.0\""),
         "Extracted snapshot must contain version 3.0 or 2.0"
     );
+
+    disp_db.cleanup().await.unwrap();
 }
 
 #[tokio::test]
@@ -239,6 +243,9 @@ async fn test_postgres_jsonb_numeric_precision_roundtrip() {
         row.0, exact_token,
         "Restored JSONB numeric value MUST match exact token without precision loss"
     );
+
+    src_disp_db.cleanup().await.unwrap();
+    target_disp_db.cleanup().await.unwrap();
 }
 
 #[tokio::test]
@@ -275,4 +282,6 @@ async fn test_spine_app_least_privilege_schema_create_rejected() {
         "PostgreSQL error must be permission denied / 42501: {}",
         err_str
     );
+
+    disp_db.cleanup().await.unwrap();
 }

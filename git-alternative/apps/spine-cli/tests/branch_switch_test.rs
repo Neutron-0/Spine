@@ -3,10 +3,17 @@ use std::process::Command;
 use tempfile::tempdir;
 
 fn spine_bin() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_spine") {
+        return std::path::PathBuf::from(p);
+    }
     let mut path = std::env::current_exe().expect("failed to get current test exe");
     path.pop(); // deps
     path.pop(); // debug
-    path.join("spine.exe")
+    if cfg!(windows) {
+        path.join("spine.exe")
+    } else {
+        path.join("spine")
+    }
 }
 
 fn run_spine(cwd: &std::path::Path, args: &[&str]) -> (bool, String, String) {

@@ -87,4 +87,6 @@ async fn test_spine_app_role_has_no_superuser_privileges() {
         "spine_app must have SELECT permissions on application tables: {:?}",
         test_user_query.err()
     );
+
+    disp_db.cleanup().await.unwrap();
 }
