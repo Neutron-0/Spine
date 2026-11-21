@@ -74,7 +74,7 @@ def validate_template(filepath):
     
     role_policies = role['Properties']['Policies'][0]['PolicyDocument']['Statement']
     assert any(s.get('Sid') == 'ExplicitDenyDeletionsDuringRetention' and s.get('Effect') == 'Deny' for s in role_policies)
-    assert any(s.get('Sid') == 'BucketMetadata' and s.get('Effect') == 'Allow' for s in role_policies)
+    assert any(s.get('Sid') == 'BucketMetadata' and 's3:GetBucketObjectLockConfiguration' in s.get('Action') for s in role_policies)
     assert any(s.get('Sid') == 'ListBackupsPrefixOnly' and s.get('Effect') == 'Allow' for s in role_policies)
     assert any(s.get('Sid') == 'BackupWriteAndRead' and s.get('Effect') == 'Allow' for s in role_policies)
     print("  [OK] IAM Role: Least-privilege actions, prefix scoping, and explicit deletion denial validated")
