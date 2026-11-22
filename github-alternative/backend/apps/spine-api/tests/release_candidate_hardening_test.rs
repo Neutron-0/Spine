@@ -1,3 +1,5 @@
+mod common;
+
 use spine_api::backup::consistency::ConsistencyBarrier;
 use spine_api::backup::journal::{CommitDecisionRecord, RestoreJournal, RestorePhase};
 use spine_api::backup::{
@@ -1469,17 +1471,9 @@ async fn test_live_coordinator_and_storage_node_processes_restore_and_restart() 
     use spine_api::coordinator::{ClusterNodeClient, CoordinatorClient};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Command, Stdio};
 
-    struct ChildGuard(Vec<Child>);
-    impl Drop for ChildGuard {
-        fn drop(&mut self) {
-            for c in &mut self.0 {
-                let _ = c.kill();
-                let _ = c.wait();
-            }
-        }
-    }
+    use common::TestChildGuard as ChildGuard;
 
     fn find_cluster_binary(name: &str) -> PathBuf {
         use sha2::{Digest, Sha256};
@@ -1630,7 +1624,7 @@ async fn test_live_coordinator_and_storage_node_processes_restore_and_restart() 
             .expect("spawn spine-storage-node")
     };
 
-    let mut guards = ChildGuard(vec![
+    let mut guards = ChildGuard::new(vec![
         spawn_coord(&coord_addr),
         spawn_node("node-1", &n1_addr, &n1_dir),
         spawn_node("node-2", &n2_addr, &n2_dir),
@@ -1690,9 +1684,7 @@ async fn test_live_coordinator_and_storage_node_processes_restore_and_restart() 
         .await
         .unwrap();
     n1_client.commit_restore("snap_live_n1", 10).await.unwrap();
-    let _ = guards.0[1].kill();
-    let _ = guards.0[1].wait();
-    guards.0[1] = spawn_node("node-1", &n1_addr, &n1_dir);
+    guards.replace(1, spawn_node("node-1", &n1_addr, &n1_dir));
     wait_for_node(&n1_addr).await;
 
     // Persist Committed restore journal and execute startup cluster recovery across live processes

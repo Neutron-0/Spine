@@ -16,6 +16,14 @@ if command -v spine-api >/dev/null 2>&1; then
   SPINE_API_BIN="spine-api"
 elif command -v spine-api.exe >/dev/null 2>&1; then
   SPINE_API_BIN="spine-api.exe"
+elif [ -x "./target/release-candidate/spine-api.exe" ]; then
+  SPINE_API_BIN="./target/release-candidate/spine-api.exe"
+elif [ -x "./target/release-candidate/spine-api" ]; then
+  SPINE_API_BIN="./target/release-candidate/spine-api"
+elif [ -x "./github-alternative/backend/target/release/spine-api.exe" ]; then
+  SPINE_API_BIN="./github-alternative/backend/target/release/spine-api.exe"
+elif [ -x "./github-alternative/backend/target/release/spine-api" ]; then
+  SPINE_API_BIN="./github-alternative/backend/target/release/spine-api"
 elif [ -x "./github-alternative/backend/target/debug/spine-api.exe" ]; then
   SPINE_API_BIN="./github-alternative/backend/target/debug/spine-api.exe"
 elif [ -x "./github-alternative/backend/target/debug/spine-api" ]; then
@@ -28,8 +36,15 @@ TARGET_INPUT="${1:-}"
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
 POSTGRES_ADMIN_USER="${POSTGRES_ADMIN_USER:-spine_admin}"
 POSTGRES_ADMIN_PASSWORD="${POSTGRES_ADMIN_PASSWORD:-}"
+POSTGRES_DB="${POSTGRES_DB:-spine_forge}"
 if [ -z "${POSTGRES_ADMIN_PASSWORD}" ] && [ -f .env ]; then
   POSTGRES_ADMIN_PASSWORD=$(grep -E "^POSTGRES_ADMIN_PASSWORD=" .env | head -n1 | cut -d'=' -f2- | tr -d '[:space:]"' || true)
+fi
+if [ "${POSTGRES_DB}" = "spine_forge" ] && [ -f .env ]; then
+  env_db=$(grep -E "^POSTGRES_DB=" .env | head -n1 | cut -d'=' -f2- | tr -d '[:space:]"' || true)
+  if [ -n "${env_db}" ]; then
+    POSTGRES_DB="${env_db}"
+  fi
 fi
 SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE:-}"
 SPINE_BACKUP_PASSPHRASE_FILE="${SPINE_BACKUP_PASSPHRASE_FILE:-}"
@@ -683,8 +698,8 @@ if [ -n "${POSTGRES_ADMIN_PASSWORD}" ]; then
 fi
 
 "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T "${PG_EXEC_ARGS[@]}" postgres psql -U "${POSTGRES_ADMIN_USER}" -d postgres -v ON_ERROR_STOP=1 \
-  -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'spine_forge' AND pid <> pg_backend_pid();" \
-  -c "DROP DATABASE IF EXISTS spine_forge;"
+  -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${POSTGRES_DB}' AND pid <> pg_backend_pid();" \
+  -c "DROP DATABASE IF EXISTS ${POSTGRES_DB};"
 
 # 3. Import dump with ON_ERROR_STOP=1, adapting CREATE ROLE statements to handle existing bootstrap roles idempotently
 echo "Importing PostgreSQL database from ${DECRYPT_DIR}/postgres_dump.sql.gz (with ON_ERROR_STOP=1)..."
@@ -697,18 +712,18 @@ gzip -dc "${DECRYPT_DIR}/postgres_dump.sql.gz" | \
 
 echo "Verifying restored PostgreSQL schema..."
 TABLE_COUNT=$("${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T "${PG_EXEC_ARGS[@]}" postgres \
-  psql -U "${POSTGRES_ADMIN_USER}" -d spine_forge -t -A -c \
+  psql -U "${POSTGRES_ADMIN_USER}" -d "${POSTGRES_DB}" -t -A -c \
   "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public';" 2>/dev/null || echo "0")
 
 if [ "${TABLE_COUNT}" -eq 0 ]; then
-  echo "FATAL: PostgreSQL restoration produced 0 tables in spine_forge public schema. Aborting." >&2
+  echo "FATAL: PostgreSQL restoration produced 0 tables in ${POSTGRES_DB} public schema. Aborting." >&2
   exit 1
 fi
-echo "PostgreSQL restoration verified (${TABLE_COUNT} public tables present in spine_forge)."
+echo "PostgreSQL restoration verified (${TABLE_COUNT} public tables present in ${POSTGRES_DB})."
 
 echo "Synchronizing PostgreSQL restore generation and barrier state to target generation ${TARGET_GEN}..."
 "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T "${PG_EXEC_ARGS[@]}" postgres \
-  psql -U "${POSTGRES_ADMIN_USER}" -d spine_forge -v ON_ERROR_STOP=1 -c "
+  psql -U "${POSTGRES_ADMIN_USER}" -d "${POSTGRES_DB}" -v ON_ERROR_STOP=1 -c "
     INSERT INTO _restore_generation (id, generation_token, backup_id, restored_at_nanos, status)
     VALUES (1, '${TARGET_GEN}', 'oob-restore-${TARGET_GEN}', (EXTRACT(EPOCH FROM NOW()) * 1000000000)::bigint, 'COMMITTED')
     ON CONFLICT (id) DO UPDATE SET

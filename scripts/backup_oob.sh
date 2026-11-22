@@ -623,6 +623,14 @@ if command -v spine-api >/dev/null 2>&1; then
   SPINE_API_BIN="spine-api"
 elif command -v spine-api.exe >/dev/null 2>&1; then
   SPINE_API_BIN="spine-api.exe"
+elif [ -x "./target/release-candidate/spine-api.exe" ]; then
+  SPINE_API_BIN="./target/release-candidate/spine-api.exe"
+elif [ -x "./target/release-candidate/spine-api" ]; then
+  SPINE_API_BIN="./target/release-candidate/spine-api"
+elif [ -x "./github-alternative/backend/target/release/spine-api.exe" ]; then
+  SPINE_API_BIN="./github-alternative/backend/target/release/spine-api.exe"
+elif [ -x "./github-alternative/backend/target/release/spine-api" ]; then
+  SPINE_API_BIN="./github-alternative/backend/target/release/spine-api"
 elif [ -x "./github-alternative/backend/target/debug/spine-api.exe" ]; then
   SPINE_API_BIN="./github-alternative/backend/target/debug/spine-api.exe"
 elif [ -x "./github-alternative/backend/target/debug/spine-api" ]; then

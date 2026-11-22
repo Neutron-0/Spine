@@ -402,3 +402,80 @@ fn require_safe_test_db_url_internal() -> Result<String, String> {
 
     Ok(trimmed.to_string())
 }
+
+/// Registers an active test-spawned child PID in `$SPINE_TEST_PID_DIR` for tracked cleanup.
+pub fn register_test_child(pid: u32) {
+    if let Ok(dir) = std::env::var("SPINE_TEST_PID_DIR") {
+        if !dir.trim().is_empty() {
+            let _ = std::fs::create_dir_all(&dir);
+            let pid_file = std::path::Path::new(&dir).join(format!("{}.pid", pid));
+            let _ = std::fs::write(pid_file, format!("{}\n", pid));
+        }
+    }
+}
+
+/// Unregisters a terminated test-spawned child PID from `$SPINE_TEST_PID_DIR`.
+pub fn unregister_test_child(pid: u32) {
+    if let Ok(dir) = std::env::var("SPINE_TEST_PID_DIR") {
+        if !dir.trim().is_empty() {
+            let pid_file = std::path::Path::new(&dir).join(format!("{}.pid", pid));
+            let _ = std::fs::remove_file(pid_file);
+        }
+    }
+}
+
+/// RAII Guard for test-spawned child processes with deterministic termination and PID tracking.
+pub struct TestChildGuard(pub Vec<std::process::Child>);
+
+impl TestChildGuard {
+    pub fn new(children: Vec<std::process::Child>) -> Self {
+        for c in &children {
+            register_test_child(c.id());
+        }
+        Self(children)
+    }
+
+    pub fn push(&mut self, child: std::process::Child) {
+        register_test_child(child.id());
+        self.0.push(child);
+    }
+
+    pub fn replace(&mut self, index: usize, child: std::process::Child) {
+        register_test_child(child.id());
+        if index < self.0.len() {
+            let mut old = std::mem::replace(&mut self.0[index], child);
+            let pid = old.id();
+            if let Err(e) = old.kill() {
+                if e.kind() != std::io::ErrorKind::InvalidInput {
+                    eprintln!("Warning: failed to kill replaced child PID {}: {}", pid, e);
+                }
+            }
+            if let Err(e) = old.wait() {
+                eprintln!(
+                    "Warning: failed to wait on replaced child PID {}: {}",
+                    pid, e
+                );
+            }
+            unregister_test_child(pid);
+        } else {
+            self.0.push(child);
+        }
+    }
+}
+
+impl Drop for TestChildGuard {
+    fn drop(&mut self) {
+        for c in &mut self.0 {
+            let pid = c.id();
+            if let Err(e) = c.kill() {
+                if e.kind() != std::io::ErrorKind::InvalidInput {
+                    eprintln!("Warning: failed to kill child PID {}: {}", pid, e);
+                }
+            }
+            if let Err(e) = c.wait() {
+                eprintln!("Warning: failed to wait on child PID {}: {}", pid, e);
+            }
+            unregister_test_child(pid);
+        }
+    }
+}

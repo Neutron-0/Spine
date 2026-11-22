@@ -173,6 +173,11 @@ jobs:
           cat PROVENANCE.txt
           cd -
 
+      - name: Setup PID Tracking Directory for Recovery Tests
+        run: |
+          mkdir -p "${{ github.workspace }}/target/test-pids"
+          echo "SPINE_TEST_PID_DIR=${{ github.workspace }}/target/test-pids" >> $GITHUB_ENV
+
       - name: Run Disposable DB Backup Cleanup Fault Injection Tests (Pure Database Tests)
         run: |
           for t in \
@@ -235,11 +240,57 @@ jobs:
       - name: Run Postgres Live Migrations and Lifecycle Tests
         run: cargo test --manifest-path github-alternative/backend/Cargo.toml --test postgres_live_test --jobs 2 -- --nocapture
 
-      - name: Post-Test Process Cleanup & Sweep
+      - name: Targeted Process Cleanup for Test-Spawned PIDs
         if: always()
         run: |
-          pkill -f spine-coordinator || true
-          pkill -f spine-storage-node || true
+          echo "=== Targeted Cleanup of Test-Spawned Child PIDs ==="
+          PID_DIR="${{ github.workspace }}/target/test-pids"
+          CLEANUP_FAILED=0
+          if [ -d "$PID_DIR" ] && [ -n "$(ls -A "$PID_DIR" 2>/dev/null)" ]; then
+            echo "Found active PID files in $PID_DIR:"
+            ls -l "$PID_DIR"
+            for pid_file in "$PID_DIR"/*.pid; do
+              [ -f "$pid_file" ] || continue
+              pid=$(cat "$pid_file" | tr -d '[:space:]')
+              if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                cmdline=$(cat /proc/"$pid"/cmdline 2>/dev/null | tr '\0' ' ' || echo "unknown")
+                echo "Terminating lingering test child PID $pid ($cmdline)..."
+                kill -TERM "$pid" 2>/dev/null || true
+                sleep 0.5
+                if kill -0 "$pid" 2>/dev/null; then
+                  echo "PID $pid did not exit on SIGTERM; sending SIGKILL..."
+                  kill -KILL "$pid" 2>/dev/null || true
+                  sleep 0.2
+                fi
+                if kill -0 "$pid" 2>/dev/null; then
+                  echo "FATAL: Failed to kill test-spawned process PID $pid"
+                  CLEANUP_FAILED=1
+                else
+                  echo "Successfully terminated lingering PID $pid"
+                fi
+              fi
+              rm -f "$pid_file"
+            done
+          else
+            echo "No lingering test-spawned PID files found in $PID_DIR (all test guards dropped cleanly)."
+          fi
+
+          if [ "$CLEANUP_FAILED" -ne 0 ]; then
+            echo "FATAL: Process cleanup failed to terminate one or more test-spawned processes."
+            exit 1
+          fi
+
+      - name: Assert Zero Lingering Test-Spawned Cluster Processes
+        if: always()
+        run: |
+          echo "=== Asserting Zero Lingering Test-Spawned Cluster Processes ==="
+          REMAINING=$(pgrep -f "target/release-candidate/spine-(coordinator|storage-node)" || true)
+          if [ -n "$REMAINING" ]; then
+            echo "FATAL: Detected uncleaned test-spawned cluster processes still running:"
+            ps -fp $REMAINING
+            exit 1
+          fi
+          echo "PASS: Verified zero test-spawned coordinator or storage-node processes remain in process table."
 
       - name: Verify Zero Leaked Disposable Databases
         if: always()

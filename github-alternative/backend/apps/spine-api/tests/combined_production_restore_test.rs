@@ -1,24 +1,13 @@
 mod common;
 
-use common::HarnessDisposableDb;
+use common::{HarnessDisposableDb, TestChildGuard as ChildGuard};
 use spine_api::backup::{CommitDecisionRecord, RestoreJournal, RestorePhase};
 use spine_api::coordinator::{ClusterNodeClient, CoordinatorClient};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use tempfile::tempdir;
-
-struct ChildGuard(Vec<Child>);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        for child in &mut self.0 {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
 
 fn compute_file_sha256_hex(path: &Path) -> String {
     use sha2::{Digest, Sha256};
@@ -204,7 +193,7 @@ async fn test_combined_production_shaped_postgres_and_cluster_recovery() {
             .expect("spawn spine-storage-node")
     };
 
-    let mut guards = ChildGuard(vec![
+    let mut guards = ChildGuard::new(vec![
         spawn_coord(&coord_addr),
         spawn_node("node-1", &n1_addr, &n1_dir),
         spawn_node("node-2", &n2_addr, &n2_dir),
@@ -353,7 +342,7 @@ async fn test_combined_production_shaped_postgres_and_cluster_recovery() {
     );
 
     // Restart node-3 and execute Recovery Run 2: all 7 participants must converge and finalize
-    guards.0[3] = spawn_node("node-3", &n3_addr, &n3_dir);
+    guards.replace(3, spawn_node("node-3", &n3_addr, &n3_dir));
     wait_for_node(&n3_addr).await;
 
     let run2 = RestoreJournal::handle_startup_recovery_cluster(

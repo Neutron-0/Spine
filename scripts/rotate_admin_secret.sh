@@ -42,12 +42,30 @@ RAW_SECRET_HEX=$(python -c "import secrets; print(secrets.token_hex(16))")
 NEW_TOKEN="sp_pat_${RAW_SECRET_HEX}"
 unset RAW_SECRET_HEX
 
-SPINE_API_BIN="./github-alternative/backend/target/debug/spine-api.exe"
-if [ ! -x "${SPINE_API_BIN}" ] && [ -x "./github-alternative/backend/target/debug/spine-api" ]; then
+SPINE_API_BIN=""
+if command -v spine-api >/dev/null 2>&1; then
+  SPINE_API_BIN="spine-api"
+elif command -v spine-api.exe >/dev/null 2>&1; then
+  SPINE_API_BIN="spine-api.exe"
+elif [ -x "./target/release-candidate/spine-api.exe" ]; then
+  SPINE_API_BIN="./target/release-candidate/spine-api.exe"
+elif [ -x "./target/release-candidate/spine-api" ]; then
+  SPINE_API_BIN="./target/release-candidate/spine-api"
+elif [ -x "./github-alternative/backend/target/release/spine-api.exe" ]; then
+  SPINE_API_BIN="./github-alternative/backend/target/release/spine-api.exe"
+elif [ -x "./github-alternative/backend/target/release/spine-api" ]; then
+  SPINE_API_BIN="./github-alternative/backend/target/release/spine-api"
+elif [ -x "./github-alternative/backend/target/debug/spine-api.exe" ]; then
+  SPINE_API_BIN="./github-alternative/backend/target/debug/spine-api.exe"
+elif [ -x "./github-alternative/backend/target/debug/spine-api" ]; then
   SPINE_API_BIN="./github-alternative/backend/target/debug/spine-api"
 fi
 
-TOKEN_HASH=$(printf "%s" "${NEW_TOKEN}" | "${SPINE_API_BIN}" hash-token)
+if [ -n "${SPINE_API_BIN}" ]; then
+  TOKEN_HASH=$(printf "%s" "${NEW_TOKEN}" | "${SPINE_API_BIN}" hash-token)
+else
+  TOKEN_HASH=$(printf "%s" "${NEW_TOKEN}" | "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T spine-api spine-api hash-token)
+fi
 NEW_PAT_ID=$(python -c "import uuid; print('pat_' + uuid.uuid4().hex)")
 ADMIN_USER_ID=$("${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T "${PG_EXEC_ARGS[@]}" postgres \
   psql -U "${POSTGRES_ADMIN_USER}" -d "${POSTGRES_DB}" -t -A -c \

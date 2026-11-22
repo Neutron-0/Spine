@@ -13,7 +13,7 @@ use sqlx::Connection;
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -307,15 +307,7 @@ async fn test_backup_cleanup_capture_failure_then_cleanup_failure_retains_both()
     node_stop.store(true, Ordering::SeqCst);
 }
 
-struct ChildGuard(Vec<Child>);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        for c in &mut self.0 {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-    }
-}
+use common::{register_test_child, unregister_test_child, TestChildGuard as ChildGuard};
 
 fn find_verified_release_binary(name: &str) -> PathBuf {
     let exe_name = if cfg!(windows) {
@@ -414,7 +406,7 @@ async fn test_backup_cleanup_live_processes_and_postgres_guard_release() {
     let coord_addr = pick_free_addr();
     let node_addr = pick_free_addr();
 
-    let _guards = ChildGuard(vec![
+    let _guards = ChildGuard::new(vec![
         Command::new(&coord_bin)
             .env("SPINE_CLUSTER_ID", "cleanup-e2e")
             .env("SPINE_LISTEN", &coord_addr)
@@ -955,7 +947,7 @@ async fn test_backup_cancellation_and_abrupt_termination_recovery() {
     let coord_addr = pick_free_addr();
     let node_addr = pick_free_addr();
 
-    let _guards = ChildGuard(vec![
+    let _guards = ChildGuard::new(vec![
         Command::new(&coord_bin)
             .env("SPINE_CLUSTER_ID", "cancel-crash-e2e")
             .env("SPINE_LISTEN", &coord_addr)
@@ -1072,6 +1064,9 @@ async fn test_backup_cancellation_and_abrupt_termination_recovery() {
         .spawn()
         .unwrap();
 
+    let crash_child_pid = crash_child.id();
+    register_test_child(crash_child_pid);
+
     let stderr = crash_child.stderr.take().unwrap();
     let mut reader = BufReader::new(stderr);
     let mut line = String::new();
@@ -1091,6 +1086,7 @@ async fn test_backup_cancellation_and_abrupt_termination_recovery() {
     // Abruptly terminate backup child process
     let _ = crash_child.kill();
     let _ = crash_child.wait();
+    unregister_test_child(crash_child_pid);
 
     // Wait past the 200ms bounded lease TTL -> admin barrier reconciles expired DB lease safely!
     tokio::time::sleep(Duration::from_millis(260)).await;
