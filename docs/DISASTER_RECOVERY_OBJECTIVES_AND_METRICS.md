@@ -4,9 +4,9 @@
 
 | Metric | Target Objective | Measured Baseline (Rehearsal) | Enforcement Mechanism | Status |
 | :--- | :--- | :--- | :--- | :--- |
-| **Backup Cadence** | Hourly (`0 * * * *`) or 30-min | Automated via `scripts/backup_oob.sh` | Production system cron + pre-deploy triggers | **VERIFIED** |
-| **Recovery Point Objective (RPO)** | **$\le$ 1 hour** (max window)<br>**0 torn transactions** | **0 lost pre-backup commits / 0 torn transactions**<br>Post-backup writes rolled back cleanly; freshness monitor verified; live webhook alerting proven | `ConsistencyBarrier` writer draining, fencing generation CAS, systemd/cron schedule, and automated freshness monitor (`check_backup_freshness.sh`) | **VERIFIED** |
-| **Recovery Time Objective (RTO) ($\le 1$ GB)** | **$< 60$ seconds** (Nominal target — **MISSED**)<br>**$\le 5$ minutes** (**PROPOSED RTO SLA — Pending Service Owner Approval**) | **Warm Restore (Preinitialized PGDATA): 197.30s** (~3.29 min)<br>**True Cold Restore (Empty Volumes & Cold `initdb`): Mean 152.57s** (Run 1: 150.12s, Run 2: 155.02s, $\sigma = 3.46$s) | Multi-volume parallel extraction, concurrent rollback archiving, bulk PostgreSQL tuning (`synchronous_commit=off`, checkpoint tuning), synchronous durability reset and verification, parallel storage node integrity audits | **MISSED $<60$s nominal target**<br>**MEETS PROPOSED $\le 5$ min SLA** (Pending Service Owner Approval) |
+| **Backup Cadence** | Hourly (`0 * * * *`) or 30-min | Automated via `scripts/backup_oob.sh` | Prepared systemd/cron timers; local test execution | **IMPLEMENTED / LOCAL TEST PASS**<br>Deployed monitoring pending operational enrollment |
+| **Recovery Point Objective (RPO)** | **$\le$ 1 hour** (max window)<br>**0 torn transactions** | **0 lost pre-backup commits / 0 torn transactions**<br>Post-backup writes rolled back cleanly; freshness monitor verified; local webhook alerting rehearsed | `ConsistencyBarrier` writer draining, fencing generation CAS, systemd/cron schedule, and automated freshness monitor (`check_backup_freshness.sh`) | **IMPLEMENTED / LOCAL TEST PASS**<br>Production destination alerting pending operational configuration |
+| **Recovery Time Objective (RTO) ($\le 1$ GB)** | **$< 60$ seconds** (Nominal target — **MISSED**)<br>**$\le 5$ minutes** (**PROPOSED TARGET — Pending Service Owner Decision**) | **Warm Restore (Preinitialized PGDATA): 197.30s** (~3.29 min)<br>**True Cold Restore (Empty Volumes & Cold `initdb`): Mean 152.57s** (Run 1: 150.12s, Run 2: 155.02s, $\sigma = 3.46$s)<br>*(Local Windows/WSL2 host rehearsal; not a production guarantee)* | Multi-volume parallel extraction, concurrent rollback archiving, bulk PostgreSQL tuning (`synchronous_commit=off`, checkpoint tuning), synchronous durability reset and verification, parallel storage node integrity audits | **MISSED $<60$s nominal target**<br>**PROPOSED $\le 5$ min TARGET** (Pending Service Owner Approval) |
 | **Recovery Time Objective (RTO) ($100$ GB)** | **$< 15$ minutes** (for 100 GB) | Projections only (~12-15 min) | Multi-node storage streaming + parallel restore | **UNVERIFIED** (Requires 100 GB infrastructure) |
 | **S3 Network Throughput** | **$\ge 50$ MB/s** sustained | Simulated local line-speed; Cloud Target $\ge 50$ MB/s | Multipart streaming upload/download with SHA-256 chunk validation | **UNVERIFIED** on Cloud |
 | **Immutability (WORM)** | 90 days minimum | **UNVERIFIED / BLOCKED** on cloud<br>Verified on local policy gate | AWS S3 Object Lock Compliance mode (prevents root/IAM bypass) | **UNVERIFIED / BLOCKED** |
@@ -115,10 +115,10 @@ To establish true catastrophic disaster recovery metrics where the host or volum
 - **Fail-Closed Import**: Dump import executes with `psql -v ON_ERROR_STOP=1`. If any SQL error, truncation, or syntax anomaly occurs, execution terminates immediately.
 - **Trap Cleanup**: The shell `EXIT` trap in `restore_oob.sh` ensures that if an error or signal occurs mid-import, the durability reset commands are executed before rollback, preventing database instances from lingering in an uncommitted durability state. Verified by 5/5 automated unit tests in `scripts/test_postgres_import_failure_injection.py`.
 
-#### 5. Operational Decision on RTO Objective:
+#### 5. Operational Status on RTO Objective:
 - **Original Nominal Target ($<60$s for 1 GB)**: **Formally recorded as MISSED**. A multi-volume cold recovery of ~1 GB with cryptographic MAC authentication, 7-volume rollback snapshotting, physical NVMe extraction, relational catalog restoration, and multi-service convergence physically cannot complete within 60 seconds on standard production hardware.
-- **Proposed Production RTO SLA**: Established at **$\le 5$ minutes** ($300$ seconds) for $\sim 1$ GB clusters.
-- **Approval Status**: **PENDING SERVICE OWNER APPROVAL**. The measured cold recovery baseline of **152.57 seconds** achieves a 49% safety margin against this proposed SLA.
+- **Proposed Operational RTO Target**: Proposed at **$\le 5$ minutes** ($300$ seconds) for $\sim 1$ GB clusters.
+- **Approval Status**: **PENDING SERVICE OWNER APPROVAL**. The measured cold recovery baseline of **152.57 seconds** (Run 1: 150.12s, Run 2: 155.02s) represents local rehearsal measurements on the specified Windows 11/WSL2 host platform and does not constitute a production guarantee. It provides empirical baseline data for service-owner evaluation.
 
 ---
 
@@ -143,24 +143,22 @@ To guarantee the RPO window ($\le 1$ hour) and confirm zero data loss for acknow
    - **Pre-Backup Storage Marker**: **SURVIVED (100%)** on volume.
    - **Post-Backup Writes**: **ROLLED BACK AS EXPECTED** (0 records, within $\le 1$ hr RPO window).
    - **Referential Integrity**: **0 torn transactions / 0 orphaned foreign keys** detected.
-5. **Operational Freshness & Closed Alerting Loop**:
-   - **Scheduled Monitoring**: Configured via systemd timers (`deploy/systemd/spine-backup-freshness.timer` running every 15 minutes) and cron (`deploy/cron/spine-backup.cron`).
-   - **Hourly Backup Automation**: Configured via systemd timers (`deploy/systemd/spine-backup.timer` running hourly).
-   - **End-to-End Alert Delivery Proof**: Tested via `scripts/exercise_stale_backup_alert_loop.py` against an active ephemeral HTTP webhook receiver:
-     - Fresh backup ($\le 60$m): 0 alerts emitted, exit code 0.
-     - Induced stale backup ($120$m old): Immediate critical alert webhook delivered (`[CRITICAL ALERT] RPO SLA Breached! Latest backup is 120m old...`), exit code 1.
-     - Induced zero-byte corrupt backup: Immediate critical alert webhook delivered, exit code 1.
-     - Webhook payload structure verified: strictly formatted, JSON-escaped payload delivered via HTTP POST.
-   - Automated monitoring is enforced via `scripts/check_backup_freshness.sh` and `scripts/check_backup_freshness.py`.
-   - The script audits the latest backup archive timestamp, computes age in minutes, and emits exit code 1 if backup age exceeds the 60-minute threshold.
-   - In rehearsal, `check_backup_freshness` audited the fresh archive:
-     ```
-     Backup Path:   tmp_backups/20261122_140420Z_gen_2/backup.spnebak
-     Archive Size:  950.92 MB
-     Backup Age:    3.5 minutes (209s)
-     RPO Threshold: 60 minutes
-     [OK] RPO SLA Met: Latest backup is fresh (3.5m old <= 60m threshold).
-     ```
+5. **Separation of Prepared Monitoring from Deployed Monitoring**:
+   - **Prepared & Locally Tested Artifacts (Verified Locally)**:
+     - Timer/service unit definitions created at `deploy/systemd/spine-backup-freshness.*` (15m interval) and `deploy/systemd/spine-backup.*` (hourly interval).
+     - Standard cron specification at `deploy/cron/spine-backup.cron`.
+     - Automated monitoring script `scripts/check_backup_freshness.sh` with 60-minute RPO threshold enforcement.
+     - Live end-to-end alert loop tested locally via `scripts/exercise_stale_backup_alert_loop.py` against an ephemeral HTTP receiver:
+       - Fresh backup ($\le 60$m): 0 alerts emitted, exit code 0.
+       - Induced stale backup ($120$m old): Critical alert webhook delivered (`[CRITICAL ALERT] RPO SLA Breached! Latest backup is 120m old...`), exit code 1.
+       - Induced zero-byte corrupt backup: Critical alert webhook delivered, exit code 1.
+       - JSON-escaped alert formatting verified.
+   - **Production Deployed Monitoring (Pending Deployment Enrollment)**:
+     - The timer units must be installed on the real production host (`sudo systemctl enable --now spine-backup.timer spine-backup-freshness.timer`).
+     - The hourly backup must execute to the real backup storage target.
+     - Real stale-backup alerts must reach the real production alerting endpoint (`ALERT_WEBHOOK_URL` in `/etc/spine/backup-monitor.env`).
+     - Failures must be observable via `journalctl -u spine-backup-freshness.service`.
+     - *Classification*: Until verified in the actual production or staging environment, scheduling and alerting are classified as **implemented and tested locally**, not production-verified.
 
 ---
 
@@ -195,15 +193,16 @@ To eliminate untrusted bundled key vulnerabilities, the release-signing trust mo
 2. **PostgreSQL Role Separation & Least Privilege**: Verified by `postgres_least_privilege_test.rs` (68 tables, `spine_app` DML only, DDL revoked).
 3. **Sustained Representative Workload**: 1,000 operations (50/50 read/write mix) under enforced container limits (65.0 req/s, 100% success rate, 0 errors, p50 67.31ms, p95 477.61ms).
 4. **Scale Disaster Recovery Roundtrip (~1 GB Dataset)**:
-   - Measured True Cold RTO: Mean **152.57 seconds** (~2.54 min) across repeated clean-volume runs (Run 1: 150.12s, Run 2: 155.02s, $\sigma = 3.46$s) with empty volumes and cold `initdb`.
+   - Measured True Cold RTO: Mean **152.57 seconds** (~2.54 min) across repeated clean-volume runs (Run 1: 150.12s, Run 2: 155.02s, $\sigma = 3.46$s) with empty volumes and cold `initdb`. Measured as local rehearsal on Windows/WSL2 host; not a production guarantee.
    - Measured Warm RTO: **197.30 seconds** (~3.29 min) with preinitialized `PGDATA`.
    - Initial nominal target $<60$s formally recorded as **MISSED**.
-   - Proposed $\le 5$ minute operational SLA achieved with 49% safety margin (**PENDING SERVICE OWNER APPROVAL**).
+   - Proposed $\le 5$ minute operational target (**PENDING SERVICE OWNER DECISION**).
    - PostgreSQL durability strictly scoped to import; durability reset and verification (`synchronous_commit = 'on'`) proven by failure-injection test suite.
 5. **RPO Window & Commit Survival**: Pre-backup writes survived 100%, post-backup writes rolled back cleanly within $\le 1$ hr window, 0 torn transactions, automated freshness monitor passing.
 6. **Destructive Rehearsal Safety**: Verified by `rehearsal_safety_guard.py` and 15/15 refusal unit tests.
 7. **Release Artifact Signing & Trust Anchor**: Verified by 12/12 anti-tamper tests with independent trust anchor at `deploy/security/spine-release-signing.pub`.
-8. **CI Test Suite**: 7/7 CI workflow jobs passing on GitHub Actions.
+8. **Prepared Monitoring & Scheduling (Local Testing Only)**: Verified systemd and cron timer specifications locally; simulated HTTP webhook alerting passed. Production deployment monitoring remains pending operational host installation.
+9. **CI Test Suite**: 7/7 CI workflow jobs passing on GitHub Actions.
 
 ### B. Unverified & Blocked (Awaiting Real Staging Infrastructure)
 > [!IMPORTANT]
