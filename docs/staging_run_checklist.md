@@ -141,11 +141,16 @@ aws --profile spine-staging cloudformation deploy \
    ```
    - Verify computed SHA-256 matches manifest `SHA256SUMS`.
 
-3. **Attempt Version-Specific Deletion with Staging Auditor Identity (Safe Under `set -e`):**
+3. **Configure Auditor Role Profile & Prove Deletion Authorization (IAM & Bucket Policy):**
    > [!IMPORTANT]
-   > Testing deletion using `SpineBackupRole` only proves IAM Deny, not S3 Object Lock Compliance retention. To verify S3 WORM enforcement, assume `SpineAuditVerificationRole`, which **explicitly allows** `s3:DeleteObject` and `s3:DeleteObjectVersion` in its IAM policy (see [`deploy/aws/staging-object-lock-storage.yaml`](../deploy/aws/staging-object-lock-storage.yaml)) and has no retention bypass permissions.
+   > A generic `AccessDenied` alone does NOT prove S3 Object Lock Compliance WORM enforcement: an unconfigured principal, expired credentials, an IAM deny, or a bucket policy deny would also yield `AccessDenied`.
    >
-   > Furthermore, in versioning-enabled S3 buckets, an unversioned `delete-object` merely places a delete marker. To test Object Lock Compliance WORM enforcement, the test MUST issue a **version-specific delete** (`--version-id`).
+   > To definitively prove that refusal is caused by the **S3 Object Lock Compliance WORM engine**, the test procedure must:
+   > 1. Use the audit role through a configured AWS CLI profile (`--profile spine-auditor`) rather than passing raw credentials inline.
+   > 2. Verify the effective assumed identity is `SpineAuditVerificationRole`.
+   > 3. Verify via IAM policy simulation that the role is **explicitly permitted** to perform `s3:DeleteObject` and `s3:DeleteObjectVersion` without explicit denies.
+   > 4. Verify the S3 bucket policy contains no explicit denies against the auditor role.
+   > 5. Require the version-specific delete to fail and confirm via `head-object` and `get-object-retention` that the exact same version remains with active `COMPLIANCE` retention metadata.
 
    ```bash
    # Retrieve AuditRoleArn from CloudFormation stack outputs:
@@ -154,18 +159,49 @@ aws --profile spine-staging cloudformation deploy \
      --query "Stacks[0].Outputs[?OutputKey=='AuditRoleArn'].OutputValue" \
      --output text)
 
-   # Assume auditor role:
-   AUDIT_SESSION=$(aws --profile spine-staging sts assume-role \
-     --role-arn "${AUDIT_ROLE_ARN}" \
-     --role-session-name "spine-auditor-worm-verification" \
-     --duration-seconds 900 \
-     --query "Credentials.[AccessKeyId,SecretAccessKey,SessionToken]" \
-     --output text)
+   # Configure dedicated staging auditor profile using AWS CLI role assumption (zero inline raw credentials):
+   aws configure set profile.spine-auditor.role_arn "${AUDIT_ROLE_ARN}"
+   aws configure set profile.spine-auditor.source_profile spine-staging
+   aws configure set profile.spine-auditor.role_session_name "spine-auditor-worm-verification"
 
-   AUDIT_ACCESS_KEY=$(echo "${AUDIT_SESSION}" | awk '{print $1}')
-   AUDIT_SECRET_KEY=$(echo "${AUDIT_SESSION}" | awk '{print $2}')
-   AUDIT_TOKEN=$(echo "${AUDIT_SESSION}" | awk '{print $3}')
+   # 1. Verify effective caller identity:
+   CALLER_ARN=$(aws --profile spine-auditor sts get-caller-identity --query "Arn" --output text)
+   if ! echo "${CALLER_ARN}" | grep -q "assumed-role/SpineForge-AuditRole-"; then
+     echo "FATAL: Effective caller identity is not SpineAuditVerificationRole (${CALLER_ARN})" >&2
+     exit 1
+   fi
 
+   # 2. Verify IAM policy permissions and check for explicit policy denies:
+   SIMULATION_JSON=$(aws --profile spine-staging iam simulate-principal-policy \
+     --policy-source-arn "${AUDIT_ROLE_ARN}" \
+     --action-names "s3:DeleteObject" "s3:DeleteObjectVersion" \
+     --resource-arns "arn:aws:s3:::<staging-bucket-name>/backups/production-rehearsal/*")
+
+   DEL_OBJ_DECISION=$(echo "${SIMULATION_JSON}" | jq -r '.EvaluationResults[] | select(.EvalActionName=="s3:DeleteObject") | .EvalDecision')
+   DEL_VER_DECISION=$(echo "${SIMULATION_JSON}" | jq -r '.EvaluationResults[] | select(.EvalActionName=="s3:DeleteObjectVersion") | .EvalDecision')
+
+   if [ "${DEL_OBJ_DECISION}" != "allowed" ] || [ "${DEL_VER_DECISION}" != "allowed" ]; then
+     echo "FATAL: IAM policy simulation failed! Expected 'allowed' without explicit denies, got DeleteObject=${DEL_OBJ_DECISION}, DeleteObjectVersion=${DEL_VER_DECISION}" >&2
+     echo "Simulation details: ${SIMULATION_JSON}" >&2
+     exit 1
+   fi
+
+   # 3. Verify S3 bucket policy does not contain explicit deny statements against the auditor role:
+   BUCKET_POLICY=$(aws --profile spine-staging s3api get-bucket-policy --bucket "<staging-bucket-name>" --query "Policy" --output text 2>/dev/null || echo "{}")
+   if echo "${BUCKET_POLICY}" | jq -e '.Statement[] | select(.Effect=="Deny" and (.Action | (if type=="array" then . else [.] end) | any(. == "s3:DeleteObject" or . == "s3:DeleteObjectVersion" or . == "s3:*")))' >/dev/null 2>&1; then
+     AUDIT_ROLE_DENIED=$(echo "${BUCKET_POLICY}" | jq -r --arg role "${AUDIT_ROLE_ARN}" '
+       .Statement[] | select(.Effect=="Deny" and (.Action | (if type=="array" then . else [.] end) | any(. == "s3:DeleteObject" or . == "s3:DeleteObjectVersion" or . == "s3:*")))
+       | select(.Principal.AWS? == $role or (.Principal.AWS? | (if type=="array" then . else [.] end) | any(. == $role)))
+     ')
+     if [ -n "${AUDIT_ROLE_DENIED}" ]; then
+       echo "FATAL: Bucket policy contains explicit Deny on deletion for auditor role (${AUDIT_ROLE_DENIED})! Cannot test S3 WORM." >&2
+       exit 1
+     fi
+   fi
+   ```
+
+4. **Attempt Version-Specific Deletion with Configured Auditor Profile (Safe Under `set -e`):**
+   ```bash
    # Retrieve exact VersionId of the uploaded backup archive:
    ARCHIVE_VERSION_ID=$(aws --profile spine-staging s3api list-object-versions \
      --bucket <staging-bucket-name> \
@@ -178,15 +214,12 @@ aws --profile spine-staging cloudformation deploy \
      exit 1
    fi
 
-   # Execute version-specific deletion under safe set -e handling:
+   # Execute version-specific deletion using the configured profile under safe set -e handling:
    set +e
-   DELETE_OUTPUT=$(AWS_ACCESS_KEY_ID="${AUDIT_ACCESS_KEY}" \
-     AWS_SECRET_ACCESS_KEY="${AUDIT_SECRET_KEY}" \
-     AWS_SESSION_TOKEN="${AUDIT_TOKEN}" \
-     aws s3api delete-object \
-       --bucket <staging-bucket-name> \
-       --key backups/production-rehearsal/<backup-archive-filename>.spnebak \
-       --version-id "${ARCHIVE_VERSION_ID}" 2>&1)
+   DELETE_OUTPUT=$(aws --profile spine-auditor s3api delete-object \
+     --bucket <staging-bucket-name> \
+     --key backups/production-rehearsal/<backup-archive-filename>.spnebak \
+     --version-id "${ARCHIVE_VERSION_ID}" 2>&1)
    DELETE_EXIT_CODE=$?
    set -e
 
@@ -196,8 +229,7 @@ aws --profile spine-staging cloudformation deploy \
      exit 1
    fi
 
-   # Evaluation 2: Capture and assert that rejection is specifically AccessDenied / HTTP 403
-   # Missing credentials, expired sessions, network timeouts, or invalid bucket errors must NEVER count as a WORM pass!
+   # Evaluation 2: Capture and assert that rejection is AccessDenied / HTTP 403
    if echo "${DELETE_OUTPUT}" | grep -qE "(AccessDenied|403|Access Denied)"; then
      echo "CONFIRMED: S3 Object Lock Compliance WORM rejected version deletion with AccessDenied (HTTP 403)."
    else
@@ -207,36 +239,45 @@ aws --profile spine-staging cloudformation deploy \
    fi
    ```
 
-4. **Confirm Version Preservation & Compliance Metadata via `head-object`:**
+5. **Confirm Version Preservation & Compliance Metadata via `head-object` and `get-object-retention`:**
    Immediately following the rejected deletion, assert that the exact same version remains in place and retains valid Compliance retention metadata:
    ```bash
+   # 1. Assert Compliance retention is active:
+   RETENTION_JSON=$(aws --profile spine-staging s3api get-object-retention \
+     --bucket <staging-bucket-name> \
+     --key backups/production-rehearsal/<backup-archive-filename>.spnebak \
+     --version-id "${ARCHIVE_VERSION_ID}")
+
+   echo "${RETENTION_JSON}" | grep -q '"Mode": "COMPLIANCE"' || {
+     echo "FATAL: ObjectLockMode is not COMPLIANCE for version ${ARCHIVE_VERSION_ID}: ${RETENTION_JSON}" >&2
+     exit 1
+   }
+
+   # 2. Assert head-object metadata confirms exact version and future retention date:
    HEAD_OBJECT_JSON=$(aws --profile spine-staging s3api head-object \
      --bucket <staging-bucket-name> \
      --key backups/production-rehearsal/<backup-archive-filename>.spnebak \
      --version-id "${ARCHIVE_VERSION_ID}")
 
-   # Assert ObjectLockMode is COMPLIANCE
    echo "${HEAD_OBJECT_JSON}" | grep -q '"ObjectLockMode": "COMPLIANCE"' || {
      echo "FATAL: ObjectLockMode is not COMPLIANCE in head-object metadata: ${HEAD_OBJECT_JSON}" >&2
      exit 1
    }
 
-   # Assert ObjectLockRetainUntilDate is present and unexpired
    echo "${HEAD_OBJECT_JSON}" | grep -q '"ObjectLockRetainUntilDate"' || {
      echo "FATAL: ObjectLockRetainUntilDate missing from object version ${ARCHIVE_VERSION_ID}" >&2
      exit 1
    }
 
-   # Assert VersionId matches the probed version
    echo "${HEAD_OBJECT_JSON}" | grep -q "\"VersionId\": \"${ARCHIVE_VERSION_ID}\"" || {
      echo "FATAL: VersionId mismatch in head-object verification" >&2
      exit 1
    }
    ```
    **Pass Criteria for Object Lock Compliance WORM:**
-   - Deletion attempt with `SpineAuditVerificationRole` fails with `AccessDenied` / HTTP 403.
-   - Deletion does not succeed, and failure is verified not to be a credential/network error.
-   - `head-object` confirms the exact version `${ARCHIVE_VERSION_ID}` remains stored with `ObjectLockMode=COMPLIANCE` and future retain date.
+   - Identity verified as `SpineAuditVerificationRole` with `s3:DeleteObject` and `s3:DeleteObjectVersion` evaluated as `allowed` in IAM and unblocked in bucket policy.
+   - Deletion attempt via `--profile spine-auditor` fails with `AccessDenied` / HTTP 403.
+   - `head-object` and `get-object-retention` confirm the exact version `${ARCHIVE_VERSION_ID}` remains stored with `ObjectLockMode=COMPLIANCE` and future retain date.
 
 ---
 
@@ -264,19 +305,52 @@ The canonical health readiness route is `/health/ready`, which is explicitly rou
 #### Probe 4a: Public CA HTTPS Ingress Trust Probe (Port 443)
 Execute the TLS trust probe from an external client outside the staging local network using the host's standard root CA store:
 ```bash
-# 1. Execute live readiness probe against canonical route /health/ready:
-curl -fsS -v "https://${STAGING_FQDN}/health/ready"
+# 1. Issue GET request over HTTPS with redirects disabled (no -L), dumping headers to verify exact HTTP 200 and security headers:
+# (Note: curl -fsS alone can succeed on a redirect; dumping headers allows strictly asserting HTTP 200)
+HTTPS_HEADER_DUMP=$(curl -s -S -D - -o /dev/null "https://${STAGING_FQDN}/health/ready")
 
-# 2. Assert HTTP 200 OK status code:
-HTTPS_STATUS=$(curl -s -S -o /dev/null -w "%{http_code}" "https://${STAGING_FQDN}/health/ready")
-if [ "${HTTPS_STATUS}" != "200" ]; then
-  echo "FATAL: HTTPS readiness probe failed with HTTP status ${HTTPS_STATUS}" >&2
+# 2. Extract final HTTP status code and assert strictly 200 (reject redirects or errors):
+HTTPS_STATUS_LINE=$(echo "${HTTPS_HEADER_DUMP}" | grep -E "^HTTP/[12\.]+" | tail -n 1)
+HTTPS_STATUS_CODE=$(echo "${HTTPS_STATUS_LINE}" | awk '{print $2}')
+
+if [ "${HTTPS_STATUS_CODE}" != "200" ]; then
+  echo "FATAL: HTTPS readiness probe did not return HTTP 200! Received status line: '${HTTPS_STATUS_LINE}'" >&2
+  echo "Full response headers:" >&2
+  echo "${HTTPS_HEADER_DUMP}" >&2
   exit 1
 fi
 
-# 3. Assert live presented TLS certificate SAN matches ${STAGING_FQDN}:
-LIVE_SAN=$(openssl s_client -connect "${STAGING_FQDN}:443" -servername "${STAGING_FQDN}" </dev/null 2>/dev/null \
-  | openssl x509 -noout -text \
+# 3. Assert mandatory security headers:
+echo "${HTTPS_HEADER_DUMP}" | grep -qi "^Strict-Transport-Security:.*max-age=" || {
+  echo "FATAL: Missing or invalid Strict-Transport-Security header in HTTPS response" >&2
+  exit 1
+}
+echo "${HTTPS_HEADER_DUMP}" | grep -qi "^X-Content-Type-Options: nosniff" || {
+  echo "FATAL: Missing or invalid X-Content-Type-Options header in HTTPS response" >&2
+  exit 1
+}
+echo "${HTTPS_HEADER_DUMP}" | grep -qi "^X-Frame-Options: SAMEORIGIN" || {
+  echo "FATAL: Missing or invalid X-Frame-Options header in HTTPS response" >&2
+  exit 1
+}
+echo "${HTTPS_HEADER_DUMP}" | grep -qi "^Referrer-Policy: strict-origin-when-cross-origin" || {
+  echo "FATAL: Missing or invalid Referrer-Policy header in HTTPS response" >&2
+  exit 1
+}
+
+# 4. Strictly validate TLS certificate chain and hostname matching using openssl s_client:
+# -verify_return_error causes openssl to exit with an error code if the root CA chain fails verification
+TLS_VERIFY_OUTPUT=$(echo | openssl s_client -connect "${STAGING_FQDN}:443" -servername "${STAGING_FQDN}" -verify_return_error 2>&1)
+TLS_VERIFY_EXIT=$?
+
+if [ ${TLS_VERIFY_EXIT} -ne 0 ]; then
+  echo "FATAL: OpenSSL certificate chain verification failed for ${STAGING_FQDN}!" >&2
+  echo "${TLS_VERIFY_OUTPUT}" >&2
+  exit 1
+fi
+
+# 5. Assert certificate Subject Alternative Name explicitly matches ${STAGING_FQDN}:
+LIVE_SAN=$(echo "${TLS_VERIFY_OUTPUT}" | openssl x509 -noout -text 2>/dev/null \
   | grep -A1 "Subject Alternative Name" \
   | grep -o "DNS:${STAGING_FQDN}")
 
@@ -289,8 +363,8 @@ fi
 > Never use `-k` or `--insecure`. The connection must succeed using the client OS standard root CA store.
 
 **Pass Criteria:**
-- HTTP status code `200 OK`.
-- TLS handshake completes without certificate errors or warnings.
+- HTTP status code is strictly `200 OK` (not a 3xx redirect or 4xx/5xx error).
+- TLS handshake completes without certificate errors or warnings; root CA chain passes `-verify_return_error`.
 - Server certificate SAN strictly matches `${STAGING_FQDN}`.
 - Certificate issuer is a recognized public CA (e.g., Let's Encrypt, AWS ACM, DigiCert; not self-signed, not localhost).
 - Modern TLS protocol negotiated (`TLSv1.3` or `TLSv1.2` with PFS cipher suites).
@@ -298,6 +372,7 @@ fi
   - `Strict-Transport-Security: max-age=63072000; includeSubDomains; preload`
   - `X-Content-Type-Options: nosniff`
   - `X-Frame-Options: SAMEORIGIN`
+  - `Referrer-Policy: strict-origin-when-cross-origin`
 
 #### Probe 4b: Plain HTTP to HTTPS Mandatory 301 Redirection Probe (Port 80)
 Execute the HTTP redirection probe against port 80 using a **GET** request with redirects **disabled** (curl does not follow redirects without `-L`):
