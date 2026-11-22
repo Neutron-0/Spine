@@ -143,6 +143,45 @@ export SPINE_RESTORE_PASSPHRASE_FILE="/etc/spine/backup_key.secret"
 ./scripts/restore_oob.sh s3://my-prod-backup-bucket/spine/spine_backup_<timestamp>.spnebak
 ```
 
+### 5.1 Scheduled Backups & RPO Freshness Monitoring (systemd & cron)
+
+To guarantee the **RPO SLA ($\le 60$ minutes)**, backups must run hourly and freshness audits must run every 15 minutes.
+
+#### Option A: systemd Timers (Recommended)
+1. Install systemd unit and timer definitions:
+   ```bash
+   sudo cp deploy/systemd/spine-backup*.service /etc/systemd/system/
+   sudo cp deploy/systemd/spine-backup*.timer /etc/systemd/system/
+   sudo systemctl daemon-reload
+   ```
+2. Configure environment overrides and alert webhook in `/etc/spine/backup-monitor.env`:
+   ```bash
+   sudo mkdir -p /etc/spine
+   sudo tee /etc/spine/backup-monitor.env <<EOF
+   BACKUP_ROOT=/mnt/backups/spine
+   MAX_AGE_MINUTES=60
+   ALERT_WEBHOOK_URL=https://alerts.example.com/webhooks/spine-rpo
+   EOF
+   sudo chmod 600 /etc/spine/backup-monitor.env
+   ```
+3. Enable and start timers:
+   ```bash
+   sudo systemctl enable --now spine-backup.timer
+   sudo systemctl enable --now spine-backup-freshness.timer
+   ```
+4. Verify timer status:
+   ```bash
+   systemctl list-timers | grep spine
+   ```
+
+#### Option B: cron Schedule
+Install the provided cron configuration:
+```bash
+sudo cp deploy/cron/spine-backup.cron /etc/cron.d/spine-backup
+sudo chmod 644 /etc/cron.d/spine-backup
+```
+Set `ALERT_WEBHOOK_URL` in `/etc/environment` or directly in `/etc/spine/backup-monitor.env`.
+
 ---
 
 ## 6. Incident Response & Troubleshooting

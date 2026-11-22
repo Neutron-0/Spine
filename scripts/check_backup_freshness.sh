@@ -10,8 +10,18 @@ BACKUP_ROOT="${BACKUP_ROOT:-/mnt/backups/spine}"
 MAX_AGE_MINUTES="${MAX_AGE_MINUTES:-60}"
 ALERT_WEBHOOK_URL="${ALERT_WEBHOOK_URL:-}"
 
+send_alert() {
+  local msg="$1"
+  echo "${msg}" >&2
+  if [ -n "${ALERT_WEBHOOK_URL}" ]; then
+    local payload
+    payload=$(python3 -c "import json, sys; print(json.dumps({'text': sys.argv[1]}))" "${msg}" 2>/dev/null || printf '{"text": "%s"}' "${msg}")
+    curl -s --connect-timeout 5 --max-time 10 -X POST -H "Content-Type: application/json" -d "${payload}" "${ALERT_WEBHOOK_URL}" || true
+  fi
+}
+
 if [ ! -d "${BACKUP_ROOT}" ]; then
-  echo "[CRITICAL ALERT] RPO SLA Breached: Backup directory '${BACKUP_ROOT}' does not exist!" >&2
+  send_alert "[CRITICAL ALERT] RPO SLA Breached: Backup directory '${BACKUP_ROOT}' does not exist!"
   exit 2
 fi
 
@@ -29,14 +39,14 @@ if [ -z "${LATEST_BACKUP}" ]; then
 fi
 
 if [ -z "${LATEST_BACKUP}" ] || [ ! -f "${LATEST_BACKUP}" ]; then
-  echo "[CRITICAL ALERT] RPO SLA Breached: Zero valid 'backup.spnebak' archives found in '${BACKUP_ROOT}'!" >&2
+  send_alert "[CRITICAL ALERT] RPO SLA Breached: Zero valid 'backup.spnebak' archives found in '${BACKUP_ROOT}'!"
   exit 2
 fi
 
 # Check file size
 FILE_SIZE=$(wc -c < "${LATEST_BACKUP}" | tr -d '[:space:]')
 if [ "${FILE_SIZE}" -eq 0 ]; then
-  echo "[CRITICAL ALERT] RPO SLA Breached: Latest backup archive '${LATEST_BACKUP}' is zero-byte empty!" >&2
+  send_alert "[CRITICAL ALERT] RPO SLA Breached: Latest backup archive '${LATEST_BACKUP}' is zero-byte empty!"
   exit 1
 fi
 
@@ -45,7 +55,7 @@ CURRENT_TIME=$(date +%s)
 FILE_MTIME=$(stat -c %Y "${LATEST_BACKUP}" 2>/dev/null || stat -f %m "${LATEST_BACKUP}" 2>/dev/null || echo "0")
 
 if [ "${FILE_MTIME}" -eq 0 ]; then
-  echo "[ERROR] Unable to determine modification timestamp for '${LATEST_BACKUP}'." >&2
+  send_alert "[ERROR] Unable to determine modification timestamp for '${LATEST_BACKUP}'."
   exit 2
 fi
 
@@ -61,10 +71,7 @@ echo "  RPO Threshold:   ${MAX_AGE_MINUTES} minutes"
 
 if [ "${AGE_SECONDS}" -gt "${MAX_AGE_SECONDS}" ]; then
   MSG="[CRITICAL ALERT] RPO SLA Breached! Latest backup is ${AGE_MINUTES}m old (exceeds ${MAX_AGE_MINUTES}m threshold). Immediate operator intervention required."
-  echo "${MSG}" >&2
-  if [ -n "${ALERT_WEBHOOK_URL}" ]; then
-    curl -s -X POST -H "Content-Type: application/json" -d "{\"text\": \"${MSG}\"}" "${ALERT_WEBHOOK_URL}" || true
-  fi
+  send_alert "${MSG}"
   exit 1
 fi
 

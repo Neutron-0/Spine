@@ -1,0 +1,12 @@
+[Unit]
+Description=Spine Forge - Periodic Backup Freshness & RPO SLA Monitor Timer
+Documentation=https://github.com/Neutron-0/Spine/blob/main/docs/PRODUCTION_DEPLOYMENT_RUNBOOK.md
+
+[Timer]
+OnBootSec=5min
+OnCalendar=*:0/15
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

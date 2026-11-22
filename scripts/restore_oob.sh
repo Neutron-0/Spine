@@ -771,7 +771,7 @@ fi
 
 echo "Awaiting PostgreSQL readiness..."
 READY_PG=0
-for _ in $(seq 1 45); do
+for _ in $(seq 1 75); do
   if "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" exec -T postgres pg_isready -U "${POSTGRES_ADMIN_USER}" >/dev/null 2>&1 && \
      "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" exec -T "${PG_EXEC_ARGS[@]}" postgres psql -U "${POSTGRES_ADMIN_USER}" -d postgres -c "SELECT 1;" >/dev/null 2>&1; then
     READY_PG=1

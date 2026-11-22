@@ -1,0 +1,10 @@
+# /etc/cron.d/spine-backup
+# Spine Forge - Production Automated Backup & Freshness Monitoring Cron Jobs
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+
+# 1. Hourly Out-of-Band Backup (0 * * * *)
+0 * * * * root /opt/spine/scripts/backup_oob.sh >> /var/log/spine/backup.log 2>&1
+
+# 2. Backup Freshness & RPO SLA Monitor (Every 15 minutes)
+*/15 * * * * root /opt/spine/scripts/check_backup_freshness.sh >> /var/log/spine/backup-freshness.log 2>&1

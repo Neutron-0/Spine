@@ -1,0 +1,16 @@
+[Unit]
+Description=Spine Forge - Automated Out-of-Band Backup
+Documentation=https://github.com/Neutron-0/Spine/blob/main/docs/PRODUCTION_DEPLOYMENT_RUNBOOK.md
+After=docker.service postgresql.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=-/etc/spine/backup.env
+Environment=COMPOSE_FILE=/opt/spine/docker-compose.prod.yml
+Environment=BACKUP_TARGET_DIR=/mnt/backups/spine
+ExecStart=/opt/spine/scripts/backup_oob.sh
+StandardOutput=journal
+StandardError=journal

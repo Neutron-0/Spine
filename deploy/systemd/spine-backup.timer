@@ -1,0 +1,12 @@
+[Unit]
+Description=Spine Forge - Automated Hourly Backup Timer
+Documentation=https://github.com/Neutron-0/Spine/blob/main/docs/PRODUCTION_DEPLOYMENT_RUNBOOK.md
+
+[Timer]
+OnBootSec=10min
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

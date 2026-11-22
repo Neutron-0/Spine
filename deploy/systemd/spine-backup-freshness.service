@@ -1,0 +1,15 @@
+[Unit]
+Description=Spine Forge - Backup Freshness & RPO SLA Monitor
+Documentation=https://github.com/Neutron-0/Spine/blob/main/docs/PRODUCTION_DEPLOYMENT_RUNBOOK.md
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=-/etc/spine/backup-monitor.env
+Environment=BACKUP_ROOT=/mnt/backups/spine
+Environment=MAX_AGE_MINUTES=60
+ExecStart=/opt/spine/scripts/check_backup_freshness.sh
+StandardOutput=journal
+StandardError=journal

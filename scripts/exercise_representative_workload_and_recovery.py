@@ -574,9 +574,9 @@ def main():
         print("Confirmed all post-backup writes were acknowledged by database, API, and storage.")
 
         # --------------------------------------------------------------------------
-        # Phase 5: Simulating Catastrophic Failure & Executing Disaster Recovery
+        # Phase 5: Simulating Catastrophic Failure & Executing True Cold Disaster Recovery
         # --------------------------------------------------------------------------
-        print("\n--- Phase 5: Simulating Catastrophic Failure & Measuring End-to-End RTO ---")
+        print("\n--- Phase 5: Simulating Catastrophic Failure & Measuring Cold Disaster Recovery RTO ---")
         RehearsalSafetyGuard.guard_destructive_action(
             action_name="DISASTER_RECOVERY_RESTORE",
             project_name=project_name,
@@ -585,12 +585,15 @@ def main():
             target_resource=f"{project_name} volumes and database {db_name}",
         )
 
-        print("Corrupting storage node chunks and dropping database to simulate catastrophic failure...")
-        run_cmd(["docker", "exec", f"{project_name}-storage-node-1", "sh", "-c", "rm -rf /var/lib/spine/node-1/chunks/*"])
-        run_cmd(["docker", "exec", f"{project_name}-storage-node-2", "sh", "-c", "rm -rf /var/lib/spine/node-2/chunks/*"])
-        run_cmd(["docker", "exec", disposable_api_container, "sh", "-c", "rm -rf /var/lib/spine/storage/repos/*"])
+        def wipe_cluster_volumes_cold():
+            print("Wiping all 7 cluster volumes to empty state (including PGDATA) to force cold recovery...")
+            run_cmd(["docker", "compose", "-p", project_name, "-f", str(compose_file), "stop"])
+            run_cmd(["docker", "compose", "-p", project_name, "-f", str(compose_file), "run", "--rm", "--no-deps", "--entrypoint", "sh", "postgres", "-c", "rm -rf /var/lib/postgresql/data/* /var/lib/postgresql/data/.[!.]* 2>/dev/null || true"])
+            run_cmd(["docker", "compose", "-p", project_name, "-f", str(compose_file), "run", "--rm", "--no-deps", "--entrypoint", "sh", "coordinator", "-c", "rm -rf /var/lib/spine/* /var/lib/spine/.[!.]* 2>/dev/null || true"])
+            for n in [1, 2, 3]:
+                run_cmd(["docker", "compose", "-p", project_name, "-f", str(compose_file), "run", "--rm", "--no-deps", "--entrypoint", "sh", f"storage-node-{n}", "-c", f"rm -rf /var/lib/spine/node-{n}/* /var/lib/spine/node-{n}/.[!.]* 2>/dev/null || true"])
+            run_cmd(["docker", "compose", "-p", project_name, "-f", str(compose_file), "run", "--rm", "--no-deps", "--entrypoint", "sh", "spine-api", "-c", "rm -rf /var/lib/spine/storage/* /var/lib/spine/storage/.[!.]* /var/lib/spine/ssh/* /var/lib/spine/ssh/.[!.]* 2>/dev/null || true"])
 
-        print("Executing restore_oob.sh against disposable cluster from Backup A archive...")
         env_restore = os.environ.copy()
         env_restore["COMPOSE_FILE"] = str(compose_file)
         env_restore["COMPOSE_PROJECT_NAME"] = project_name
@@ -600,16 +603,45 @@ def main():
         env_restore["SPINE_BACKUP_PASSPHRASE"] = passphrase_val
 
         rel_archive = str(archive_file.relative_to(REPO_ROOT)).replace("\\", "/")
-        restore_start = time.time()
-        ret, restore_out, restore_err = run_cmd([
-            BASH_BIN, "scripts/restore_oob.sh",
-            rel_archive
-        ], env=env_restore, cwd=str(REPO_ROOT))
-        end_to_end_rto = time.time() - restore_start
 
-        assert ret == 0, f"Restore failed with exit code {ret}:\n{restore_err}\n{restore_out}"
-        print(f"[PASS] 1 GB Multi-Volume Disaster Recovery Completed!")
-        print(f"[MEASURED RTO] End-to-End Recovery Time Objective: {end_to_end_rto:.2f} seconds")
+        cold_restore_runs = []
+        NUM_COLD_RUNS = 2
+
+        for run_idx in range(1, NUM_COLD_RUNS + 1):
+            print(f"\n>>> Executing Clean-Volume Cold Disaster Recovery Run {run_idx}/{NUM_COLD_RUNS} <<<")
+            wipe_cluster_volumes_cold()
+
+            run_start = time.time()
+            ret, restore_out, restore_err = run_cmd([
+                BASH_BIN, "scripts/restore_oob.sh",
+                rel_archive
+            ], env=env_restore, cwd=str(REPO_ROOT))
+            run_duration = time.time() - run_start
+
+            assert ret == 0, f"Cold restore run {run_idx} failed with exit code {ret}:\n{restore_err}\n{restore_out}"
+            assert "Preparing strictly empty PGDATA for fresh PostgreSQL initialization..." in restore_out or "Starting fresh PostgreSQL container..." in restore_out, \
+                f"Run {run_idx} did not perform cold PostgreSQL initialization!"
+            cold_restore_runs.append(run_duration)
+            print(f"[PASS] Cold Disaster Recovery Run {run_idx} completed in {run_duration:.2f} seconds.")
+
+        import statistics
+        mean_rto = statistics.mean(cold_restore_runs)
+        stdev_rto = statistics.stdev(cold_restore_runs) if len(cold_restore_runs) > 1 else 0.0
+        min_rto = min(cold_restore_runs)
+        max_rto = max(cold_restore_runs)
+        end_to_end_rto = mean_rto
+
+        print(f"\n=======================================================")
+        print(f"COLD DISASTER RECOVERY RTO SUMMARY (~985 MB Dataset)")
+        print(f"  Runs Executed:    {NUM_COLD_RUNS}")
+        for idx, t_run in enumerate(cold_restore_runs, 1):
+            print(f"    - Run {idx}:       {t_run:.2f}s")
+        print(f"  Mean Cold RTO:    {mean_rto:.2f}s")
+        print(f"  Min / Max RTO:    {min_rto:.2f}s / {max_rto:.2f}s")
+        print(f"  Std Deviation:    {stdev_rto:.2f}s")
+        print(f"  Proposed SLA:     300.00s (<= 5 min) [PENDING SERVICE OWNER APPROVAL]")
+        print(f"  Original SLA:     <60.00s [MISSED]")
+        print(f"=======================================================")
 
         # --------------------------------------------------------------------------
         # Phase 6: Commit Survival & RPO Reconciliation Audit
