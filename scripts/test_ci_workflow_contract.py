@@ -28,7 +28,13 @@ import shutil
 import subprocess
 import tempfile
 import unittest
-import yaml
+
+try:
+    import yaml
+except ImportError:
+    import sys
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "pyyaml"])
+    import yaml
 
 from check_ci_change_scope import evaluate_scope
 

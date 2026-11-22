@@ -413,7 +413,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install cryptography
+        run: pip install cryptography pyyaml
 
       - name: Run Synthetic Secret Scanner Verification Test
         run: python scripts/test_secret_scanner.py
