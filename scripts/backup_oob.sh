@@ -17,6 +17,11 @@ SPINE_ADMIN_TOKEN="${SPINE_ADMIN_TOKEN:-}"
 SPINE_ADMIN_TOKEN_FILE="${SPINE_ADMIN_TOKEN_FILE:-}"
 BACKUP_ROOT="${BACKUP_ROOT:-/mnt/backups/spine}"
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-}"
+COMPOSE_ARGS=(-f "${COMPOSE_FILE}")
+if [ -n "${COMPOSE_PROJECT_NAME}" ]; then
+  COMPOSE_ARGS+=(-p "${COMPOSE_PROJECT_NAME}")
+fi
 POSTGRES_ADMIN_USER="${POSTGRES_ADMIN_USER:-spine_admin}"
 POSTGRES_ADMIN_PASSWORD="${POSTGRES_ADMIN_PASSWORD:-}"
 SPINE_BACKUP_PASSPHRASE="${SPINE_BACKUP_PASSPHRASE:-}"
@@ -132,8 +137,10 @@ verify_supported_storage_topology() {
 
   # 2. Check live Docker volumes if docker daemon is reachable
   if "${DOCKER_BIN}" info >/dev/null 2>&1; then
-    local project_name
-    project_name=$("${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" config --format json 2>/dev/null | grep -o '"name": *"[^"]*"' | head -1 | cut -d'"' -f4 || echo "")
+    local project_name="${COMPOSE_PROJECT_NAME:-}"
+    if [ -z "${project_name}" ]; then
+      project_name=$("${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" config --format json 2>/dev/null | grep -o '"name": *"[^"]*"' | head -1 | cut -d'"' -f4 || echo "")
+    fi
     if [ -z "${project_name}" ]; then
       project_name="spine"
     fi
@@ -499,13 +506,13 @@ echo "All active writers drained. API recorded generation: ${API_GENERATION}"
 
 # Phase 1b: Direct Pre-Capture Audit Across All Distributed Participants
 echo "=== Phase 1b: Direct Participant Fencing Generation Verification ==="
-COORD_GEN=$("${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T coordinator \
+COORD_GEN=$("${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" exec -T coordinator \
   cat /var/lib/spine/.coordinator_fencing_generation 2>/dev/null | tr -d '[:space:]' || echo "MISSING")
-NODE_1_GEN=$("${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T storage-node-1 \
+NODE_1_GEN=$("${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" exec -T storage-node-1 \
   cat /var/lib/spine/node-1/.fencing_generation 2>/dev/null | tr -d '[:space:]' || echo "MISSING")
-NODE_2_GEN=$("${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T storage-node-2 \
+NODE_2_GEN=$("${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" exec -T storage-node-2 \
   cat /var/lib/spine/node-2/.fencing_generation 2>/dev/null | tr -d '[:space:]' || echo "MISSING")
-NODE_3_GEN=$("${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T storage-node-3 \
+NODE_3_GEN=$("${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" exec -T storage-node-3 \
   cat /var/lib/spine/node-3/.fencing_generation 2>/dev/null | tr -d '[:space:]' || echo "MISSING")
 
 echo "Participant generations:"
@@ -592,30 +599,30 @@ EOF
 # 1. Database snapshot via docker compose exec
 echo "Capturing PostgreSQL dump..."
 if [ -n "${POSTGRES_ADMIN_PASSWORD}" ]; then
-  "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T -e PGPASSWORD="${POSTGRES_ADMIN_PASSWORD}" postgres \
+  "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" exec -T -e PGPASSWORD="${POSTGRES_ADMIN_PASSWORD}" postgres \
     pg_dumpall -U "${POSTGRES_ADMIN_USER}" | gzip > "${STAGING_DIR}/postgres_dump.sql.gz"
 else
-  "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T postgres \
+  "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" exec -T postgres \
     pg_dumpall -U "${POSTGRES_ADMIN_USER}" | gzip > "${STAGING_DIR}/postgres_dump.sql.gz"
 fi
 
 # 2. Coordinator state
 echo "Capturing Coordinator consensus state..."
-"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T coordinator \
+"${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" exec -T coordinator \
   tar -czf - -C /var/lib/spine . > "${STAGING_DIR}/coordinator.tar.gz"
 
 # 3. Storage node volumes
 for NODE in 1 2 3; do
   echo "Capturing Storage Node ${NODE} volume..."
-  "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T "storage-node-${NODE}" \
+  "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" exec -T "storage-node-${NODE}" \
     tar -czf - -C "/var/lib/spine/node-${NODE}" . > "${STAGING_DIR}/storage_node_${NODE}.tar.gz"
 done
 
 # 4. API storage & host SSH keys
 echo "Capturing API storage & SSH identities..."
-"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T spine-api \
+"${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" exec -T spine-api \
   tar -czf - -C /var/lib/spine/ssh . > "${STAGING_DIR}/spine_ssh.tar.gz"
-"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T spine-api \
+"${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" exec -T spine-api \
   tar -czf - -C /var/lib/spine/storage . > "${STAGING_DIR}/spine_storage.tar.gz"
 
 # 5. Internal checksum manifest of captured participants
@@ -662,7 +669,7 @@ else
   # Encrypt through the spine-api container via mounted read-only secret file.
   # Credentials are never passed in process arguments or container environment variables.
   mount_pass_file=$(to_host_mount_path "${RESOLVED_PASSPHRASE_FILE}")
-  "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm -i --no-deps \
+  "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm -i --no-deps \
     -v "${mount_pass_file}:/run/secrets/backup_passphrase:ro" \
     spine-api \
     backup encrypt --passphrase-file /run/secrets/backup_passphrase --input - --output - \
@@ -904,7 +911,7 @@ PG_EXEC_ARGS=()
 if [ -n "${POSTGRES_ADMIN_PASSWORD:-}" ]; then
   PG_EXEC_ARGS+=(-e "PGPASSWORD=${POSTGRES_ADMIN_PASSWORD}")
 fi
-"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T "${PG_EXEC_ARGS[@]}" postgres \
+"${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" exec -T "${PG_EXEC_ARGS[@]}" postgres \
   psql -U "${POSTGRES_ADMIN_USER:-spine_admin}" -d "${POSTGRES_DB:-spine_forge}" -v ON_ERROR_STOP=1 -c \
   "UPDATE _restore_generation SET generation_token = '${GENERATION_TOKEN}' WHERE id = 1;" >/dev/null 2>&1 || true
 

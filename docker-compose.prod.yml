@@ -56,7 +56,8 @@ services:
       test: ["CMD-SHELL", "pidof nginx && nc -z 127.0.0.1 80 || exit 1"]
       interval: 10s
       timeout: 3s
-      retries: 3
+      retries: 5
+      start_period: 15s
     depends_on:
       spine-api:
         condition: service_healthy
@@ -87,7 +88,8 @@ services:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_APP_USER:-spine_app} -d ${POSTGRES_DB:-spine_forge}"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 20s
     security_opt:
       - no-new-privileges:true
     mem_limit: 1024m
@@ -127,7 +129,8 @@ services:
       test: ["CMD-SHELL", "nc -z 127.0.0.1 8400 || exit 1"]
       interval: 5s
       timeout: 3s
-      retries: 5
+      retries: 10
+      start_period: 15s
     security_opt:
       - no-new-privileges:true
     mem_limit: 512m
@@ -164,7 +167,8 @@ services:
       test: ["CMD-SHELL", "nc -z 127.0.0.1 8401 || exit 1"]
       interval: 5s
       timeout: 3s
-      retries: 5
+      retries: 10
+      start_period: 20s
     depends_on:
       coordinator:
         condition: service_healthy
@@ -201,7 +205,8 @@ services:
       test: ["CMD-SHELL", "nc -z 127.0.0.1 8401 || exit 1"]
       interval: 5s
       timeout: 3s
-      retries: 5
+      retries: 10
+      start_period: 20s
     depends_on:
       coordinator:
         condition: service_healthy
@@ -238,7 +243,8 @@ services:
       test: ["CMD-SHELL", "nc -z 127.0.0.1 8401 || exit 1"]
       interval: 5s
       timeout: 3s
-      retries: 5
+      retries: 10
+      start_period: 20s
     depends_on:
       coordinator:
         condition: service_healthy
@@ -302,7 +308,8 @@ services:
       test: ["CMD-SHELL", "curl -f http://127.0.0.1:3000/health/ready || exit 1"]
       interval: 10s
       timeout: 3s
-      retries: 3
+      retries: 10
+      start_period: 25s
     depends_on:
       postgres:
         condition: service_healthy
@@ -352,7 +359,8 @@ services:
       test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:80/ || exit 1"]
       interval: 10s
       timeout: 3s
-      retries: 3
+      retries: 5
+      start_period: 15s
     # No host port exposed; routed strictly via ingress on port 443
     depends_on:
       spine-api:

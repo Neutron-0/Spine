@@ -33,4 +33,8 @@ tmp_backups/
 *.spnebak
 *.dump
 *.sql
+tmp_rehearsal/
+.docker-compose.rehearsal-*.yml
+__pycache__/
+*.pyc
 

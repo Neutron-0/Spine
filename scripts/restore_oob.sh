@@ -34,6 +34,12 @@ BACKUP_DIR=""
 ENCRYPTED_FILE=""
 TARGET_INPUT="${1:-}"
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
+SPINE_API_URL="${SPINE_API_URL:-http://127.0.0.1:3000}"
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-}"
+COMPOSE_ARGS=(-f "${COMPOSE_FILE}")
+if [ -n "${COMPOSE_PROJECT_NAME}" ]; then
+  COMPOSE_ARGS+=(-p "${COMPOSE_PROJECT_NAME}")
+fi
 POSTGRES_ADMIN_USER="${POSTGRES_ADMIN_USER:-spine_admin}"
 POSTGRES_ADMIN_PASSWORD="${POSTGRES_ADMIN_PASSWORD:-}"
 POSTGRES_DB="${POSTGRES_DB:-spine_forge}"
@@ -109,8 +115,10 @@ verify_supported_storage_topology() {
 
   # 2. Check live Docker volumes if docker daemon is reachable
   if "${DOCKER_BIN}" info >/dev/null 2>&1; then
-    local project_name
-    project_name=$("${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" config --format json 2>/dev/null | grep -o '"name": *"[^"]*"' | head -1 | cut -d'"' -f4 || echo "")
+    local project_name="${COMPOSE_PROJECT_NAME:-}"
+    if [ -z "${project_name}" ]; then
+      project_name=$("${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" config --format json 2>/dev/null | grep -o '"name": *"[^"]*"' | head -1 | cut -d'"' -f4 || echo "")
+    fi
     if [ -z "${project_name}" ]; then
       project_name="spine"
     fi
@@ -175,7 +183,7 @@ encrypt_stream() {
   if [ -n "${SPINE_API_BIN}" ]; then
     "${SPINE_API_BIN}" backup encrypt --passphrase-file "${host_pass_file}" --input - --output -
   else
-    "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm -i --no-deps \
+    "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm -i --no-deps \
       -v "${host_pass_file}:/run/secrets/backup_passphrase:ro" spine-api \
       backup encrypt --passphrase-file /run/secrets/backup_passphrase --input - --output -
   fi
@@ -187,7 +195,7 @@ decrypt_stream() {
   if [ -n "${SPINE_API_BIN}" ]; then
     "${SPINE_API_BIN}" backup decrypt --passphrase-file "${host_pass_file}" --input - --output -
   else
-    "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm -i --no-deps \
+    "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm -i --no-deps \
       -v "${host_pass_file}:/run/secrets/backup_passphrase:ro" spine-api \
       backup decrypt --passphrase-file /run/secrets/backup_passphrase --input - --output -
   fi
@@ -229,13 +237,13 @@ restore_cleanup() {
 
       # 1. Mandatory stop of any partially started services (NO || true)
       echo "Stopping cluster services before executing rollback extraction..." >&2
-      if ! "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" stop ingress spine-api storage-node-1 storage-node-2 storage-node-3 coordinator postgres spine-frontend; then
+      if ! "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" stop ingress spine-api storage-node-1 storage-node-2 storage-node-3 coordinator postgres spine-frontend; then
         echo "ERROR: Failed to stop cluster services during rollback." >&2
         ROLLBACK_FAILED=1
       fi
 
       # 2. Mandatory quiescence verification (Fail-closed: MUST NOT extract if containers still running)
-      RUNNING_ROLLBACK=$("${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" ps --services --filter "status=running" 2>/dev/null || echo "CHECK_FAILED")
+      RUNNING_ROLLBACK=$("${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" ps --services --filter "status=running" 2>/dev/null || echo "CHECK_FAILED")
       if [ -n "${RUNNING_ROLLBACK}" ]; then
         echo "CRITICAL FATAL: Cannot execute rollback extraction because containers are still running:" >&2
         echo "${RUNNING_ROLLBACK}" >&2
@@ -258,11 +266,11 @@ restore_cleanup() {
       # 3. Roll back Coordinator from encrypted archive
       if [ -f "${ROLLBACK_DIR}/coordinator.spnebak" ]; then
         echo "Rolling back Coordinator volume from encrypted archive..." >&2
-        if ! decrypt_stream < "${ROLLBACK_DIR}/coordinator.spnebak" | "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm -i --no-deps --entrypoint sh coordinator \
+        if ! decrypt_stream < "${ROLLBACK_DIR}/coordinator.spnebak" | "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm -i --no-deps --entrypoint sh coordinator \
           -c "rm -rf /var/lib/spine/* /var/lib/spine/.[!.]* && tar -xzf - -C /var/lib/spine"; then
           echo "ERROR: Failed to extract rollback archive for Coordinator!" >&2
           ROLLBACK_FAILED=1
-        elif ! "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint test coordinator -f /var/lib/spine/.coordinator_fencing_generation; then
+        elif ! "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm --no-deps --entrypoint test coordinator -f /var/lib/spine/.coordinator_fencing_generation; then
           echo "ERROR: Coordinator volume verification failed after rollback (.coordinator_fencing_generation missing)!" >&2
           ROLLBACK_FAILED=1
         else
@@ -278,11 +286,11 @@ restore_cleanup() {
       for NODE in 1 2 3; do
         if [ -f "${ROLLBACK_DIR}/storage_node_${NODE}.spnebak" ]; then
           echo "Rolling back Storage Node ${NODE} volume from encrypted archive..." >&2
-          if ! decrypt_stream < "${ROLLBACK_DIR}/storage_node_${NODE}.spnebak" | "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm -i --no-deps --entrypoint sh "storage-node-${NODE}" \
+          if ! decrypt_stream < "${ROLLBACK_DIR}/storage_node_${NODE}.spnebak" | "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm -i --no-deps --entrypoint sh "storage-node-${NODE}" \
             -c "rm -rf /var/lib/spine/node-${NODE}/* /var/lib/spine/node-${NODE}/.[!.]* && tar -xzf - -C /var/lib/spine/node-${NODE}"; then
             echo "ERROR: Failed to extract rollback archive for Storage Node ${NODE}!" >&2
             ROLLBACK_FAILED=1
-          elif ! "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint test "storage-node-${NODE}" -f "/var/lib/spine/node-${NODE}/.fencing_generation"; then
+          elif ! "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm --no-deps --entrypoint test "storage-node-${NODE}" -f "/var/lib/spine/node-${NODE}/.fencing_generation"; then
             echo "ERROR: Storage Node ${NODE} volume verification failed after rollback (.fencing_generation missing)!" >&2
             ROLLBACK_FAILED=1
           else
@@ -298,11 +306,11 @@ restore_cleanup() {
       # 5. Roll back API SSH from encrypted archive
       if [ -f "${ROLLBACK_DIR}/spine_ssh.spnebak" ]; then
         echo "Rolling back API SSH volume from encrypted archive..." >&2
-        if ! decrypt_stream < "${ROLLBACK_DIR}/spine_ssh.spnebak" | "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm -i --no-deps --entrypoint sh spine-api \
+        if ! decrypt_stream < "${ROLLBACK_DIR}/spine_ssh.spnebak" | "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm -i --no-deps --entrypoint sh spine-api \
           -c "rm -rf /var/lib/spine/ssh/* /var/lib/spine/ssh/.[!.]* && tar -xzf - -C /var/lib/spine/ssh"; then
           echo "ERROR: Failed to extract rollback archive for API SSH!" >&2
           ROLLBACK_FAILED=1
-        elif ! "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint test spine-api -d /var/lib/spine/ssh; then
+        elif ! "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm --no-deps --entrypoint test spine-api -d /var/lib/spine/ssh; then
           echo "ERROR: API SSH volume verification failed after rollback (/var/lib/spine/ssh missing)!" >&2
           ROLLBACK_FAILED=1
         else
@@ -317,11 +325,11 @@ restore_cleanup() {
       # 6. Roll back API storage from encrypted archive
       if [ -f "${ROLLBACK_DIR}/spine_storage.spnebak" ]; then
         echo "Rolling back API storage volume from encrypted archive..." >&2
-        if ! decrypt_stream < "${ROLLBACK_DIR}/spine_storage.spnebak" | "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm -i --no-deps --entrypoint sh spine-api \
+        if ! decrypt_stream < "${ROLLBACK_DIR}/spine_storage.spnebak" | "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm -i --no-deps --entrypoint sh spine-api \
           -c "rm -rf /var/lib/spine/storage/* /var/lib/spine/storage/.[!.]* && tar -xzf - -C /var/lib/spine/storage"; then
           echo "ERROR: Failed to extract rollback archive for API storage!" >&2
           ROLLBACK_FAILED=1
-        elif ! "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint test spine-api -d /var/lib/spine/storage; then
+        elif ! "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm --no-deps --entrypoint test spine-api -d /var/lib/spine/storage; then
           echo "ERROR: API storage volume verification failed after rollback (/var/lib/spine/storage missing)!" >&2
           ROLLBACK_FAILED=1
         else
@@ -336,11 +344,11 @@ restore_cleanup() {
       # 7. Roll back PostgreSQL from encrypted archive
       if [ -f "${ROLLBACK_DIR}/postgres_data.spnebak" ]; then
         echo "Rolling back PostgreSQL volume from encrypted archive..." >&2
-        if ! decrypt_stream < "${ROLLBACK_DIR}/postgres_data.spnebak" | "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm -i --no-deps --entrypoint sh postgres \
+        if ! decrypt_stream < "${ROLLBACK_DIR}/postgres_data.spnebak" | "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm -i --no-deps --entrypoint sh postgres \
           -c "rm -rf /var/lib/postgresql/data/* /var/lib/postgresql/data/.[!.]* && tar -xzf - -C /var/lib/postgresql/data"; then
           echo "ERROR: Failed to extract rollback archive for PostgreSQL!" >&2
           ROLLBACK_FAILED=1
-        elif ! "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint test postgres -f /var/lib/postgresql/data/PG_VERSION; then
+        elif ! "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm --no-deps --entrypoint test postgres -f /var/lib/postgresql/data/PG_VERSION; then
           echo "ERROR: PostgreSQL volume verification failed after rollback (PG_VERSION missing)!" >&2
           ROLLBACK_FAILED=1
         else
@@ -487,7 +495,7 @@ if [ -n "${SPINE_API_BIN}" ]; then
 else
   # Decrypt through spine-api container via read-only mounted secret file.
   # Credentials are never passed in process arguments or container environment variables.
-  if ! "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm -i --no-deps \
+  if ! "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm -i --no-deps \
     -v "${mount_pass_file}:/run/secrets/backup_passphrase:ro" spine-api \
     backup decrypt --passphrase-file /run/secrets/backup_passphrase --input - --output - < "${ENCRYPTED_FILE}" | tar -xzf - -C "${DECRYPT_DIR}"; then
     DECRYPT_FAILED=1
@@ -518,11 +526,11 @@ echo "=== Step 0b: Verifying Restored Payload SHA-256 Checksum Manifest ==="
 
 echo "=== Step 1: Stopping Cluster Services & Verifying Full Quiescence ==="
 # Stop services; failures here are fatal (no || true)
-"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" stop ingress spine-api
-"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" stop storage-node-1 storage-node-2 storage-node-3 coordinator postgres spine-frontend
+"${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" stop ingress spine-api
+"${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" stop storage-node-1 storage-node-2 storage-node-3 coordinator postgres spine-frontend
 
 # Strictly verify no stateful containers are running
-RUNNING=$("${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" ps --services --filter "status=running")
+RUNNING=$("${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" ps --services --filter "status=running")
 if [ -n "${RUNNING}" ]; then
   echo "FATAL: The following services failed to stop and are still running:" >&2
   echo "${RUNNING}" >&2
@@ -547,27 +555,48 @@ echo "=== Step 2a: Mandatory Pre-Restore Archiving & Integrity Gate (Volumes Unt
 # All rollback artifacts are encrypted on the fly (SPNEBAK v2) to prevent persisting plaintext on disk.
 # Any failure here aborts immediately before a single byte of live volume data is modified.
 
-echo "Archiving Coordinator volume (encrypted)..."
-"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint tar coordinator \
-  -czf - -C /var/lib/spine . | encrypt_stream > "${ROLLBACK_DIR}/coordinator.spnebak"
+echo "Archiving cluster volumes concurrently (encrypted)..."
+ARCH_PIDS=()
+ARCH_NAMES=()
+
+"${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm --no-deps --entrypoint tar coordinator \
+  -czf - -C /var/lib/spine . | encrypt_stream > "${ROLLBACK_DIR}/coordinator.spnebak" &
+ARCH_PIDS+=($!)
+ARCH_NAMES+=("coordinator")
 
 for NODE in 1 2 3; do
-  echo "Archiving Storage Node ${NODE} volume (encrypted)..."
-  "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint tar "storage-node-${NODE}" \
-    -czf - -C "/var/lib/spine/node-${NODE}" . | encrypt_stream > "${ROLLBACK_DIR}/storage_node_${NODE}.spnebak"
+  "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm --no-deps --entrypoint tar "storage-node-${NODE}" \
+    -czf - -C "/var/lib/spine/node-${NODE}" . | encrypt_stream > "${ROLLBACK_DIR}/storage_node_${NODE}.spnebak" &
+  ARCH_PIDS+=($!)
+  ARCH_NAMES+=("storage_node_${NODE}")
 done
 
-echo "Archiving API SSH identities (encrypted)..."
-"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint tar spine-api \
-  -czf - -C /var/lib/spine/ssh . | encrypt_stream > "${ROLLBACK_DIR}/spine_ssh.spnebak"
+"${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm --no-deps --entrypoint tar spine-api \
+  -czf - -C /var/lib/spine/ssh . | encrypt_stream > "${ROLLBACK_DIR}/spine_ssh.spnebak" &
+ARCH_PIDS+=($!)
+ARCH_NAMES+=("spine_ssh")
 
-echo "Archiving API storage cache (encrypted)..."
-"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint tar spine-api \
-  -czf - -C /var/lib/spine/storage . | encrypt_stream > "${ROLLBACK_DIR}/spine_storage.spnebak"
+"${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm --no-deps --entrypoint tar spine-api \
+  -czf - -C /var/lib/spine/storage . | encrypt_stream > "${ROLLBACK_DIR}/spine_storage.spnebak" &
+ARCH_PIDS+=($!)
+ARCH_NAMES+=("spine_storage")
 
-echo "Archiving PostgreSQL volume (encrypted)..."
-"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint tar postgres \
-  -czf - -C /var/lib/postgresql/data . | encrypt_stream > "${ROLLBACK_DIR}/postgres_data.spnebak"
+"${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm --no-deps --entrypoint tar postgres \
+  -czf - -C /var/lib/postgresql/data . | encrypt_stream > "${ROLLBACK_DIR}/postgres_data.spnebak" &
+ARCH_PIDS+=($!)
+ARCH_NAMES+=("postgres_data")
+
+ARCH_FAIL=0
+for i in "${!ARCH_PIDS[@]}"; do
+  if ! wait "${ARCH_PIDS[$i]}"; then
+    echo "ERROR: Archiving failed for ${ARCH_NAMES[$i]}." >&2
+    ARCH_FAIL=1
+  fi
+done
+if [ ${ARCH_FAIL} -ne 0 ]; then
+  echo "FATAL: One or more pre-restore rollback archives failed to generate. Aborting restore." >&2
+  exit 1
+fi
 
 # Restrictive permissions on rollback directory and encrypted archives
 chmod 600 "${ROLLBACK_DIR}"/*
@@ -600,36 +629,58 @@ VOLUMES_MODIFIED=1
 
 echo "=== Step 2b: Cleaning Target Volumes & Extracting Incoming Backup ==="
 
-# 1. Clean ephemeral staging in storage nodes (unquoted wildcards inside container shell)
+# 1. Clean ephemeral staging in storage nodes
 for NODE in 1 2 3; do
-  echo "Cleaning staging directories in storage node ${NODE}..."
-  "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
-    -c "rm -rf /var/lib/spine/node-${NODE}/.staged_restore_* /var/lib/spine/node-${NODE}/.old_restore_* 2>/dev/null || true"
+  "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
+    -c "rm -rf /var/lib/spine/node-${NODE}/.staged_restore_* /var/lib/spine/node-${NODE}/.old_restore_* 2>/dev/null || true" &
+done
+wait
+
+# 2. Empty target volumes and extract incoming backup cleanly in parallel
+echo "Restoring cluster volumes concurrently in background..."
+EXTRACT_PIDS=()
+EXTRACT_NAMES=()
+
+"${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm --no-deps --entrypoint sh coordinator \
+  -c "rm -rf /var/lib/spine/* /var/lib/spine/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine" < "${DECRYPT_DIR}/coordinator.tar.gz" &
+EXTRACT_PIDS+=($!)
+EXTRACT_NAMES+=("coordinator")
+
+for NODE in 1 2 3; do
+  "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
+    -c "rm -rf /var/lib/spine/node-${NODE}/* /var/lib/spine/node-${NODE}/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine/node-${NODE}" < "${DECRYPT_DIR}/storage_node_${NODE}.tar.gz" &
+  EXTRACT_PIDS+=($!)
+  EXTRACT_NAMES+=("storage-node-${NODE}")
 done
 
-# 2. Empty target volumes and extract incoming backup cleanly
-echo "Restoring Coordinator volume..."
-"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh coordinator \
-  -c "rm -rf /var/lib/spine/* /var/lib/spine/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine" < "${DECRYPT_DIR}/coordinator.tar.gz"
+"${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm --no-deps --entrypoint sh spine-api \
+  -c "rm -rf /var/lib/spine/ssh/* /var/lib/spine/ssh/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine/ssh" < "${DECRYPT_DIR}/spine_ssh.tar.gz" &
+EXTRACT_PIDS+=($!)
+EXTRACT_NAMES+=("spine-api-ssh")
 
-for NODE in 1 2 3; do
-  echo "Restoring Storage Node ${NODE} volume..."
-  "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh "storage-node-${NODE}" \
-    -c "rm -rf /var/lib/spine/node-${NODE}/* /var/lib/spine/node-${NODE}/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine/node-${NODE}" < "${DECRYPT_DIR}/storage_node_${NODE}.tar.gz"
+"${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm --no-deps --entrypoint sh spine-api \
+  -c "rm -rf /var/lib/spine/storage/* /var/lib/spine/storage/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine/storage" < "${DECRYPT_DIR}/spine_storage.tar.gz" &
+EXTRACT_PIDS+=($!)
+EXTRACT_NAMES+=("spine-api-storage")
+
+EXTRACT_FAIL=0
+for i in "${!EXTRACT_PIDS[@]}"; do
+  if ! wait "${EXTRACT_PIDS[$i]}"; then
+    echo "ERROR: Extraction failed for ${EXTRACT_NAMES[$i]}." >&2
+    EXTRACT_FAIL=1
+  else
+    echo "Volume extraction succeeded for ${EXTRACT_NAMES[$i]} [OK]."
+  fi
 done
-
-echo "Restoring API SSH identities..."
-"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh spine-api \
-  -c "rm -rf /var/lib/spine/ssh/* /var/lib/spine/ssh/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine/ssh" < "${DECRYPT_DIR}/spine_ssh.tar.gz"
-
-echo "Restoring API storage cache..."
-"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh spine-api \
-  -c "rm -rf /var/lib/spine/storage/* /var/lib/spine/storage/.[!.]* 2>/dev/null || true; tar -xzf - -C /var/lib/spine/storage" < "${DECRYPT_DIR}/spine_storage.tar.gz"
+if [ ${EXTRACT_FAIL} -ne 0 ]; then
+  echo "FATAL: One or more volume extractions failed. Aborting restore." >&2
+  exit 1
+fi
 
 echo "=== Step 3: Automated Fail-Closed Fencing Generation Verification ==="
 FAILED=0
 
-COORD_GEN=$("${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint cat coordinator \
+COORD_GEN=$("${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm --no-deps --entrypoint cat coordinator \
   /var/lib/spine/.coordinator_fencing_generation 2>/dev/null | tr -d '[:space:]' || echo "MISSING")
 
 if [ "${COORD_GEN}" != "${TARGET_GEN}" ]; then
@@ -640,7 +691,7 @@ else
 fi
 
 for NODE in 1 2 3; do
-  NODE_GEN=$("${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint cat "storage-node-${NODE}" \
+  NODE_GEN=$("${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm --no-deps --entrypoint cat "storage-node-${NODE}" \
     "/var/lib/spine/node-${NODE}/.fencing_generation" 2>/dev/null | tr -d '[:space:]' || echo "MISSING")
   if [ "${NODE_GEN}" != "${TARGET_GEN}" ]; then
     echo "ERROR: Storage node ${NODE} generation (${NODE_GEN}) does not match target generation (${TARGET_GEN})."
@@ -673,38 +724,58 @@ fi
 echo "All participants match fencing generation ${TARGET_GEN}. Consensus verified."
 
 echo "=== Step 4: Storage Node Volume Integrity Check ==="
+VERIFY_PIDS=()
+VERIFY_NODES=()
 for NODE in 1 2 3; do
-  echo "Verifying storage volume integrity on node ${NODE}..."
-  "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm "storage-node-${NODE}" \
-    --verify-integrity --data-dir "/var/lib/spine/node-${NODE}"
+  echo "Verifying storage volume integrity on node ${NODE} in background..."
+  "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm "storage-node-${NODE}" \
+    --verify-integrity --data-dir "/var/lib/spine/node-${NODE}" &
+  VERIFY_PIDS+=($!)
+  VERIFY_NODES+=("${NODE}")
 done
 
+VERIFY_FAIL=0
+for i in "${!VERIFY_PIDS[@]}"; do
+  if ! wait "${VERIFY_PIDS[$i]}"; then
+    echo "ERROR: Storage node ${VERIFY_NODES[$i]} failed volume integrity check." >&2
+    VERIFY_FAIL=1
+  else
+    echo "Storage node ${VERIFY_NODES[$i]} integrity verified [OK]."
+  fi
+done
+if [ ${VERIFY_FAIL} -ne 0 ]; then
+  echo "FATAL: Storage node integrity checks failed. Aborting restore." >&2
+  exit 1
+fi
+
 echo "=== Step 5: Clean PostgreSQL Restoration & Verification ==="
-# 1. Strictly empty /var/lib/postgresql/data for PostgreSQL initdb
-echo "Preparing strictly empty PGDATA for fresh PostgreSQL initialization..."
-"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" run --rm --no-deps --entrypoint sh postgres \
-  -c "rm -rf /var/lib/postgresql/data/* /var/lib/postgresql/data/.[!.]* 2>/dev/null || true"
-
-echo "Starting fresh PostgreSQL container..."
-"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" up -d postgres
-
-echo "Awaiting PostgreSQL readiness..."
-READY_PG=0
 PG_EXEC_ARGS=()
 if [ -n "${POSTGRES_ADMIN_PASSWORD}" ]; then
   PG_EXEC_ARGS+=(-e "PGPASSWORD=${POSTGRES_ADMIN_PASSWORD}")
 fi
 
+# Fast-path: Check if PGDATA is already initialized to skip 40-second redundant initdb
+IS_INITIALIZED=$("${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm --no-deps --entrypoint sh postgres \
+  -c "[ -s /var/lib/postgresql/data/PG_VERSION ] && echo 'YES' || echo 'NO'" 2>/dev/null || echo "NO")
+
+if [ "${IS_INITIALIZED}" != "YES" ]; then
+  echo "Preparing strictly empty PGDATA for fresh PostgreSQL initialization..."
+  "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" run --rm --no-deps --entrypoint sh postgres \
+    -c "rm -rf /var/lib/postgresql/data/* /var/lib/postgresql/data/.[!.]* 2>/dev/null || true"
+  echo "Starting fresh PostgreSQL container..."
+  "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" up -d postgres
+else
+  echo "PostgreSQL PGDATA is already initialized. Starting PostgreSQL container..."
+  "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" up -d postgres
+fi
+
+echo "Awaiting PostgreSQL readiness..."
+READY_PG=0
 for _ in $(seq 1 45); do
-  # Require both pg_isready and a successful psql query to ensure the permanent postgres server
-  # has finished initializing and has not shut down from the temporary initdb process.
-  if "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T postgres pg_isready -U "${POSTGRES_ADMIN_USER}" >/dev/null 2>&1 && \
-     "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T "${PG_EXEC_ARGS[@]}" postgres psql -U "${POSTGRES_ADMIN_USER}" -d postgres -c "SELECT 1;" >/dev/null 2>&1; then
-    sleep 2
-    if "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T "${PG_EXEC_ARGS[@]}" postgres psql -U "${POSTGRES_ADMIN_USER}" -d postgres -c "SELECT 1;" >/dev/null 2>&1; then
-      READY_PG=1
-      break
-    fi
+  if "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" exec -T postgres pg_isready -U "${POSTGRES_ADMIN_USER}" >/dev/null 2>&1 && \
+     "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" exec -T "${PG_EXEC_ARGS[@]}" postgres psql -U "${POSTGRES_ADMIN_USER}" -d postgres -c "SELECT 1;" >/dev/null 2>&1; then
+    READY_PG=1
+    break
   fi
   sleep 1
 done
@@ -714,24 +785,38 @@ if [ ${READY_PG} -ne 1 ]; then
   exit 1
 fi
 
-# 2. Terminate connections and drop empty compose-initialized spine_forge database
-echo "Preparing database cluster for dump import..."
-
-"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T "${PG_EXEC_ARGS[@]}" postgres psql -U "${POSTGRES_ADMIN_USER}" -d postgres -v ON_ERROR_STOP=1 \
+echo "Preparing database cluster for high-throughput dump import..."
+"${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" exec -T "${PG_EXEC_ARGS[@]}" postgres psql -U "${POSTGRES_ADMIN_USER}" -d postgres -v ON_ERROR_STOP=1 \
   -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${POSTGRES_DB}' AND pid <> pg_backend_pid();" \
-  -c "DROP DATABASE IF EXISTS ${POSTGRES_DB};"
+  -c "DROP DATABASE IF EXISTS ${POSTGRES_DB};" \
+  -c "DROP TABLE IF EXISTS _spine_active_database_selector CASCADE;"
 
-# 3. Import dump with ON_ERROR_STOP=1, adapting CREATE ROLE statements to handle existing bootstrap roles idempotently
+# Temporarily optimize durability and WAL parameters for bulk restore speed
+"${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" exec -T "${PG_EXEC_ARGS[@]}" postgres psql -U "${POSTGRES_ADMIN_USER}" -d postgres -v ON_ERROR_STOP=1 \
+  -c "ALTER SYSTEM SET synchronous_commit = off;" \
+  -c "ALTER SYSTEM SET checkpoint_timeout = '30min';" \
+  -c "ALTER SYSTEM SET max_wal_size = '2GB';" \
+  -c "SELECT pg_reload_conf();"
+
+# Import dump with ON_ERROR_STOP=1, adapting CREATE ROLE statements to handle existing bootstrap roles idempotently
 echo "Importing PostgreSQL database from ${DECRYPT_DIR}/postgres_dump.sql.gz (with ON_ERROR_STOP=1)..."
-# Stream through sed: converts 'CREATE ROLE <name> ...;' into idempotent PL/pgSQL block
-# Catching duplicate_object prevents collision with bootstrap roles while failing closed on any real error
 gzip -dc "${DECRYPT_DIR}/postgres_dump.sql.gz" | \
-  sed -E 's/^CREATE ROLE ([^;]+);/DO \$\$ BEGIN CREATE ROLE \1; EXCEPTION WHEN duplicate_object THEN NULL; END \$\$;/' | \
-  "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T "${PG_EXEC_ARGS[@]}" postgres \
+  sed -E -e 's/^CREATE ROLE ([^;]+);/DO \$\$ BEGIN CREATE ROLE \1; EXCEPTION WHEN duplicate_object THEN NULL; END \$\$;/' \
+         -e 's/^CREATE TABLE _spine_active_database_selector/CREATE TABLE IF NOT EXISTS _spine_active_database_selector/' | \
+  "${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" exec -T "${PG_EXEC_ARGS[@]}" postgres \
   psql -v ON_ERROR_STOP=1 -U "${POSTGRES_ADMIN_USER}" -d postgres
 
+# Synchronously restore durability parameters and force checkpoint
+echo "Restoring PostgreSQL transactional durability and synchronizing checkpoint..."
+"${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" exec -T "${PG_EXEC_ARGS[@]}" postgres psql -U "${POSTGRES_ADMIN_USER}" -d postgres -v ON_ERROR_STOP=1 \
+  -c "ALTER SYSTEM RESET synchronous_commit;" \
+  -c "ALTER SYSTEM RESET checkpoint_timeout;" \
+  -c "ALTER SYSTEM RESET max_wal_size;" \
+  -c "SELECT pg_reload_conf();" \
+  -c "CHECKPOINT;"
+
 echo "Verifying restored PostgreSQL schema..."
-TABLE_COUNT=$("${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T "${PG_EXEC_ARGS[@]}" postgres \
+TABLE_COUNT=$("${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" exec -T "${PG_EXEC_ARGS[@]}" postgres \
   psql -U "${POSTGRES_ADMIN_USER}" -d "${POSTGRES_DB}" -t -A -c \
   "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public';" 2>/dev/null || echo "0")
 
@@ -742,7 +827,7 @@ fi
 echo "PostgreSQL restoration verified (${TABLE_COUNT} public tables present in ${POSTGRES_DB})."
 
 echo "Synchronizing PostgreSQL restore generation and barrier state to target generation ${TARGET_GEN}..."
-"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T "${PG_EXEC_ARGS[@]}" postgres \
+"${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" exec -T "${PG_EXEC_ARGS[@]}" postgres \
   psql -U "${POSTGRES_ADMIN_USER}" -d "${POSTGRES_DB}" -v ON_ERROR_STOP=1 -c "
     INSERT INTO _restore_generation (id, generation_token, backup_id, restored_at_nanos, status)
     VALUES (1, '${TARGET_GEN}', 'oob-restore-${TARGET_GEN}', (EXTRACT(EPOCH FROM NOW()) * 1000000000)::bigint, 'COMMITTED')
@@ -751,6 +836,8 @@ echo "Synchronizing PostgreSQL restore generation and barrier state to target ge
       backup_id = EXCLUDED.backup_id,
       restored_at_nanos = EXCLUDED.restored_at_nanos,
       status = EXCLUDED.status;
+    GRANT ALL PRIVILEGES ON TABLE _restore_generation TO ${POSTGRES_APP_USER:-spine_app};
+    GRANT ALL PRIVILEGES ON TABLE _cluster_maintenance_barrier TO ${POSTGRES_APP_USER:-spine_app};
     UPDATE _cluster_maintenance_barrier
     SET is_active = FALSE,
         lease_expires_at_nanos = 0,
@@ -761,20 +848,20 @@ echo "Synchronizing PostgreSQL restore generation and barrier state to target ge
 
 echo "=== Step 6: Starting Core Infrastructure & Application Control Plane ==="
 echo "Starting coordinator and storage nodes..."
-"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" up -d coordinator storage-node-1 storage-node-2 storage-node-3
+"${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" up -d coordinator storage-node-1 storage-node-2 storage-node-3
 
 echo "Awaiting core infrastructure health..."
 sleep 5
-"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" ps
+"${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" ps
 
 echo "Starting API, frontend, and ingress..."
-"${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" up -d spine-api spine-frontend ingress
+"${DOCKER_BIN}" compose "${COMPOSE_ARGS[@]}" up -d spine-api spine-frontend ingress
 
 echo "=== Step 7: Readiness Health Check & Rollback Purge Gate ==="
 sleep 3
 READY_APP=0
 for _ in $(seq 1 30); do
-  if curl -s -f http://127.0.0.1:3000/health/ready > /dev/null 2>&1; then
+  if curl -s -f "${SPINE_API_URL}/health/ready" > /dev/null 2>&1; then
     READY_APP=1
     break
   fi
@@ -783,7 +870,7 @@ done
 
 if [ ${READY_APP} -ne 1 ]; then
   echo "FATAL: /health/ready returned non-200 after restoration. Halting without committing rollback purge." >&2
-  curl -s http://127.0.0.1:3000/health/diagnostics || true
+  curl -s "${SPINE_API_URL}/health/diagnostics" || true
   exit 1
 fi
 
