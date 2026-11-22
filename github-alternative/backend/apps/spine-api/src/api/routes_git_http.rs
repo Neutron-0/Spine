@@ -410,7 +410,7 @@ pub async fn git_receive_pack(
     State(state): State<AppState>,
     Path((owner, repo_git)): Path<(String, String)>,
     headers: HeaderMap,
-    body: Bytes,
+    body: axum::body::Body,
 ) -> Response {
     let _write_permit = match state.consistency_barrier.acquire_write_permit().await {
         Ok(permit) => permit,
@@ -429,11 +429,14 @@ pub async fn git_receive_pack(
     }
 
     let repo_name = repo_git.strip_suffix(".git").unwrap_or(&repo_git);
+
+    // 1. Authentication check: must happen BEFORE reading body
     let user = match authenticate_git_user(&state, &headers).await {
         Some(u) => u,
         None => return unauthorized_response(),
     };
 
+    // 2. Repository existence check: BEFORE reading body
     let repo = match state
         .db
         .get_repository_by_owner_name(&owner, repo_name)
@@ -443,6 +446,7 @@ pub async fn git_receive_pack(
         _ => return (StatusCode::NOT_FOUND, "Repository not found\n").into_response(),
     };
 
+    // 3. Permission check: BEFORE reading body
     if let Err(e) = state
         .permissions
         .check_write_access(Some(&user), &repo)
@@ -455,7 +459,48 @@ pub async fn git_receive_pack(
             .into_response();
     }
 
-    let resp_bytes = match process_git_receive_pack(&state, &repo, &user.id, &body).await {
+    // 4. Concurrency control: acquire an upload permit
+    let _upload_slot = match state.acquire_upload_permit().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(axum::http::header::RETRY_AFTER, "5")],
+                "Server is experiencing high upload concurrency. Please retry shortly.\n",
+            )
+                .into_response();
+        }
+    };
+
+    // 5. Stream body into bounded tempfile on disk
+    let (tempfile, total_bytes, _digest) = match crate::api::streaming::stream_body_to_tempfile(
+        body,
+        crate::api::streaming::DEFAULT_MAX_UPLOAD_BYTES,
+        crate::api::streaming::DEFAULT_STREAM_TIMEOUT,
+    )
+    .await
+    {
+        Ok(res) => res,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("Upload error or client aborted: {}\n", e),
+            )
+                .into_response()
+        }
+    };
+
+    let mut file = tempfile.into_file();
+    let mut body_bytes = Vec::with_capacity(std::cmp::min(total_bytes as usize, 64 * 1024 * 1024));
+    if let Err(e) = std::io::Read::read_to_end(&mut file, &mut body_bytes) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to read pack: {}\n", e),
+        )
+            .into_response();
+    }
+
+    let resp_bytes = match process_git_receive_pack(&state, &repo, &user.id, &body_bytes).await {
         Ok(b) => b,
         Err((code, msg)) => return (code, msg).into_response(),
     };

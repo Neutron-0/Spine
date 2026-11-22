@@ -368,6 +368,163 @@ pub fn compute_directory_staged_resource_digest(
     Ok((digest, total_bytes, files.len()))
 }
 
+/// Unpacks an uncompressed or decompressed tar archive into `staged_dir` with fail-closed security safeguards:
+/// 1. Rejects unsafe entry types: only Regular files and Directories are allowed. Symlinks, hardlinks,
+///    FIFOs, block devices, char devices, and special entries are strictly prohibited.
+/// 2. Rejects path traversal components: Prefix, RootDir, ParentDir ('..') are strictly prohibited.
+/// 3. Rejects duplicate entry paths to prevent replacement attacks or link races.
+/// 4. Confirms destination path is strictly within the canonical staging root.
+/// 5. Verifies no intermediate path component in the hierarchy is a symlink.
+/// 6. Creates regular files using `OpenOptions::new().write(true).create(true).truncate(true)`
+///    (rejecting existing symlinks) and copies bytes with `std::io::copy`, never following symlinks.
+pub fn safe_unpack_archive<R: std::io::Read>(
+    mut archive: Archive<R>,
+    staged_dir: &Path,
+) -> Result<usize, ForgeError> {
+    use std::fs::OpenOptions;
+
+    let canonical_staged = staged_dir.canonicalize().map_err(|e| {
+        ForgeError::Internal(format!("Failed to canonicalize staging directory: {}", e))
+    })?;
+
+    let entries = archive
+        .entries()
+        .map_err(|e| ForgeError::Internal(format!("Failed to read archive entries: {}", e)))?;
+
+    let mut seen_paths = HashSet::new();
+    let mut file_count = 0;
+
+    for entry in entries {
+        let mut file =
+            entry.map_err(|e| ForgeError::Internal(format!("Corrupt archive entry: {}", e)))?;
+        let entry_type = file.header().entry_type();
+
+        // 1. Strict entry type rejection: allow ONLY regular files and directories.
+        // Prohibit symlinks, hardlinks, FIFOs, char/block devices, etc.
+        if !entry_type.is_file() && !entry_type.is_dir() {
+            return Err(ForgeError::Internal(format!(
+                "Prohibited unsafe entry type ({:?}) in snapshot archive: {:?}",
+                entry_type,
+                file.path().ok()
+            )));
+        }
+
+        let raw_path = file
+            .path()
+            .map_err(|e| ForgeError::Internal(format!("Invalid path in archive: {}", e)))?
+            .to_path_buf();
+
+        // 2. Lexical component check: forbid RootDir, Prefix, ParentDir.
+        for comp in raw_path.components() {
+            match comp {
+                std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+                _ => {
+                    return Err(ForgeError::Internal(format!(
+                        "Unsafe path traversal component in snapshot archive: {:?}",
+                        raw_path
+                    )));
+                }
+            }
+        }
+
+        // 3. Forbid duplicate paths in archive to prevent replacement/race conditions
+        if !seen_paths.insert(raw_path.clone()) {
+            return Err(ForgeError::Internal(format!(
+                "Duplicate entry path detected in snapshot archive: {:?}",
+                raw_path
+            )));
+        }
+
+        // 4. Construct destination path and verify it stays within staging root
+        let dest = canonical_staged.join(&raw_path);
+        if !dest.starts_with(&canonical_staged) {
+            return Err(ForgeError::Internal(format!(
+                "Unsafe destination path outside staging directory: {:?}",
+                dest
+            )));
+        }
+
+        // 5. Verify no intermediate path component in the hierarchy is a symlink
+        let mut curr = canonical_staged.clone();
+        for comp in raw_path.components() {
+            if let std::path::Component::Normal(p) = comp {
+                curr.push(p);
+                if let Ok(meta) = fs::symlink_metadata(&curr) {
+                    if meta.is_symlink() {
+                        return Err(ForgeError::Internal(format!(
+                            "Symlink detected in destination hierarchy: {:?}",
+                            curr
+                        )));
+                    }
+                }
+            }
+        }
+
+        // 6. Safe extraction without following symlinks
+        if entry_type.is_dir() {
+            fs::create_dir_all(&dest).map_err(|e| {
+                ForgeError::Internal(format!("Failed to create directory {:?}: {}", dest, e))
+            })?;
+        } else {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    ForgeError::Internal(format!("Failed to create parent dir {:?}: {}", parent, e))
+                })?;
+                let canonical_parent = parent.canonicalize().map_err(|e| {
+                    ForgeError::Internal(format!(
+                        "Failed to canonicalize parent {:?}: {}",
+                        parent, e
+                    ))
+                })?;
+                if !canonical_parent.starts_with(&canonical_staged) {
+                    return Err(ForgeError::Internal(format!(
+                        "Parent directory escaped staging root: {:?}",
+                        canonical_parent
+                    )));
+                }
+            }
+
+            // Ensure target file does not already exist as a symlink
+            if let Ok(meta) = fs::symlink_metadata(&dest) {
+                if meta.is_symlink() {
+                    return Err(ForgeError::Internal(format!(
+                        "Destination already exists as a symlink: {:?}",
+                        dest
+                    )));
+                }
+            }
+
+            let mut out = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&dest)
+                .map_err(|e| {
+                    ForgeError::Internal(format!(
+                        "Failed to open destination file {:?}: {}",
+                        dest, e
+                    ))
+                })?;
+
+            std::io::copy(&mut file, &mut out).map_err(|e| {
+                ForgeError::Internal(format!("Failed to write file {:?}: {}", dest, e))
+            })?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = file.header().mode().unwrap_or(0o600);
+                let safe_mode = (mode & 0o777) | 0o600;
+                let _ = fs::set_permissions(&dest, fs::Permissions::from_mode(safe_mode));
+            }
+
+            file_count += 1;
+        }
+    }
+
+    Ok(file_count)
+}
+
 /// Durable participant adapter for local VCS repository storage (`spine_storage`).
 pub struct LocalStorageParticipantAdapter {
     pub storage_root: PathBuf,
@@ -410,47 +567,10 @@ impl LocalStorageParticipantAdapter {
         hasher.update(payload_bytes);
         let archive_payload_sha256 = hex::encode(hasher.finalize());
 
-        // Unpack tar or tar.gz payload into staged_dir
+        // Unpack tar or tar.gz payload into staged_dir with fail-closed security
         let gz = GzDecoder::new(payload_bytes);
-        let mut archive = Archive::new(gz);
-        let entries = archive.entries().map_err(|e| {
-            ForgeError::Internal(format!(
-                "Failed to read storage snapshot tar entries: {}",
-                e
-            ))
-        })?;
-
-        for entry in entries {
-            let mut file = entry.map_err(|e| ForgeError::Internal(e.to_string()))?;
-            let path = file
-                .path()
-                .map_err(|e| ForgeError::Internal(e.to_string()))?
-                .to_path_buf();
-            for c in path.components() {
-                match c {
-                    std::path::Component::Normal(_) | std::path::Component::CurDir => {}
-                    _ => {
-                        return Err(ForgeError::Internal(format!(
-                            "Unsafe path traversal component in storage snapshot: {:?}",
-                            path
-                        )));
-                    }
-                }
-            }
-            let dest = staged_dir.join(&path);
-            if !dest.starts_with(&staged_dir) {
-                return Err(ForgeError::Internal(format!(
-                    "Unsafe destination path outside staging directory: {:?}",
-                    dest
-                )));
-            }
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
-            }
-            file.unpack(&dest).map_err(|e| {
-                ForgeError::Internal(format!("Failed to unpack storage file: {}", e))
-            })?;
-        }
+        let archive = Archive::new(gz);
+        safe_unpack_archive(archive, &staged_dir)?;
 
         // Compute actual staged resource digest from the unpacked files on disk
         let (staged_resource_digest, staged_byte_length, file_count) =
@@ -721,44 +841,10 @@ impl SshParticipantAdapter {
         hasher.update(payload_bytes);
         let archive_payload_sha256 = hex::encode(hasher.finalize());
 
-        // Unpack payload
+        // Unpack SSH payload with fail-closed security
         let gz = GzDecoder::new(payload_bytes);
-        let mut archive = Archive::new(gz);
-        let entries = archive.entries().map_err(|e| {
-            ForgeError::Internal(format!("Failed to read SSH snapshot tar entries: {}", e))
-        })?;
-
-        for entry in entries {
-            let mut file = entry.map_err(|e| ForgeError::Internal(e.to_string()))?;
-            let path = file
-                .path()
-                .map_err(|e| ForgeError::Internal(e.to_string()))?
-                .to_path_buf();
-            for c in path.components() {
-                match c {
-                    std::path::Component::Normal(_) | std::path::Component::CurDir => {}
-                    _ => {
-                        return Err(ForgeError::Internal(format!(
-                            "Unsafe path traversal component in SSH snapshot: {:?}",
-                            path
-                        )));
-                    }
-                }
-            }
-            let dest = staged_dir.join(&path);
-            if !dest.starts_with(&staged_dir) {
-                return Err(ForgeError::Internal(format!(
-                    "Unsafe destination path outside staging directory: {:?}",
-                    dest
-                )));
-            }
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
-            }
-            file.unpack(&dest).map_err(|e| {
-                ForgeError::Internal(format!("Failed to unpack SSH key file: {}", e))
-            })?;
-        }
+        let archive = Archive::new(gz);
+        safe_unpack_archive(archive, &staged_dir)?;
 
         // Compute actual staged resource digest from the unpacked key files on disk
         let (staged_resource_digest, staged_byte_length, file_count) =

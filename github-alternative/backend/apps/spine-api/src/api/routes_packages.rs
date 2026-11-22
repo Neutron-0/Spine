@@ -80,14 +80,13 @@ pub async fn cargo_download(
     Path((crate_name, version)): Path<(String, String)>,
 ) -> Result<Response, ForgeError> {
     let bytes = state.cargo.download(&crate_name, &version).await?;
+    let filename = format!("{}-{}.crate", crate_name, version);
+    let cd_value = crate::api::streaming::format_content_disposition("attachment", &filename);
     let res = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/x-tar")
         .header(header::CONTENT_LENGTH, bytes.len().to_string())
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}-{}.crate\"", crate_name, version),
-        )
+        .header(header::CONTENT_DISPOSITION, cd_value)
         .body(axum::body::Body::from(bytes))
         .map_err(|e| ForgeError::Internal(e.to_string()))?;
     Ok(res)

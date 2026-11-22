@@ -42,6 +42,130 @@ fn count_files_recursive(path: &Path) -> usize {
     count
 }
 
+pub fn safe_unpack_storage_archive<R: std::io::Read>(
+    mut archive: Archive<R>,
+    staged_root: &Path,
+) -> Result<usize> {
+    use std::collections::HashSet;
+    use std::fs::OpenOptions;
+
+    let canonical_staged = staged_root
+        .canonicalize()
+        .with_context(|| format!("Failed to canonicalize staging root: {:?}", staged_root))?;
+
+    let mut seen_paths = HashSet::new();
+    let mut file_count = 0;
+
+    for entry in archive.entries()? {
+        let mut file = entry?;
+        let entry_type = file.header().entry_type();
+
+        // 1. Strict entry type rejection: allow ONLY regular files and directories.
+        // Prohibit symlinks, hardlinks, FIFOs, char/block devices, etc.
+        if !entry_type.is_file() && !entry_type.is_dir() {
+            bail!(
+                "Prohibited unsafe entry type ({:?}) in storage node archive: {:?}",
+                entry_type,
+                file.path().ok()
+            );
+        }
+
+        let raw_path = file.path()?.to_path_buf();
+
+        // 2. Lexical component check: forbid RootDir, Prefix, ParentDir.
+        for comp in raw_path.components() {
+            match comp {
+                std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+                _ => {
+                    bail!(
+                        "Unsafe path traversal component in storage node snapshot: {:?}",
+                        raw_path
+                    );
+                }
+            }
+        }
+
+        // 3. Forbid duplicate paths in archive to prevent replacement/race conditions
+        if !seen_paths.insert(raw_path.clone()) {
+            bail!(
+                "Duplicate entry path detected in storage node snapshot: {:?}",
+                raw_path
+            );
+        }
+
+        // 4. Construct destination path and verify it stays within staging root
+        let dest = canonical_staged.join(&raw_path);
+        if !dest.starts_with(&canonical_staged) {
+            bail!(
+                "Unsafe destination path outside staging directory: {:?}",
+                dest
+            );
+        }
+
+        // 5. Verify no intermediate path component in the hierarchy is a symlink
+        let mut curr = canonical_staged.clone();
+        for comp in raw_path.components() {
+            if let std::path::Component::Normal(p) = comp {
+                curr.push(p);
+                if let Ok(meta) = fs::symlink_metadata(&curr) {
+                    if meta.is_symlink() {
+                        bail!("Symlink detected in destination hierarchy: {:?}", curr);
+                    }
+                }
+            }
+        }
+
+        // 6. Safe extraction without following symlinks
+        if entry_type.is_dir() {
+            fs::create_dir_all(&dest)
+                .with_context(|| format!("Failed to create directory {:?}", dest))?;
+        } else {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("Failed to create parent dir {:?}", parent))?;
+                let canonical_parent = parent
+                    .canonicalize()
+                    .with_context(|| format!("Failed to canonicalize parent {:?}", parent))?;
+                if !canonical_parent.starts_with(&canonical_staged) {
+                    bail!(
+                        "Parent directory escaped staging root: {:?}",
+                        canonical_parent
+                    );
+                }
+            }
+
+            // Ensure target file does not already exist as a symlink
+            if let Ok(meta) = fs::symlink_metadata(&dest) {
+                if meta.is_symlink() {
+                    bail!("Destination already exists as a symlink: {:?}", dest);
+                }
+            }
+
+            let mut out = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&dest)
+                .with_context(|| format!("Failed to open destination file {:?}", dest))?;
+
+            std::io::copy(&mut file, &mut out)
+                .with_context(|| format!("Failed to write file {:?}", dest))?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = file.header().mode().unwrap_or(0o600);
+                let safe_mode = (mode & 0o777) | 0o600;
+                let _ = fs::set_permissions(&dest, fs::Permissions::from_mode(safe_mode));
+            }
+
+            file_count += 1;
+        }
+    }
+
+    Ok(file_count)
+}
+
 pub trait StorageBackend: Send + Sync {
     fn repo_path(&self, repo_id: &str) -> PathBuf;
     fn get_capacity(&self) -> Result<NodeCapacity>;
@@ -870,35 +994,8 @@ impl StorageBackend for FileSystemStorageBackend {
         fs::create_dir_all(&staged_root)?;
 
         let gz = GzDecoder::new(payload_tar_gz);
-        let mut archive = Archive::new(gz);
-
-        for entry in archive.entries()? {
-            let mut file = entry?;
-            let path = file.path()?.to_path_buf();
-            // Reject path traversal: only allow normal relative path components
-            for c in path.components() {
-                match c {
-                    std::path::Component::Normal(_) | std::path::Component::CurDir => {}
-                    _ => {
-                        bail!(
-                            "Unsafe path traversal component detected in storage node snapshot: {:?}",
-                            path
-                        );
-                    }
-                }
-            }
-            let dest = staged_root.join(&path);
-            if !dest.starts_with(&staged_root) {
-                bail!(
-                    "Unsafe destination path outside staging directory: {:?}",
-                    dest
-                );
-            }
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            file.unpack(&dest)?;
-        }
+        let archive = Archive::new(gz);
+        safe_unpack_storage_archive(archive, &staged_root)?;
 
         use sha2::Sha256;
         let mut hasher = Sha256::new();

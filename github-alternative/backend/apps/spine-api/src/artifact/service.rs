@@ -188,18 +188,37 @@ impl ArtifactService {
         Ok(stored)
     }
 
-    /// High-level atomic object ingestion: chunks, stores, creates manifest, and updates quota.
-    pub async fn store_object_bytes(
+    /// High-level streaming object ingestion: reads from any std::io::Read, chunks in bounded memory,
+    /// stores chunks, creates manifest, and updates quota.
+    pub async fn store_object_reader<R: std::io::Read>(
         &self,
         owner_type: &str,
         owner_id: &str,
         artifact_id: &str,
         content_type: Option<String>,
-        data: &[u8],
+        reader: R,
+        declared_size: Option<u64>,
     ) -> Result<StoredArtifactManifest, ForgeError> {
-        let total_size = data.len() as u64;
+        // Optional pre-stream quota check if size is declared upfront
+        if let Some(size) = declared_size {
+            let quota = self.db.get_or_create_quota(owner_type, owner_id).await?;
+            if (quota.used_logical_bytes as u64) + size > quota.logical_quota_bytes as u64 {
+                return Err(ForgeError::BadRequest(format!(
+                    "Storage quota exceeded: requested {} bytes, currently using {}/{} bytes",
+                    size, quota.used_logical_bytes, quota.logical_quota_bytes
+                )));
+            }
+        }
 
-        // Quota check
+        // Chunk data in bounded memory using StreamChunker (buffers at most one chunk in RAM)
+        let chunker = StreamChunker::new(Some(DEFAULT_CHUNK_SIZE));
+        let res = chunker
+            .chunk_reader(reader, artifact_id, content_type.clone())
+            .map_err(|e| ForgeError::Internal(format!("Chunking failed: {}", e)))?;
+
+        let total_size = res.manifest.total_size;
+
+        // Post-stream quota check against actual bytes ingested
         let quota = self.db.get_or_create_quota(owner_type, owner_id).await?;
         if (quota.used_logical_bytes as u64) + total_size > quota.logical_quota_bytes as u64 {
             return Err(ForgeError::BadRequest(format!(
@@ -207,12 +226,6 @@ impl ArtifactService {
                 total_size, quota.used_logical_bytes, quota.logical_quota_bytes
             )));
         }
-
-        // Chunk data
-        let chunker = StreamChunker::new(Some(DEFAULT_CHUNK_SIZE));
-        let res = chunker
-            .chunk_reader(Cursor::new(data), artifact_id, content_type.clone())
-            .map_err(|e| ForgeError::Internal(format!("Chunking failed: {}", e)))?;
 
         // Store chunks
         for chunk in &res.chunks {
@@ -254,6 +267,26 @@ impl ArtifactService {
             .await?;
 
         Ok(stored)
+    }
+
+    /// High-level atomic object ingestion: chunks, stores, creates manifest, and updates quota.
+    pub async fn store_object_bytes(
+        &self,
+        owner_type: &str,
+        owner_id: &str,
+        artifact_id: &str,
+        content_type: Option<String>,
+        data: &[u8],
+    ) -> Result<StoredArtifactManifest, ForgeError> {
+        self.store_object_reader(
+            owner_type,
+            owner_id,
+            artifact_id,
+            content_type,
+            Cursor::new(data),
+            Some(data.len() as u64),
+        )
+        .await
     }
 
     /// Retrieve raw chunk bytes

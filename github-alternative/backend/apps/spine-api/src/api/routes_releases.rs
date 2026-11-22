@@ -2,7 +2,6 @@ use crate::api::middleware::AppState;
 use crate::core::error::ForgeError;
 use crate::core::types::*;
 use axum::{
-    body::Bytes,
     extract::{Path, Query, State},
     http::{header, StatusCode},
     response::Response,
@@ -189,15 +188,18 @@ pub async fn upload_release_asset(
     Path((owner, repo_name, release_id)): Path<(String, String, String)>,
     Query(query): Query<UploadAssetQuery>,
     user: Option<Extension<User>>,
-    body: Bytes,
+    body: axum::body::Body,
 ) -> Result<(StatusCode, Json<ReleaseAssetDto>), ForgeError> {
     let _permit = state.consistency_barrier.acquire_write_permit().await?;
+
+    // 1. Authentication check: must occur BEFORE reading or processing the body
     let current_user = user
         .ok_or_else(|| {
             ForgeError::Unauthorized("Authentication required to upload asset".to_string())
         })?
         .0;
 
+    // 2. Asset name validation: must occur BEFORE reading body
     let trimmed_name = query.name.trim();
     if trimmed_name.is_empty() || trimmed_name.len() > 255 {
         return Err(ForgeError::BadRequest(
@@ -230,16 +232,19 @@ pub async fn upload_release_asset(
         }
     }
 
+    // 3. Repository lookup & tenant isolation check: BEFORE reading body
     let repo = state
         .repositories
         .get_repository(Some(&current_user), &owner, &repo_name)
         .await?;
 
+    // 4. Write permission check: BEFORE reading body
     state
         .permissions
         .check_write_access(Some(&current_user), &repo)
         .await?;
 
+    // 5. Release lookup: BEFORE reading body
     let rel = state.releases.get_release(&release_id).await?;
     if rel.repo_id != repo.id {
         return Err(ForgeError::NotFound(
@@ -247,13 +252,30 @@ pub async fn upload_release_asset(
         ));
     }
 
+    // 6. Concurrency control: acquire an upload permit
+    let _upload_slot = state.acquire_upload_permit().await?;
+
     let content_type = query
         .content_type
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
+    // 7. Bounded streaming: stream body to tempfile on disk (peak RAM < 64 KiB)
+    let (tempfile, total_bytes, _digest) = crate::api::streaming::stream_body_to_tempfile(
+        body,
+        crate::api::streaming::DEFAULT_MAX_UPLOAD_BYTES,
+        crate::api::streaming::DEFAULT_STREAM_TIMEOUT,
+    )
+    .await?;
+
     let asset = state
         .releases
-        .upload_asset(&release_id, &query.name, &content_type, &body)
+        .upload_asset_reader(
+            &release_id,
+            &query.name,
+            &content_type,
+            tempfile.into_file(),
+            Some(total_bytes),
+        )
         .await?;
 
     Ok((StatusCode::CREATED, Json(asset)))
@@ -285,16 +307,13 @@ pub async fn download_release_asset(
         return Err(ForgeError::NotFound("Asset not found in release".into()));
     }
 
-    let sanitized_filename = asset.name.replace(['\r', '\n', '"', '\\', '/'], "_");
+    let cd_value = crate::api::streaming::format_content_disposition("attachment", &asset.name);
 
     let res = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, asset.content_type)
         .header(header::CONTENT_LENGTH, bytes.len().to_string())
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", sanitized_filename),
-        )
+        .header(header::CONTENT_DISPOSITION, cd_value)
         .body(axum::body::Body::from(bytes))
         .map_err(|e| ForgeError::Internal(e.to_string()))?;
 

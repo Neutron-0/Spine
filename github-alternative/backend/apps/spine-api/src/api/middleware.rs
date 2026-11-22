@@ -48,9 +48,24 @@ pub struct AppState {
     pub consistency_barrier: Arc<crate::backup::ConsistencyBarrier>,
     pub storage_nodes: Vec<(String, String)>,
     pub active_maintenance: Arc<tokio::sync::Mutex<Option<crate::backup::MaintenanceGuard>>>,
+    pub upload_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
+    pub async fn acquire_upload_permit(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, crate::core::error::ForgeError> {
+        self.upload_semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                crate::core::error::ForgeError::RateLimited(
+                    "Upload concurrency limit reached. Please retry your upload shortly."
+                        .to_string(),
+                )
+            })
+    }
+
     pub fn storage_root(&self) -> &std::path::Path {
         self.vcs.storage_root()
     }
@@ -178,6 +193,7 @@ impl AppState {
             consistency_barrier,
             storage_nodes: Vec::new(),
             active_maintenance: Arc::new(tokio::sync::Mutex::new(None)),
+            upload_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
         })
     }
 }

@@ -26,6 +26,7 @@ pub mod routes_teams;
 pub mod routes_users;
 pub mod routes_webhooks;
 pub mod routes_workflows;
+pub mod streaming;
 
 pub use middleware::AppState;
 

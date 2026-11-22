@@ -24,8 +24,8 @@ pub mod v2;
 pub use consistency::{ConsistencyBarrier, MaintenanceGuard, SPINE_CLUSTER_MAINTENANCE_LOCK_ID};
 pub use journal::{CommitDecisionRecord, ParticipantAcknowledgement, RestoreJournal, RestorePhase};
 pub use participants::{
-    DeploymentResource, LocalStorageParticipantAdapter, ParticipantClassification,
-    ParticipantRegistry, SshParticipantAdapter,
+    safe_unpack_archive, DeploymentResource, LocalStorageParticipantAdapter,
+    ParticipantClassification, ParticipantRegistry, SshParticipantAdapter,
 };
 pub use v2::{BackupHeaderV2, StreamSummary};
 

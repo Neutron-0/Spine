@@ -2746,6 +2746,7 @@ async fn run_server(args: Cli) -> anyhow::Result<()> {
         consistency_barrier: Arc::clone(&consistency_barrier),
         storage_nodes,
         active_maintenance: Arc::new(tokio::sync::Mutex::new(None)),
+        upload_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
     };
 
     // 4. Spawn background workers

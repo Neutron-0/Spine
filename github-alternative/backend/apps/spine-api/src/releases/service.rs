@@ -2,6 +2,7 @@ use crate::artifact::ArtifactService;
 use crate::core::error::ForgeError;
 use crate::core::types::*;
 use crate::db::Database;
+use std::io::Cursor;
 use std::sync::Arc;
 
 pub struct ReleaseService {
@@ -154,12 +155,13 @@ impl ReleaseService {
         self.db.delete_release(release_id).await
     }
 
-    pub async fn upload_asset(
+    pub async fn upload_asset_reader<R: std::io::Read>(
         &self,
         release_id: &str,
         name: &str,
         content_type: &str,
-        data: &[u8],
+        reader: R,
+        declared_size: Option<u64>,
     ) -> Result<ReleaseAssetDto, ForgeError> {
         let rel = self
             .db
@@ -183,12 +185,13 @@ impl ReleaseService {
 
         let stored = self
             .artifacts
-            .store_object_bytes(
+            .store_object_reader(
                 owner_type,
                 owner_id,
                 name,
                 Some(content_type.to_string()),
-                data,
+                reader,
+                declared_size,
             )
             .await?;
 
@@ -202,7 +205,7 @@ impl ReleaseService {
             release_id: release_id.to_string(),
             name: name.to_string(),
             content_type: content_type.to_string(),
-            size_bytes: data.len() as i64,
+            size_bytes: stored.total_size,
             manifest_id: stored.id,
             whole_hash: stored.whole_object_hash,
             downloads_count: 0,
@@ -211,6 +214,23 @@ impl ReleaseService {
 
         let created = self.db.create_release_asset(asset).await?;
         Ok(ReleaseAssetDto::from(&created))
+    }
+
+    pub async fn upload_asset(
+        &self,
+        release_id: &str,
+        name: &str,
+        content_type: &str,
+        data: &[u8],
+    ) -> Result<ReleaseAssetDto, ForgeError> {
+        self.upload_asset_reader(
+            release_id,
+            name,
+            content_type,
+            Cursor::new(data),
+            Some(data.len() as u64),
+        )
+        .await
     }
 
     pub async fn download_asset(

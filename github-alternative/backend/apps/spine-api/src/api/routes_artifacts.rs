@@ -2,7 +2,6 @@ use crate::api::middleware::AppState;
 use crate::core::error::ForgeError;
 use crate::core::types::*;
 use axum::{
-    body::Bytes,
     extract::{Path, State},
     http::{header, StatusCode},
     response::Response,
@@ -85,25 +84,65 @@ pub async fn upload_artifact_version(
     State(state): State<AppState>,
     Path((ns_name, artifact_name, version)): Path<(String, String, String)>,
     user: Option<Extension<User>>,
-    body: Bytes,
+    body: axum::body::Body,
 ) -> Result<(StatusCode, Json<ArtifactVersionDto>), ForgeError> {
     let _permit = state.consistency_barrier.acquire_write_permit().await?;
+
+    // 1. Authentication check: must happen BEFORE reading body
     let current_user = user
         .ok_or_else(|| ForgeError::Unauthorized("Authentication required".to_string()))?
         .0;
 
+    // 2. Validate artifact_name and version format: must happen BEFORE reading body
+    let trimmed_artifact = artifact_name.trim();
+    let trimmed_version = version.trim();
+    if trimmed_artifact.is_empty()
+        || trimmed_artifact.len() > 128
+        || trimmed_version.is_empty()
+        || trimmed_version.len() > 64
+    {
+        return Err(ForgeError::BadRequest(
+            "Artifact name or version invalid length".into(),
+        ));
+    }
+    if trimmed_artifact.contains('/')
+        || trimmed_artifact.contains('\\')
+        || trimmed_artifact.contains("..")
+        || trimmed_artifact
+            .chars()
+            .any(|c| c.is_control() || c == '\r' || c == '\n' || c == '"')
+    {
+        return Err(ForgeError::BadRequest(
+            "Artifact name contains illegal path traversal or control characters".into(),
+        ));
+    }
+    if trimmed_version.contains('/')
+        || trimmed_version.contains('\\')
+        || trimmed_version.contains("..")
+        || trimmed_version
+            .chars()
+            .any(|c| c.is_control() || c == '\r' || c == '\n' || c == '"')
+    {
+        return Err(ForgeError::BadRequest(
+            "Version contains illegal path traversal or control characters".into(),
+        ));
+    }
+
+    // 3. Namespace lookup: BEFORE reading body
     let ns = state
         .db
         .get_artifact_namespace_by_name(&ns_name)
         .await?
         .ok_or_else(|| ForgeError::NotFound(format!("Namespace '{}' not found", ns_name)))?;
 
+    // 4. Namespace ownership check: BEFORE reading body
     if ns.owner_id != current_user.id {
         return Err(ForgeError::Forbidden(
             "Only the namespace owner can publish versions".to_string(),
         ));
     }
 
+    // 5. Version conflict check: BEFORE reading body
     if state
         .db
         .get_artifact_version(&ns.id, &artifact_name, &version)
@@ -116,14 +155,27 @@ pub async fn upload_artifact_version(
         )));
     }
 
+    // 6. Concurrency control: acquire an upload permit
+    let _upload_slot = state.acquire_upload_permit().await?;
+
+    // 7. Bounded streaming: stream body to tempfile on disk (peak RAM < 64 KiB)
+    let (tempfile, total_bytes, _digest) = crate::api::streaming::stream_body_to_tempfile(
+        body,
+        crate::api::streaming::DEFAULT_MAX_UPLOAD_BYTES,
+        crate::api::streaming::DEFAULT_STREAM_TIMEOUT,
+    )
+    .await?;
+
+    // 8. Ingest artifact via reader into deduplicated chunk store
     let stored = state
         .artifacts
-        .store_object_bytes(
+        .store_object_reader(
             &ns.owner_type,
             &ns.owner_id,
             &format!("{}-{}.bin", artifact_name, version),
             Some("application/octet-stream".to_string()),
-            &body,
+            tempfile.into_file(),
+            Some(total_bytes),
         )
         .await?;
 
@@ -139,7 +191,7 @@ pub async fn upload_artifact_version(
         version: version.clone(),
         manifest_id: stored.id.clone(),
         whole_hash: stored.whole_object_hash.clone(),
-        size_bytes: body.len() as i64,
+        size_bytes: stored.total_size,
         created_by_user_id: current_user.id,
         created_at_nanos: now,
     };
@@ -244,14 +296,14 @@ pub async fn download_artifact_version(
 
     let bytes = state.artifacts.reconstruct_object(&ver.manifest_id).await?;
 
+    let filename = format!("{}-{}.bin", artifact_name, version);
+    let cd_value = crate::api::streaming::format_content_disposition("attachment", &filename);
+
     let res = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(header::CONTENT_LENGTH, bytes.len().to_string())
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}-{}.bin\"", artifact_name, version),
-        )
+        .header(header::CONTENT_DISPOSITION, cd_value)
         .body(axum::body::Body::from(bytes))
         .map_err(|e| ForgeError::Internal(e.to_string()))?;
 

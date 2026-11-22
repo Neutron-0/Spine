@@ -5,6 +5,7 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -446,6 +447,9 @@ jobs:
 
       - name: Run Backup Automation Installer Tests
         run: python scripts/test_backup_automation_installer.py
+
+      - name: Run CI Workflow Gating Contract Tests
+        run: python scripts/test_ci_workflow_contract.py
 
       - name: Scan Repository with Gitleaks (Redacted Output)
         uses: gitleaks/gitleaks-action@f586c14365d4643c6aa59d472ae6e984bf47bb34 # v2.3.8

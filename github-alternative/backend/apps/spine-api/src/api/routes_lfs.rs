@@ -11,10 +11,9 @@ use axum::{
 };
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use spine_artifact::{ArtifactManifest, StreamChunker, DEFAULT_CHUNK_SIZE};
+use sha2::Sha256;
+use spine_artifact::ArtifactManifest;
 use std::collections::HashMap;
-use std::io::Cursor;
 use subtle::ConstantTimeEq;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -549,7 +548,7 @@ pub async fn git_lfs_upload_object(
     State(state): State<AppState>,
     Path((owner, repo_git, oid)): Path<(String, String, String)>,
     headers: HeaderMap,
-    body: Bytes,
+    body: axum::body::Body,
 ) -> Response {
     let _write_permit = match state.consistency_barrier.acquire_write_permit().await {
         Ok(permit) => permit,
@@ -577,7 +576,7 @@ pub async fn git_lfs_upload_object(
         _ => return (StatusCode::NOT_FOUND, "Repository not found\n").into_response(),
     };
 
-    // 1. Authorization: check scoped transfer token or Basic auth write access
+    // 1. Authorization: check scoped transfer token or Basic auth write access BEFORE reading body
     let authorized = if let Some(auth_val) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -592,10 +591,13 @@ pub async fn git_lfs_upload_object(
     };
 
     if !authorized {
-        let caller = authenticate_git_user(&state, &headers).await;
+        let caller = match authenticate_git_user(&state, &headers).await {
+            Some(u) => u,
+            None => return unauthorized_response(),
+        };
         if let Err(e) = state
             .permissions
-            .check_write_access(caller.as_ref(), &repo)
+            .check_write_access(Some(&caller), &repo)
             .await
         {
             return (
@@ -607,7 +609,7 @@ pub async fn git_lfs_upload_object(
         }
     }
 
-    // 2. Validate OID format
+    // 2. Validate OID format: BEFORE reading body
     if oid.len() != 64 || !oid.chars().all(|c| c.is_ascii_hexdigit()) {
         return (
             StatusCode::BAD_REQUEST,
@@ -617,11 +619,40 @@ pub async fn git_lfs_upload_object(
             .into_response();
     }
 
-    // 3. Check and verify SHA-256 checksum across received payload
-    let mut hasher = Sha256::new();
-    hasher.update(&body);
-    let actual_sha256 = hex::encode(hasher.finalize());
+    // 3. Concurrency control: acquire an upload permit
+    let _upload_slot = match state.acquire_upload_permit().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+                "{\"message\":\"Upload concurrency limit reached. Please retry shortly.\"}\n",
+            )
+                .into_response();
+        }
+    };
 
+    // 4. Bounded streaming: stream body to tempfile on disk, computing SHA-256 on the fly
+    let (tempfile, total_size, actual_sha256) =
+        match crate::api::streaming::stream_body_to_tempfile(
+            body,
+            crate::api::streaming::DEFAULT_MAX_UPLOAD_BYTES,
+            crate::api::streaming::DEFAULT_STREAM_TIMEOUT,
+        )
+        .await
+        {
+            Ok(res) => res,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+                    format!("{{\"message\":\"{}\"}}\n", e),
+                )
+                    .into_response();
+            }
+        };
+
+    // 5. Check and verify SHA-256 checksum across received payload
     if actual_sha256 != oid {
         return (
             StatusCode::BAD_REQUEST,
@@ -634,67 +665,36 @@ pub async fn git_lfs_upload_object(
             .into_response();
     }
 
-    // 4. Ingest payload into native spine-artifact store
-    let chunker = StreamChunker::new(Some(DEFAULT_CHUNK_SIZE));
-    let chunk_res = match chunker.chunk_reader(
-        Cursor::new(&body),
-        &oid,
-        Some("application/octet-stream".to_string()),
-    ) {
-        Ok(r) => r,
+    // 6. Ingest payload into native spine-artifact store using streaming reader from tempfile
+    let owner_type = if repo.owner_org_id.is_some() {
+        "organization"
+    } else {
+        "user"
+    };
+    let owner_id = repo.owner_org_id.as_deref().unwrap_or(&repo.owner_user_id);
+
+    let _stored = match state
+        .artifacts
+        .store_object_reader(
+            owner_type,
+            owner_id,
+            &oid,
+            Some("application/octet-stream".to_string()),
+            tempfile.into_file(),
+            Some(total_size),
+        )
+        .await
+    {
+        Ok(s) => s,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
-                format!("{{\"message\":\"Artifact chunking failed: {}\"}}\n", e),
+                format!("{{\"message\":\"Failed to store artifact: {}\"}}\n", e),
             )
                 .into_response();
         }
     };
-
-    for chunk in &chunk_res.chunks {
-        if let Err(e) = state
-            .artifacts
-            .store()
-            .store_chunk(&chunk.entry.chunk_hash, &chunk.bytes)
-        {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
-                format!("{{\"message\":\"Failed to store chunk: {}\"}}\n", e),
-            )
-                .into_response();
-        }
-    }
-
-    if let Err(e) = state.artifacts.store().store_manifest(&chunk_res.manifest) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
-            format!("{{\"message\":\"Failed to store manifest: {}\"}}\n", e),
-        )
-            .into_response();
-    }
-
-    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-    let stored = StoredArtifactManifest {
-        id: oid.clone(),
-        artifact_id: oid.clone(),
-        whole_object_hash: oid.clone(),
-        total_size: body.len() as i64,
-        chunk_size: DEFAULT_CHUNK_SIZE as i32,
-        chunk_count: chunk_res.manifest.chunks.len() as i32,
-        content_type: Some("application/octet-stream".to_string()),
-        manifest_json: serde_json::to_string(&chunk_res.manifest).unwrap_or_default(),
-        created_at_nanos: now,
-    };
-
-    let _ = state.db.save_artifact_manifest(stored).await;
-    let owner_id = repo.owner_org_id.as_deref().unwrap_or(&repo.owner_user_id);
-    let _ = state
-        .db
-        .update_quota_usage(owner_id, body.len() as i64, body.len() as i64)
-        .await;
 
     (
         StatusCode::OK,
@@ -754,10 +754,13 @@ pub async fn git_lfs_verify_object(
     };
 
     if !authorized {
-        let caller = authenticate_git_user(&state, &headers).await;
+        let caller = match authenticate_git_user(&state, &headers).await {
+            Some(u) => u,
+            None => return unauthorized_response(),
+        };
         if let Err(e) = state
             .permissions
-            .check_write_access(caller.as_ref(), &repo)
+            .check_write_access(Some(&caller), &repo)
             .await
         {
             return (
