@@ -197,6 +197,39 @@ pub async fn upload_release_asset(
             ForgeError::Unauthorized("Authentication required to upload asset".to_string())
         })?
         .0;
+
+    let trimmed_name = query.name.trim();
+    if trimmed_name.is_empty() || trimmed_name.len() > 255 {
+        return Err(ForgeError::BadRequest(
+            "Asset name must be non-empty and at most 255 characters".into(),
+        ));
+    }
+    if trimmed_name == "." || trimmed_name == ".." {
+        return Err(ForgeError::BadRequest(
+            "Asset name cannot be '.' or '..'".into(),
+        ));
+    }
+    if trimmed_name.contains('/')
+        || trimmed_name.contains('\\')
+        || trimmed_name.contains("..")
+        || trimmed_name
+            .chars()
+            .any(|c| c.is_control() || c == '"' || c == '\0' || c == '\r' || c == '\n')
+    {
+        return Err(ForgeError::BadRequest(
+            "Asset name contains illegal path traversal, quotation, or control characters".into(),
+        ));
+    }
+
+    if let Some(ref ct) = query.content_type {
+        if ct.len() > 128 || ct.chars().any(|c| c.is_control() || c == '\r' || c == '\n') {
+            return Err(ForgeError::BadRequest(
+                "Invalid content_type format: prohibited control characters or excessive length"
+                    .into(),
+            ));
+        }
+    }
+
     let repo = state
         .repositories
         .get_repository(Some(&current_user), &owner, &repo_name)
@@ -252,13 +285,15 @@ pub async fn download_release_asset(
         return Err(ForgeError::NotFound("Asset not found in release".into()));
     }
 
+    let sanitized_filename = asset.name.replace(['\r', '\n', '"', '\\', '/'], "_");
+
     let res = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, asset.content_type)
         .header(header::CONTENT_LENGTH, bytes.len().to_string())
         .header(
             header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", asset.name),
+            format!("attachment; filename=\"{}\"", sanitized_filename),
         )
         .body(axum::body::Body::from(bytes))
         .map_err(|e| ForgeError::Internal(e.to_string()))?;

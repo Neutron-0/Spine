@@ -373,7 +373,8 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/repos/:owner/:name/releases/:release_id/assets",
-            post(routes_releases::upload_release_asset),
+            post(routes_releases::upload_release_asset)
+                .route_layer(DefaultBodyLimit::max(1024 * 1024 * 1024)),
         )
         .route(
             "/api/v1/repos/:owner/:name/releases/:release_id/assets/:asset_id/download",
@@ -395,7 +396,8 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/artifacts/:namespace/:artifact/versions/:version",
-            post(routes_artifacts::upload_artifact_version),
+            post(routes_artifacts::upload_artifact_version)
+                .route_layer(DefaultBodyLimit::max(1024 * 1024 * 1024)),
         )
         .route(
             "/api/v1/artifacts/:namespace/:artifact/versions/:version/download",
@@ -664,7 +666,8 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/:owner/:repo_git/git-receive-pack",
-            post(routes_git_http::git_receive_pack),
+            post(routes_git_http::git_receive_pack)
+                .route_layer(DefaultBodyLimit::max(1024 * 1024 * 1024)),
         )
         // Native Git LFS HTTP endpoints (Batch 17)
         .route(
@@ -673,7 +676,9 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/:owner/:repo_git/info/lfs/objects/:oid",
-            put(routes_lfs::git_lfs_upload_object).get(routes_lfs::git_lfs_download_object),
+            put(routes_lfs::git_lfs_upload_object)
+                .route_layer(DefaultBodyLimit::max(1024 * 1024 * 1024))
+                .get(routes_lfs::git_lfs_download_object),
         )
         .route(
             "/:owner/:repo_git/info/lfs/verify",
@@ -693,7 +698,9 @@ pub fn build_router(state: AppState) -> Router {
             post(routes_lfs::git_lfs_unlock),
         )
         // Layers
-        .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))
+        // General API limit: 10 MiB to prevent denial-of-service on JSON/auth endpoints.
+        // Dedicated large-body routes (releases, artifacts, git-receive-pack, LFS) have their own route_layer(1 GiB).
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
             middleware::auth_middleware,

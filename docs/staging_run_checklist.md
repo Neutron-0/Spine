@@ -130,12 +130,16 @@ Run [`scripts/rehearse_s3_compliance.py`](../scripts/rehearse_s3_compliance.py):
 ```bash
 python scripts/rehearse_s3_compliance.py \
   --bucket "<staging-bucket-name>" \
+  --control-bucket "<staging-control-bucket-name>" \
   --target-key "backups/production-rehearsal/<backup-archive-filename>.spnebak" \
   --version-id "${ARCHIVE_VERSION_ID}" \
   --expected-role "SpineForge-AuditRole" \
   --profile spine-auditor \
   --region us-east-1
 ```
+> [!NOTE]
+> If the primary target bucket was deployed with bucket-level `DefaultRetention: COMPLIANCE` (as configured by `staging-object-lock-storage.yaml`), any object uploaded to that bucket is immediately locked. To prove positive-control deletion power without default retention interference, specify `--control-bucket` using the companion bucket outputted by CloudFormation (`ControlBucketName`), which allows unlocked test object creation and verified deletion by `SpineForge-AuditRole`.
+
 The automated script executes the full 5-phase verification:
 1. Asserts caller identity matches `SpineForge-AuditRole` via `--profile spine-auditor` (rejects raw key CLI args).
 2. Simulates IAM policy to verify `s3:DeleteObject` and `s3:DeleteObjectVersion` are explicitly `allowed`, and audits bucket policy for absence of unconditional denies.

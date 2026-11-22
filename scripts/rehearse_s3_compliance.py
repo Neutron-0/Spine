@@ -180,6 +180,29 @@ def verify_bucket_policy(
                     )
 
 
+def check_bucket_default_retention(
+    bucket: str,
+    profile: Optional[str] = None,
+    region: Optional[str] = None,
+    runner: Optional[Callable] = None,
+) -> Optional[Dict[str, Any]]:
+    """Check whether bucket-level default retention rule is active."""
+    code, stdout, stderr = run_aws_cli(
+        ["s3api", "get-object-lock-configuration", "--bucket", bucket, "--output", "json"],
+        profile,
+        region,
+        runner,
+    )
+    if code != 0:
+        return None
+    try:
+        data = json.loads(stdout)
+        rule = data.get("ObjectLockConfiguration", {}).get("Rule", {})
+        return rule.get("DefaultRetention")
+    except Exception:
+        return None
+
+
 def exercise_control_object(
     bucket: str,
     control_key: str,
@@ -204,7 +227,12 @@ def exercise_control_object(
         region,
         runner,
     )
-    # Note: runner may mock put-object returning VersionId
+    if code != 0:
+        raise PositiveControlFailure(
+            f"Failed to put control object into '{bucket}': {stderr.strip()}. "
+            "Ensure the audit role has s3:PutObject permissions on the control location."
+        )
+
     # 2. Get object version ID
     code, stdout, stderr = run_aws_cli(
         [
@@ -371,6 +399,7 @@ def rehearse_s3_compliance(
     target_version_id: str,
     expected_role: str = "SpineForge-AuditRole",
     control_key: str = "rehearsals/control-delete-test.txt",
+    control_bucket: Optional[str] = None,
     profile: Optional[str] = None,
     region: Optional[str] = None,
     runner: Optional[Callable] = None,
@@ -380,6 +409,7 @@ def rehearse_s3_compliance(
     print("Spine Forge - S3 Object Lock Compliance WORM Rehearsal")
     print("=" * 70)
     print(f"Target Bucket:     {bucket}")
+    print(f"Control Bucket:    {control_bucket or bucket}")
     print(f"Target Key:        {target_key}")
     print(f"Target VersionId:  {target_version_id}")
     print(f"Expected Role:     {expected_role}")
@@ -400,10 +430,24 @@ def rehearse_s3_compliance(
     verify_bucket_policy(bucket, profile, region, runner)
     print("   [PASS] Bucket policy evaluated: no blocking Deny statements.")
 
+    # Phase 2c: Evaluate Bucket Default Retention Rule
+    default_retention = check_bucket_default_retention(bucket, profile, region, runner)
+    effective_control_bucket = control_bucket or bucket
+
+    if default_retention and not control_bucket:
+        mode = default_retention.get("Mode", "COMPLIANCE")
+        days = default_retention.get("Days", 30)
+        raise RehearsalError(
+            f"Bucket '{bucket}' has bucket-level default retention enabled (Mode: {mode}, Days: {days}). "
+            "In S3, newly uploaded objects in this bucket automatically inherit COMPLIANCE retention, "
+            "making unlocked positive-control deletion in this bucket infeasible. "
+            "Pass an unlocked companion bucket via --control-bucket to prove deletion permissions."
+        )
+
     # Phase 3
-    print("[Phase 3/5] Exercising positive control object deletion...")
-    exercise_control_object(bucket, control_key, profile, region, runner)
-    print("   [PASS] Unlocked control object deleted successfully. Principal possesses real deletion power.")
+    print(f"[Phase 3/5] Exercising positive control object deletion in '{effective_control_bucket}'...")
+    exercise_control_object(effective_control_bucket, control_key, profile, region, runner)
+    print(f"   [PASS] Unlocked control object deleted successfully from '{effective_control_bucket}'. Principal possesses real deletion power.")
 
     # Phase 4
     print("[Phase 4/5] Probing locked object deletion (WORM immutability proof)...")
@@ -431,6 +475,7 @@ def main() -> None:
     parser.add_argument("--version-id", required=True, help="VersionId of the protected backup archive")
     parser.add_argument("--expected-role", default="SpineForge-AuditRole", help="Expected IAM role name substring")
     parser.add_argument("--control-key", default="rehearsals/control-delete-test.txt", help="Key for unlocked control object")
+    parser.add_argument("--control-bucket", default=None, help="Optional unlocked control bucket (required if target bucket has default retention)")
     parser.add_argument("--profile", default=None, help="AWS CLI profile name (do NOT pass raw credentials)")
     parser.add_argument("--region", default=None, help="AWS Region (e.g. us-east-1)")
 
@@ -443,6 +488,7 @@ def main() -> None:
             target_version_id=args.version_id,
             expected_role=args.expected_role,
             control_key=args.control_key,
+            control_bucket=args.control_bucket,
             profile=args.profile,
             region=args.region,
         )

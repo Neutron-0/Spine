@@ -19,6 +19,27 @@ MONITOR_ENV="${CONF_DIR}/backup-monitor.env"
 
 MODE="systemd"
 DRY_RUN=0
+INSTALLED_FILES=()
+
+cleanup_on_error() {
+  local exit_code=$?
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    return
+  fi
+  echo "FATAL: Installation encountered an error (exit ${exit_code}). Rolling back partially installed components..." >&2
+  for file in "${INSTALLED_FILES[@]}"; do
+    if [ -f "${file}" ]; then
+      echo "Rolling back: removing ${file}" >&2
+      rm -f "${file}" || true
+    fi
+  done
+  if [ "${MODE}" = "systemd" ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload 2>/dev/null || true
+  fi
+  echo "Rollback completed." >&2
+  exit "${exit_code}"
+}
+trap cleanup_on_error ERR
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -177,6 +198,7 @@ if [ "${MODE}" = "systemd" ]; then
     if [ -f "${SRC_DIR}/${unit}" ]; then
       execute cp "${SRC_DIR}/${unit}" "/etc/systemd/system/${unit}"
       execute chmod 0644 "/etc/systemd/system/${unit}"
+      INSTALLED_FILES+=("/etc/systemd/system/${unit}")
       echo "Installed /etc/systemd/system/${unit}"
     else
       echo "FATAL: Could not locate ${SRC_DIR}/${unit}" >&2
@@ -206,6 +228,7 @@ elif [ "${MODE}" = "cron" ]; then
     execute cp "${SRC_CRON}" "/etc/cron.d/spine-backup"
     execute chmod 0644 "/etc/cron.d/spine-backup"
     execute chown root:root "/etc/cron.d/spine-backup"
+    INSTALLED_FILES+=("/etc/cron.d/spine-backup")
     echo "Installed /etc/cron.d/spine-backup"
   else
     echo "FATAL: Could not locate ${SRC_CRON}" >&2

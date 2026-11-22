@@ -109,6 +109,32 @@ Resources:
           Value: !Sub '${RetentionDays}Days-${ObjectLockMode}'
 
   # ----------------------------------------------------------------------------
+  # Unlocked Companion Control Bucket for Positive Deletion Permission Rehearsal
+  # ----------------------------------------------------------------------------
+  SpineControlBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub '${BucketPrefix}-ctrl-${EnvironmentName}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Service
+          Value: SpineForgeControl
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ----------------------------------------------------------------------------
   # S3 Bucket Policy: Enforce In-Transit Encryption (TLS 1.2+) & Deny Non-SSL
   # ----------------------------------------------------------------------------
   SpineBackupBucketPolicy:
@@ -228,7 +254,9 @@ Resources:
                   - 's3:GetBucketLocation'
                   - 's3:GetBucketVersioning'
                   - 's3:GetBucketObjectLockConfiguration'
-                Resource: !Sub 'arn:aws:s3:::${SpineBackupBucket}'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${SpineBackupBucket}'
+                  - !Sub 'arn:aws:s3:::${SpineControlBucket}'
               - Sid: AuditAttemptDeleteObject
                 Effect: Allow
                 Action:
@@ -236,7 +264,16 @@ Resources:
                   - 's3:GetObjectRetention'
                   - 's3:DeleteObject'
                   - 's3:DeleteObjectVersion'
-                Resource: !Sub 'arn:aws:s3:::${SpineBackupBucket}/*'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${SpineBackupBucket}/*'
+                  - !Sub 'arn:aws:s3:::${SpineControlBucket}/*'
+              - Sid: AuditControlObjectManagement
+                Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${SpineBackupBucket}/rehearsals/*'
+                  - !Sub 'arn:aws:s3:::${SpineControlBucket}/*'
 
 Conditions:
   IsServicePrincipal: !Equals [!Ref PrincipalType, 'Service']
@@ -254,6 +291,12 @@ Outputs:
     Value: !GetAtt SpineBackupBucket.Arn
     Export:
       Name: !Sub '${AWS::StackName}-BackupBucketArn'
+
+  ControlBucketName:
+    Description: Name of the unlocked companion control bucket for positive deletion rehearsal
+    Value: !Ref SpineControlBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ControlBucketName'
 
   BackupRoleArn:
     Description: ARN of the least-privilege IAM execution role

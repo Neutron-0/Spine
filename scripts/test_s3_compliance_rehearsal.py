@@ -33,10 +33,31 @@ class MockAWSCommandRunner:
         self.locked_delete_unrelated_error = False
         self.wrong_retention_mode = False
         self.past_retention_date = False
+        self.bucket_has_default_retention = False
 
     def __call__(self, cmd: List[str]) -> Tuple[int, str, str]:
         self.commands_issued.append(cmd)
         cmd_str = " ".join(cmd)
+
+        # s3api get-object-lock-configuration
+        if "s3api get-object-lock-configuration" in cmd_str:
+            if self.bucket_has_default_retention:
+                return 0, json.dumps({
+                    "ObjectLockConfiguration": {
+                        "ObjectLockEnabled": "Enabled",
+                        "Rule": {
+                            "DefaultRetention": {
+                                "Mode": "COMPLIANCE",
+                                "Days": 30,
+                            }
+                        }
+                    }
+                }), ""
+            return 0, json.dumps({
+                "ObjectLockConfiguration": {
+                    "ObjectLockEnabled": "Enabled"
+                }
+            }), ""
 
         # sts get-caller-identity
         if "sts get-caller-identity" in cmd_str:
@@ -210,6 +231,37 @@ class TestS3ComplianceRehearsal(unittest.TestCase):
                 runner=self.runner,
             )
         self.assertIn("is in the past", str(cm.exception))
+
+
+    def test_bucket_default_retention_without_control_bucket_fails(self):
+        """Fails with actionable guidance when bucket default retention is active and no control bucket is given."""
+        self.runner.bucket_has_default_retention = True
+        with self.assertRaises(RehearsalError) as cm:
+            rehearse_s3_compliance.rehearse_s3_compliance(
+                bucket="spineforge-backups-production",
+                target_key="backups/postgres-20261122.tar.gz",
+                target_version_id="tgt-v1",
+                expected_role="SpineForge-AuditRole",
+                control_bucket=None,
+                runner=self.runner,
+            )
+        self.assertIn("has bucket-level default retention enabled", str(cm.exception))
+        self.assertIn("Pass an unlocked companion bucket via --control-bucket", str(cm.exception))
+
+    def test_bucket_default_retention_with_control_bucket_succeeds(self):
+        """Succeeds when bucket default retention is active by using companion control bucket."""
+        self.runner.bucket_has_default_retention = True
+        res = rehearse_s3_compliance.rehearse_s3_compliance(
+            bucket="spineforge-backups-production",
+            target_key="backups/postgres-20261122.tar.gz",
+            target_version_id="tgt-v1",
+            expected_role="SpineForge-AuditRole",
+            control_bucket="spineforge-control-production",
+            runner=self.runner,
+        )
+        self.assertTrue(res)
+        self.assertTrue(self.runner.control_object_uploaded)
+        self.assertTrue(self.runner.control_object_deleted)
 
 
 if __name__ == "__main__":

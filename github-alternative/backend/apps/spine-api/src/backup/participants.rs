@@ -426,16 +426,24 @@ impl LocalStorageParticipantAdapter {
                 .path()
                 .map_err(|e| ForgeError::Internal(e.to_string()))?
                 .to_path_buf();
-            if path
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                return Err(ForgeError::Internal(format!(
-                    "Unsafe path traversal in storage snapshot: {:?}",
-                    path
-                )));
+            for c in path.components() {
+                match c {
+                    std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+                    _ => {
+                        return Err(ForgeError::Internal(format!(
+                            "Unsafe path traversal component in storage snapshot: {:?}",
+                            path
+                        )));
+                    }
+                }
             }
             let dest = staged_dir.join(&path);
+            if !dest.starts_with(&staged_dir) {
+                return Err(ForgeError::Internal(format!(
+                    "Unsafe destination path outside staging directory: {:?}",
+                    dest
+                )));
+            }
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
             }
@@ -726,16 +734,24 @@ impl SshParticipantAdapter {
                 .path()
                 .map_err(|e| ForgeError::Internal(e.to_string()))?
                 .to_path_buf();
-            if path
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                return Err(ForgeError::Internal(format!(
-                    "Unsafe path traversal in SSH snapshot: {:?}",
-                    path
-                )));
+            for c in path.components() {
+                match c {
+                    std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+                    _ => {
+                        return Err(ForgeError::Internal(format!(
+                            "Unsafe path traversal component in SSH snapshot: {:?}",
+                            path
+                        )));
+                    }
+                }
             }
             let dest = staged_dir.join(&path);
+            if !dest.starts_with(&staged_dir) {
+                return Err(ForgeError::Internal(format!(
+                    "Unsafe destination path outside staging directory: {:?}",
+                    dest
+                )));
+            }
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent).map_err(|e| ForgeError::Internal(e.to_string()))?;
             }

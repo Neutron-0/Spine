@@ -875,17 +875,25 @@ impl StorageBackend for FileSystemStorageBackend {
         for entry in archive.entries()? {
             let mut file = entry?;
             let path = file.path()?.to_path_buf();
-            // Reject path traversal
-            if path
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                bail!(
-                    "Unsafe path traversal detected in storage node snapshot: {:?}",
-                    path
-                );
+            // Reject path traversal: only allow normal relative path components
+            for c in path.components() {
+                match c {
+                    std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+                    _ => {
+                        bail!(
+                            "Unsafe path traversal component detected in storage node snapshot: {:?}",
+                            path
+                        );
+                    }
+                }
             }
             let dest = staged_root.join(&path);
+            if !dest.starts_with(&staged_root) {
+                bail!(
+                    "Unsafe destination path outside staging directory: {:?}",
+                    dest
+                );
+            }
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent)?;
             }

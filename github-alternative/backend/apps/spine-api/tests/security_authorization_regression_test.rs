@@ -829,4 +829,61 @@ async fn test_security_authorization_and_cross_tenant_isolation_regression() {
         StatusCode::NOT_FOUND,
         "Cross-tenant secret finding remediation must fail with 404 Not Found"
     );
+
+    // -------------------------------------------------------------------------
+    // 11. Release Asset Name Validation & Header Injection Prevention
+    // -------------------------------------------------------------------------
+    // 11a. Traversal sequence in asset name -> 400 Bad Request
+    let traversal_req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/api/v1/repos/alice/secret-project/releases/{}/assets?name=../../etc/passwd",
+            release_id
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {}", pat_alice_plain))
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(b"TRAVERSAL".to_vec()))
+        .unwrap();
+    let traversal_res = router.clone().oneshot(traversal_req).await.unwrap();
+    assert_eq!(
+        traversal_res.status(),
+        StatusCode::BAD_REQUEST,
+        "Directory traversal in asset name must fail with 400 Bad Request"
+    );
+
+    // 11b. Header injection attempt (CRLF) in asset name -> 400 Bad Request
+    let crlf_req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/api/v1/repos/alice/secret-project/releases/{}/assets?name=evil%0d%0aInjected-Header:%20pwned",
+            release_id
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {}", pat_alice_plain))
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(b"CRLF".to_vec()))
+        .unwrap();
+    let crlf_res = router.clone().oneshot(crlf_req).await.unwrap();
+    assert_eq!(
+        crlf_res.status(),
+        StatusCode::BAD_REQUEST,
+        "CRLF sequence in asset name must fail with 400 Bad Request"
+    );
+
+    // 11c. Quote characters in asset name -> 400 Bad Request
+    let quote_req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/api/v1/repos/alice/secret-project/releases/{}/assets?name=exploit%22.bin",
+            release_id
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {}", pat_alice_plain))
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(b"QUOTE".to_vec()))
+        .unwrap();
+    let quote_res = router.clone().oneshot(quote_req).await.unwrap();
+    assert_eq!(
+        quote_res.status(),
+        StatusCode::BAD_REQUEST,
+        "Quotes in asset name must fail with 400 Bad Request"
+    );
 }
