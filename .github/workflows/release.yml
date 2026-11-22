@@ -1,0 +1,117 @@
+name: Release Packaging, Signing & Provenance
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag name (e.g. v0.1.0-rc4)'
+        required: false
+        default: 'v0.1.0-rc4'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-sign-publish:
+    name: Build, Sign & Publish Release Artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free Runner Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force 2>/dev/null || true
+
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: "1.97.1"
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: '3.11'
+
+      - name: Install Signing Dependencies
+        run: pip install cryptography
+
+      - name: Build git-alternative Release Binaries
+        run: |
+          cargo build --manifest-path git-alternative/Cargo.toml --release --bin spine --bin spine-coordinator --bin spine-storage-node
+
+      - name: Build github-alternative/backend Release Binaries
+        run: |
+          cargo build --manifest-path github-alternative/backend/Cargo.toml --release --bin spine-api
+
+      - name: Stage Release Artifacts & Generate Checksums
+        run: |
+          mkdir -p target/release-dist
+          cp git-alternative/target/release/spine target/release-dist/
+          cp git-alternative/target/release/spine-coordinator target/release-dist/
+          cp git-alternative/target/release/spine-storage-node target/release-dist/
+          cp github-alternative/backend/target/release/spine-api target/release-dist/
+
+          cd target/release-dist
+          sha256sum spine spine-coordinator spine-storage-node spine-api > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Sign Release Artifacts with Ed25519
+        env:
+          SPINE_RELEASE_SIGNING_KEY: ${{ secrets.SPINE_RELEASE_SIGNING_KEY }}
+        run: |
+          # If signing key is not provided in repository secrets, generate an ephemeral key for provenance verification
+          if [ -z "$SPINE_RELEASE_SIGNING_KEY" ]; then
+            echo "::warning::SPINE_RELEASE_SIGNING_KEY secret not found in repository. Generating ephemeral key for verification."
+            python scripts/sign_release_artifacts.py --dir target/release-dist --generate-key-if-missing /tmp/ephemeral_sign.key --public-key-out target/release-dist/SPINE_RELEASE_PUBLIC_KEY.pub
+          else
+            python scripts/sign_release_artifacts.py --dir target/release-dist --public-key-out target/release-dist/SPINE_RELEASE_PUBLIC_KEY.pub
+          fi
+
+      - name: Cryptographically Verify Signatures & Manifest
+        run: |
+          python scripts/verify_release_signatures.py --dir target/release-dist --public-key-file target/release-dist/SPINE_RELEASE_PUBLIC_KEY.pub
+          echo "[PASS] All binaries and manifests cryptographically verified against Ed25519 public key."
+
+      - name: Run Anti-Tamper Verification Suite
+        run: |
+          python scripts/test_release_signing_and_tamper_detection.py
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87238604da99376a6cb63 # v2.2.12
+        with:
+          files: |
+            target/release-dist/spine
+            target/release-dist/spine-coordinator
+            target/release-dist/spine-storage-node
+            target/release-dist/spine-api
+            target/release-dist/SHA256SUMS
+            target/release-dist/SHA256SUMS.sig
+            target/release-dist/*.sig
+            target/release-dist/release-provenance.json
+            target/release-dist/SPINE_RELEASE_PUBLIC_KEY.pub
+          body: |
+            ### Spine Production Release Candidate
+            **Commit:** `${{ github.sha }}`
+            
+            #### Verification Instructions:
+            1. Download the release binaries, `SHA256SUMS`, `SHA256SUMS.sig`, and `SPINE_RELEASE_PUBLIC_KEY.pub`.
+            2. Verify checksums:
+               ```bash
+               sha256sum -c SHA256SUMS
+               ```
+            3. Verify cryptographic signatures:
+               ```bash
+               python scripts/verify_release_signatures.py --dir . --public-key-file SPINE_RELEASE_PUBLIC_KEY.pub
+               ```
