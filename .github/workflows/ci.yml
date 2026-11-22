@@ -85,7 +85,7 @@ jobs:
   # 2. Database-Backed Integration Tests (Isolated PostgreSQL Service)
   # ----------------------------------------------------------------------------
   database-tests:
-    name: Database-Backed Integration Tests (PostgreSQL)
+    name: Database-Backed Integration & Cluster Recovery Tests (PostgreSQL)
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -118,6 +118,18 @@ jobs:
       SPINE_APP_PASSWORD: test_app_password
       SPINE_TEST_APP_PASSWORD: test_app_password
     steps:
+      - name: Free Runner Disk Space
+        run: |
+          echo "Disk space before cleanup:"
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force 2>/dev/null || true
+          echo "Disk space after cleanup:"
+          df -h
+
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -137,6 +149,30 @@ jobs:
           done
           sh docker/postgres/01-init-roles.sh
 
+      - name: Build Release Candidate Binaries for Recovery Tests
+        run: cargo build --release --manifest-path git-alternative/Cargo.toml -p spine-coordinator -p spine-storage-node
+
+      - name: Stage Release Candidate Binaries & Generate Provenance Checksums
+        run: |
+          mkdir -p target/release-candidate
+          cp git-alternative/target/release/spine-coordinator target/release-candidate/
+          cp git-alternative/target/release/spine-storage-node target/release-candidate/
+          chmod +x target/release-candidate/spine-coordinator target/release-candidate/spine-storage-node
+          cd target/release-candidate
+          sha256sum spine-coordinator spine-storage-node > SHA256SUMS
+          cat <<EOF > PROVENANCE.txt
+          COMMIT: ${{ github.sha }}
+          BUILD_TIMESTAMP: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          RUSTC: $(rustc --version)
+          BINARIES:
+          $(cat SHA256SUMS)
+          EOF
+          echo "=== Staged Release Binaries SHA256SUMS ==="
+          cat SHA256SUMS
+          echo "=== Provenance Manifest ==="
+          cat PROVENANCE.txt
+          cd -
+
       - name: Run Disposable DB Backup Cleanup Fault Injection Tests (Pure Database Tests)
         run: |
           for t in \
@@ -154,17 +190,31 @@ jobs:
             cargo test --manifest-path github-alternative/backend/Cargo.toml --test backup_cleanup_fault_injection_test "$t" -- --ignored --exact --nocapture
           done
 
-      - name: Report External Infrastructure Tests (Skipped in Disposable DB CI)
+      - name: Run Live Process Cluster Recovery & Fault Injection Tests
+        run: |
+          echo "Running backup_cleanup_fault_injection_test: test_backup_cleanup_live_processes_and_postgres_guard_release"
+          cargo test --manifest-path github-alternative/backend/Cargo.toml --test backup_cleanup_fault_injection_test test_backup_cleanup_live_processes_and_postgres_guard_release -- --ignored --exact --nocapture
+
+          echo "Running backup_cleanup_fault_injection_test: test_backup_cancellation_and_abrupt_termination_recovery"
+          cargo test --manifest-path github-alternative/backend/Cargo.toml --test backup_cleanup_fault_injection_test test_backup_cancellation_and_abrupt_termination_recovery -- --ignored --exact --nocapture
+
+          echo "Running combined_production_restore_test: test_combined_production_shaped_postgres_and_cluster_recovery"
+          cargo test --manifest-path github-alternative/backend/Cargo.toml --test combined_production_restore_test test_combined_production_shaped_postgres_and_cluster_recovery -- --ignored --exact --nocapture
+
+          echo "Running release_candidate_hardening_test: test_live_coordinator_and_storage_node_processes_restore_and_restart"
+          cargo test --manifest-path github-alternative/backend/Cargo.toml --test release_candidate_hardening_test test_live_coordinator_and_storage_node_processes_restore_and_restart -- --ignored --exact --nocapture
+
+      - name: Report External Infrastructure Gates Status
         run: |
           echo "================================================================================"
-          echo "EXTERNAL INFRASTRUCTURE TEST INVENTORY:"
-          echo "The following tests require external release-candidate binaries (spine-coordinator"
-          echo "and spine-storage-node staged in target/release-candidate) and are intentionally"
-          echo "marked NOT RUN in disposable database / standard CI without staged binaries:"
-          echo "  - backup_cleanup_fault_injection_test::test_backup_cleanup_live_processes_and_postgres_guard_release"
-          echo "  - backup_cleanup_fault_injection_test::test_backup_cancellation_and_abrupt_termination_recovery"
-          echo "  - combined_production_restore_test::test_combined_production_shaped_postgres_and_cluster_recovery"
-          echo "  - release_candidate_hardening_test::test_live_coordinator_and_storage_node_processes_restore_and_restart"
+          echo "EXTERNAL INFRASTRUCTURE RELEASE GATES STATUS:"
+          echo "1. AWS S3 Object Lock Compliance-Mode Storage: UNVERIFIED / BLOCKED"
+          echo "   - Reason: Requires live AWS account, S3 bucket with Object Lock in Compliance mode,"
+          echo "             and assumed IAM staging credentials. CloudFormation template validated."
+          echo "2. Public CA-Signed TLS Gateway: UNVERIFIED / BLOCKED"
+          echo "   - Reason: Requires publicly resolvable staging DNS FQDN, CA-signed certificate,"
+          echo "             and external HTTPS ingress verification without '-k'."
+          echo "All 13 repository-level #[ignore] integration tests are executed and verified in CI."
           echo "================================================================================"
 
       - name: Run Disposable DB Safety Contract Test
@@ -185,7 +235,14 @@ jobs:
       - name: Run Postgres Live Migrations and Lifecycle Tests
         run: cargo test --manifest-path github-alternative/backend/Cargo.toml --test postgres_live_test --jobs 2 -- --nocapture
 
+      - name: Post-Test Process Cleanup & Sweep
+        if: always()
+        run: |
+          pkill -f spine-coordinator || true
+          pkill -f spine-storage-node || true
+
       - name: Verify Zero Leaked Disposable Databases
+        if: always()
         run: |
           echo "Verifying no orphaned disposable databases (spine_disp_*) remain..."
           LEAKED=$(psql -U postgres -d postgres -t -A -c "SELECT datname FROM pg_database WHERE datname LIKE 'spine_disp_%';")
