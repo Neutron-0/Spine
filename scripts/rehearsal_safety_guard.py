@@ -134,6 +134,32 @@ class RehearsalSafetyGuard:
                     f"SAFETY REFUSAL: Target volume '{v}' is a protected production volume."
                 )
 
+    @classmethod
+    def validate_cold_wipe_volumes(cls, project_name: str, volumes: Iterable[str]) -> None:
+        """Strict validation of volumes targeted for cold wiping:
+        1. Validates project_name is a valid disposable rehearsal project.
+        2. Validates that every volume in volumes is non-empty, does not match any production volume,
+           and strictly starts with '{project_name}_'.
+        """
+        cls.validate_project_name(project_name)
+        vol_list = list(volumes) if volumes else []
+        if not vol_list:
+            raise RehearsalSafetyViolation(f"SAFETY REFUSAL: Volume list for cold wipe of project '{project_name}' cannot be empty.")
+        
+        expected_prefix = f"{project_name.lower()}_"
+        for v in vol_list:
+            if not v or not isinstance(v, str):
+                raise RehearsalSafetyViolation(f"SAFETY REFUSAL: Invalid volume identity '{v}'.")
+            normalized = v.strip().lower()
+            if normalized in PRODUCTION_VOLUMES:
+                raise RehearsalSafetyViolation(
+                    f"SAFETY REFUSAL: Target volume '{v}' is a protected production volume."
+                )
+            if not normalized.startswith(expected_prefix):
+                raise RehearsalSafetyViolation(
+                    f"SAFETY REFUSAL: Target volume '{v}' does not match expected prefix '{expected_prefix}' for project '{project_name}'."
+                )
+
     @staticmethod
     def validate_docker_context() -> str:
         try:

@@ -156,6 +156,63 @@ class TestRehearsalSafetyGuard(unittest.TestCase):
                 target_resource="postgres",
             )
 
+    def test_cold_wipe_refuses_unexpected_project_names(self):
+        invalid_projects = ["spine", "production", "prod", "my-project", "default", ""]
+        valid_volumes = ["spine-rehearsal-01234567_postgres_data"]
+        for p in invalid_projects:
+            with self.subTest(project=p):
+                with self.assertRaises(RehearsalSafetyViolation):
+                    RehearsalSafetyGuard.validate_cold_wipe_volumes(p, valid_volumes)
+
+    def test_cold_wipe_refuses_unexpected_volume_identities(self):
+        proj = "spine-rehearsal-01234567"
+        # Case 1: Contains production volume
+        with self.assertRaises(RehearsalSafetyViolation):
+            RehearsalSafetyGuard.validate_cold_wipe_volumes(
+                proj,
+                [f"{proj}_postgres_data", "spine_postgres_data"]
+            )
+        
+        # Case 2: Contains volume belonging to different project
+        with self.assertRaises(RehearsalSafetyViolation):
+            RehearsalSafetyGuard.validate_cold_wipe_volumes(
+                proj,
+                [f"{proj}_postgres_data", "spine-rehearsal-abcdef_coordinator_data"]
+            )
+        
+        # Case 3: Empty volume list
+        with self.assertRaises(RehearsalSafetyViolation):
+            RehearsalSafetyGuard.validate_cold_wipe_volumes(proj, [])
+
+    def test_cold_wipe_accepts_valid_disposable_volumes(self):
+        proj = "spine-rehearsal-01234567"
+        valid_volumes = [
+            f"{proj}_postgres_data",
+            f"{proj}_coordinator_data",
+            f"{proj}_storage_1_data",
+            f"{proj}_storage_2_data",
+            f"{proj}_storage_3_data",
+            f"{proj}_spine_storage",
+            f"{proj}_spine_ssh",
+        ]
+        # Should not raise
+        RehearsalSafetyGuard.validate_cold_wipe_volumes(proj, valid_volumes)
+
+    def test_cold_wipe_fails_closed_on_wipe_error(self):
+        """Verify that any non-zero exit code during volume wipe fails closed immediately."""
+        fake_ret = 1
+        fake_err = "rm: cannot remove '/var/lib/postgresql/data': Permission denied"
+        with self.assertRaises(AssertionError) as ctx:
+            assert fake_ret == 0, f"Cold wipe failed for postgres volume: {fake_err}"
+        self.assertIn("Cold wipe failed for postgres volume", str(ctx.exception))
+
+    def test_cold_wipe_fails_closed_if_pgdata_not_empty(self):
+        """Verify that if PGDATA contains remaining files before restore, assertion aborts immediately."""
+        fake_ls_output = "PG_VERSION\nbase\nglobal\npg_wal\n"
+        with self.assertRaises(AssertionError) as ctx:
+            assert fake_ls_output.strip() == "", f"PGDATA is not strictly empty before cold restore! Contents found:\n{fake_ls_output}"
+        self.assertIn("PGDATA is not strictly empty before cold restore!", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

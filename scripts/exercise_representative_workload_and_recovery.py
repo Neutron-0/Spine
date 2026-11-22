@@ -587,12 +587,61 @@ def main():
 
         def wipe_cluster_volumes_cold():
             print("Wiping all 7 cluster volumes to empty state (including PGDATA) to force cold recovery...")
-            run_cmd(["docker", "compose", "-p", project_name, "-f", str(compose_file), "stop"])
-            run_cmd(["docker", "compose", "-p", project_name, "-f", str(compose_file), "run", "--rm", "--no-deps", "--entrypoint", "sh", "postgres", "-c", "rm -rf /var/lib/postgresql/data/* /var/lib/postgresql/data/.[!.]* 2>/dev/null || true"])
-            run_cmd(["docker", "compose", "-p", project_name, "-f", str(compose_file), "run", "--rm", "--no-deps", "--entrypoint", "sh", "coordinator", "-c", "rm -rf /var/lib/spine/* /var/lib/spine/.[!.]* 2>/dev/null || true"])
+            # 1. Verify expected rehearsal Compose project and volume identities before deletion
+            RehearsalSafetyGuard.validate_project_name(project_name)
+            ret, out, err = run_cmd([
+                "docker", "volume", "ls",
+                "--filter", f"label=com.docker.compose.project={project_name}",
+                "--format", "{{.Name}}"
+            ])
+            assert ret == 0, f"Failed discovering volumes for project {project_name}: {err}\n{out}"
+            disposable_volumes = [v.strip() for v in out.strip().splitlines() if v.strip()]
+            assert len(disposable_volumes) >= 7, f"Expected at least 7 cluster volumes for {project_name}, found {len(disposable_volumes)}: {disposable_volumes}"
+            RehearsalSafetyGuard.validate_cold_wipe_volumes(project_name, disposable_volumes)
+
+            # 2. Stop containers (fail-closed)
+            ret, out, err = run_cmd(["docker", "compose", "-p", project_name, "-f", str(compose_file), "stop"])
+            assert ret == 0, f"Failed stopping cluster before cold wipe: {err}\n{out}"
+
+            # 3. Fail-closed cold wipe of each volume without || true
+            ret, out, err = run_cmd([
+                "docker", "compose", "-p", project_name, "-f", str(compose_file),
+                "run", "--rm", "--no-deps", "--entrypoint", "sh", "postgres",
+                "-c", "find /var/lib/postgresql/data -mindepth 1 -delete"
+            ])
+            assert ret == 0, f"Cold wipe failed for postgres volume: {err}\n{out}"
+
+            ret, out, err = run_cmd([
+                "docker", "compose", "-p", project_name, "-f", str(compose_file),
+                "run", "--rm", "--no-deps", "--entrypoint", "sh", "coordinator",
+                "-c", "find /var/lib/spine -mindepth 1 -delete"
+            ])
+            assert ret == 0, f"Cold wipe failed for coordinator volume: {err}\n{out}"
+
             for n in [1, 2, 3]:
-                run_cmd(["docker", "compose", "-p", project_name, "-f", str(compose_file), "run", "--rm", "--no-deps", "--entrypoint", "sh", f"storage-node-{n}", "-c", f"rm -rf /var/lib/spine/node-{n}/* /var/lib/spine/node-{n}/.[!.]* 2>/dev/null || true"])
-            run_cmd(["docker", "compose", "-p", project_name, "-f", str(compose_file), "run", "--rm", "--no-deps", "--entrypoint", "sh", "spine-api", "-c", "rm -rf /var/lib/spine/storage/* /var/lib/spine/storage/.[!.]* /var/lib/spine/ssh/* /var/lib/spine/ssh/.[!.]* 2>/dev/null || true"])
+                ret, out, err = run_cmd([
+                    "docker", "compose", "-p", project_name, "-f", str(compose_file),
+                    "run", "--rm", "--no-deps", "--entrypoint", "sh", f"storage-node-{n}",
+                    "-c", f"find /var/lib/spine/node-{n} -mindepth 1 -delete"
+                ])
+                assert ret == 0, f"Cold wipe failed for storage-node-{n} volume: {err}\n{out}"
+
+            ret, out, err = run_cmd([
+                "docker", "compose", "-p", project_name, "-f", str(compose_file),
+                "run", "--rm", "--no-deps", "--entrypoint", "sh", "spine-api",
+                "-c", "find /var/lib/spine/storage /var/lib/spine/ssh -mindepth 1 -delete"
+            ])
+            assert ret == 0, f"Cold wipe failed for spine-api volumes: {err}\n{out}"
+
+            # 4. Strictly assert PGDATA is empty before restore
+            ret, out, err = run_cmd([
+                "docker", "compose", "-p", project_name, "-f", str(compose_file),
+                "run", "--rm", "--no-deps", "--entrypoint", "sh", "postgres",
+                "-c", "ls -A /var/lib/postgresql/data"
+            ])
+            assert ret == 0, f"Failed checking PGDATA directory contents: {err}\n{out}"
+            assert out.strip() == "", f"PGDATA is not strictly empty before cold restore! Contents found:\n{out}"
+            print("[PASS] Verified all 7 cluster volumes wiped and PGDATA confirmed strictly empty.")
 
         env_restore = os.environ.copy()
         env_restore["COMPOSE_FILE"] = str(compose_file)
