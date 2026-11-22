@@ -12,10 +12,45 @@ concurrency:
 
 jobs:
   # ----------------------------------------------------------------------------
+  # 0. Path & Scope Change Detection (Optimizes CI for docs-only changes)
+  # ----------------------------------------------------------------------------
+  detect-changes:
+    name: Detect File Changes
+    runs-on: ubuntu-latest
+    outputs:
+      run_heavy_matrix: ${{ steps.filter.outputs.run_heavy_matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 2
+
+      - id: filter
+        name: Evaluate modified paths
+        run: |
+          if ! git rev-parse HEAD~1 >/dev/null 2>&1; then
+            echo "run_heavy_matrix=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
+          echo "Changed files in this commit:"
+          echo "${CHANGED_FILES}"
+          NON_DOC_FILES=$(echo "${CHANGED_FILES}" | grep -v -E "^(docs/|.*\.md$)" || true)
+          if [ -n "${NON_DOC_FILES}" ]; then
+            echo "Non-documentation files modified. Triggering full test matrix."
+            echo "run_heavy_matrix=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Only documentation/markdown files modified. Skipping heavy Rust and PostgreSQL matrix."
+            echo "run_heavy_matrix=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ----------------------------------------------------------------------------
   # 1a. Rust Workspace Checks (git-alternative)
   # ----------------------------------------------------------------------------
   rust-git-alternative:
     name: Rust Workspace Checks & Tests (git-alternative)
+    needs: detect-changes
+    if: needs.detect-changes.outputs.run_heavy_matrix == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -44,6 +79,8 @@ jobs:
   # ----------------------------------------------------------------------------
   rust-github-backend:
     name: Rust Workspace Checks & Tests (github-alternative/backend)
+    needs: detect-changes
+    if: needs.detect-changes.outputs.run_heavy_matrix == 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_INCREMENTAL: "0"
@@ -86,6 +123,8 @@ jobs:
   # ----------------------------------------------------------------------------
   database-tests:
     name: Database-Backed Integration & Cluster Recovery Tests (PostgreSQL)
+    needs: detect-changes
+    if: needs.detect-changes.outputs.run_heavy_matrix == 'true'
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -309,6 +348,8 @@ jobs:
   # ----------------------------------------------------------------------------
   frontend-checks:
     name: Frontend Typecheck & Production Build
+    needs: detect-changes
+    if: needs.detect-changes.outputs.run_heavy_matrix == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -399,6 +440,15 @@ jobs:
 
       - name: Run Stale Backup Alerting Loop Test
         run: python scripts/exercise_stale_backup_alert_loop.py
+
+      - name: Run Staging Ingress Prober Tests
+        run: python scripts/test_staging_ingress_probes.py
+
+      - name: Run S3 Compliance WORM Rehearsal Tests
+        run: python scripts/test_s3_compliance_rehearsal.py
+
+      - name: Run Deployed Operations Verifier Tests
+        run: python scripts/test_deployed_operations_verifier.py
 
       - name: Scan Repository with Gitleaks (Redacted Output)
         uses: gitleaks/gitleaks-action@f586c14365d4643c6aa59d472ae6e984bf47bb34 # v2.3.8

@@ -122,6 +122,30 @@ aws --profile spine-staging cloudformation deploy \
 ---
 
 ### Step 2: S3 Object Lock & Cryptographic Verification
+
+To definitively prove that backup immutability is enforced by the **S3 Object Lock Compliance WORM engine** rather than unconfigured principals, expired credentials, an IAM deny, or a bucket policy deny, operators can use either the automated rehearsal script or the manual procedure below.
+
+#### Automated Rehearsal Tool (Recommended)
+Run [`scripts/rehearse_s3_compliance.py`](../scripts/rehearse_s3_compliance.py):
+```bash
+python scripts/rehearse_s3_compliance.py \
+  --bucket "<staging-bucket-name>" \
+  --target-key "backups/production-rehearsal/<backup-archive-filename>.spnebak" \
+  --version-id "${ARCHIVE_VERSION_ID}" \
+  --expected-role "SpineForge-AuditRole" \
+  --profile spine-auditor \
+  --region us-east-1
+```
+The automated script executes the full 5-phase verification:
+1. Asserts caller identity matches `SpineForge-AuditRole` via `--profile spine-auditor` (rejects raw key CLI args).
+2. Simulates IAM policy to verify `s3:DeleteObject` and `s3:DeleteObjectVersion` are explicitly `allowed`, and audits bucket policy for absence of unconditional denies.
+3. Performs positive control deletion of an unlocked test object (must succeed to prove genuine deletion permissions).
+4. Probes version-specific deletion of the locked archive (strictly asserts failure with `AccessDenied` / HTTP 403; fails as a critical breach if deletion succeeds).
+5. Asserts `head-object` and `get-object-retention` confirm the exact version remains intact with `COMPLIANCE` mode and future retain date.
+
+---
+
+#### Manual CLI Verification Procedure
 1. **Query Remote Object Retention Mode (using SpineBackupRole or Auditor Role):**
    ```bash
    aws s3api get-object-retention \
@@ -302,6 +326,21 @@ aws --profile spine-staging cloudformation deploy \
 
 The canonical health readiness route is `/health/ready`, which is explicitly routed by `deploy/nginx/ingress.conf` (`location ~ ^/(health|healthz|readyz)`) to `http://spine-api:3000/health/ready` and matches the container healthcheck definition in `docker-compose.prod.yml`. All probes strictly target the configured `${STAGING_FQDN}` without insecure TLS bypass flags (`-k`/`--insecure`).
 
+#### Automated Ingress Prober (Recommended)
+Operators can execute both Probe 4a (HTTPS trust, SAN, HTTP 200, headers) and Probe 4b (plain HTTP port 80 redirect to HTTPS) with a single command via [`scripts/probe_staging_ingress.py`](../scripts/probe_staging_ingress.py) or [`scripts/probe_staging_ingress.sh`](../scripts/probe_staging_ingress.sh):
+
+```bash
+# Python prober:
+python scripts/probe_staging_ingress.py --fqdn "${STAGING_FQDN}"
+
+# Or POSIX bash wrapper:
+./scripts/probe_staging_ingress.sh "${STAGING_FQDN}"
+```
+
+---
+
+#### Manual Probe Procedures
+
 #### Probe 4a: Public CA HTTPS Ingress Trust Probe (Port 443)
 Execute the TLS trust probe from an external client outside the staging local network using the host's standard root CA store:
 ```bash
@@ -467,9 +506,9 @@ unset BACKUP_SESSION AUDIT_SESSION
 | **Disaster Recovery RTO (1 GB Active Dataset)** | Nominal $<60$s Target | **MISSED (Nominal Target)** | Nominal target failed. Proved cold restore in **150.12s** & **155.02s** (mean **152.57s**, $\sigma = 3.46$s) on Windows/WSL2 NVMe host. |
 | **Disaster Recovery RTO (Proposed SLA)** | $\le 5$ Minutes ($300$s) | **PROPOSED (Pending Approval)** | Local rehearsal measurements documented; pending formal service-owner sign-off. |
 | **Disaster Recovery RTO (100 GB Scale)** | $< 15$ Minutes ($900$s) | **UNVERIFIED / PROJECTED** | Extrapolated; unverified pending large-scale staging measurement. |
-| **Backup Scheduling & RPO Freshness Alerting** | Hourly automated backups, Alert webhook delivery on $>60$m age | **LOCALLY TESTED** | Systemd timers, cron definitions, and JSON webhook alert delivery loop verified locally; pending target host deployment. |
-| **AWS S3 Object Lock Compliance WORM** | S3 WORM Compliance Mode, $\ge 30$-day retention, versioned delete refusal | **BLOCKED / UNVERIFIED** | CloudFormation template and runbook prepared; blocked on real AWS account & bucket. |
-| **Public CA TLS Gateway & HTTPS Redirection** | Valid CA Trust Chain (no `-k`), Port 80 $\to$ 443 301 Redirect | **BLOCKED / UNVERIFIED** | Ingress configured; blocked on public DNS record & public CA certificate. |
+| **Backup Scheduling & RPO Freshness Alerting** | Hourly automated backups, Alert webhook delivery on $>60$m age | **LOCALLY TESTED / PREPARED** | Automation installer (`scripts/install_backup_automation.sh`) and verifier (`scripts/verify_deployed_operations.py`) tested with 14 unit tests; pending target host deployment enrollment. |
+| **AWS S3 Object Lock Compliance WORM** | S3 WORM Compliance Mode, $\ge 30$-day retention, versioned delete refusal | **BLOCKED / UNVERIFIED** | 5-phase rehearsal tool (`scripts/rehearse_s3_compliance.py`, 8 unit tests) and CloudFormation template ready; blocked on real AWS account & bucket. |
+| **Public CA TLS Gateway & HTTPS Redirection** | Valid CA Trust Chain (no `-k`), Port 80 $\to$ 443 301 Redirect | **BLOCKED / UNVERIFIED** | Ingress verification probers (`scripts/probe_staging_ingress.py`, 11 unit tests) ready; blocked on public DNS record & public CA certificate. |
 
 **Overall Production-Readiness Status:** **NOT PRODUCTION-READY** (Held pending real AWS Object Lock and public CA TLS staging verification).
 
