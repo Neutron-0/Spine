@@ -23,7 +23,7 @@ Spine strictly requires operators to obtain or verify the Ed25519 public key thr
    - Bound directly to git repository history and protected branches.
 2. **Out-of-Band DNS TXT Attestation:**
    - Domain: `_spine-release-key.spine.dev`
-   - Published Record: `v=spine1; alg=ed25519; fp=dada4ec5ae0317e05f62915fa8b330364d95b542095f9e8a719bf8beae09fd02; key=4ac344ceb9efd42cf898aa55c5df05b22b07e05ec68661eb5271eb53dfbbef77`
+   - Published Record: `v=spine1; alg=ed25519; fp=dada4ec5ae0317e05f62915fa8b330364d95b542095f9e8a719bf8beae09fd02; pubkey=4ac344ceb9efd42cf898aa55c5df05b22b07e05ec68661eb5271eb53dfbbef77`
    - Operators can verify the fingerprint over DNSSEC before importing.
 3. **Signed Git Release Tag / Maintainer GPG Web of Trust:**
    - Every official release tag (e.g. `v0.1.0-rc3`) is cryptographically signed with the maintainer's hardware security key (YubiKey / GPG) verified against public key registries.

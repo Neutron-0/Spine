@@ -32,11 +32,14 @@ regexes = [
 ]
 
 [allowlist]
-description = "Global allowlist for build artifacts, locks, and reference sources"
+description = "Global allowlist for build artifacts, locks, reference sources, and public keys"
 paths = [
     '''(^|/)Cargo\.lock$''',
     '''(^|/)package-lock\.json$''',
     '''(^|/)references/''',
     '''(^|/)target/''',
     '''(^|/)dist/''',
+]
+regexes = [
+    '''4ac344ceb9efd42cf898aa55c5df05b22b07e05ec68661eb5271eb53dfbbef77''',
 ]
