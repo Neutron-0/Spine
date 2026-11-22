@@ -1,0 +1,4 @@
+# Authoritative Spine Release Signing Public Key (Ed25519)
+# Trust Anchor for verifying distributed Spine release binaries and manifests.
+# Fingerprint / Hex:
+dada4ec5294c7c1f48f4c0c941aa01bdc924b20a7db3255fa950a9f3b753e3b3

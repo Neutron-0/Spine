@@ -12,21 +12,21 @@ if command -v docker.exe >/dev/null 2>&1; then
 fi
 
 SPINE_API_BIN=""
-if command -v spine-api >/dev/null 2>&1; then
+if command -v spine-api >/dev/null 2>&1 && [ -s "$(command -v spine-api)" ]; then
   SPINE_API_BIN="spine-api"
-elif command -v spine-api.exe >/dev/null 2>&1; then
+elif command -v spine-api.exe >/dev/null 2>&1 && [ -s "$(command -v spine-api.exe)" ]; then
   SPINE_API_BIN="spine-api.exe"
-elif [ -x "./target/release-candidate/spine-api.exe" ]; then
+elif [ -s "./target/release-candidate/spine-api.exe" ]; then
   SPINE_API_BIN="./target/release-candidate/spine-api.exe"
-elif [ -x "./target/release-candidate/spine-api" ]; then
+elif [ -s "./target/release-candidate/spine-api" ]; then
   SPINE_API_BIN="./target/release-candidate/spine-api"
-elif [ -x "./github-alternative/backend/target/release/spine-api.exe" ]; then
+elif [ -s "./github-alternative/backend/target/release/spine-api.exe" ]; then
   SPINE_API_BIN="./github-alternative/backend/target/release/spine-api.exe"
-elif [ -x "./github-alternative/backend/target/release/spine-api" ]; then
+elif [ -s "./github-alternative/backend/target/release/spine-api" ]; then
   SPINE_API_BIN="./github-alternative/backend/target/release/spine-api"
-elif [ -x "./github-alternative/backend/target/debug/spine-api.exe" ]; then
+elif [ -s "./github-alternative/backend/target/debug/spine-api.exe" ]; then
   SPINE_API_BIN="./github-alternative/backend/target/debug/spine-api.exe"
-elif [ -x "./github-alternative/backend/target/debug/spine-api" ]; then
+elif [ -s "./github-alternative/backend/target/debug/spine-api" ]; then
   SPINE_API_BIN="./github-alternative/backend/target/debug/spine-api"
 fi
 
@@ -145,10 +145,23 @@ fi
 RESTORE_SUCCESS=0
 VOLUMES_MODIFIED=0
 to_host_mount_path() {
+  local target="$1"
   if command -v cygpath >/dev/null 2>&1; then
-    cygpath -w "$1"
+    cygpath -w "${target}"
+  elif command -v wslpath >/dev/null 2>&1; then
+    if [ -e "${target}" ]; then
+      wslpath -w "${target}" 2>/dev/null || printf "%s" "${target}"
+    else
+      local dir
+      dir=$(dirname "${target}")
+      local base
+      base=$(basename "${target}")
+      local host_dir
+      host_dir=$(wslpath -w "${dir}" 2>/dev/null || printf "%s" "${dir}")
+      printf "%s\\%s" "${host_dir}" "${base}"
+    fi
   else
-    printf "%s" "$1"
+    printf "%s" "${target}"
   fi
 }
 
@@ -677,10 +690,21 @@ echo "Starting fresh PostgreSQL container..."
 
 echo "Awaiting PostgreSQL readiness..."
 READY_PG=0
-for _ in $(seq 1 30); do
-  if "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T postgres pg_isready -U "${POSTGRES_ADMIN_USER}" >/dev/null 2>&1; then
-    READY_PG=1
-    break
+PG_EXEC_ARGS=()
+if [ -n "${POSTGRES_ADMIN_PASSWORD}" ]; then
+  PG_EXEC_ARGS+=(-e "PGPASSWORD=${POSTGRES_ADMIN_PASSWORD}")
+fi
+
+for _ in $(seq 1 45); do
+  # Require both pg_isready and a successful psql query to ensure the permanent postgres server
+  # has finished initializing and has not shut down from the temporary initdb process.
+  if "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T postgres pg_isready -U "${POSTGRES_ADMIN_USER}" >/dev/null 2>&1 && \
+     "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T "${PG_EXEC_ARGS[@]}" postgres psql -U "${POSTGRES_ADMIN_USER}" -d postgres -c "SELECT 1;" >/dev/null 2>&1; then
+    sleep 2
+    if "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T "${PG_EXEC_ARGS[@]}" postgres psql -U "${POSTGRES_ADMIN_USER}" -d postgres -c "SELECT 1;" >/dev/null 2>&1; then
+      READY_PG=1
+      break
+    fi
   fi
   sleep 1
 done
@@ -692,10 +716,6 @@ fi
 
 # 2. Terminate connections and drop empty compose-initialized spine_forge database
 echo "Preparing database cluster for dump import..."
-PG_EXEC_ARGS=()
-if [ -n "${POSTGRES_ADMIN_PASSWORD}" ]; then
-  PG_EXEC_ARGS+=(-e "PGPASSWORD=${POSTGRES_ADMIN_PASSWORD}")
-fi
 
 "${DOCKER_BIN}" compose -f "${COMPOSE_FILE}" exec -T "${PG_EXEC_ARGS[@]}" postgres psql -U "${POSTGRES_ADMIN_USER}" -d postgres -v ON_ERROR_STOP=1 \
   -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${POSTGRES_DB}' AND pid <> pg_backend_pid();" \

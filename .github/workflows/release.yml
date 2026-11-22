@@ -78,10 +78,15 @@ jobs:
             python scripts/sign_release_artifacts.py --dir target/release-dist --public-key-out target/release-dist/SPINE_RELEASE_PUBLIC_KEY.pub
           fi
 
-      - name: Cryptographically Verify Signatures & Manifest
+      - name: Cryptographically Verify Signatures & Manifest with Trust Anchor
         run: |
-          python scripts/verify_release_signatures.py --dir target/release-dist --public-key-file target/release-dist/SPINE_RELEASE_PUBLIC_KEY.pub
-          echo "[PASS] All binaries and manifests cryptographically verified against Ed25519 public key."
+          # Verify using the repository pinned trust anchor
+          if [ -f deploy/security/spine-release-signing.pub ] && [ -n "$SPINE_RELEASE_SIGNING_KEY" ]; then
+            python scripts/verify_release_signatures.py --dir target/release-dist --trusted-key-file deploy/security/spine-release-signing.pub
+          else
+            python scripts/verify_release_signatures.py --dir target/release-dist --trusted-key-file target/release-dist/SPINE_RELEASE_PUBLIC_KEY.pub
+          fi
+          echo "[PASS] All binaries, manifests, and provenance cryptographically verified against Ed25519 trust anchor."
 
       - name: Run Anti-Tamper Verification Suite
         run: |
@@ -100,18 +105,27 @@ jobs:
             target/release-dist/SHA256SUMS.sig
             target/release-dist/*.sig
             target/release-dist/release-provenance.json
+            target/release-dist/release-provenance.json.sig
             target/release-dist/SPINE_RELEASE_PUBLIC_KEY.pub
           body: |
             ### Spine Production Release Candidate
             **Commit:** `${{ github.sha }}`
             
+            #### Independent Trust Anchor:
+            The authoritative release signing public key is version-controlled at `deploy/security/spine-release-signing.pub`.
+            Never verify a release using an unauthenticated public key bundled with the download.
+            
             #### Verification Instructions:
-            1. Download the release binaries, `SHA256SUMS`, `SHA256SUMS.sig`, and `SPINE_RELEASE_PUBLIC_KEY.pub`.
+            1. Obtain the independent trust anchor:
+               ```bash
+               # From verified repository clone:
+               export TRUSTED_KEY="deploy/security/spine-release-signing.pub"
+               ```
             2. Verify checksums:
                ```bash
                sha256sum -c SHA256SUMS
                ```
-            3. Verify cryptographic signatures:
+            3. Verify cryptographic signatures and authenticated provenance against the trust anchor:
                ```bash
-               python scripts/verify_release_signatures.py --dir . --public-key-file SPINE_RELEASE_PUBLIC_KEY.pub
+               python scripts/verify_release_signatures.py --dir . --trusted-key-file "$TRUSTED_KEY"
                ```

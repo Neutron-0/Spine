@@ -194,9 +194,17 @@ def sign_release_artifacts(
     }
 
     provenance_path = artifacts_dir / "release-provenance.json"
-    provenance_path.write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
+    prov_bytes = (json.dumps(provenance, indent=2) + "\n").encode("utf-8")
+    provenance_path.write_bytes(prov_bytes)
     print(f"[SIGN] Created provenance metadata -> {provenance_path.name}")
-    print(f"[SUCCESS] All {len(artifact_records)} artifacts and manifest signed with Ed25519.")
+
+    # 4. Sign release-provenance.json itself to bind provenance to trusted key
+    prov_sig = private_key.sign(prov_bytes)
+    prov_sig_path = artifacts_dir / "release-provenance.json.sig"
+    prov_sig_path.write_bytes(prov_sig)
+    print(f"[SIGN] Signed provenance metadata -> {prov_sig_path.name} (Ed25519, {len(prov_sig)} bytes)")
+
+    print(f"[SUCCESS] All {len(artifact_records)} artifacts, manifest, and provenance signed with Ed25519.")
 
 
 def main():

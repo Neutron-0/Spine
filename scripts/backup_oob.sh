@@ -431,10 +431,23 @@ cleanup_backup() {
 trap cleanup_backup EXIT ERR INT TERM
 
 to_host_mount_path() {
+  local target="$1"
   if command -v cygpath >/dev/null 2>&1; then
-    cygpath -w "$1"
+    cygpath -w "${target}"
+  elif command -v wslpath >/dev/null 2>&1; then
+    if [ -e "${target}" ]; then
+      wslpath -w "${target}" 2>/dev/null || printf "%s" "${target}"
+    else
+      local dir
+      dir=$(dirname "${target}")
+      local base
+      base=$(basename "${target}")
+      local host_dir
+      host_dir=$(wslpath -w "${dir}" 2>/dev/null || printf "%s" "${dir}")
+      printf "%s\\%s" "${host_dir}" "${base}"
+    fi
   else
-    printf "%s" "$1"
+    printf "%s" "${target}"
   fi
 }
 
@@ -619,30 +632,32 @@ tar -czf "${PLAINTEXT_TAR}" -C "${STAGING_DIR}" .
 
 echo "Encrypting backup bundle into SPNEBAK v2 AEAD envelope (AES-256-GCM)..."
 SPINE_API_BIN=""
-if command -v spine-api >/dev/null 2>&1; then
+if command -v spine-api >/dev/null 2>&1 && [ -s "$(command -v spine-api)" ]; then
   SPINE_API_BIN="spine-api"
-elif command -v spine-api.exe >/dev/null 2>&1; then
+elif command -v spine-api.exe >/dev/null 2>&1 && [ -s "$(command -v spine-api.exe)" ]; then
   SPINE_API_BIN="spine-api.exe"
-elif [ -x "./target/release-candidate/spine-api.exe" ]; then
+elif [ -s "./target/release-candidate/spine-api.exe" ]; then
   SPINE_API_BIN="./target/release-candidate/spine-api.exe"
-elif [ -x "./target/release-candidate/spine-api" ]; then
+elif [ -s "./target/release-candidate/spine-api" ]; then
   SPINE_API_BIN="./target/release-candidate/spine-api"
-elif [ -x "./github-alternative/backend/target/release/spine-api.exe" ]; then
+elif [ -s "./github-alternative/backend/target/release/spine-api.exe" ]; then
   SPINE_API_BIN="./github-alternative/backend/target/release/spine-api.exe"
-elif [ -x "./github-alternative/backend/target/release/spine-api" ]; then
+elif [ -s "./github-alternative/backend/target/release/spine-api" ]; then
   SPINE_API_BIN="./github-alternative/backend/target/release/spine-api"
-elif [ -x "./github-alternative/backend/target/debug/spine-api.exe" ]; then
+elif [ -s "./github-alternative/backend/target/debug/spine-api.exe" ]; then
   SPINE_API_BIN="./github-alternative/backend/target/debug/spine-api.exe"
-elif [ -x "./github-alternative/backend/target/debug/spine-api" ]; then
+elif [ -s "./github-alternative/backend/target/debug/spine-api" ]; then
   SPINE_API_BIN="./github-alternative/backend/target/debug/spine-api"
 fi
 
 if [ -n "${SPINE_API_BIN}" ]; then
   host_pass_file=$(to_host_mount_path "${RESOLVED_PASSPHRASE_FILE}")
+  host_plain_tar=$(to_host_mount_path "${PLAINTEXT_TAR}")
+  host_encrypted_archive=$(to_host_mount_path "${ENCRYPTED_ARCHIVE}")
   "${SPINE_API_BIN}" backup encrypt \
     --passphrase-file "${host_pass_file}" \
-    --input "${PLAINTEXT_TAR}" \
-    --output "${ENCRYPTED_ARCHIVE}"
+    --input "${host_plain_tar}" \
+    --output "${host_encrypted_archive}"
 else
   # Encrypt through the spine-api container via mounted read-only secret file.
   # Credentials are never passed in process arguments or container environment variables.
