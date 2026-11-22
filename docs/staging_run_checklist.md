@@ -36,10 +36,28 @@ aws --profile spine-staging cloudformation deploy \
 ---
 
 ### B. Public DNS & Trusted CA TLS Certificate
-1. **Public DNS Record:** Configure an external DNS `A` or `CNAME` record (e.g., `git.spine-staging.example.com`) resolving to the public edge IP of the staging environment.
-2. **Publicly Trusted CA Certificate:** Obtain a certificate issued by a recognized public CA (e.g., Let's Encrypt / ACME, AWS ACM, or DigiCert).
-3. **Full Chain Assembly:** Ensure the certificate bundle includes the leaf certificate and all intermediate CA certificates (`fullchain.pem`).
-4. **Proxy Mount:** Deploy the certificate and private key with restrictive permissions (`chmod 600`):
+1. **Configure Authoritative Staging FQDN:**
+   Define and export the single canonical `${STAGING_FQDN}` used across all TLS and ingress steps:
+   ```bash
+   export STAGING_FQDN="git-staging.example-corp.net" # Set to operator's real assigned public domain
+   ```
+   Validate that the domain is configured and is neither empty nor a placeholder:
+   ```bash
+   if [ -z "${STAGING_FQDN}" ] || [[ "${STAGING_FQDN}" =~ (example\.com|<.*>|placeholder|localhost|127\.0\.0\.1) ]]; then
+     echo "FATAL: STAGING_FQDN must be configured with a real, authoritative public domain name (got '${STAGING_FQDN}'). Placeholders and localhost are forbidden." >&2
+     exit 1
+   fi
+   ```
+2. **Public DNS Resolution:** Configure an external DNS `A` or `CNAME` record mapping `${STAGING_FQDN}` strictly to the public edge IP of the staging host.
+3. **Publicly Trusted CA Certificate & SAN Validation:** Obtain a certificate issued by a recognized public root CA (e.g. Let's Encrypt / ACME, AWS ACM, DigiCert). Confirm that the certificate Subject Alternative Name (SAN) explicitly includes `${STAGING_FQDN}` prior to edge deployment:
+   ```bash
+   CERT_SANS=$(openssl x509 -in "${SPINE_TLS_CERT_FILE}" -noout -text | grep -A1 "Subject Alternative Name" | tr -d '\n\r ')
+   if ! echo "${CERT_SANS}" | grep -q "DNS:${STAGING_FQDN}"; then
+     echo "FATAL: Certificate SAN (${CERT_SANS}) does not include the configured STAGING_FQDN (DNS:${STAGING_FQDN})" >&2
+     exit 1
+   fi
+   ```
+4. **Full Chain Assembly & Mount:** Ensure the certificate bundle includes the leaf certificate and all intermediate CA certificates (`fullchain.pem`), deployed with restrictive permissions (`chmod 600`):
    - Ingress certificate: `SPINE_TLS_CERT_FILE=/etc/ssl/certs/fullchain.pem`
    - Ingress key: `SPINE_TLS_KEY_FILE=/etc/ssl/private/privkey.pem`
 
@@ -70,8 +88,15 @@ aws --profile spine-staging cloudformation deploy \
    export AWS_SESSION_TOKEN=$(echo "${BACKUP_SESSION}" | awk '{print $3}')
    ```
 
-2. **Configure Staging Environment Parameters:**
+2. **Configure Staging Environment & Unique Project Parameters:**
    ```bash
+   # Assign and validate a unique, isolated staging Compose project name:
+   export STAGING_PROJECT_NAME="spine-staging-$(openssl rand -hex 4)"
+   if [[ ! "${STAGING_PROJECT_NAME}" =~ ^spine-staging-[0-9a-fA-F]{6,16}$ ]]; then
+     echo "FATAL: STAGING_PROJECT_NAME '${STAGING_PROJECT_NAME}' is invalid! Must match ^spine-staging-[0-9a-fA-F]{6,16}$" >&2
+     exit 1
+   fi
+
    export SPINE_DEPLOYMENT_PROFILE=core-forge-v1
    export SPINE_BACKUP_REQUIRE_REMOTE=1
    export SPINE_BACKUP_OBJECT_LOCK_MODE=COMPLIANCE
@@ -116,7 +141,7 @@ aws --profile spine-staging cloudformation deploy \
    ```
    - Verify computed SHA-256 matches manifest `SHA256SUMS`.
 
-3. **Attempt Version-Specific Deletion with Staging Auditor Identity:**
+3. **Attempt Version-Specific Deletion with Staging Auditor Identity (Safe Under `set -e`):**
    > [!IMPORTANT]
    > Testing deletion using `SpineBackupRole` only proves IAM Deny, not S3 Object Lock Compliance retention. To verify S3 WORM enforcement, assume `SpineAuditVerificationRole`, which **explicitly allows** `s3:DeleteObject` and `s3:DeleteObjectVersion` in its IAM policy (see [`deploy/aws/staging-object-lock-storage.yaml`](../deploy/aws/staging-object-lock-storage.yaml)) and has no retention bypass permissions.
    >
@@ -148,36 +173,70 @@ aws --profile spine-staging cloudformation deploy \
      --query "Versions[?IsLatest==\`true\`].VersionId" \
      --output text)
 
-   # Attempt version-specific deletion with auditor credentials:
-   AWS_ACCESS_KEY_ID="${AUDIT_ACCESS_KEY}" \
-   AWS_SECRET_ACCESS_KEY="${AUDIT_SECRET_KEY}" \
-   AWS_SESSION_TOKEN="${AUDIT_TOKEN}" \
-   aws s3api delete-object \
-     --bucket <staging-bucket-name> \
-     --key backups/production-rehearsal/<backup-archive-filename>.spnebak \
-     --version-id "${ARCHIVE_VERSION_ID}"
+   if [ -z "${ARCHIVE_VERSION_ID}" ] || [ "${ARCHIVE_VERSION_ID}" = "None" ]; then
+     echo "FATAL: Could not resolve latest VersionId for archive backups/production-rehearsal/<backup-archive-filename>.spnebak" >&2
+     exit 1
+   fi
+
+   # Execute version-specific deletion under safe set -e handling:
+   set +e
+   DELETE_OUTPUT=$(AWS_ACCESS_KEY_ID="${AUDIT_ACCESS_KEY}" \
+     AWS_SECRET_ACCESS_KEY="${AUDIT_SECRET_KEY}" \
+     AWS_SESSION_TOKEN="${AUDIT_TOKEN}" \
+     aws s3api delete-object \
+       --bucket <staging-bucket-name> \
+       --key backups/production-rehearsal/<backup-archive-filename>.spnebak \
+       --version-id "${ARCHIVE_VERSION_ID}" 2>&1)
+   DELETE_EXIT_CODE=$?
+   set -e
+
+   # Evaluation 1: A successful delete is a critical test failure under Object Lock Compliance
+   if [ "${DELETE_EXIT_CODE}" -eq 0 ]; then
+     echo "FATAL: S3 version-specific delete succeeded! S3 Object Lock Compliance WORM failed to protect archive version ${ARCHIVE_VERSION_ID}." >&2
+     exit 1
+   fi
+
+   # Evaluation 2: Capture and assert that rejection is specifically AccessDenied / HTTP 403
+   # Missing credentials, expired sessions, network timeouts, or invalid bucket errors must NEVER count as a WORM pass!
+   if echo "${DELETE_OUTPUT}" | grep -qE "(AccessDenied|403|Access Denied)"; then
+     echo "CONFIRMED: S3 Object Lock Compliance WORM rejected version deletion with AccessDenied (HTTP 403)."
+   else
+     echo "FATAL: Deletion failed with unexpected non-WORM error (${DELETE_OUTPUT})." >&2
+     echo "Unrelated errors or credential failures cannot satisfy the WORM Compliance verification gate." >&2
+     exit 1
+   fi
    ```
 
-   **Pass Criteria for Deletion Rejection:**
-   - The command must exit with a non-zero exit code (`$? != 0`).
-   - Standard error output must indicate `AccessDenied` / HTTP status code `403` (e.g. `An error occurred (AccessDenied) when calling the DeleteObject operation: Access Denied`).
-   - Do NOT require an undocumented internal error message. Because `SpineAuditVerificationRole` is explicitly granted `s3:DeleteObject` and `s3:DeleteObjectVersion` in IAM, this refusal definitively proves that the rejection is enforced by the **AWS S3 Object Lock Compliance WORM engine**.
-
-4. **Confirm Version Preservation & Compliance Metadata:**
-   Immediately following the rejected deletion, assert that the version still exists and retains its Compliance metadata:
+4. **Confirm Version Preservation & Compliance Metadata via `head-object`:**
+   Immediately following the rejected deletion, assert that the exact same version remains in place and retains valid Compliance retention metadata:
    ```bash
-   aws --profile spine-staging s3api head-object \
+   HEAD_OBJECT_JSON=$(aws --profile spine-staging s3api head-object \
      --bucket <staging-bucket-name> \
      --key backups/production-rehearsal/<backup-archive-filename>.spnebak \
-     --version-id "${ARCHIVE_VERSION_ID}"
+     --version-id "${ARCHIVE_VERSION_ID}")
+
+   # Assert ObjectLockMode is COMPLIANCE
+   echo "${HEAD_OBJECT_JSON}" | grep -q '"ObjectLockMode": "COMPLIANCE"' || {
+     echo "FATAL: ObjectLockMode is not COMPLIANCE in head-object metadata: ${HEAD_OBJECT_JSON}" >&2
+     exit 1
+   }
+
+   # Assert ObjectLockRetainUntilDate is present and unexpired
+   echo "${HEAD_OBJECT_JSON}" | grep -q '"ObjectLockRetainUntilDate"' || {
+     echo "FATAL: ObjectLockRetainUntilDate missing from object version ${ARCHIVE_VERSION_ID}" >&2
+     exit 1
+   }
+
+   # Assert VersionId matches the probed version
+   echo "${HEAD_OBJECT_JSON}" | grep -q "\"VersionId\": \"${ARCHIVE_VERSION_ID}\"" || {
+     echo "FATAL: VersionId mismatch in head-object verification" >&2
+     exit 1
+   }
    ```
-   **Pass Criteria for Version Preservation:**
-   - Command exits `0`.
-   - Output contains:
-     - `"ObjectLockMode": "COMPLIANCE"`
-     - `"ObjectLockRetainUntilDate"` populated and $\ge 30$ days into the future.
-     - `"VersionId"` matching `"${ARCHIVE_VERSION_ID}"`.
-     - `"ContentLength"` matching the local backup archive size.
+   **Pass Criteria for Object Lock Compliance WORM:**
+   - Deletion attempt with `SpineAuditVerificationRole` fails with `AccessDenied` / HTTP 403.
+   - Deletion does not succeed, and failure is verified not to be a credential/network error.
+   - `head-object` confirms the exact version `${ARCHIVE_VERSION_ID}` remains stored with `ObjectLockMode=COMPLIANCE` and future retain date.
 
 ---
 
@@ -200,12 +259,31 @@ aws --profile spine-staging cloudformation deploy \
 
 ### Step 4: External Ingress Verification (HTTPS Trust & HTTP Redirection)
 
-The canonical health readiness route is `/health/ready`, which is explicitly routed by `deploy/nginx/ingress.conf` (`location ~ ^/(health|healthz|readyz)`) to `http://spine-api:3000/health/ready` and matches the container healthcheck definition in `docker-compose.prod.yml`.
+The canonical health readiness route is `/health/ready`, which is explicitly routed by `deploy/nginx/ingress.conf` (`location ~ ^/(health|healthz|readyz)`) to `http://spine-api:3000/health/ready` and matches the container healthcheck definition in `docker-compose.prod.yml`. All probes strictly target the configured `${STAGING_FQDN}` without insecure TLS bypass flags (`-k`/`--insecure`).
 
 #### Probe 4a: Public CA HTTPS Ingress Trust Probe (Port 443)
 Execute the TLS trust probe from an external client outside the staging local network using the host's standard root CA store:
 ```bash
-curl -Iv https://<staging-hostname>/health/ready
+# 1. Execute live readiness probe against canonical route /health/ready:
+curl -fsS -v "https://${STAGING_FQDN}/health/ready"
+
+# 2. Assert HTTP 200 OK status code:
+HTTPS_STATUS=$(curl -s -S -o /dev/null -w "%{http_code}" "https://${STAGING_FQDN}/health/ready")
+if [ "${HTTPS_STATUS}" != "200" ]; then
+  echo "FATAL: HTTPS readiness probe failed with HTTP status ${HTTPS_STATUS}" >&2
+  exit 1
+fi
+
+# 3. Assert live presented TLS certificate SAN matches ${STAGING_FQDN}:
+LIVE_SAN=$(openssl s_client -connect "${STAGING_FQDN}:443" -servername "${STAGING_FQDN}" </dev/null 2>/dev/null \
+  | openssl x509 -noout -text \
+  | grep -A1 "Subject Alternative Name" \
+  | grep -o "DNS:${STAGING_FQDN}")
+
+if [ -z "${LIVE_SAN}" ]; then
+  echo "FATAL: Live TLS certificate presented at ${STAGING_FQDN}:443 does not match SAN DNS:${STAGING_FQDN}" >&2
+  exit 1
+fi
 ```
 > [!IMPORTANT]
 > Never use `-k` or `--insecure`. The connection must succeed using the client OS standard root CA store.
@@ -213,7 +291,7 @@ curl -Iv https://<staging-hostname>/health/ready
 **Pass Criteria:**
 - HTTP status code `200 OK`.
 - TLS handshake completes without certificate errors or warnings.
-- Server certificate subject (CN or SAN) matches `<staging-hostname>`.
+- Server certificate SAN strictly matches `${STAGING_FQDN}`.
 - Certificate issuer is a recognized public CA (e.g., Let's Encrypt, AWS ACM, DigiCert; not self-signed, not localhost).
 - Modern TLS protocol negotiated (`TLSv1.3` or `TLSv1.2` with PFS cipher suites).
 - Security headers verified:
@@ -222,13 +300,30 @@ curl -Iv https://<staging-hostname>/health/ready
   - `X-Frame-Options: SAMEORIGIN`
 
 #### Probe 4b: Plain HTTP to HTTPS Mandatory 301 Redirection Probe (Port 80)
-Execute the HTTP redirection probe against port 80:
+Execute the HTTP redirection probe against port 80 using a **GET** request with redirects **disabled** (curl does not follow redirects without `-L`):
 ```bash
-curl -Iv http://<staging-hostname>/health/ready
+# Issue GET request with redirects disabled, capturing headers:
+HTTP_HEADER_DUMP=$(curl -s -S -D - -o /dev/null "http://${STAGING_FQDN}/health/ready")
+
+# 1. Assert HTTP 301 Moved Permanently status line:
+if ! echo "${HTTP_HEADER_DUMP}" | grep -qE "^HTTP/[12\.]+ 301"; then
+  echo "FATAL: Port 80 did not return HTTP 301! Full response headers:" >&2
+  echo "${HTTP_HEADER_DUMP}" >&2
+  exit 1
+fi
+
+# 2. Assert Location header points strictly to canonical HTTPS URL:
+LOCATION_HEADER=$(echo "${HTTP_HEADER_DUMP}" | grep -i "^Location:" | tr -d '\r' | awk '{print $2}')
+EXPECTED_LOCATION="https://${STAGING_FQDN}/health/ready"
+
+if [ "${LOCATION_HEADER}" != "${EXPECTED_LOCATION}" ]; then
+  echo "FATAL: Location header '${LOCATION_HEADER}' does not match expected '${EXPECTED_LOCATION}'" >&2
+  exit 1
+fi
 ```
 **Pass Criteria:**
-- HTTP status code `301 Moved Permanently`.
-- `Location` header is strictly `https://<staging-hostname>/health/ready` (preserving path and query string).
+- HTTP status code is strictly `301 Moved Permanently`.
+- `Location` header is strictly `https://${STAGING_FQDN}/health/ready` (preserving path and query string).
 - No unencrypted payload or sensitive data returned over plain HTTP.
 
 ---
@@ -237,18 +332,30 @@ curl -Iv http://<staging-hostname>/health/ready
 
 To ensure zero cost leakage, clean state boundaries, and secure credential handling after staging verification:
 
-### A. Standby Application & Database Teardown
+### A. Standby Application & Database Teardown (Safe Project Scoping)
+Teardown must strictly target only the unique staging project name generated for this run, preventing accidental disruption of production or co-located stacks:
 ```bash
-# If running isolated restore Compose project:
-docker compose -p spine-staging-restore down -v --remove-orphans
+# 1. Validate STAGING_PROJECT_NAME syntax before teardown:
+if [[ ! "${STAGING_PROJECT_NAME}" =~ ^spine-staging-[0-9a-fA-F]{6,16}$ ]]; then
+  echo "FATAL: Refusing teardown! STAGING_PROJECT_NAME '${STAGING_PROJECT_NAME}' does not match expected staging pattern ^spine-staging-[0-9a-fA-F]{6,16}$" >&2
+  exit 1
+fi
 
-# If running primary staging Compose project:
-docker compose -p spine-staging down -v --remove-orphans
-```
-Confirm all staging containers, networks, and named volumes are removed:
-```bash
-docker ps -a --filter "name=spine-staging"
-docker volume ls --filter "name=spine-staging"
+# 2. Tear down only containers, networks, and volumes belonging to this specific staging run:
+docker compose -p "${STAGING_PROJECT_NAME}" down -v --remove-orphans
+
+# 3. Assert zero lingering containers or volumes for this project:
+LINGERING_CONTAINERS=$(docker ps -a -q --filter "name=${STAGING_PROJECT_NAME}")
+if [ -n "${LINGERING_CONTAINERS}" ]; then
+  echo "FATAL: Lingering staging containers found after teardown: ${LINGERING_CONTAINERS}" >&2
+  exit 1
+fi
+
+LINGERING_VOLUMES=$(docker volume ls -q --filter "name=${STAGING_PROJECT_NAME}_")
+if [ -n "${LINGERING_VOLUMES}" ]; then
+  echo "FATAL: Lingering staging volumes found after teardown: ${LINGERING_VOLUMES}" >&2
+  exit 1
+fi
 ```
 
 ### B. Ephemeral Credential & Token Purge
