@@ -577,36 +577,39 @@ pub async fn git_lfs_upload_object(
     };
 
     // 1. Authorization: check scoped transfer token or Basic auth write access BEFORE reading body
-    let authorized = if let Some(auth_val) = headers
+    if let Some(auth_val) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
     {
         if let Some(tok) = auth_val.strip_prefix("Bearer ") {
-            verify_scoped_token(tok.trim(), &repo.id, &oid, "upload").is_ok()
+            if verify_scoped_token(tok.trim(), &repo.id, &oid, "upload").is_err() {
+                return (
+                    StatusCode::FORBIDDEN,
+                    [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+                    "{\"message\":\"Invalid or expired scoped token\"}\n",
+                )
+                    .into_response();
+            }
         } else {
-            false
+            let caller = match authenticate_git_user(&state, &headers).await {
+                Some(u) => u,
+                None => return unauthorized_response(),
+            };
+            if let Err(e) = state
+                .permissions
+                .check_write_access(Some(&caller), &repo)
+                .await
+            {
+                return (
+                    StatusCode::FORBIDDEN,
+                    [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+                    format!("{{\"message\":\"Write permission denied: {}\"}}\n", e),
+                )
+                    .into_response();
+            }
         }
     } else {
-        false
-    };
-
-    if !authorized {
-        let caller = match authenticate_git_user(&state, &headers).await {
-            Some(u) => u,
-            None => return unauthorized_response(),
-        };
-        if let Err(e) = state
-            .permissions
-            .check_write_access(Some(&caller), &repo)
-            .await
-        {
-            return (
-                StatusCode::FORBIDDEN,
-                [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
-                format!("{{\"message\":\"Write permission denied: {}\"}}\n", e),
-            )
-                .into_response();
-        }
+        return unauthorized_response();
     }
 
     // 2. Validate OID format: BEFORE reading body
@@ -673,7 +676,7 @@ pub async fn git_lfs_upload_object(
     };
     let owner_id = repo.owner_org_id.as_deref().unwrap_or(&repo.owner_user_id);
 
-    let _stored = match state
+    let stored = match state
         .artifacts
         .store_object_reader(
             owner_type,
@@ -695,6 +698,18 @@ pub async fn git_lfs_upload_object(
                 .into_response();
         }
     };
+
+    // Git LFS addresses and verifies objects by OID, so index the manifest by OID
+    let mut stored_lfs = stored;
+    stored_lfs.id = oid.clone();
+    if let Err(e) = state.db.save_artifact_manifest(stored_lfs).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+            format!("{{\"message\":\"Failed to index LFS manifest: {}\"}}\n", e),
+        )
+            .into_response();
+    }
 
     (
         StatusCode::OK,
@@ -740,36 +755,39 @@ pub async fn git_lfs_verify_object(
     };
 
     // Authenticate: scoped verify token or user Basic auth
-    let authorized = if let Some(auth_val) = headers
+    if let Some(auth_val) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
     {
         if let Some(tok) = auth_val.strip_prefix("Bearer ") {
-            verify_scoped_token(tok.trim(), &repo.id, &verify_req.oid, "verify").is_ok()
+            if verify_scoped_token(tok.trim(), &repo.id, &verify_req.oid, "verify").is_err() {
+                return (
+                    StatusCode::FORBIDDEN,
+                    [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+                    "{\"message\":\"Invalid or expired scoped token\"}\n",
+                )
+                    .into_response();
+            }
         } else {
-            false
+            let caller = match authenticate_git_user(&state, &headers).await {
+                Some(u) => u,
+                None => return unauthorized_response(),
+            };
+            if let Err(e) = state
+                .permissions
+                .check_write_access(Some(&caller), &repo)
+                .await
+            {
+                return (
+                    StatusCode::FORBIDDEN,
+                    [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+                    format!("{{\"message\":\"Write permission denied: {}\"}}\n", e),
+                )
+                    .into_response();
+            }
         }
     } else {
-        false
-    };
-
-    if !authorized {
-        let caller = match authenticate_git_user(&state, &headers).await {
-            Some(u) => u,
-            None => return unauthorized_response(),
-        };
-        if let Err(e) = state
-            .permissions
-            .check_write_access(Some(&caller), &repo)
-            .await
-        {
-            return (
-                StatusCode::FORBIDDEN,
-                [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
-                format!("{{\"message\":\"Write permission denied: {}\"}}\n", e),
-            )
-                .into_response();
-        }
+        return unauthorized_response();
     }
 
     match state.db.get_artifact_manifest(&verify_req.oid).await {
