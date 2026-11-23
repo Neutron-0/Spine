@@ -87,6 +87,7 @@ pub const RESTORE_TABLE_ORDER: &[&str] = &[
     "artifact_namespaces",
     "artifact_quotas",
     "artifact_manifests",
+    "lfs_objects",
     "artifact_versions",
     "artifact_upload_sessions",
     "releases",

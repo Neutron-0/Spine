@@ -128,6 +128,8 @@ struct MemoryState {
     lfs_locks: HashMap<String, LfsLock>,
     lfs_locks_by_repo_path: HashMap<(String, String), String>,
     lfs_lock_audits: Vec<LfsLockAudit>,
+    lfs_objects: HashMap<String, LfsObject>,
+    lfs_objects_by_repo_oid: HashMap<(String, String), String>,
 }
 
 pub struct InMemoryDatabase {
@@ -1889,24 +1891,53 @@ impl Database for InMemoryDatabase {
             .state
             .read()
             .map_err(|e| ForgeError::Internal(e.to_string()))?;
-        if let Some(m) = state.manifests.get(manifest_id) {
-            return Ok(Some(m.clone()));
-        }
-        Ok(state.manifests_by_artifact_id.get(manifest_id).cloned())
+        Ok(state.manifests.get(manifest_id).cloned())
     }
 
-    async fn get_artifact_manifest_by_oid(
+    async fn save_lfs_object(&self, object: LfsObject) -> Result<LfsObject, ForgeError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let key = (object.repository_id.clone(), object.oid.clone());
+        state.lfs_objects_by_repo_oid.insert(key, object.id.clone());
+        state.lfs_objects.insert(object.id.clone(), object.clone());
+        Ok(object)
+    }
+
+    async fn get_lfs_object_by_repo_oid(
         &self,
+        repository_id: &str,
+        oid: &str,
+    ) -> Result<Option<LfsObject>, ForgeError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let key = (repository_id.to_string(), oid.to_string());
+        if let Some(id) = state.lfs_objects_by_repo_oid.get(&key) {
+            Ok(state.lfs_objects.get(id).cloned())
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn get_artifact_manifest_by_repo_oid(
+        &self,
+        repository_id: &str,
         oid: &str,
     ) -> Result<Option<StoredArtifactManifest>, ForgeError> {
         let state = self
             .state
             .read()
             .map_err(|e| ForgeError::Internal(e.to_string()))?;
-        if let Some(m) = state.manifests_by_artifact_id.get(oid) {
-            return Ok(Some(m.clone()));
+        let key = (repository_id.to_string(), oid.to_string());
+        if let Some(id) = state.lfs_objects_by_repo_oid.get(&key) {
+            if let Some(lfs_obj) = state.lfs_objects.get(id) {
+                return Ok(state.manifests.get(&lfs_obj.manifest_id).cloned());
+            }
         }
-        Ok(state.manifests.get(oid).cloned())
+        Ok(None)
     }
 
     async fn create_release(&self, release: Release) -> Result<Release, ForgeError> {

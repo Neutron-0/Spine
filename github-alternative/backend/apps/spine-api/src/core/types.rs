@@ -1653,6 +1653,16 @@ pub struct CreateDeployKeyRequest {
 // -----------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LfsObject {
+    pub id: String,
+    pub repository_id: String,
+    pub oid: String,
+    pub size_bytes: i64,
+    pub manifest_id: String,
+    pub created_at_nanos: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LfsLock {
     pub id: String,
     pub repository_id: String,

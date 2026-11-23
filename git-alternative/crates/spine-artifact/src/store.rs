@@ -38,6 +38,34 @@ pub trait ArtifactStore: Send + Sync {
     ) -> Result<bool, StoreError>;
 }
 
+impl<T: ?Sized + ArtifactStore> ArtifactStore for Arc<T> {
+    fn store_chunk(&self, chunk_hash: &str, bytes: &[u8]) -> Result<(), StoreError> {
+        (**self).store_chunk(chunk_hash, bytes)
+    }
+    fn get_chunk(&self, chunk_hash: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        (**self).get_chunk(chunk_hash)
+    }
+    fn has_chunk(&self, chunk_hash: &str) -> bool {
+        (**self).has_chunk(chunk_hash)
+    }
+    fn store_manifest(&self, manifest: &ArtifactManifest) -> Result<String, StoreError> {
+        (**self).store_manifest(manifest)
+    }
+    fn get_manifest(&self, manifest_id: &str) -> Result<Option<ArtifactManifest>, StoreError> {
+        (**self).get_manifest(manifest_id)
+    }
+    fn has_manifest(&self, manifest_id: &str) -> bool {
+        (**self).has_manifest(manifest_id)
+    }
+    fn verify_artifact_durability(
+        &self,
+        manifest_id: &str,
+        policy: DurabilityPolicy,
+    ) -> Result<bool, StoreError> {
+        (**self).verify_artifact_durability(manifest_id, policy)
+    }
+}
+
 /// Local directory-backed content-addressed artifact store.
 #[derive(Clone)]
 pub struct LocalArtifactStore {

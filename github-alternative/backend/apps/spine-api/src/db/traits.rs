@@ -416,8 +416,16 @@ pub trait Database: Send + Sync {
         &self,
         manifest_id: &str,
     ) -> Result<Option<StoredArtifactManifest>, ForgeError>;
-    async fn get_artifact_manifest_by_oid(
+
+    async fn save_lfs_object(&self, object: LfsObject) -> Result<LfsObject, ForgeError>;
+    async fn get_lfs_object_by_repo_oid(
         &self,
+        repository_id: &str,
+        oid: &str,
+    ) -> Result<Option<LfsObject>, ForgeError>;
+    async fn get_artifact_manifest_by_repo_oid(
+        &self,
+        repository_id: &str,
         oid: &str,
     ) -> Result<Option<StoredArtifactManifest>, ForgeError>;
 

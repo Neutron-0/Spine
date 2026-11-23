@@ -2795,7 +2795,7 @@ impl Database for PgDatabase {
         &self,
         manifest_id: &str,
     ) -> Result<Option<StoredArtifactManifest>, ForgeError> {
-        let query = "SELECT id, artifact_id, whole_object_hash, total_size, chunk_size, chunk_count, content_type, manifest_json, created_at_nanos FROM artifact_manifests WHERE id = $1 OR artifact_id = $1 ORDER BY (id = $1) DESC, created_at_nanos DESC LIMIT 1";
+        let query = "SELECT id, artifact_id, whole_object_hash, total_size, chunk_size, chunk_count, content_type, manifest_json, created_at_nanos FROM artifact_manifests WHERE id = $1";
         let row = sqlx::query(query)
             .bind(manifest_id)
             .fetch_optional(&self.pool)
@@ -2815,12 +2815,72 @@ impl Database for PgDatabase {
         }))
     }
 
-    async fn get_artifact_manifest_by_oid(
+    async fn save_lfs_object(&self, object: LfsObject) -> Result<LfsObject, ForgeError> {
+        let query = r#"
+            INSERT INTO lfs_objects (id, repository_id, oid, size_bytes, manifest_id, created_at_nanos)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (repository_id, oid) DO UPDATE SET
+                size_bytes = EXCLUDED.size_bytes,
+                manifest_id = EXCLUDED.manifest_id
+            RETURNING id, repository_id, oid, size_bytes, manifest_id, created_at_nanos
+        "#;
+        let row = sqlx::query(query)
+            .bind(&object.id)
+            .bind(&object.repository_id)
+            .bind(&object.oid)
+            .bind(object.size_bytes)
+            .bind(&object.manifest_id)
+            .bind(object.created_at_nanos)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        Ok(LfsObject {
+            id: row.get(0),
+            repository_id: row.get(1),
+            oid: row.get(2),
+            size_bytes: row.get(3),
+            manifest_id: row.get(4),
+            created_at_nanos: row.get(5),
+        })
+    }
+
+    async fn get_lfs_object_by_repo_oid(
         &self,
+        repository_id: &str,
+        oid: &str,
+    ) -> Result<Option<LfsObject>, ForgeError> {
+        let query = "SELECT id, repository_id, oid, size_bytes, manifest_id, created_at_nanos FROM lfs_objects WHERE repository_id = $1 AND oid = $2";
+        let row = sqlx::query(query)
+            .bind(repository_id)
+            .bind(oid)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        Ok(row.map(|r| LfsObject {
+            id: r.get(0),
+            repository_id: r.get(1),
+            oid: r.get(2),
+            size_bytes: r.get(3),
+            manifest_id: r.get(4),
+            created_at_nanos: r.get(5),
+        }))
+    }
+
+    async fn get_artifact_manifest_by_repo_oid(
+        &self,
+        repository_id: &str,
         oid: &str,
     ) -> Result<Option<StoredArtifactManifest>, ForgeError> {
-        let query = "SELECT id, artifact_id, whole_object_hash, total_size, chunk_size, chunk_count, content_type, manifest_json, created_at_nanos FROM artifact_manifests WHERE artifact_id = $1 OR id = $1 ORDER BY (artifact_id = $1) DESC, created_at_nanos DESC LIMIT 1";
+        let query = r#"
+            SELECT m.id, m.artifact_id, m.whole_object_hash, m.total_size, m.chunk_size, m.chunk_count, m.content_type, m.manifest_json, m.created_at_nanos
+            FROM lfs_objects lo
+            JOIN artifact_manifests m ON lo.manifest_id = m.id
+            WHERE lo.repository_id = $1 AND lo.oid = $2
+        "#;
         let row = sqlx::query(query)
+            .bind(repository_id)
             .bind(oid)
             .fetch_optional(&self.pool)
             .await

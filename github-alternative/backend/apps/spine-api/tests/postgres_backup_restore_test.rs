@@ -285,3 +285,120 @@ async fn test_spine_app_least_privilege_schema_create_rejected() {
 
     disp_db.cleanup().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_postgres_lfs_objects_backup_restore_roundtrip() {
+    let src_disp_db = match HarnessDisposableDb::provision_migrated().await {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!(
+                "Skipping test_postgres_lfs_objects_backup_restore_roundtrip: {}",
+                e
+            );
+            return;
+        }
+    };
+    let pool = src_disp_db
+        .migrator_pool()
+        .await
+        .expect("connect source pool");
+
+    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let uid = format!("usr_lfs_{}", uuid::Uuid::new_v4().simple());
+    let username = format!("user_{}", &uid[8..16]);
+    let email = format!("{}@example.com", &uid[8..16]);
+
+    // Insert user
+    sqlx::query(
+        "INSERT INTO users (id, username, normalized_username, email, normalized_email, display_name, password_hash, created_at_nanos, updated_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, 'hash', $7, $7)",
+    )
+    .bind(&uid)
+    .bind(&username)
+    .bind(username.to_lowercase())
+    .bind(&email)
+    .bind(email.to_lowercase())
+    .bind(&username)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert user");
+
+    // Insert repository
+    let repo_id = format!("repo_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO forge_repositories (id, owner_id, name, normalized_name, native_repo_id, is_private, durability_policy, created_at_nanos, updated_at_nanos) VALUES ($1, $2, 'lfs-test-repo', 'lfs-test-repo', 'test_lfs_repo', true, 'three_copies', $3, $3)",
+    )
+    .bind(&repo_id)
+    .bind(&uid)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert repository");
+
+    // Insert artifact manifest
+    let manifest_id = format!("man_{}", uuid::Uuid::new_v4().simple());
+    let oid = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    sqlx::query(
+        "INSERT INTO artifact_manifests (id, artifact_id, version, size_bytes, chunk_count, stored_path, created_at_nanos) VALUES ($1, $2, '1.0.0', 1024, 1, '/cas/test_path', $3)",
+    )
+    .bind(&manifest_id)
+    .bind(oid)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert artifact manifest");
+
+    // Insert lfs_objects mapping
+    let lfs_id = format!("lfs_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO lfs_objects (id, repository_id, oid, size_bytes, manifest_id, created_at_nanos) VALUES ($1, $2, $3, 1024, $4, $5)",
+    )
+    .bind(&lfs_id)
+    .bind(&repo_id)
+    .bind(oid)
+    .bind(&manifest_id)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert lfs_objects");
+
+    // Dump database to streaming writer
+    let mut dump_buf = Vec::new();
+    spine_api::dump_database_to_writer(&pool, &mut dump_buf)
+        .await
+        .expect("dump_database_to_writer failed");
+
+    // Restore to target empty DB
+    let target_disp_db = HarnessDisposableDb::provision_empty()
+        .await
+        .expect("provision empty target");
+    let target_pool = target_disp_db
+        .migrator_pool()
+        .await
+        .expect("connect target pool");
+
+    let mut reader = std::io::BufReader::new(std::io::Cursor::new(dump_buf));
+    let restore_report = spine_api::restore_database_from_reader(&target_pool, &mut reader)
+        .await
+        .expect("restore_database_from_reader failed");
+
+    assert!(restore_report.tables_restored > 0);
+
+    // Query restored lfs_objects joined with artifact_manifests
+    let row: (String, String, String, i64) = sqlx::query_as(
+        "SELECT lo.repository_id, lo.oid, m.stored_path, lo.size_bytes FROM lfs_objects lo JOIN artifact_manifests m ON lo.manifest_id = m.id WHERE lo.repository_id = $1 AND lo.oid = $2",
+    )
+    .bind(&repo_id)
+    .bind(oid)
+    .fetch_one(&target_pool)
+    .await
+    .expect("query restored lfs object");
+
+    assert_eq!(row.0, repo_id);
+    assert_eq!(row.1, oid);
+    assert_eq!(row.2, "/cas/test_path");
+    assert_eq!(row.3, 1024);
+
+    src_disp_db.cleanup().await.unwrap();
+    target_disp_db.cleanup().await.unwrap();
+}

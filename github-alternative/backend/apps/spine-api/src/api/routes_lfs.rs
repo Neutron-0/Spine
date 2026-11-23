@@ -409,9 +409,13 @@ pub async fn git_lfs_batch(
 
     if payload.operation == "upload" {
         for obj in payload.objects {
-            // Check if object already exists with matching size
-            if let Ok(Some(existing)) = state.db.get_artifact_manifest_by_oid(&obj.oid).await {
-                if existing.total_size as u64 == obj.size {
+            // Check if object already exists in this repository with matching size
+            if let Ok(Some(existing)) = state
+                .db
+                .get_lfs_object_by_repo_oid(&repo.id, &obj.oid)
+                .await
+            {
+                if existing.size_bytes as u64 == obj.size {
                     // Object is already fully present in storage; omit actions so git-lfs skips upload
                     response_objects.push(LfsObjectResponse {
                         oid: obj.oid,
@@ -476,7 +480,11 @@ pub async fn git_lfs_batch(
     } else {
         // Download operation
         for obj in payload.objects {
-            if let Ok(Some(existing)) = state.db.get_artifact_manifest_by_oid(&obj.oid).await {
+            if let Ok(Some(existing)) = state
+                .db
+                .get_artifact_manifest_by_repo_oid(&repo.id, &obj.oid)
+                .await
+            {
                 let (download_token, _exp) = generate_scoped_token(
                     &repo.id,
                     &obj.oid,
@@ -706,7 +714,7 @@ pub async fn git_lfs_upload_object(
     };
     let owner_id = repo.owner_org_id.as_deref().unwrap_or(&repo.owner_user_id);
 
-    let _stored = match state
+    let stored = match state
         .artifacts
         .store_object_reader(
             owner_type,
@@ -728,6 +736,26 @@ pub async fn git_lfs_upload_object(
                 .into_response();
         }
     };
+
+    let lfs_obj = LfsObject {
+        id: format!("lfs_{}", uuid::Uuid::new_v4().simple()),
+        repository_id: repo.id.clone(),
+        oid: oid.clone(),
+        size_bytes: total_size as i64,
+        manifest_id: stored.id.clone(),
+        created_at_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+    };
+    if let Err(e) = state.db.save_lfs_object(lfs_obj).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+            format!(
+                "{{\"message\":\"Failed to register LFS object to repository: {}\"}}\n",
+                e
+            ),
+        )
+            .into_response();
+    }
 
     (
         StatusCode::OK,
@@ -808,7 +836,11 @@ pub async fn git_lfs_verify_object(
         return unauthorized_response();
     }
 
-    match state.db.get_artifact_manifest_by_oid(&verify_req.oid).await {
+    match state
+        .db
+        .get_artifact_manifest_by_repo_oid(&repo.id, &verify_req.oid)
+        .await
+    {
         Ok(Some(manifest)) => {
             if manifest.total_size as u64 != verify_req.size {
                 return (
@@ -910,7 +942,11 @@ pub async fn git_lfs_download_object(
         }
     }
 
-    let stored = match state.db.get_artifact_manifest_by_oid(&oid).await {
+    let stored = match state
+        .db
+        .get_artifact_manifest_by_repo_oid(&repo.id, &oid)
+        .await
+    {
         Ok(Some(s)) => s,
         _ => {
             return (
@@ -987,7 +1023,11 @@ pub async fn lfs_batch(
 
     let mut response_objects = Vec::new();
     for obj in payload.objects {
-        if let Ok(Some(_)) = state.db.get_artifact_manifest_by_oid(&obj.oid).await {
+        if let Ok(Some(_)) = state
+            .db
+            .get_lfs_object_by_repo_oid(&repo.id, &obj.oid)
+            .await
+        {
             response_objects.push(LfsObjectResponse {
                 oid: obj.oid,
                 size: obj.size,
@@ -1068,8 +1108,34 @@ pub async fn lfs_finalize(
 
 pub async fn lfs_download_object(
     State(state): State<AppState>,
-    Path((_owner, _repo, manifest_id)): Path<(String, String, String)>,
+    Path((owner, repo_name, manifest_id)): Path<(String, String, String)>,
+    user: Option<Extension<User>>,
 ) -> Result<Response, ForgeError> {
+    let caller = user.as_ref().map(|Extension(u)| u);
+    let repo = state
+        .repositories
+        .get_repository(caller, &owner, &repo_name)
+        .await?;
+    state.permissions.check_read_access(caller, &repo).await?;
+
+    let manifest = state
+        .db
+        .get_artifact_manifest(&manifest_id)
+        .await?
+        .ok_or_else(|| ForgeError::NotFound("Manifest not found".to_string()))?;
+
+    let is_linked = state
+        .db
+        .get_lfs_object_by_repo_oid(&repo.id, &manifest.artifact_id)
+        .await?
+        .is_some();
+
+    if !is_linked {
+        return Err(ForgeError::NotFound(
+            "LFS object not found in repository".to_string(),
+        ));
+    }
+
     let bytes = state.artifacts.reconstruct_object(&manifest_id).await?;
     let res = Response::builder()
         .status(StatusCode::OK)
@@ -1082,8 +1148,16 @@ pub async fn lfs_download_object(
 
 pub async fn lfs_download_chunk(
     State(state): State<AppState>,
-    Path((_owner, _repo, chunk_hash)): Path<(String, String, String)>,
+    Path((owner, repo_name, chunk_hash)): Path<(String, String, String)>,
+    user: Option<Extension<User>>,
 ) -> Result<Response, ForgeError> {
+    let caller = user.as_ref().map(|Extension(u)| u);
+    let repo = state
+        .repositories
+        .get_repository(caller, &owner, &repo_name)
+        .await?;
+    state.permissions.check_read_access(caller, &repo).await?;
+
     let bytes = state.artifacts.get_chunk(&chunk_hash).await?;
     let res = Response::builder()
         .status(StatusCode::OK)

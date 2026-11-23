@@ -6,6 +6,7 @@ use spine_api::api::{build_router, AppState};
 use spine_api::auth::pat::hash_pat;
 use spine_api::core::types::*;
 use spine_api::db::{Database, InMemoryDatabase};
+use spine_artifact::ArtifactGcCollector;
 use std::fs;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -109,6 +110,45 @@ async fn setup_test_env() -> (
     (db, state, router, user, pat_secret, repo)
 }
 
+async fn create_test_user_and_pat(
+    db: &Arc<dyn Database>,
+    id: &str,
+    username: &str,
+    email: &str,
+    pat_secret: &str,
+) -> (User, String) {
+    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let user = User {
+        id: id.to_string(),
+        username: username.to_string(),
+        normalized_username: username.to_lowercase(),
+        email: email.to_string(),
+        normalized_email: email.to_lowercase(),
+        display_name: username.to_string(),
+        password_hash: "hash".to_string(),
+        account_status: "ACTIVE".to_string(),
+        avatar_url: None,
+        created_at_nanos: now,
+        updated_at_nanos: now,
+        last_login_nanos: None,
+    };
+    db.create_user(user.clone()).await.unwrap();
+
+    let pat = PersonalAccessToken {
+        id: format!("pat_{}", username),
+        user_id: user.id.clone(),
+        name: format!("{} PAT", username),
+        token_hash: hash_pat(pat_secret),
+        scopes: vec!["repo".to_string()],
+        expires_at_nanos: i64::MAX,
+        created_at_nanos: now,
+        last_used_at_nanos: None,
+        revoked: false,
+    };
+    db.create_pat(pat).await.unwrap();
+    (user, pat_secret.to_string())
+}
+
 #[tokio::test]
 async fn test_adversarial_lfs_hash_mismatch_and_no_manifest_persisted() {
     let (db, _state, router, user, pat_secret, repo) = setup_test_env().await;
@@ -176,7 +216,7 @@ async fn test_adversarial_lfs_hash_mismatch_and_no_manifest_persisted() {
 
     // 3. Confirm invariant: no manifest was persisted into the database!
     let found_by_oid = db
-        .get_artifact_manifest_by_oid(&legitimate_oid)
+        .get_artifact_manifest_by_repo_oid(&repo.id, &legitimate_oid)
         .await
         .unwrap();
     assert!(
@@ -279,7 +319,10 @@ async fn test_adversarial_lfs_content_length_mismatch() {
     );
 
     // Confirm no manifest persisted
-    let found = db.get_artifact_manifest_by_oid(&oid).await.unwrap();
+    let found = db
+        .get_artifact_manifest_by_repo_oid(&repo.id, &oid)
+        .await
+        .unwrap();
     assert!(found.is_none());
 }
 
@@ -511,7 +554,7 @@ async fn test_adversarial_lfs_deduplication_and_duplicate_upload() {
 
     // Verify record exists in DB and OID resolves
     let manifest1 = db
-        .get_artifact_manifest_by_oid(&oid)
+        .get_artifact_manifest_by_repo_oid(&repo.id, &oid)
         .await
         .unwrap()
         .expect("Manifest must exist");
@@ -553,7 +596,7 @@ async fn test_adversarial_lfs_deduplication_and_duplicate_upload() {
 
     // Manifest is still cleanly intact
     let manifest2 = db
-        .get_artifact_manifest_by_oid(&oid)
+        .get_artifact_manifest_by_repo_oid(&repo.id, &oid)
         .await
         .unwrap()
         .expect("Manifest must exist");
@@ -597,4 +640,569 @@ async fn test_unrelated_routes_retain_strict_body_limit() {
         StatusCode::PAYLOAD_TOO_LARGE,
         "LFS batch route must reject payload > 10 MiB with 413 Payload Too Large"
     );
+}
+
+#[tokio::test]
+async fn test_multitenant_lfs_repository_isolation_and_existence_leak_prevention() {
+    let (db, state, router, alice, alice_pat, _default_repo) = setup_test_env().await;
+
+    // 1. Create private repo for Alice
+    let repo_a = state
+        .repositories
+        .create_repository(
+            &alice,
+            "private-repo-a",
+            Some("Alice Private Repo".into()),
+            true, // private
+            None,
+        )
+        .await
+        .unwrap();
+
+    // 2. Create Bob and private repo for Bob
+    let (bob, bob_pat) = create_test_user_and_pat(
+        &db,
+        "usr_bob_adv",
+        "bob",
+        "bob@spine.build",
+        "sp_pat_bob_12345",
+    )
+    .await;
+
+    let repo_b = state
+        .repositories
+        .create_repository(
+            &bob,
+            "private-repo-b",
+            Some("Bob Private Repo".into()),
+            true, // private
+            None,
+        )
+        .await
+        .unwrap();
+
+    let alice_auth = format!(
+        "Basic {}",
+        encode_base64(format!("{}:{}", alice.username, alice_pat).as_bytes())
+    );
+    let bob_auth = format!(
+        "Basic {}",
+        encode_base64(format!("{}:{}", bob.username, bob_pat).as_bytes())
+    );
+
+    let payload = b"CONFIDENTIAL_ALICE_PROPRIETARY_PAYLOAD";
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    let oid = hex::encode(hasher.finalize());
+
+    // 3. Alice uploads payload to repo_a
+    let batch_req = serde_json::json!({
+        "operation": "upload",
+        "transfers": ["basic"],
+        "objects": [{ "oid": &oid, "size": payload.len() }]
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/objects/batch",
+            alice.username, repo_a.name
+        ))
+        .header(header::AUTHORIZATION, &alice_auth)
+        .header(header::CONTENT_TYPE, LFS_MEDIA_TYPE)
+        .body(Body::from(serde_json::to_vec(&batch_req).unwrap()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let batch_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+    let upload_href = batch_json["objects"][0]["actions"]["upload"]["href"]
+        .as_str()
+        .unwrap();
+    let upload_path = url::Url::parse(upload_href).unwrap().path().to_string();
+    let upload_auth = batch_json["objects"][0]["actions"]["upload"]["header"]["Authorization"]
+        .as_str()
+        .unwrap();
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri(&upload_path)
+        .header(header::AUTHORIZATION, upload_auth)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(payload.to_vec()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Verify object is mapped in repo_a, but NOT in repo_b
+    let obj_a = db
+        .get_lfs_object_by_repo_oid(&repo_a.id, &oid)
+        .await
+        .unwrap();
+    assert!(obj_a.is_some(), "Object must exist in repo_a");
+    let obj_b = db
+        .get_lfs_object_by_repo_oid(&repo_b.id, &oid)
+        .await
+        .unwrap();
+    assert!(obj_b.is_none(), "Object must NOT exist in repo_b");
+
+    // 4. Bob queries batch download on repo_b for Alice's OID -> 404 error
+    let batch_dl_req = serde_json::json!({
+        "operation": "download",
+        "transfers": ["basic"],
+        "objects": [{ "oid": &oid, "size": payload.len() }]
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/objects/batch",
+            bob.username, repo_b.name
+        ))
+        .header(header::AUTHORIZATION, &bob_auth)
+        .header(header::CONTENT_TYPE, LFS_MEDIA_TYPE)
+        .body(Body::from(serde_json::to_vec(&batch_dl_req).unwrap()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bob_dl_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(
+        bob_dl_json["objects"][0]["error"]["code"], 404,
+        "Bob must receive 404 for unmapped object on repo_b"
+    );
+    assert!(
+        bob_dl_json["objects"][0]["actions"].is_null(),
+        "Bob must not receive download actions for unmapped object"
+    );
+
+    // 5. CRITICAL: Bob queries batch upload on repo_b for Alice's OID -> MUST return upload action!
+    // If actions were omitted, Bob would learn that Alice already uploaded this OID somewhere else in the multi-tenant system!
+    let batch_ul_req = serde_json::json!({
+        "operation": "upload",
+        "transfers": ["basic"],
+        "objects": [{ "oid": &oid, "size": payload.len() }]
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/objects/batch",
+            bob.username, repo_b.name
+        ))
+        .header(header::AUTHORIZATION, &bob_auth)
+        .header(header::CONTENT_TYPE, LFS_MEDIA_TYPE)
+        .body(Body::from(serde_json::to_vec(&batch_ul_req).unwrap()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bob_ul_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(
+        !bob_ul_json["objects"][0]["actions"]["upload"].is_null(),
+        "Upload batch for unmapped OID on repo_b must return upload action (no cross-repo existence leak)"
+    );
+
+    // 6. Direct download on repo_b for Alice's OID -> 404 Not Found
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/objects/{}",
+            bob.username, repo_b.name, oid
+        ))
+        .header(header::AUTHORIZATION, &bob_auth)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // 7. Direct verify on repo_b for Alice's OID -> 404 Not Found
+    let verify_req = serde_json::json!({ "oid": &oid, "size": payload.len() });
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/verify",
+            bob.username, repo_b.name
+        ))
+        .header(header::AUTHORIZATION, &bob_auth)
+        .header(header::CONTENT_TYPE, LFS_MEDIA_TYPE)
+        .body(Body::from(serde_json::to_vec(&verify_req).unwrap()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // 8. Bob attempts direct access to Alice's private repo_a -> 404 / 403
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/objects/batch",
+            alice.username, repo_a.name
+        ))
+        .header(header::AUTHORIZATION, &bob_auth)
+        .header(header::CONTENT_TYPE, LFS_MEDIA_TYPE)
+        .body(Body::from(serde_json::to_vec(&batch_dl_req).unwrap()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert!(
+        resp.status() == StatusCode::NOT_FOUND || resp.status() == StatusCode::FORBIDDEN,
+        "Bob must be rejected when attempting to query Alice's private repository"
+    );
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/objects/{}",
+            alice.username, repo_a.name, oid
+        ))
+        .header(header::AUTHORIZATION, &bob_auth)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert!(
+        resp.status() == StatusCode::NOT_FOUND || resp.status() == StatusCode::FORBIDDEN,
+        "Bob must be rejected when attempting to download directly from Alice's private repository"
+    );
+
+    // 9. Bob legitimately uploads the same payload to repo_b (deduplication happens in CAS)
+    let bob_upload_href = bob_ul_json["objects"][0]["actions"]["upload"]["href"]
+        .as_str()
+        .unwrap();
+    let bob_upload_path = url::Url::parse(bob_upload_href).unwrap().path().to_string();
+    let bob_upload_auth = bob_ul_json["objects"][0]["actions"]["upload"]["header"]["Authorization"]
+        .as_str()
+        .unwrap();
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri(&bob_upload_path)
+        .header(header::AUTHORIZATION, bob_upload_auth)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(payload.to_vec()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Check that both repos now map the object, sharing the deduplicated underlying CAS chunks
+    let lfs_a = db
+        .get_lfs_object_by_repo_oid(&repo_a.id, &oid)
+        .await
+        .unwrap()
+        .expect("repo_a mapping exists");
+    let lfs_b = db
+        .get_lfs_object_by_repo_oid(&repo_b.id, &oid)
+        .await
+        .unwrap()
+        .expect("repo_b mapping exists");
+
+    let manifest_a = db
+        .get_artifact_manifest(&lfs_a.manifest_id)
+        .await
+        .unwrap()
+        .expect("manifest_a exists");
+    let manifest_b = db
+        .get_artifact_manifest(&lfs_b.manifest_id)
+        .await
+        .unwrap()
+        .expect("manifest_b exists");
+    assert_eq!(
+        manifest_a.whole_object_hash, manifest_b.whole_object_hash,
+        "Underlying whole object hash must match across repositories"
+    );
+    assert_eq!(manifest_a.total_size, manifest_b.total_size);
+
+    let store_manifest_a = state
+        .artifacts
+        .store()
+        .get_manifest(&lfs_a.manifest_id)
+        .unwrap()
+        .expect("store manifest a");
+    let store_manifest_b = state
+        .artifacts
+        .store()
+        .get_manifest(&lfs_b.manifest_id)
+        .unwrap()
+        .expect("store manifest b");
+    assert_eq!(
+        store_manifest_a.chunks[0].chunk_hash, store_manifest_b.chunks[0].chunk_hash,
+        "Underlying CAS chunk hashes must be identical and shared"
+    );
+
+    // Bob can now query download on repo_b and receive download action
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/objects/batch",
+            bob.username, repo_b.name
+        ))
+        .header(header::AUTHORIZATION, &bob_auth)
+        .header(header::CONTENT_TYPE, LFS_MEDIA_TYPE)
+        .body(Body::from(serde_json::to_vec(&batch_dl_req).unwrap()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bob_dl_json2: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    let bob_dl_href = bob_dl_json2["objects"][0]["actions"]["download"]["href"]
+        .as_str()
+        .unwrap();
+    let bob_dl_path = url::Url::parse(bob_dl_href).unwrap().path().to_string();
+    let bob_dl_auth = bob_dl_json2["objects"][0]["actions"]["download"]["header"]["Authorization"]
+        .as_str()
+        .unwrap();
+
+    // Bob downloads from repo_b
+    let req = Request::builder()
+        .method("GET")
+        .uri(&bob_dl_path)
+        .header(header::AUTHORIZATION, bob_dl_auth)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let downloaded_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&downloaded_bytes[..], payload);
+
+    // 10. Collaborator and Revocation: Carol (User 3)
+    let (carol, carol_pat) = create_test_user_and_pat(
+        &db,
+        "usr_carol_adv",
+        "carol",
+        "carol@spine.build",
+        "sp_pat_carol_12345",
+    )
+    .await;
+    let carol_auth = format!(
+        "Basic {}",
+        encode_base64(format!("{}:{}", carol.username, carol_pat).as_bytes())
+    );
+
+    // Carol tries to access Alice's private repo_a without permission -> rejected
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/objects/batch",
+            alice.username, repo_a.name
+        ))
+        .header(header::AUTHORIZATION, &carol_auth)
+        .header(header::CONTENT_TYPE, LFS_MEDIA_TYPE)
+        .body(Body::from(serde_json::to_vec(&batch_dl_req).unwrap()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert!(
+        resp.status() == StatusCode::NOT_FOUND || resp.status() == StatusCode::FORBIDDEN,
+        "Carol without permission must be rejected from repo_a"
+    );
+
+    // Alice grants Carol Reader access
+    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    db.create_permission(RepositoryPermission {
+        id: "perm_carol_reader".to_string(),
+        repo_id: repo_a.id.clone(),
+        user_id: carol.id.clone(),
+        role: PermissionRole::Reader,
+        created_at_nanos: now,
+    })
+    .await
+    .unwrap();
+
+    // Carol now successfully queries batch download on repo_a
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/objects/batch",
+            alice.username, repo_a.name
+        ))
+        .header(header::AUTHORIZATION, &carol_auth)
+        .header(header::CONTENT_TYPE, LFS_MEDIA_TYPE)
+        .body(Body::from(serde_json::to_vec(&batch_dl_req).unwrap()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let carol_dl_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    let carol_dl_href = carol_dl_json["objects"][0]["actions"]["download"]["href"]
+        .as_str()
+        .unwrap();
+    let carol_dl_path = url::Url::parse(carol_dl_href).unwrap().path().to_string();
+    let carol_dl_auth = carol_dl_json["objects"][0]["actions"]["download"]["header"]
+        ["Authorization"]
+        .as_str()
+        .unwrap();
+
+    // Carol downloads from repo_a
+    let req = Request::builder()
+        .method("GET")
+        .uri(&carol_dl_path)
+        .header(header::AUTHORIZATION, carol_dl_auth)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let carol_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&carol_bytes[..], payload);
+
+    // Alice revokes Carol's permission
+    db.delete_permission(&repo_a.id, &carol.id).await.unwrap();
+
+    // Carol's access is immediately revoked
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/objects/batch",
+            alice.username, repo_a.name
+        ))
+        .header(header::AUTHORIZATION, &carol_auth)
+        .header(header::CONTENT_TYPE, LFS_MEDIA_TYPE)
+        .body(Body::from(serde_json::to_vec(&batch_dl_req).unwrap()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert!(
+        resp.status() == StatusCode::NOT_FOUND || resp.status() == StatusCode::FORBIDDEN,
+        "Revoked collaborator must be rejected immediately"
+    );
+}
+
+#[tokio::test]
+async fn test_concurrent_duplicate_lfs_uploads() {
+    let (db, _state, router, user, _pat_secret, repo) = setup_test_env().await;
+
+    let payload = b"CONCURRENT_DUPLICATE_LFS_UPLOAD_TEST_PAYLOAD";
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    let oid = hex::encode(hasher.finalize());
+
+    // Generate valid scoped upload token for each concurrent task
+    let mut handles = Vec::new();
+    for _ in 0..5 {
+        let (token, _) =
+            generate_scoped_token(&repo.id, &oid, "upload", payload.len() as u64, 3600);
+        let upload_path = format!(
+            "/{}/{}.git/info/lfs/objects/{}",
+            user.username, repo.name, oid
+        );
+        let router_clone = router.clone();
+        let payload_vec = payload.to_vec();
+
+        handles.push(tokio::spawn(async move {
+            let req = Request::builder()
+                .method("PUT")
+                .uri(&upload_path)
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(Body::from(payload_vec))
+                .unwrap();
+            router_clone.oneshot(req).await.unwrap()
+        }));
+    }
+
+    let results = futures_util::future::join_all(handles).await;
+    for res in results {
+        let resp = res.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "All concurrent duplicate uploads must return 200 OK"
+        );
+    }
+
+    // Invariant: Exactly one mapping exists in DB for this repo and OID
+    let lfs_obj = db
+        .get_lfs_object_by_repo_oid(&repo.id, &oid)
+        .await
+        .unwrap()
+        .expect("Object mapping must exist");
+    assert_eq!(lfs_obj.oid, oid);
+    assert_eq!(lfs_obj.size_bytes, payload.len() as i64);
+}
+
+#[tokio::test]
+async fn test_lfs_upload_gc_reachability_and_preservation() {
+    let (db, state, router, user, _pat_secret, repo) = setup_test_env().await;
+
+    let payload = b"LFS_GC_REACHABILITY_ACTIVE_PAYLOAD";
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    let oid = hex::encode(hasher.finalize());
+
+    let (token, _) = generate_scoped_token(&repo.id, &oid, "upload", payload.len() as u64, 3600);
+    let upload_path = format!(
+        "/{}/{}.git/info/lfs/objects/{}",
+        user.username, repo.name, oid
+    );
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri(&upload_path)
+        .header(header::AUTHORIZATION, format!("Bearer {}", token))
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(payload.to_vec()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 1. Committed LFS object has manifest ID
+    let lfs_obj = db
+        .get_lfs_object_by_repo_oid(&repo.id, &oid)
+        .await
+        .unwrap()
+        .expect("LFS object mapping exists");
+
+    let manifest = state
+        .artifacts
+        .store()
+        .get_manifest(&lfs_obj.manifest_id)
+        .unwrap()
+        .expect("Manifest exists in artifact store");
+    assert!(!manifest.chunks.is_empty(), "Manifest must have chunks");
+
+    let chunk_hashes: Vec<String> = manifest
+        .chunks
+        .iter()
+        .map(|c| c.chunk_hash.clone())
+        .collect();
+
+    // 2. Add an unreferenced orphan chunk directly to the store (simulating an interrupted upload)
+    let orphan_bytes = b"ORPHAN_UNCOMMITTED_CHUNK_SHOULD_BE_COLLECTED";
+    let orphan_hash = blake3::hash(orphan_bytes).to_hex().to_string();
+    state
+        .artifacts
+        .store()
+        .store_chunk(&orphan_hash, orphan_bytes)
+        .unwrap();
+
+    let mut all_scanned_chunks = chunk_hashes.clone();
+    all_scanned_chunks.push(orphan_hash.clone());
+
+    // 3. Run GC tracing active manifests from DB
+    let active_manifest_ids = vec![lfs_obj.manifest_id.clone()];
+    let report = ArtifactGcCollector::collect_garbage(
+        state.artifacts.store(),
+        &active_manifest_ids,
+        &all_scanned_chunks,
+        true, // dry run
+    )
+    .unwrap();
+
+    assert_eq!(
+        report.reachable_chunks,
+        chunk_hashes.len(),
+        "All chunks belonging to active LFS object must be reachable"
+    );
+    assert_eq!(
+        report.candidate_chunks, 1,
+        "Orphaned chunk must be identified as candidate for GC"
+    );
+    assert_eq!(
+        report.reclaimed_bytes,
+        orphan_bytes.len() as u64,
+        "Reclaimed bytes must equal orphan chunk size"
+    );
+
+    // Re-verify that reachable chunks are untouched and retrievable
+    for ch in &chunk_hashes {
+        assert!(
+            state.artifacts.store().get_chunk(ch).unwrap().is_some(),
+            "LFS chunk {} must remain intact in CAS",
+            ch
+        );
+    }
 }

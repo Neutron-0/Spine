@@ -665,7 +665,7 @@ pub async fn process_git_receive_pack(
             if let Ok(ptr) = spine_migration::GitLfsPointer::parse(payload) {
                 let exists = state
                     .db
-                    .get_artifact_manifest(&ptr.oid_sha256)
+                    .get_lfs_object_by_repo_oid(&repo.id, &ptr.oid_sha256)
                     .await
                     .map(|opt| opt.is_some())
                     .unwrap_or(false);

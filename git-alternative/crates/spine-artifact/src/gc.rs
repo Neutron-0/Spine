@@ -23,7 +23,7 @@ pub struct ArtifactGcCollector;
 
 impl ArtifactGcCollector {
     /// Computes reachable chunks given a set of active manifest IDs.
-    pub fn trace_reachable_chunks<S: ArtifactStore>(
+    pub fn trace_reachable_chunks<S: ArtifactStore + ?Sized>(
         store: &S,
         active_manifest_ids: &[String],
     ) -> Result<HashSet<String>, GcError> {
@@ -41,7 +41,7 @@ impl ArtifactGcCollector {
     }
 
     /// Generates a GC report and optionally removes unreachable chunks not protected by grace period.
-    pub fn collect_garbage<S: ArtifactStore>(
+    pub fn collect_garbage<S: ArtifactStore + ?Sized>(
         store: &S,
         active_manifest_ids: &[String],
         all_chunk_hashes: &[String],
