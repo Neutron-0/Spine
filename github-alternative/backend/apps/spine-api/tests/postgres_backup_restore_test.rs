@@ -340,9 +340,10 @@ async fn test_postgres_lfs_objects_backup_restore_roundtrip() {
     let manifest_id = format!("man_{}", uuid::Uuid::new_v4().simple());
     let oid = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     sqlx::query(
-        "INSERT INTO artifact_manifests (id, artifact_id, version, size_bytes, chunk_count, stored_path, created_at_nanos) VALUES ($1, $2, '1.0.0', 1024, 1, '/cas/test_path', $3)",
+        "INSERT INTO artifact_manifests (id, artifact_id, whole_object_hash, total_size, chunk_size, chunk_count, content_type, manifest_json, created_at_nanos) VALUES ($1, $2, $3, 1024, 1024, 1, 'application/octet-stream', '{}', $4)",
     )
     .bind(&manifest_id)
+    .bind(oid)
     .bind(oid)
     .bind(now)
     .execute(&pool)
@@ -387,7 +388,7 @@ async fn test_postgres_lfs_objects_backup_restore_roundtrip() {
 
     // Query restored lfs_objects joined with artifact_manifests
     let row: (String, String, String, i64) = sqlx::query_as(
-        "SELECT lo.repository_id, lo.oid, m.stored_path, lo.size_bytes FROM lfs_objects lo JOIN artifact_manifests m ON lo.manifest_id = m.id WHERE lo.repository_id = $1 AND lo.oid = $2",
+        "SELECT lo.repository_id, lo.oid, m.whole_object_hash, lo.size_bytes FROM lfs_objects lo JOIN artifact_manifests m ON lo.manifest_id = m.id WHERE lo.repository_id = $1 AND lo.oid = $2",
     )
     .bind(&repo_id)
     .bind(oid)
@@ -397,7 +398,7 @@ async fn test_postgres_lfs_objects_backup_restore_roundtrip() {
 
     assert_eq!(row.0, repo_id);
     assert_eq!(row.1, oid);
-    assert_eq!(row.2, "/cas/test_path");
+    assert_eq!(row.2, oid);
     assert_eq!(row.3, 1024);
 
     src_disp_db.cleanup().await.unwrap();
