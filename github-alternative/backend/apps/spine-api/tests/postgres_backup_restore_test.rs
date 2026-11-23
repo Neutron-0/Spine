@@ -326,10 +326,11 @@ async fn test_postgres_lfs_objects_backup_restore_roundtrip() {
     // Insert repository
     let repo_id = format!("repo_{}", uuid::Uuid::new_v4().simple());
     sqlx::query(
-        "INSERT INTO forge_repositories (id, owner_id, name, normalized_name, native_repo_id, is_private, durability_policy, created_at_nanos, updated_at_nanos) VALUES ($1, $2, 'lfs-test-repo', 'lfs-test-repo', 'test_lfs_repo', true, 'three_copies', $3, $3)",
+        "INSERT INTO forge_repositories (id, owner_user_id, owner_username, name, normalized_name, native_repo_id, is_private, durability_policy, created_at_nanos, updated_at_nanos) VALUES ($1, $2, $3, 'lfs-test-repo', 'lfs-test-repo', 'test_lfs_repo', true, 'ThreeCopies', $4, $4)",
     )
     .bind(&repo_id)
     .bind(&uid)
+    .bind(&username)
     .bind(now)
     .execute(&pool)
     .await
