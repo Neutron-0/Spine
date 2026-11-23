@@ -416,6 +416,10 @@ pub trait Database: Send + Sync {
         &self,
         manifest_id: &str,
     ) -> Result<Option<StoredArtifactManifest>, ForgeError>;
+    async fn get_artifact_manifest_by_oid(
+        &self,
+        oid: &str,
+    ) -> Result<Option<StoredArtifactManifest>, ForgeError>;
 
     async fn create_release(&self, release: Release) -> Result<Release, ForgeError>;
     async fn get_release_by_id(&self, id: &str) -> Result<Option<Release>, ForgeError>;

@@ -2795,9 +2795,33 @@ impl Database for PgDatabase {
         &self,
         manifest_id: &str,
     ) -> Result<Option<StoredArtifactManifest>, ForgeError> {
-        let query = "SELECT id, artifact_id, whole_object_hash, total_size, chunk_size, chunk_count, content_type, manifest_json, created_at_nanos FROM artifact_manifests WHERE id = $1";
+        let query = "SELECT id, artifact_id, whole_object_hash, total_size, chunk_size, chunk_count, content_type, manifest_json, created_at_nanos FROM artifact_manifests WHERE id = $1 OR artifact_id = $1 ORDER BY (id = $1) DESC, created_at_nanos DESC LIMIT 1";
         let row = sqlx::query(query)
             .bind(manifest_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        Ok(row.map(|r| StoredArtifactManifest {
+            id: r.get(0),
+            artifact_id: r.get(1),
+            whole_object_hash: r.get(2),
+            total_size: r.get(3),
+            chunk_size: r.get(4),
+            chunk_count: r.get(5),
+            content_type: r.get(6),
+            manifest_json: r.get(7),
+            created_at_nanos: r.get(8),
+        }))
+    }
+
+    async fn get_artifact_manifest_by_oid(
+        &self,
+        oid: &str,
+    ) -> Result<Option<StoredArtifactManifest>, ForgeError> {
+        let query = "SELECT id, artifact_id, whole_object_hash, total_size, chunk_size, chunk_count, content_type, manifest_json, created_at_nanos FROM artifact_manifests WHERE artifact_id = $1 OR id = $1 ORDER BY (artifact_id = $1) DESC, created_at_nanos DESC LIMIT 1";
+        let row = sqlx::query(query)
+            .bind(oid)
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| ForgeError::Internal(e.to_string()))?;

@@ -152,7 +152,7 @@ pub fn verify_scoped_token(
     expected_oid: &str,
     expected_op: &str,
 ) -> Result<u64, StatusCode> {
-    let (payload_hex, sig_hex) = token_str.split_once('.').ok_or(StatusCode::UNAUTHORIZED)?;
+    let (payload_hex, sig_hex) = token_str.split_once('.').ok_or(StatusCode::FORBIDDEN)?;
     let expected_sig = {
         let salt = resolve_lfs_secret_salt();
         let mut mac = HmacSha256::new_from_slice(&salt).expect("HMAC slice valid");
@@ -169,9 +169,9 @@ pub fn verify_scoped_token(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let json_bytes = hex::decode(payload_hex).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let json_bytes = hex::decode(payload_hex).map_err(|_| StatusCode::FORBIDDEN)?;
     let token: LfsScopedToken =
-        serde_json::from_slice(&json_bytes).map_err(|_| StatusCode::UNAUTHORIZED)?;
+        serde_json::from_slice(&json_bytes).map_err(|_| StatusCode::FORBIDDEN)?;
 
     let now = chrono::Utc::now().timestamp();
     if token.exp < now {
@@ -410,7 +410,7 @@ pub async fn git_lfs_batch(
     if payload.operation == "upload" {
         for obj in payload.objects {
             // Check if object already exists with matching size
-            if let Ok(Some(existing)) = state.db.get_artifact_manifest(&obj.oid).await {
+            if let Ok(Some(existing)) = state.db.get_artifact_manifest_by_oid(&obj.oid).await {
                 if existing.total_size as u64 == obj.size {
                     // Object is already fully present in storage; omit actions so git-lfs skips upload
                     response_objects.push(LfsObjectResponse {
@@ -476,7 +476,7 @@ pub async fn git_lfs_batch(
     } else {
         // Download operation
         for obj in payload.objects {
-            if let Ok(Some(existing)) = state.db.get_artifact_manifest(&obj.oid).await {
+            if let Ok(Some(existing)) = state.db.get_artifact_manifest_by_oid(&obj.oid).await {
                 let (download_token, _exp) = generate_scoped_token(
                     &repo.id,
                     &obj.oid,
@@ -577,18 +577,22 @@ pub async fn git_lfs_upload_object(
     };
 
     // 1. Authorization: check scoped transfer token or Basic auth write access BEFORE reading body
+    let mut scoped_max_size: Option<u64> = None;
     if let Some(auth_val) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
     {
         if let Some(tok) = auth_val.strip_prefix("Bearer ") {
-            if verify_scoped_token(tok.trim(), &repo.id, &oid, "upload").is_err() {
-                return (
-                    StatusCode::FORBIDDEN,
-                    [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
-                    "{\"message\":\"Invalid or expired scoped token\"}\n",
-                )
-                    .into_response();
+            match verify_scoped_token(tok.trim(), &repo.id, &oid, "upload") {
+                Ok(max_sz) => scoped_max_size = Some(max_sz),
+                Err(_) => {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+                        "{\"message\":\"Invalid or expired scoped token\"}\n",
+                    )
+                        .into_response();
+                }
             }
         } else {
             let caller = match authenticate_git_user(&state, &headers).await {
@@ -636,10 +640,14 @@ pub async fn git_lfs_upload_object(
     };
 
     // 4. Bounded streaming: stream body to tempfile on disk, computing SHA-256 on the fly
+    let max_upload_bytes = scoped_max_size
+        .unwrap_or(crate::api::streaming::DEFAULT_MAX_UPLOAD_BYTES)
+        .min(crate::api::streaming::DEFAULT_MAX_UPLOAD_BYTES);
+
     let (tempfile, total_size, actual_sha256) =
         match crate::api::streaming::stream_body_to_tempfile(
             body,
-            crate::api::streaming::DEFAULT_MAX_UPLOAD_BYTES,
+            max_upload_bytes,
             crate::api::streaming::DEFAULT_STREAM_TIMEOUT,
         )
         .await
@@ -654,6 +662,28 @@ pub async fn git_lfs_upload_object(
                     .into_response();
             }
         };
+
+    // 4b. Content-Length header verification (if declared by client)
+    if let Some(content_length) = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        if total_size != content_length {
+            return (
+                StatusCode::BAD_REQUEST,
+                [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+                serde_json::to_string(&serde_json::json!({
+                    "message": format!(
+                        "Payload size mismatch: Content-Length header declared {}, but received {} bytes",
+                        content_length, total_size
+                    )
+                }))
+                .unwrap_or_default(),
+            )
+                .into_response();
+        }
+    }
 
     // 5. Check and verify SHA-256 checksum across received payload
     if actual_sha256 != oid {
@@ -676,7 +706,7 @@ pub async fn git_lfs_upload_object(
     };
     let owner_id = repo.owner_org_id.as_deref().unwrap_or(&repo.owner_user_id);
 
-    let stored = match state
+    let _stored = match state
         .artifacts
         .store_object_reader(
             owner_type,
@@ -698,18 +728,6 @@ pub async fn git_lfs_upload_object(
                 .into_response();
         }
     };
-
-    // Git LFS addresses and verifies objects by OID, so index the manifest by OID
-    let mut stored_lfs = stored;
-    stored_lfs.id = oid.clone();
-    if let Err(e) = state.db.save_artifact_manifest(stored_lfs).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
-            format!("{{\"message\":\"Failed to index LFS manifest: {}\"}}\n", e),
-        )
-            .into_response();
-    }
 
     (
         StatusCode::OK,
@@ -790,7 +808,7 @@ pub async fn git_lfs_verify_object(
         return unauthorized_response();
     }
 
-    match state.db.get_artifact_manifest(&verify_req.oid).await {
+    match state.db.get_artifact_manifest_by_oid(&verify_req.oid).await {
         Ok(Some(manifest)) => {
             if manifest.total_size as u64 != verify_req.size {
                 return (
@@ -841,28 +859,46 @@ pub async fn git_lfs_download_object(
     };
 
     // Authenticate: scoped download token or user Basic auth
-    let authorized = if let Some(auth_val) = headers
+    if let Some(auth_val) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
     {
         if let Some(tok) = auth_val.strip_prefix("Bearer ") {
-            verify_scoped_token(tok.trim(), &repo.id, &oid, "download").is_ok()
+            if verify_scoped_token(tok.trim(), &repo.id, &oid, "download").is_err() {
+                return (
+                    StatusCode::FORBIDDEN,
+                    [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+                    "{\"message\":\"Invalid or expired scoped token\"}\n",
+                )
+                    .into_response();
+            }
         } else {
-            false
+            let caller = authenticate_git_user(&state, &headers).await;
+            if state
+                .permissions
+                .check_read_access(caller.as_ref(), &repo)
+                .await
+                .is_err()
+            {
+                if caller.is_none() && repo.is_private {
+                    return unauthorized_response();
+                }
+                return (
+                    StatusCode::FORBIDDEN,
+                    [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+                    "{\"message\":\"Permission denied\"}\n",
+                )
+                    .into_response();
+            }
         }
     } else {
-        false
-    };
-
-    if !authorized {
-        let caller = authenticate_git_user(&state, &headers).await;
         if state
             .permissions
-            .check_read_access(caller.as_ref(), &repo)
+            .check_read_access(None, &repo)
             .await
             .is_err()
         {
-            if caller.is_none() && repo.is_private {
+            if repo.is_private {
                 return unauthorized_response();
             }
             return (
@@ -874,7 +910,7 @@ pub async fn git_lfs_download_object(
         }
     }
 
-    let stored = match state.db.get_artifact_manifest(&oid).await {
+    let stored = match state.db.get_artifact_manifest_by_oid(&oid).await {
         Ok(Some(s)) => s,
         _ => {
             return (
@@ -951,7 +987,7 @@ pub async fn lfs_batch(
 
     let mut response_objects = Vec::new();
     for obj in payload.objects {
-        if let Ok(Some(_)) = state.db.get_artifact_manifest(&obj.oid).await {
+        if let Ok(Some(_)) = state.db.get_artifact_manifest_by_oid(&obj.oid).await {
             response_objects.push(LfsObjectResponse {
                 oid: obj.oid,
                 size: obj.size,

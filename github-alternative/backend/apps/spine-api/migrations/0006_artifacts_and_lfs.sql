@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS artifact_manifests (
 );
 
 CREATE INDEX IF NOT EXISTS idx_art_manifest_hash ON artifact_manifests (whole_object_hash);
+CREATE INDEX IF NOT EXISTS idx_art_manifest_artifact_id ON artifact_manifests (artifact_id);
 
 CREATE TABLE IF NOT EXISTS artifact_namespaces (
     id TEXT PRIMARY KEY,

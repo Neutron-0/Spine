@@ -71,6 +71,7 @@ struct MemoryState {
     quotas: HashMap<String, ArtifactQuota>,
     upload_sessions: HashMap<String, ArtifactUploadSession>,
     manifests: HashMap<String, StoredArtifactManifest>,
+    manifests_by_artifact_id: HashMap<String, StoredArtifactManifest>,
     releases: HashMap<String, Release>,
     release_by_repo_tag: HashMap<(String, String), String>,
     release_assets: HashMap<String, ReleaseAsset>,
@@ -1873,6 +1874,9 @@ impl Database for InMemoryDatabase {
             .state
             .write()
             .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        state
+            .manifests_by_artifact_id
+            .insert(manifest.artifact_id.clone(), manifest.clone());
         state.manifests.insert(manifest.id.clone(), manifest);
         Ok(())
     }
@@ -1885,7 +1889,24 @@ impl Database for InMemoryDatabase {
             .state
             .read()
             .map_err(|e| ForgeError::Internal(e.to_string()))?;
-        Ok(state.manifests.get(manifest_id).cloned())
+        if let Some(m) = state.manifests.get(manifest_id) {
+            return Ok(Some(m.clone()));
+        }
+        Ok(state.manifests_by_artifact_id.get(manifest_id).cloned())
+    }
+
+    async fn get_artifact_manifest_by_oid(
+        &self,
+        oid: &str,
+    ) -> Result<Option<StoredArtifactManifest>, ForgeError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        if let Some(m) = state.manifests_by_artifact_id.get(oid) {
+            return Ok(Some(m.clone()));
+        }
+        Ok(state.manifests.get(oid).cloned())
     }
 
     async fn create_release(&self, release: Release) -> Result<Release, ForgeError> {
