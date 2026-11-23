@@ -2815,6 +2815,30 @@ impl Database for PgDatabase {
         }))
     }
 
+    async fn get_artifact_manifest_by_artifact_id(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Option<StoredArtifactManifest>, ForgeError> {
+        let query = "SELECT id, artifact_id, whole_object_hash, total_size, chunk_size, chunk_count, content_type, manifest_json, created_at_nanos FROM artifact_manifests WHERE artifact_id = $1 ORDER BY created_at_nanos ASC LIMIT 1";
+        let row = sqlx::query(query)
+            .bind(artifact_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+
+        Ok(row.map(|r| StoredArtifactManifest {
+            id: r.get(0),
+            artifact_id: r.get(1),
+            whole_object_hash: r.get(2),
+            total_size: r.get(3),
+            chunk_size: r.get(4),
+            chunk_count: r.get(5),
+            content_type: r.get(6),
+            manifest_json: r.get(7),
+            created_at_nanos: r.get(8),
+        }))
+    }
+
     async fn save_lfs_object(&self, object: LfsObject) -> Result<LfsObject, ForgeError> {
         let query = r#"
             INSERT INTO lfs_objects (id, repository_id, oid, size_bytes, manifest_id, created_at_nanos)

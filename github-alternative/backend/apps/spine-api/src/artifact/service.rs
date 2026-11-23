@@ -2,8 +2,8 @@ use crate::core::error::ForgeError;
 use crate::core::types::*;
 use crate::db::Database;
 use spine_artifact::{
-    chunker::ChunkerError, ArtifactManifest, ArtifactStore, ObjectReconstructor, StreamChunker,
-    TransferSession, DEFAULT_CHUNK_SIZE,
+    chunker::ChunkerError, ArtifactManifest, ArtifactStore, InFlightUploadRegistry,
+    ObjectReconstructor, StreamChunker, TransferSession, DEFAULT_CHUNK_SIZE,
 };
 use spine_cluster::durability::DurabilityPolicy;
 use std::collections::HashMap;
@@ -15,6 +15,7 @@ pub struct ArtifactService {
     db: Arc<dyn Database>,
     store: Arc<dyn ArtifactStore>,
     active_sessions: RwLock<HashMap<String, TransferSession>>,
+    in_flight_registry: Arc<InFlightUploadRegistry>,
 }
 
 impl ArtifactService {
@@ -23,11 +24,16 @@ impl ArtifactService {
             db,
             store,
             active_sessions: RwLock::new(HashMap::new()),
+            in_flight_registry: Arc::new(InFlightUploadRegistry::new()),
         }
     }
 
     pub fn store(&self) -> &Arc<dyn ArtifactStore> {
         &self.store
+    }
+
+    pub fn in_flight_registry(&self) -> &Arc<InFlightUploadRegistry> {
+        &self.in_flight_registry
     }
 
     /// Checks quota and creates a new resumable upload session.
@@ -227,20 +233,44 @@ impl ArtifactService {
             )));
         }
 
-        // Store chunks
+        // Register in-flight upload lease protecting newly written CAS chunks from GC
+        let lease_id = format!("lease_upl_{}", uuid::Uuid::new_v4().simple());
+        self.in_flight_registry.register_lease(&lease_id, 300);
+
+        // Store chunks and pin each in lease
         for chunk in &res.chunks {
-            self.store
+            if let Err(e) = self
+                .store
                 .store_chunk(&chunk.entry.chunk_hash, &chunk.bytes)
-                .map_err(|e| ForgeError::Internal(format!("Failed to store chunk: {}", e)))?;
+            {
+                self.in_flight_registry.cancel_lease(&lease_id);
+                return Err(ForgeError::Internal(format!(
+                    "Failed to store chunk: {}",
+                    e
+                )));
+            }
+            self.in_flight_registry
+                .pin_chunk(&lease_id, &chunk.entry.chunk_hash);
         }
 
-        let manifest_id = self
-            .store
-            .store_manifest(&res.manifest)
-            .map_err(|e| ForgeError::Internal(format!("Failed to store manifest: {}", e)))?;
+        let manifest_id = match self.store.store_manifest(&res.manifest) {
+            Ok(id) => id,
+            Err(e) => {
+                self.in_flight_registry.cancel_lease(&lease_id);
+                return Err(ForgeError::Internal(format!(
+                    "Failed to store manifest: {}",
+                    e
+                )));
+            }
+        };
 
-        let manifest_json = serde_json::to_string(&res.manifest)
-            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let manifest_json = match serde_json::to_string(&res.manifest) {
+            Ok(j) => j,
+            Err(e) => {
+                self.in_flight_registry.cancel_lease(&lease_id);
+                return Err(ForgeError::Internal(e.to_string()));
+            }
+        };
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -259,7 +289,13 @@ impl ArtifactService {
             created_at_nanos: now,
         };
 
-        self.db.save_artifact_manifest(stored.clone()).await?;
+        if let Err(e) = self.db.save_artifact_manifest(stored.clone()).await {
+            self.in_flight_registry.cancel_lease(&lease_id);
+            return Err(e);
+        }
+
+        // Release lease now that manifest is durable in DB
+        self.in_flight_registry.complete_lease(&lease_id);
 
         // Update quota
         self.db

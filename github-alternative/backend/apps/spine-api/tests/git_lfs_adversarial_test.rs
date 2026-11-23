@@ -1563,3 +1563,364 @@ async fn test_lfs_cross_repository_token_reuse_rejected_across_all_routes() {
         "Verify with cross-repo token must be rejected with 403 Forbidden"
     );
 }
+
+#[tokio::test]
+async fn test_lfs_upload_in_flight_active_longer_than_grace_protected_from_repeated_gc() {
+    let (_db, state, _router, _user, _pat_secret, _repo) = setup_test_env().await;
+
+    // 1. Simulate an in-flight upload that writes a chunk to CAS and registers an explicit lease
+    let chunk_bytes = b"LONG_RUNNING_IN_FLIGHT_CHUNK_EXCEEDING_GRACE_PERIOD";
+    let chunk_hash = blake3::hash(chunk_bytes).to_hex().to_string();
+    state
+        .artifacts
+        .store()
+        .store_chunk(&chunk_hash, chunk_bytes)
+        .unwrap();
+
+    let lease_id = "lease_long_running_upload";
+    state
+        .artifacts
+        .in_flight_registry()
+        .register_lease(lease_id, 300); // 300s TTL
+    state
+        .artifacts
+        .in_flight_registry()
+        .pin_chunk(lease_id, &chunk_hash);
+
+    let all_scanned_chunks = vec![chunk_hash.clone()];
+    let active_manifest_ids: Vec<String> = Vec::new(); // No committed manifest yet!
+
+    // 2. Run GC repeatedly with grace_secs = 0 (simulating upload duration > grace interval)
+    // The explicit lease MUST protect the chunk on every GC pass
+    for i in 0..4 {
+        let report = ArtifactGcCollector::collect_garbage_with_registry(
+            state.artifacts.store(),
+            &active_manifest_ids,
+            &all_scanned_chunks,
+            Some(state.artifacts.in_flight_registry()),
+            0, // 0s grace period: mtime grace alone would NOT protect this!
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.in_flight_protected_chunks, 1,
+            "Pass {}: chunk must be protected by explicit in-flight lease",
+            i
+        );
+        assert_eq!(report.candidate_chunks, 0);
+        assert_eq!(report.reclaimed_bytes, 0);
+        assert!(
+            state.artifacts.store().has_chunk(&chunk_hash),
+            "Pass {}: chunk must remain in CAS",
+            i
+        );
+    }
+
+    // 3. Test cancellation / abort: if client aborts, lease is cancelled
+    state.artifacts.in_flight_registry().cancel_lease(lease_id);
+
+    // Now GC runs: without the lease and with 0 grace, the uncommitted chunk is reclaimed
+    let report_after_cancel = ArtifactGcCollector::collect_garbage_with_registry(
+        state.artifacts.store(),
+        &active_manifest_ids,
+        &all_scanned_chunks,
+        Some(state.artifacts.in_flight_registry()),
+        0,
+        false,
+    )
+    .unwrap();
+    assert_eq!(report_after_cancel.in_flight_protected_chunks, 0);
+    assert_eq!(report_after_cancel.candidate_chunks, 1);
+    assert_eq!(
+        report_after_cancel.reclaimed_bytes,
+        chunk_bytes.len() as u64
+    );
+
+    // 4. Test crash expiry: a lease that was not renewed expires
+    let crash_lease_id = "lease_crashed_worker";
+    state
+        .artifacts
+        .in_flight_registry()
+        .register_lease(crash_lease_id, 1); // 1s TTL
+
+    let crash_bytes = b"CRASHED_WORKER_CHUNK";
+    let crash_hash = blake3::hash(crash_bytes).to_hex().to_string();
+    state
+        .artifacts
+        .store()
+        .store_chunk(&crash_hash, crash_bytes)
+        .unwrap();
+    state
+        .artifacts
+        .in_flight_registry()
+        .pin_chunk(crash_lease_id, &crash_hash);
+
+    // Wait for 1s TTL to expire
+    tokio::time::sleep(tokio::time::Duration::from_millis(1100)).await;
+
+    let all_crash_chunks = vec![crash_hash.clone()];
+    let report_crash = ArtifactGcCollector::collect_garbage_with_registry(
+        state.artifacts.store(),
+        &active_manifest_ids,
+        &all_crash_chunks,
+        Some(state.artifacts.in_flight_registry()),
+        0,
+        false,
+    )
+    .unwrap();
+    assert_eq!(report_crash.in_flight_protected_chunks, 0);
+    assert_eq!(report_crash.candidate_chunks, 1);
+    assert_eq!(report_crash.reclaimed_bytes, crash_bytes.len() as u64);
+}
+
+#[tokio::test]
+async fn test_publication_visibility_only_after_cas_and_repo_mapping_durable() {
+    let (db, state, router, user, _pat_secret, repo) = setup_test_env().await;
+
+    let payload = b"DURABLE_VISIBILITY_INVARIANT_PAYLOAD";
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    let oid = hex::encode(hasher.finalize());
+
+    let (dl_token, _) =
+        generate_scoped_token(&repo.id, &oid, "download", payload.len() as u64, 3600);
+
+    // Phase 1: Zero data exists -> 404
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/objects/{}",
+            user.username, repo.name, oid
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {}", dl_token))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Phase 2: Chunks and Manifest exist in CAS, but NOT mapped in lfs_objects
+    let stored = state
+        .artifacts
+        .store_object_reader(
+            "user",
+            &user.id,
+            &oid,
+            Some("application/octet-stream".to_string()),
+            std::io::Cursor::new(payload.to_vec()),
+            Some(payload.len() as u64),
+        )
+        .await
+        .unwrap();
+
+    // Verify mapping is not present
+    let mapping = db.get_lfs_object_by_repo_oid(&repo.id, &oid).await.unwrap();
+    assert!(mapping.is_none(), "Mapping must not exist yet");
+
+    // Visibility test: Object MUST NOT be visible via batch or direct GET
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/objects/{}",
+            user.username, repo.name, oid
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {}", dl_token))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "Object without repo mapping must be invisible (404)"
+    );
+
+    // Phase 3: Now persist repository mapping in lfs_objects
+    let lfs_obj = LfsObject {
+        id: format!("lfs_{}", uuid::Uuid::new_v4().simple()),
+        repository_id: repo.id.clone(),
+        oid: oid.clone(),
+        size_bytes: payload.len() as i64,
+        manifest_id: stored.id.clone(),
+        created_at_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+    };
+    db.save_lfs_object(lfs_obj).await.unwrap();
+
+    // Visibility test: Now BOTH CAS and mapping are durable -> object is VISIBLE and downloadable!
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/objects/{}",
+            user.username, repo.name, oid
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {}", dl_token))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let downloaded = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&downloaded[..], payload);
+}
+
+#[tokio::test]
+async fn test_multitenant_shared_cas_deduplication_and_gc_reachability() {
+    let (db, state, router, alice, _alice_pat, _default_repo) = setup_test_env().await;
+
+    let repo_a = state
+        .repositories
+        .create_repository(&alice, "repo-shared-a", None, true, None)
+        .await
+        .unwrap();
+
+    let (bob, _bob_pat) = create_test_user_and_pat(
+        &db,
+        "usr_bob_shared",
+        "bob_shared",
+        "bob_shared@spine.build",
+        "sp_pat_bob_shared_12345",
+    )
+    .await;
+
+    let repo_b = state
+        .repositories
+        .create_repository(&bob, "repo-shared-b", None, true, None)
+        .await
+        .unwrap();
+
+    let (charlie, _charlie_pat) = create_test_user_and_pat(
+        &db,
+        "usr_charlie_shared",
+        "charlie_shared",
+        "charlie_shared@spine.build",
+        "sp_pat_charlie_shared_12345",
+    )
+    .await;
+
+    let repo_c = state
+        .repositories
+        .create_repository(&charlie, "repo-shared-c", None, true, None)
+        .await
+        .unwrap();
+
+    let payload = b"DEDUPLICATED_SHARED_CAS_MULTI_TENANT_OBJECT_BYTES";
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    let oid = hex::encode(hasher.finalize());
+
+    // 1. Repo A ingests the shared object
+    let (upload_token_a, _) =
+        generate_scoped_token(&repo_a.id, &oid, "upload", payload.len() as u64, 3600);
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/objects/{}",
+            alice.username, repo_a.name, oid
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {}", upload_token_a))
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(payload.to_vec()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 2. Repo B ingests the identical shared object -> deduplication!
+    let (upload_token_b, _) =
+        generate_scoped_token(&repo_b.id, &oid, "upload", payload.len() as u64, 3600);
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/objects/{}",
+            bob.username, repo_b.name, oid
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {}", upload_token_b))
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(payload.to_vec()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Verify both Repo A and Repo B resolve the object and point to the same manifest
+    let obj_a = db
+        .get_lfs_object_by_repo_oid(&repo_a.id, &oid)
+        .await
+        .unwrap()
+        .expect("Repo A object");
+    let obj_b = db
+        .get_lfs_object_by_repo_oid(&repo_b.id, &oid)
+        .await
+        .unwrap()
+        .expect("Repo B object");
+    assert_eq!(
+        obj_a.manifest_id, obj_b.manifest_id,
+        "Both repos must point to the identical shared deduplicated manifest"
+    );
+
+    // Repo C (unauthorized) cannot download or resolve object
+    let (dl_token_c, _) =
+        generate_scoped_token(&repo_c.id, &oid, "download", payload.len() as u64, 3600);
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/objects/{}",
+            charlie.username, repo_c.name, oid
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {}", dl_token_c))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "Repo C must not resolve object belonging only to Repo A and B"
+    );
+
+    // 3. GC Reachability Check with shared references
+    let shared_manifest = state
+        .artifacts
+        .store()
+        .get_manifest(&obj_a.manifest_id)
+        .unwrap()
+        .unwrap();
+    let shared_chunk_hashes: Vec<String> = shared_manifest
+        .chunks
+        .iter()
+        .map(|c| c.chunk_hash.clone())
+        .collect();
+
+    // With both repos referencing the manifest, GC reachability retains chunks
+    let rep1 = ArtifactGcCollector::collect_garbage(
+        state.artifacts.store(),
+        std::slice::from_ref(&obj_a.manifest_id),
+        &shared_chunk_hashes,
+        false,
+    )
+    .unwrap();
+    assert_eq!(rep1.reachable_chunks, shared_chunk_hashes.len());
+    assert_eq!(rep1.candidate_chunks, 0);
+
+    // 4. Delete Repo A's mapping: Repo B still references the manifest!
+    // Verify Repo B can STILL download the object
+    let (dl_token_b, _) =
+        generate_scoped_token(&repo_b.id, &oid, "download", payload.len() as u64, 3600);
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/objects/{}",
+            bob.username, repo_b.name, oid
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {}", dl_token_b))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // GC check: as long as Repo B's manifest is in active_manifest_ids, chunks are NOT collected
+    let rep2 = ArtifactGcCollector::collect_garbage(
+        state.artifacts.store(),
+        std::slice::from_ref(&obj_b.manifest_id),
+        &shared_chunk_hashes,
+        false,
+    )
+    .unwrap();
+    assert_eq!(rep2.reachable_chunks, shared_chunk_hashes.len());
+    assert_eq!(rep2.candidate_chunks, 0);
+}

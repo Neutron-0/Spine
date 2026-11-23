@@ -714,26 +714,32 @@ pub async fn git_lfs_upload_object(
     };
     let owner_id = repo.owner_org_id.as_deref().unwrap_or(&repo.owner_user_id);
 
-    let stored = match state
-        .artifacts
-        .store_object_reader(
-            owner_type,
-            owner_id,
-            &oid,
-            Some("application/octet-stream".to_string()),
-            tempfile.into_file(),
-            Some(total_size),
-        )
-        .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
-                format!("{{\"message\":\"Failed to store artifact: {}\"}}\n", e),
-            )
-                .into_response();
+    let manifest_id = match state.db.get_artifact_manifest_by_artifact_id(&oid).await {
+        Ok(Some(existing_manifest)) => existing_manifest.id,
+        _ => {
+            let stored = match state
+                .artifacts
+                .store_object_reader(
+                    owner_type,
+                    owner_id,
+                    &oid,
+                    Some("application/octet-stream".to_string()),
+                    tempfile.into_file(),
+                    Some(total_size),
+                )
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        [(header::CONTENT_TYPE, LFS_MEDIA_TYPE)],
+                        format!("{{\"message\":\"Failed to store artifact: {}\"}}\n", e),
+                    )
+                        .into_response();
+                }
+            };
+            stored.id
         }
     };
 
@@ -742,7 +748,7 @@ pub async fn git_lfs_upload_object(
         repository_id: repo.id.clone(),
         oid: oid.clone(),
         size_bytes: total_size as i64,
-        manifest_id: stored.id.clone(),
+        manifest_id,
         created_at_nanos: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
     };
     if let Err(e) = state.db.save_lfs_object(lfs_obj).await {

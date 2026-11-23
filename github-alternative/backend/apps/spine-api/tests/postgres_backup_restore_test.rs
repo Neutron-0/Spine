@@ -404,3 +404,172 @@ async fn test_postgres_lfs_objects_backup_restore_roundtrip() {
     src_disp_db.cleanup().await.unwrap();
     target_disp_db.cleanup().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_postgres_multitenant_shared_lfs_backup_restore_roundtrip() {
+    let src_disp_db = match HarnessDisposableDb::provision_empty().await {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!(
+                "Skipping test_postgres_multitenant_shared_lfs_backup_restore_roundtrip: {}",
+                e
+            );
+            return;
+        }
+    };
+    let pool = src_disp_db
+        .migrator_pool()
+        .await
+        .expect("connect migrator pool");
+
+    spine_api::db::run_migrations(&pool)
+        .await
+        .expect("run_migrations failed");
+
+    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+    // Insert Alice and Repo A
+    let uid_a = format!("usr_a_{}", uuid::Uuid::new_v4().simple());
+    let username_a = format!("alice_{}", &uid_a[6..14]);
+    let email_a = format!("{}@example.com", username_a);
+    sqlx::query(
+        "INSERT INTO users (id, username, normalized_username, email, normalized_email, display_name, password_hash, created_at_nanos, updated_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, 'hash', $7, $7)",
+    )
+    .bind(&uid_a)
+    .bind(&username_a)
+    .bind(username_a.to_lowercase())
+    .bind(&email_a)
+    .bind(email_a.to_lowercase())
+    .bind(&username_a)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let repo_a_id = format!("repo_a_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO forge_repositories (id, owner_user_id, owner_username, name, normalized_name, native_repo_id, is_private, durability_policy, created_at_nanos, updated_at_nanos) VALUES ($1, $2, $3, 'shared-a', 'shared-a', 'native_a', true, 'ThreeCopies', $4, $4)",
+    )
+    .bind(&repo_a_id)
+    .bind(&uid_a)
+    .bind(&username_a)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert Bob and Repo B
+    let uid_b = format!("usr_b_{}", uuid::Uuid::new_v4().simple());
+    let username_b = format!("bob_{}", &uid_b[6..14]);
+    let email_b = format!("{}@example.com", username_b);
+    sqlx::query(
+        "INSERT INTO users (id, username, normalized_username, email, normalized_email, display_name, password_hash, created_at_nanos, updated_at_nanos) VALUES ($1, $2, $3, $4, $5, $6, 'hash', $7, $7)",
+    )
+    .bind(&uid_b)
+    .bind(&username_b)
+    .bind(username_b.to_lowercase())
+    .bind(&email_b)
+    .bind(email_b.to_lowercase())
+    .bind(&username_b)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let repo_b_id = format!("repo_b_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO forge_repositories (id, owner_user_id, owner_username, name, normalized_name, native_repo_id, is_private, durability_policy, created_at_nanos, updated_at_nanos) VALUES ($1, $2, $3, 'shared-b', 'shared-b', 'native_b', true, 'ThreeCopies', $4, $4)",
+    )
+    .bind(&repo_b_id)
+    .bind(&uid_b)
+    .bind(&username_b)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert single shared CAS manifest
+    let manifest_id = format!("man_shared_{}", uuid::Uuid::new_v4().simple());
+    let oid = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    sqlx::query(
+        "INSERT INTO artifact_manifests (id, artifact_id, whole_object_hash, total_size, chunk_size, chunk_count, content_type, manifest_json, created_at_nanos) VALUES ($1, $2, $3, 2048, 1024, 2, 'application/octet-stream', '{}', $4)",
+    )
+    .bind(&manifest_id)
+    .bind(oid)
+    .bind(oid)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Both Repo A and Repo B reference the SAME manifest (deduplicated)
+    let lfs_a_id = format!("lfs_a_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO lfs_objects (id, repository_id, oid, size_bytes, manifest_id, created_at_nanos) VALUES ($1, $2, $3, 2048, $4, $5)",
+    )
+    .bind(&lfs_a_id)
+    .bind(&repo_a_id)
+    .bind(oid)
+    .bind(&manifest_id)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let lfs_b_id = format!("lfs_b_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO lfs_objects (id, repository_id, oid, size_bytes, manifest_id, created_at_nanos) VALUES ($1, $2, $3, 2048, $4, $5)",
+    )
+    .bind(&lfs_b_id)
+    .bind(&repo_b_id)
+    .bind(oid)
+    .bind(&manifest_id)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Dump and restore
+    let mut dump_buf = Vec::new();
+    spine_api::dump_database_to_writer(&pool, &mut dump_buf)
+        .await
+        .unwrap();
+
+    let target_disp_db = HarnessDisposableDb::provision_empty().await.unwrap();
+    let target_pool = target_disp_db.migrator_pool().await.unwrap();
+
+    let mut reader = std::io::BufReader::new(std::io::Cursor::new(dump_buf));
+    spine_api::restore_database_from_reader(&target_pool, &mut reader)
+        .await
+        .unwrap();
+
+    // Verify both mappings restored and point to same manifest
+    let row_a: (String, String, i64, String) = sqlx::query_as(
+        "SELECT repository_id, oid, size_bytes, manifest_id FROM lfs_objects WHERE repository_id = $1 AND oid = $2",
+    )
+    .bind(&repo_a_id)
+    .bind(oid)
+    .fetch_one(&target_pool)
+    .await
+    .unwrap();
+    assert_eq!(row_a.0, repo_a_id);
+    assert_eq!(row_a.1, oid);
+    assert_eq!(row_a.2, 2048);
+    assert_eq!(row_a.3, manifest_id);
+
+    let row_b: (String, String, i64, String) = sqlx::query_as(
+        "SELECT repository_id, oid, size_bytes, manifest_id FROM lfs_objects WHERE repository_id = $1 AND oid = $2",
+    )
+    .bind(&repo_b_id)
+    .bind(oid)
+    .fetch_one(&target_pool)
+    .await
+    .unwrap();
+    assert_eq!(row_b.0, repo_b_id);
+    assert_eq!(row_b.1, oid);
+    assert_eq!(row_b.2, 2048);
+    assert_eq!(row_b.3, manifest_id);
+
+    src_disp_db.cleanup().await.unwrap();
+    target_disp_db.cleanup().await.unwrap();
+}

@@ -1,5 +1,6 @@
 use crate::store::ArtifactStore;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::RwLock;
 use thiserror::Error;
 
 pub const DEFAULT_ARTIFACT_GC_GRACE_SECS: i64 = 86400; // 24 hours
@@ -10,12 +11,126 @@ pub enum GcError {
     Store(#[from] crate::store::StoreError),
 }
 
+/// An active in-flight upload lease protecting newly written CAS chunks from GC
+/// even if the upload duration exceeds filesystem mtime grace intervals.
+#[derive(Debug, Clone)]
+pub struct InFlightUploadLease {
+    pub lease_id: String,
+    pub created_at_epoch_secs: i64,
+    pub expires_at_epoch_secs: i64,
+    pub pinned_chunks: HashSet<String>,
+}
+
+/// Registry for active in-flight upload leases. Thread-safe and queryable by GC.
+#[derive(Debug, Default)]
+pub struct InFlightUploadRegistry {
+    leases: RwLock<HashMap<String, InFlightUploadLease>>,
+}
+
+impl InFlightUploadRegistry {
+    pub fn new() -> Self {
+        Self {
+            leases: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Register a new in-flight upload lease with a specified TTL in seconds.
+    pub fn register_lease(&self, lease_id: &str, ttl_secs: i64) -> InFlightUploadLease {
+        let now = chrono::Utc::now().timestamp();
+        let lease = InFlightUploadLease {
+            lease_id: lease_id.to_string(),
+            created_at_epoch_secs: now,
+            expires_at_epoch_secs: now + ttl_secs.max(1),
+            pinned_chunks: HashSet::new(),
+        };
+        let mut map = self.leases.write().unwrap();
+        map.insert(lease_id.to_string(), lease.clone());
+        lease
+    }
+
+    /// Pin a chunk hash under an active lease.
+    pub fn pin_chunk(&self, lease_id: &str, chunk_hash: &str) -> bool {
+        let mut map = self.leases.write().unwrap();
+        if let Some(lease) = map.get_mut(lease_id) {
+            lease.pinned_chunks.insert(chunk_hash.to_string());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Pin multiple chunk hashes under an active lease.
+    pub fn pin_chunks(&self, lease_id: &str, chunk_hashes: &[String]) -> bool {
+        let mut map = self.leases.write().unwrap();
+        if let Some(lease) = map.get_mut(lease_id) {
+            for ch in chunk_hashes {
+                lease.pinned_chunks.insert(ch.clone());
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Extend lease expiration (heartbeat).
+    pub fn heartbeat(&self, lease_id: &str, extend_secs: i64) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        let mut map = self.leases.write().unwrap();
+        if let Some(lease) = map.get_mut(lease_id) {
+            lease.expires_at_epoch_secs = now + extend_secs.max(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Complete an upload lease upon successful manifest commit.
+    pub fn complete_lease(&self, lease_id: &str) {
+        let mut map = self.leases.write().unwrap();
+        map.remove(lease_id);
+    }
+
+    /// Cancel an upload lease upon client abort or error.
+    pub fn cancel_lease(&self, lease_id: &str) {
+        let mut map = self.leases.write().unwrap();
+        map.remove(lease_id);
+    }
+
+    /// Prune expired leases and return the count of pruned leases.
+    pub fn purge_expired_leases(&self, now_secs: i64) -> usize {
+        let mut map = self.leases.write().unwrap();
+        let initial_len = map.len();
+        map.retain(|_, lease| lease.expires_at_epoch_secs > now_secs);
+        initial_len - map.len()
+    }
+
+    /// Get all chunk hashes currently protected across active (unexpired) leases.
+    pub fn get_active_pinned_chunks(&self, now_secs: i64) -> HashSet<String> {
+        let mut map = self.leases.write().unwrap();
+        map.retain(|_, lease| lease.expires_at_epoch_secs > now_secs);
+        let mut pinned = HashSet::new();
+        for lease in map.values() {
+            pinned.extend(lease.pinned_chunks.iter().cloned());
+        }
+        pinned
+    }
+
+    /// Check if a specific chunk is pinned in any active lease.
+    pub fn is_chunk_pinned(&self, chunk_hash: &str, now_secs: i64) -> bool {
+        let mut map = self.leases.write().unwrap();
+        map.retain(|_, lease| lease.expires_at_epoch_secs > now_secs);
+        map.values()
+            .any(|lease| lease.pinned_chunks.contains(chunk_hash))
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ArtifactGcReport {
     pub total_chunks_scanned: usize,
     pub reachable_chunks: usize,
     pub candidate_chunks: usize,
     pub grace_protected_chunks: usize,
+    pub in_flight_protected_chunks: usize,
     pub reclaimed_bytes: u64,
     pub dry_run: bool,
 }
@@ -48,7 +163,14 @@ impl ArtifactGcCollector {
         all_chunk_hashes: &[String],
         dry_run: bool,
     ) -> Result<ArtifactGcReport, GcError> {
-        Self::collect_garbage_with_grace(store, active_manifest_ids, all_chunk_hashes, 0, dry_run)
+        Self::collect_garbage_with_registry(
+            store,
+            active_manifest_ids,
+            all_chunk_hashes,
+            None,
+            0,
+            dry_run,
+        )
     }
 
     /// Generates a GC report with configurable grace period protection for in-flight/recent chunks.
@@ -59,13 +181,37 @@ impl ArtifactGcCollector {
         grace_secs: i64,
         dry_run: bool,
     ) -> Result<ArtifactGcReport, GcError> {
+        Self::collect_garbage_with_registry(
+            store,
+            active_manifest_ids,
+            all_chunk_hashes,
+            None,
+            grace_secs,
+            dry_run,
+        )
+    }
+
+    /// Generates a GC report with in-flight registry lease protection and mtime grace period protection.
+    pub fn collect_garbage_with_registry<S: ArtifactStore + ?Sized>(
+        store: &S,
+        active_manifest_ids: &[String],
+        all_chunk_hashes: &[String],
+        in_flight_registry: Option<&InFlightUploadRegistry>,
+        grace_secs: i64,
+        dry_run: bool,
+    ) -> Result<ArtifactGcReport, GcError> {
         let reachable = Self::trace_reachable_chunks(store, active_manifest_ids)?;
         let now = chrono::Utc::now().timestamp();
+        let in_flight_pinned = in_flight_registry
+            .map(|reg| reg.get_active_pinned_chunks(now))
+            .unwrap_or_default();
+
         let mut report = ArtifactGcReport {
             total_chunks_scanned: all_chunk_hashes.len(),
             reachable_chunks: 0,
             candidate_chunks: 0,
             grace_protected_chunks: 0,
+            in_flight_protected_chunks: 0,
             reclaimed_bytes: 0,
             dry_run,
         };
@@ -73,8 +219,10 @@ impl ArtifactGcCollector {
         for chunk_hash in all_chunk_hashes {
             if reachable.contains(chunk_hash) {
                 report.reachable_chunks += 1;
+            } else if in_flight_pinned.contains(chunk_hash) {
+                report.in_flight_protected_chunks += 1;
             } else {
-                // If chunk was modified within grace period, protect it from GC (e.g. concurrent in-flight upload)
+                // If chunk was modified within grace period, protect it from GC (e.g. recent disk write)
                 if grace_secs > 0 {
                     if let Ok(Some(mtime)) = store.get_chunk_mtime_secs(chunk_hash) {
                         if now - mtime < grace_secs {
@@ -88,7 +236,6 @@ impl ArtifactGcCollector {
                 if let Ok(Some(bytes)) = store.get_chunk(chunk_hash) {
                     report.reclaimed_bytes += bytes.len() as u64;
                 }
-                // If not dry_run, deletion would be executed here
             }
         }
 
@@ -286,5 +433,189 @@ mod tests {
             rep3.reclaimed_bytes,
             (chunk_a.len() + chunk_b.len() + chunk_c.len()) as u64
         );
+    }
+
+    #[test]
+    fn test_gc_in_flight_upload_lease_protects_longer_than_grace_interval() {
+        let tmp = TempDir::new().unwrap();
+        let store = LocalArtifactStore::new(tmp.path()).unwrap();
+        let registry = InFlightUploadRegistry::new();
+
+        // 1. In-flight upload starts and registers lease with 60s TTL
+        let lease_id = "upload_slow_stream_001";
+        registry.register_lease(lease_id, 60);
+
+        let chunk_slow = b"chunk from slow upload staying active longer than grace";
+        let hash_slow = blake3::hash(chunk_slow).to_hex().to_string();
+        store.store_chunk(&hash_slow, chunk_slow).unwrap();
+
+        // Pin chunk in the in-flight lease
+        assert!(registry.pin_chunk(lease_id, &hash_slow));
+
+        let all_chunks = vec![hash_slow.clone()];
+
+        // 2. Simulate GC running repeatedly with a very short grace period (0s grace).
+        // Since the chunk has no manifest, mtime grace alone would collect it if grace=0.
+        // But with in_flight_registry, it is protected!
+        for _ in 0..5 {
+            let report = ArtifactGcCollector::collect_garbage_with_registry(
+                &store,
+                &[], // no active manifests yet!
+                &all_chunks,
+                Some(&registry),
+                0, // 0s grace
+                false,
+            )
+            .unwrap();
+
+            assert_eq!(report.reachable_chunks, 0);
+            assert_eq!(report.candidate_chunks, 0);
+            assert_eq!(report.in_flight_protected_chunks, 1);
+            assert_eq!(report.reclaimed_bytes, 0);
+        }
+
+        // 3. Complete the upload: create manifest referencing the chunk, then complete lease
+        let manifest = ArtifactManifest::new(
+            "art_slow".into(),
+            hash_slow.clone(),
+            chunk_slow.len() as u64,
+            chunk_slow.len() as u32,
+            vec![ChunkEntry {
+                index: 0,
+                offset: 0,
+                length: chunk_slow.len() as u32,
+                chunk_hash: hash_slow.clone(),
+            }],
+            None,
+        )
+        .unwrap();
+        let m_id = store.store_manifest(&manifest).unwrap();
+        registry.complete_lease(lease_id);
+
+        // 4. Run GC again: now chunk is reachable via manifest!
+        let report_after = ArtifactGcCollector::collect_garbage_with_registry(
+            &store,
+            &[m_id],
+            &all_chunks,
+            Some(&registry),
+            0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(report_after.reachable_chunks, 1);
+        assert_eq!(report_after.candidate_chunks, 0);
+        assert_eq!(report_after.in_flight_protected_chunks, 0);
+    }
+
+    #[test]
+    fn test_gc_in_flight_upload_cancellation_and_orphan_collection() {
+        let tmp = TempDir::new().unwrap();
+        let store = LocalArtifactStore::new(tmp.path()).unwrap();
+        let registry = InFlightUploadRegistry::new();
+
+        let lease_id = "upload_cancelled_002";
+        registry.register_lease(lease_id, 30);
+
+        let chunk_bytes = b"chunk from aborted upload";
+        let chunk_hash = blake3::hash(chunk_bytes).to_hex().to_string();
+        store.store_chunk(&chunk_hash, chunk_bytes).unwrap();
+        registry.pin_chunk(lease_id, &chunk_hash);
+
+        let all_chunks = vec![chunk_hash.clone()];
+
+        // While active, chunk is protected
+        let rep1 = ArtifactGcCollector::collect_garbage_with_registry(
+            &store,
+            &[],
+            &all_chunks,
+            Some(&registry),
+            0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(rep1.in_flight_protected_chunks, 1);
+        assert_eq!(rep1.candidate_chunks, 0);
+
+        // Client aborts/cancels upload
+        registry.cancel_lease(lease_id);
+
+        // GC runs: chunk is immediately candidate orphan and reclaimed
+        let rep2 = ArtifactGcCollector::collect_garbage_with_registry(
+            &store,
+            &[],
+            &all_chunks,
+            Some(&registry),
+            0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(rep2.in_flight_protected_chunks, 0);
+        assert_eq!(rep2.candidate_chunks, 1);
+        assert_eq!(rep2.reclaimed_bytes, chunk_bytes.len() as u64);
+    }
+
+    #[test]
+    fn test_gc_in_flight_upload_crash_expiry_and_cleanup() {
+        let tmp = TempDir::new().unwrap();
+        let store = LocalArtifactStore::new(tmp.path()).unwrap();
+        let registry = InFlightUploadRegistry::new();
+
+        let lease_id = "upload_crashed_003";
+        // Lease with 1 second TTL simulating crashed worker that stopped renewing
+        registry.register_lease(lease_id, 1);
+
+        let chunk_bytes = b"chunk from crashed process";
+        let chunk_hash = blake3::hash(chunk_bytes).to_hex().to_string();
+        store.store_chunk(&chunk_hash, chunk_bytes).unwrap();
+        registry.pin_chunk(lease_id, &chunk_hash);
+
+        // Sleep 1.1s so lease expires
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        let all_chunks = vec![chunk_hash.clone()];
+
+        // GC runs: detects lease expired, purges it, and marks chunk as candidate
+        let report = ArtifactGcCollector::collect_garbage_with_registry(
+            &store,
+            &[],
+            &all_chunks,
+            Some(&registry),
+            0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(report.in_flight_protected_chunks, 0);
+        assert_eq!(report.candidate_chunks, 1);
+        assert_eq!(report.reclaimed_bytes, chunk_bytes.len() as u64);
+    }
+
+    #[test]
+    fn test_gc_in_flight_upload_coarse_timestamp_and_clock_skew_resilience() {
+        let tmp = TempDir::new().unwrap();
+        let store = LocalArtifactStore::new(tmp.path()).unwrap();
+        let registry = InFlightUploadRegistry::new();
+
+        let lease_id = "upload_skew_004";
+        registry.register_lease(lease_id, 120);
+
+        let chunk_bytes = b"chunk with coarse mtime";
+        let chunk_hash = blake3::hash(chunk_bytes).to_hex().to_string();
+        store.store_chunk(&chunk_hash, chunk_bytes).unwrap();
+        registry.pin_chunk(lease_id, &chunk_hash);
+
+        let all_chunks = vec![chunk_hash.clone()];
+
+        // Even with grace_secs = 0 and simulated elapsed time, registry protects chunk
+        let report = ArtifactGcCollector::collect_garbage_with_registry(
+            &store,
+            &[],
+            &all_chunks,
+            Some(&registry),
+            0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(report.in_flight_protected_chunks, 1);
+        assert_eq!(report.candidate_chunks, 0);
     }
 }

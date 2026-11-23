@@ -1894,6 +1894,17 @@ impl Database for InMemoryDatabase {
         Ok(state.manifests.get(manifest_id).cloned())
     }
 
+    async fn get_artifact_manifest_by_artifact_id(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Option<StoredArtifactManifest>, ForgeError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(state.manifests_by_artifact_id.get(artifact_id).cloned())
+    }
+
     async fn save_lfs_object(&self, object: LfsObject) -> Result<LfsObject, ForgeError> {
         let mut state = self
             .state

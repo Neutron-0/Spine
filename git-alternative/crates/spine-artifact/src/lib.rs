@@ -9,7 +9,7 @@ pub mod store;
 pub mod transfer;
 
 pub use chunker::{ChunkData, ChunkingResult, ObjectReconstructor, StreamChunker};
-pub use gc::{ArtifactGcCollector, ArtifactGcReport};
+pub use gc::{ArtifactGcCollector, ArtifactGcReport, InFlightUploadLease, InFlightUploadRegistry};
 pub use lfs::{LfsPointer, LfsTrackingRules};
 pub use manifest::{ArtifactManifest, ChunkEntry, DEFAULT_CHUNK_SIZE, MANIFEST_VERSION};
 pub use store::{ArtifactStore, DistributedArtifactStore, LocalArtifactStore, StoreError};
