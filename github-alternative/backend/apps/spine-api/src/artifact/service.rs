@@ -20,11 +20,12 @@ pub struct ArtifactService {
 
 impl ArtifactService {
     pub fn new(db: Arc<dyn Database>, store: Arc<dyn ArtifactStore>) -> Self {
+        let lease_dir = store.in_flight_lease_dir();
         Self {
             db,
             store,
             active_sessions: RwLock::new(HashMap::new()),
-            in_flight_registry: Arc::new(InFlightUploadRegistry::new()),
+            in_flight_registry: Arc::new(InFlightUploadRegistry::with_shared_dir(lease_dir)),
         }
     }
 

@@ -1897,8 +1897,30 @@ async fn test_multitenant_shared_cas_deduplication_and_gc_reachability() {
     assert_eq!(rep1.reachable_chunks, shared_chunk_hashes.len());
     assert_eq!(rep1.candidate_chunks, 0);
 
-    // 4. Delete Repo A's mapping: Repo B still references the manifest!
-    // Verify Repo B can STILL download the object
+    // 4. Delete Repo A's mapping:
+    let deleted_a = db.delete_lfs_object(&repo_a.id, &oid).await.unwrap();
+    assert!(deleted_a, "Repo A LFS mapping must be deleted");
+
+    // Invariant 1: Repo A gets 404 Not Found on download
+    let (dl_token_a_post, _) =
+        generate_scoped_token(&repo_a.id, &oid, "download", payload.len() as u64, 3600);
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/objects/{}",
+            alice.username, repo_a.name, oid
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {}", dl_token_a_post))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "Repo A must return 404 after mapping is deleted"
+    );
+
+    // Invariant 2: Repo B still references the manifest and CAN download the bytes!
     let (dl_token_b, _) =
         generate_scoped_token(&repo_b.id, &oid, "download", payload.len() as u64, 3600);
     let req = Request::builder()
@@ -1912,8 +1934,10 @@ async fn test_multitenant_shared_cas_deduplication_and_gc_reachability() {
         .unwrap();
     let resp = router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    let downloaded_b = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&downloaded_b[..], payload);
 
-    // GC check: as long as Repo B's manifest is in active_manifest_ids, chunks are NOT collected
+    // Invariant 3: GC check - Repo B's manifest preserves shared chunks!
     let rep2 = ArtifactGcCollector::collect_garbage(
         state.artifacts.store(),
         std::slice::from_ref(&obj_b.manifest_id),
@@ -1923,4 +1947,21 @@ async fn test_multitenant_shared_cas_deduplication_and_gc_reachability() {
     .unwrap();
     assert_eq!(rep2.reachable_chunks, shared_chunk_hashes.len());
     assert_eq!(rep2.candidate_chunks, 0);
+
+    // Invariant 4: Now delete Repo B's mapping as well
+    let deleted_b = db.delete_lfs_object(&repo_b.id, &oid).await.unwrap();
+    assert!(deleted_b, "Repo B LFS mapping must be deleted");
+
+    // Both mappings deleted: GC with expired grace now reclaims orphan CAS chunks!
+    let rep3 = ArtifactGcCollector::collect_garbage_with_grace(
+        state.artifacts.store(),
+        &[], // no active manifests
+        &shared_chunk_hashes,
+        0, // expired grace
+        false,
+    )
+    .unwrap();
+    assert_eq!(rep3.reachable_chunks, 0);
+    assert_eq!(rep3.candidate_chunks, shared_chunk_hashes.len());
+    assert_eq!(rep3.reclaimed_bytes, payload.len() as u64);
 }

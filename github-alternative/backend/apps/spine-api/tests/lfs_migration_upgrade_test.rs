@@ -54,6 +54,9 @@ async fn test_lfs_migration_fresh_install() {
         "idx_lfs_objects_repo_oid index must exist after fresh install"
     );
 
+    // Verify foreign key constraints, table names, indexes, cascade, and restrict contracts
+    assert_lfs_objects_schema_and_fk_contracts(&pool).await;
+
     disp_db.cleanup().await.unwrap();
 }
 
@@ -440,6 +443,312 @@ async fn test_lfs_migration_upgrade_safety_and_non_lfs_exclusion() {
         "Manifest 1 must be resolvable for repo A"
     );
     assert_eq!(manifest_v1.unwrap().total_size, 2048);
+
+    // Verify foreign key constraints, table names, indexes, cascade, and restrict contracts on upgrade
+    assert_lfs_objects_schema_and_fk_contracts(&pool).await;
+
+    disp_db.cleanup().await.unwrap();
+}
+
+async fn assert_lfs_objects_schema_and_fk_contracts(pool: &sqlx::PgPool) {
+    // 1. lfs_objects table exists
+    let table_exists: (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'lfs_objects')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(table_exists.0, "lfs_objects table must exist");
+
+    // 2. Indexes exist on lfs_objects
+    for idx_name in &[
+        "idx_lfs_objects_repo_oid",
+        "idx_lfs_objects_manifest",
+        "idx_lfs_objects_oid",
+    ] {
+        let exists: (bool,) = sqlx::query_as(
+            "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE tablename = 'lfs_objects' AND indexname = $1)",
+        )
+        .bind(idx_name)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(exists.0, "Index {} must exist on lfs_objects", idx_name);
+    }
+
+    // 3. Unique constraint uq_repo_lfs_oid exists
+    let uq_exists: (bool,) = sqlx::query_as(
+        "SELECT EXISTS (
+            SELECT 1 FROM pg_constraint c
+            JOIN pg_class t ON c.conrelid = t.oid
+            WHERE t.relname = 'lfs_objects' AND c.conname = 'uq_repo_lfs_oid' AND c.contype = 'u'
+        )",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(
+        uq_exists.0,
+        "Unique constraint uq_repo_lfs_oid must exist on lfs_objects"
+    );
+
+    // 4. FK on repository_id references forge_repositories(id) with CASCADE (confdeltype = 'c')
+    let fk_repo: (String, i8) = sqlx::query_as(
+        "SELECT f.relname::text, c.confdeltype::\"char\"::int8
+         FROM pg_constraint c
+         JOIN pg_class t ON c.conrelid = t.oid
+         JOIN pg_class f ON c.confrelid = f.oid
+         WHERE t.relname = 'lfs_objects' AND c.contype = 'f' AND c.conname LIKE '%repository_id%'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("repository_id foreign key constraint must exist");
+    assert_eq!(
+        fk_repo.0, "forge_repositories",
+        "repository_id FK must reference forge_repositories"
+    );
+    assert_eq!(
+        fk_repo.1, b'c' as i8,
+        "repository_id FK must have ON DELETE CASCADE ('c')"
+    );
+
+    // 5. FK on manifest_id references artifact_manifests(id) with RESTRICT (confdeltype = 'r')
+    let fk_manifest: (String, i8) = sqlx::query_as(
+        "SELECT f.relname::text, c.confdeltype::\"char\"::int8
+         FROM pg_constraint c
+         JOIN pg_class t ON c.conrelid = t.oid
+         JOIN pg_class f ON c.confrelid = f.oid
+         WHERE t.relname = 'lfs_objects' AND c.contype = 'f' AND c.conname LIKE '%manifest_id%'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("manifest_id foreign key constraint must exist");
+    assert_eq!(
+        fk_manifest.0, "artifact_manifests",
+        "manifest_id FK must reference artifact_manifests"
+    );
+    assert_eq!(
+        fk_manifest.1, b'r' as i8,
+        "manifest_id FK must have ON DELETE RESTRICT ('r')"
+    );
+
+    // 6. Test live foreign key constraints:
+    let uid = format!("u_fk_{}", uuid::Uuid::new_v4().simple());
+    let repo_id = format!("r_fk_{}", uuid::Uuid::new_v4().simple());
+    let man_id = format!("m_fk_{}", uuid::Uuid::new_v4().simple());
+    let lfs_id = format!("l_fk_{}", uuid::Uuid::new_v4().simple());
+    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+    sqlx::query(
+        "INSERT INTO users (id, username, normalized_username, email, normalized_email, display_name, password_hash, account_status, created_at_nanos, updated_at_nanos) VALUES ($1, $1, $1, $1 || '@spine.test', $1 || '@spine.test', $1, 'hash', 'ACTIVE', $2, $2)",
+    )
+    .bind(&uid)
+    .bind(now)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO forge_repositories (id, owner_user_id, owner_username, name, normalized_name, native_repo_id, is_private, durability_policy, created_at_nanos, updated_at_nanos) VALUES ($1, $2, $2, 'test-fk-repo', 'test-fk-repo', 'native', true, 'ThreeCopies', $3, $3)",
+    )
+    .bind(&repo_id)
+    .bind(&uid)
+    .bind(now)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let dummy_oid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    sqlx::query(
+        "INSERT INTO artifact_manifests (id, artifact_id, total_size, chunk_count, manifest_json, created_at_nanos) VALUES ($1, $2, 1024, 1, '{}', $3)",
+    )
+    .bind(&man_id)
+    .bind(dummy_oid)
+    .bind(now)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO lfs_objects (id, repository_id, oid, size_bytes, manifest_id, created_at_nanos) VALUES ($1, $2, $3, 1024, $4, $5)",
+    )
+    .bind(&lfs_id)
+    .bind(&repo_id)
+    .bind(dummy_oid)
+    .bind(&man_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // Assert RESTRICT on manifest: deleting referenced manifest must fail
+    let del_man_err = sqlx::query("DELETE FROM artifact_manifests WHERE id = $1")
+        .bind(&man_id)
+        .execute(pool)
+        .await;
+    assert!(
+        del_man_err.is_err(),
+        "Deleting artifact_manifests row referenced by lfs_objects must be rejected by RESTRICT"
+    );
+
+    // Assert CASCADE on forge_repositories: deleting repository cascades and removes lfs_objects row!
+    sqlx::query("DELETE FROM forge_repositories WHERE id = $1")
+        .bind(&repo_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let lfs_rem_count: (i64,) = sqlx::query_as("SELECT count(*) FROM lfs_objects WHERE id = $1")
+        .bind(&lfs_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        lfs_rem_count.0, 0,
+        "Deleting forge_repositories row must CASCADE delete referencing lfs_objects row"
+    );
+
+    sqlx::query("DELETE FROM artifact_manifests WHERE id = $1")
+        .bind(&man_id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_lfs_migration_preflight_and_operator_remediation() {
+    let disp_db = match HarnessDisposableDb::provision_empty().await {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!(
+                "Skipping test_lfs_migration_preflight_and_operator_remediation: {}",
+                e
+            );
+            return;
+        }
+    };
+    let pool = disp_db
+        .migrator_pool()
+        .await
+        .expect("connect migrator pool");
+
+    // Initialize schema at 0015
+    run_migrations_up_to(&pool, "0015_maintenance_lease_owner_token")
+        .await
+        .expect("run migrations up to 0015");
+
+    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let uid = "u_preflight_test";
+    let repo_id = "r_preflight_test";
+
+    sqlx::query(
+        "INSERT INTO users (id, username, normalized_username, email, normalized_email, display_name, password_hash, account_status, created_at_nanos, updated_at_nanos) VALUES ($1, $1, $1, $1 || '@spine.test', $1 || '@spine.test', $1, 'hash', 'ACTIVE', $2, $2)",
+    )
+    .bind(uid)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO forge_repositories (id, owner_user_id, owner_username, name, normalized_name, native_repo_id, is_private, durability_policy, created_at_nanos, updated_at_nanos) VALUES ($1, $2, $2, 'preflight-repo', 'preflight-repo', 'native', true, 'ThreeCopies', $3, $3)",
+    )
+    .bind(repo_id)
+    .bind(uid)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let oid_ambiguous = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let man_ambiguous = "man_ambiguous_01";
+    sqlx::query(
+        "INSERT INTO artifact_manifests (id, artifact_id, total_size, chunk_count, manifest_json, created_at_nanos) VALUES ($1, $2, 1024, 1, '{}', $3)",
+    )
+    .bind(man_ambiguous)
+    .bind(oid_ambiguous)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 1. Preflight inventory discovers ambiguous ownership
+    let inv1 = spine_api::db::inventory_legacy_lfs_manifests(&pool)
+        .await
+        .unwrap();
+    assert!(!inv1.is_safe_to_migrate);
+    assert_eq!(inv1.ambiguous_ownership.len(), 1);
+    assert_eq!(inv1.ambiguous_ownership[0].manifest_id, man_ambiguous);
+
+    // 2. Malformed operator input rejected
+    let bad_input = vec![spine_api::db::OperatorLfsMapping {
+        manifest_id: "nonexistent_manifest".to_string(),
+        repository_id: repo_id.to_string(),
+    }];
+    let err_bad = spine_api::db::remediate_legacy_lfs_manifests(&pool, &bad_input, false).await;
+    assert!(err_bad.is_err(), "Non-existent manifest must be rejected");
+
+    let bad_repo = vec![spine_api::db::OperatorLfsMapping {
+        manifest_id: man_ambiguous.to_string(),
+        repository_id: "nonexistent_repo".to_string(),
+    }];
+    let err_repo = spine_api::db::remediate_legacy_lfs_manifests(&pool, &bad_repo, false).await;
+    assert!(err_repo.is_err(), "Non-existent repo must be rejected");
+
+    // 3. Dry-run remediation succeeds without committing changes
+    let valid_mapping = vec![spine_api::db::OperatorLfsMapping {
+        manifest_id: man_ambiguous.to_string(),
+        repository_id: repo_id.to_string(),
+    }];
+    let dry_res = spine_api::db::remediate_legacy_lfs_manifests(&pool, &valid_mapping, true)
+        .await
+        .unwrap();
+    assert!(dry_res.is_dry_run);
+    assert_eq!(dry_res.manifests_remediated, 1);
+
+    // Verify DB was NOT updated (dry-run rollback)
+    let inv2 = spine_api::db::inventory_legacy_lfs_manifests(&pool)
+        .await
+        .unwrap();
+    assert!(!inv2.is_safe_to_migrate);
+    assert_eq!(inv2.ambiguous_ownership.len(), 1);
+
+    // 4. Real remediation commits the update
+    let real_res = spine_api::db::remediate_legacy_lfs_manifests(&pool, &valid_mapping, false)
+        .await
+        .unwrap();
+    assert!(!real_res.is_dry_run);
+    assert_eq!(real_res.manifests_remediated, 1);
+
+    // 5. Rerun is idempotent
+    let rerun_res = spine_api::db::remediate_legacy_lfs_manifests(&pool, &valid_mapping, false)
+        .await
+        .unwrap();
+    assert_eq!(rerun_res.already_correct, 1);
+    assert_eq!(rerun_res.manifests_remediated, 0);
+
+    // 6. Preflight now reports safe to migrate!
+    let inv3 = spine_api::db::inventory_legacy_lfs_manifests(&pool)
+        .await
+        .unwrap();
+    assert!(inv3.is_safe_to_migrate);
+    assert_eq!(inv3.ready_to_migrate_count, 1);
+    assert_eq!(inv3.ambiguous_ownership.len(), 0);
+
+    // 7. Apply migration 0016
+    run_migrations(&pool)
+        .await
+        .expect("migration 0016 must succeed after preflight remediation");
+
+    // 8. Verify lfs_objects mapping is populated
+    let lfs_row: (String, String) =
+        sqlx::query_as("SELECT repository_id, oid FROM lfs_objects WHERE manifest_id = $1")
+            .bind(man_ambiguous)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(lfs_row.0, repo_id);
+    assert_eq!(lfs_row.1, oid_ambiguous);
 
     disp_db.cleanup().await.unwrap();
 }

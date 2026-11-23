@@ -1,5 +1,6 @@
 pub mod dump;
 pub mod in_memory;
+pub mod lfs_preflight;
 pub mod migrations;
 pub mod postgres;
 pub mod selector;
@@ -12,6 +13,10 @@ pub use dump::{
     DatabaseSnapshot,
 };
 pub use in_memory::InMemoryDatabase;
+pub use lfs_preflight::{
+    inventory_legacy_lfs_manifests, remediate_legacy_lfs_manifests, LfsPreflightInventory,
+    OperatorLfsMapping, RemediationResult,
+};
 pub use migrations::run_migrations;
 pub use postgres::{DbPoolSettings, PgDatabase};
 pub use selector::{ActiveDatabaseRecord, DatabaseSelector};

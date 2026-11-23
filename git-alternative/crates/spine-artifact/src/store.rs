@@ -40,6 +40,10 @@ pub trait ArtifactStore: Send + Sync {
     fn get_chunk_mtime_secs(&self, _chunk_hash: &str) -> Result<Option<i64>, StoreError> {
         Ok(None)
     }
+
+    fn in_flight_lease_dir(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 impl<T: ?Sized + ArtifactStore> ArtifactStore for Arc<T> {
@@ -71,6 +75,9 @@ impl<T: ?Sized + ArtifactStore> ArtifactStore for Arc<T> {
     fn get_chunk_mtime_secs(&self, chunk_hash: &str) -> Result<Option<i64>, StoreError> {
         (**self).get_chunk_mtime_secs(chunk_hash)
     }
+    fn in_flight_lease_dir(&self) -> Option<PathBuf> {
+        (**self).in_flight_lease_dir()
+    }
 }
 
 /// Local directory-backed content-addressed artifact store.
@@ -85,7 +92,12 @@ impl LocalArtifactStore {
         fs::create_dir_all(p.join("chunks"))?;
         fs::create_dir_all(p.join("manifests"))?;
         fs::create_dir_all(p.join("staging"))?;
+        fs::create_dir_all(p.join("in_flight_leases"))?;
         Ok(Self { root_dir: p })
+    }
+
+    pub fn lease_dir(&self) -> PathBuf {
+        self.root_dir.join("in_flight_leases")
     }
 
     fn chunk_path(&self, chunk_hash: &str) -> PathBuf {
@@ -227,6 +239,10 @@ impl ArtifactStore for LocalArtifactStore {
             .unwrap_or(0);
         Ok(Some(mtime))
     }
+
+    fn in_flight_lease_dir(&self) -> Option<PathBuf> {
+        Some(self.lease_dir())
+    }
 }
 
 /// Clustered artifact store wrapper combining local storage with replica storage dispatch.
@@ -338,5 +354,9 @@ impl ArtifactStore for DistributedArtifactStore {
 
     fn get_chunk_mtime_secs(&self, chunk_hash: &str) -> Result<Option<i64>, StoreError> {
         self.local.get_chunk_mtime_secs(chunk_hash)
+    }
+
+    fn in_flight_lease_dir(&self) -> Option<PathBuf> {
+        self.local.in_flight_lease_dir()
     }
 }

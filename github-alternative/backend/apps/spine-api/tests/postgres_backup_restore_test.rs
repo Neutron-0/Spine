@@ -570,6 +570,80 @@ async fn test_postgres_multitenant_shared_lfs_backup_restore_roundtrip() {
     assert_eq!(row_b.2, 2048);
     assert_eq!(row_b.3, manifest_id);
 
+    // Retest shared-CAS deletion and restore:
+    // 1. Delete Repo A's mapping on target_pool
+    let del_res = sqlx::query("DELETE FROM lfs_objects WHERE repository_id = $1 AND oid = $2")
+        .bind(&repo_a_id)
+        .bind(oid)
+        .execute(&target_pool)
+        .await
+        .unwrap();
+    assert_eq!(del_res.rows_affected(), 1);
+
+    // Invariant: Repo A has 0 mappings, Repo B still has 1 mapping
+    let count_a: (i64,) =
+        sqlx::query_as("SELECT count(*) FROM lfs_objects WHERE repository_id = $1")
+            .bind(&repo_a_id)
+            .fetch_one(&target_pool)
+            .await
+            .unwrap();
+    assert_eq!(count_a.0, 0, "Repo A mapping must be deleted");
+
+    let count_b: (i64,) =
+        sqlx::query_as("SELECT count(*) FROM lfs_objects WHERE repository_id = $1")
+            .bind(&repo_b_id)
+            .fetch_one(&target_pool)
+            .await
+            .unwrap();
+    assert_eq!(count_b.0, 1, "Repo B mapping must still exist");
+
+    // Manifest still exists and is referenced by Repo B
+    let man_count: (i64,) = sqlx::query_as("SELECT count(*) FROM artifact_manifests WHERE id = $1")
+        .bind(&manifest_id)
+        .fetch_one(&target_pool)
+        .await
+        .unwrap();
+    assert_eq!(man_count.0, 1, "Shared manifest must remain preserved");
+
+    // 2. Dump and restore again to a 3rd target database
+    let mut second_dump = Vec::new();
+    spine_api::dump_database_to_writer(&target_pool, &mut second_dump)
+        .await
+        .unwrap();
+
+    let final_disp_db = HarnessDisposableDb::provision_empty().await.unwrap();
+    let final_pool = final_disp_db.migrator_pool().await.unwrap();
+
+    let mut second_reader = std::io::BufReader::new(std::io::Cursor::new(second_dump));
+    spine_api::restore_database_from_reader(&final_pool, &mut second_reader)
+        .await
+        .unwrap();
+
+    // Invariant: After restore, Repo A has 0 mappings, Repo B has 1 mapping
+    let final_count_a: (i64,) =
+        sqlx::query_as("SELECT count(*) FROM lfs_objects WHERE repository_id = $1")
+            .bind(&repo_a_id)
+            .fetch_one(&final_pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        final_count_a.0, 0,
+        "Repo A must remain deleted after restore"
+    );
+
+    let final_row_b: (String, String, String) = sqlx::query_as(
+        "SELECT repository_id, oid, manifest_id FROM lfs_objects WHERE repository_id = $1 AND oid = $2",
+    )
+    .bind(&repo_b_id)
+    .bind(oid)
+    .fetch_one(&final_pool)
+    .await
+    .unwrap();
+    assert_eq!(final_row_b.0, repo_b_id);
+    assert_eq!(final_row_b.1, oid);
+    assert_eq!(final_row_b.2, manifest_id);
+
     src_disp_db.cleanup().await.unwrap();
     target_disp_db.cleanup().await.unwrap();
+    final_disp_db.cleanup().await.unwrap();
 }

@@ -432,6 +432,7 @@ pub trait Database: Send + Sync {
         repository_id: &str,
         oid: &str,
     ) -> Result<Option<StoredArtifactManifest>, ForgeError>;
+    async fn delete_lfs_object(&self, repository_id: &str, oid: &str) -> Result<bool, ForgeError>;
 
     async fn create_release(&self, release: Release) -> Result<Release, ForgeError>;
     async fn get_release_by_id(&self, id: &str) -> Result<Option<Release>, ForgeError>;

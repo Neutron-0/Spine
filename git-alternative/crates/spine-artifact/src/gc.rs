@@ -1,5 +1,6 @@
 use crate::store::ArtifactStore;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use thiserror::Error;
 
@@ -13,7 +14,7 @@ pub enum GcError {
 
 /// An active in-flight upload lease protecting newly written CAS chunks from GC
 /// even if the upload duration exceeds filesystem mtime grace intervals.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InFlightUploadLease {
     pub lease_id: String,
     pub created_at_epoch_secs: i64,
@@ -21,17 +22,50 @@ pub struct InFlightUploadLease {
     pub pinned_chunks: HashSet<String>,
 }
 
+fn write_disk_lease(dir: &Path, lease: &InFlightUploadLease) {
+    if std::fs::create_dir_all(dir).is_ok() {
+        let tmp_path = dir.join(format!("{}.lease.tmp", lease.lease_id));
+        let final_path = dir.join(format!("{}.lease", lease.lease_id));
+        if let Ok(bytes) = serde_json::to_vec(lease) {
+            if std::fs::write(&tmp_path, bytes).is_ok() {
+                let _ = std::fs::rename(&tmp_path, &final_path);
+            }
+        }
+    }
+}
+
+fn remove_disk_lease(dir: &Path, lease_id: &str) {
+    let final_path = dir.join(format!("{}.lease", lease_id));
+    let tmp_path = dir.join(format!("{}.lease.tmp", lease_id));
+    let _ = std::fs::remove_file(final_path);
+    let _ = std::fs::remove_file(tmp_path);
+}
+
 /// Registry for active in-flight upload leases. Thread-safe and queryable by GC.
+/// Supports both in-memory leases and shared durable filesystem leases across worker processes.
 #[derive(Debug, Default)]
 pub struct InFlightUploadRegistry {
     leases: RwLock<HashMap<String, InFlightUploadLease>>,
+    shared_dir: Option<PathBuf>,
 }
 
 impl InFlightUploadRegistry {
     pub fn new() -> Self {
         Self {
             leases: RwLock::new(HashMap::new()),
+            shared_dir: None,
         }
+    }
+
+    pub fn with_shared_dir(shared_dir: Option<PathBuf>) -> Self {
+        Self {
+            leases: RwLock::new(HashMap::new()),
+            shared_dir,
+        }
+    }
+
+    pub fn shared_dir(&self) -> Option<&Path> {
+        self.shared_dir.as_deref()
     }
 
     /// Register a new in-flight upload lease with a specified TTL in seconds.
@@ -43,16 +77,31 @@ impl InFlightUploadRegistry {
             expires_at_epoch_secs: now + ttl_secs.max(1),
             pinned_chunks: HashSet::new(),
         };
-        let mut map = self.leases.write().unwrap();
-        map.insert(lease_id.to_string(), lease.clone());
+        {
+            let mut map = self.leases.write().unwrap();
+            map.insert(lease_id.to_string(), lease.clone());
+        }
+        if let Some(ref dir) = self.shared_dir {
+            write_disk_lease(dir, &lease);
+        }
         lease
     }
 
     /// Pin a chunk hash under an active lease.
     pub fn pin_chunk(&self, lease_id: &str, chunk_hash: &str) -> bool {
-        let mut map = self.leases.write().unwrap();
-        if let Some(lease) = map.get_mut(lease_id) {
-            lease.pinned_chunks.insert(chunk_hash.to_string());
+        let updated_lease = {
+            let mut map = self.leases.write().unwrap();
+            if let Some(lease) = map.get_mut(lease_id) {
+                lease.pinned_chunks.insert(chunk_hash.to_string());
+                Some(lease.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(ref lease) = updated_lease {
+            if let Some(ref dir) = self.shared_dir {
+                write_disk_lease(dir, lease);
+            }
             true
         } else {
             false
@@ -61,10 +110,20 @@ impl InFlightUploadRegistry {
 
     /// Pin multiple chunk hashes under an active lease.
     pub fn pin_chunks(&self, lease_id: &str, chunk_hashes: &[String]) -> bool {
-        let mut map = self.leases.write().unwrap();
-        if let Some(lease) = map.get_mut(lease_id) {
-            for ch in chunk_hashes {
-                lease.pinned_chunks.insert(ch.clone());
+        let updated_lease = {
+            let mut map = self.leases.write().unwrap();
+            if let Some(lease) = map.get_mut(lease_id) {
+                for ch in chunk_hashes {
+                    lease.pinned_chunks.insert(ch.clone());
+                }
+                Some(lease.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(ref lease) = updated_lease {
+            if let Some(ref dir) = self.shared_dir {
+                write_disk_lease(dir, lease);
             }
             true
         } else {
@@ -75,9 +134,19 @@ impl InFlightUploadRegistry {
     /// Extend lease expiration (heartbeat).
     pub fn heartbeat(&self, lease_id: &str, extend_secs: i64) -> bool {
         let now = chrono::Utc::now().timestamp();
-        let mut map = self.leases.write().unwrap();
-        if let Some(lease) = map.get_mut(lease_id) {
-            lease.expires_at_epoch_secs = now + extend_secs.max(1);
+        let updated_lease = {
+            let mut map = self.leases.write().unwrap();
+            if let Some(lease) = map.get_mut(lease_id) {
+                lease.expires_at_epoch_secs = now + extend_secs.max(1);
+                Some(lease.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(ref lease) = updated_lease {
+            if let Some(ref dir) = self.shared_dir {
+                write_disk_lease(dir, lease);
+            }
             true
         } else {
             false
@@ -86,41 +155,119 @@ impl InFlightUploadRegistry {
 
     /// Complete an upload lease upon successful manifest commit.
     pub fn complete_lease(&self, lease_id: &str) {
-        let mut map = self.leases.write().unwrap();
-        map.remove(lease_id);
+        {
+            let mut map = self.leases.write().unwrap();
+            map.remove(lease_id);
+        }
+        if let Some(ref dir) = self.shared_dir {
+            remove_disk_lease(dir, lease_id);
+        }
     }
 
     /// Cancel an upload lease upon client abort or error.
     pub fn cancel_lease(&self, lease_id: &str) {
-        let mut map = self.leases.write().unwrap();
-        map.remove(lease_id);
+        {
+            let mut map = self.leases.write().unwrap();
+            map.remove(lease_id);
+        }
+        if let Some(ref dir) = self.shared_dir {
+            remove_disk_lease(dir, lease_id);
+        }
     }
 
     /// Prune expired leases and return the count of pruned leases.
     pub fn purge_expired_leases(&self, now_secs: i64) -> usize {
-        let mut map = self.leases.write().unwrap();
-        let initial_len = map.len();
-        map.retain(|_, lease| lease.expires_at_epoch_secs > now_secs);
-        initial_len - map.len()
+        let mut purged = {
+            let mut map = self.leases.write().unwrap();
+            let initial_len = map.len();
+            map.retain(|_, lease| lease.expires_at_epoch_secs > now_secs);
+            initial_len - map.len()
+        };
+        if let Some(ref dir) = self.shared_dir {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) == Some("lease") {
+                        if let Ok(bytes) = std::fs::read(&path) {
+                            if let Ok(lease) = serde_json::from_slice::<InFlightUploadLease>(&bytes)
+                            {
+                                if lease.expires_at_epoch_secs <= now_secs {
+                                    let _ = std::fs::remove_file(&path);
+                                    purged += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        purged
     }
 
     /// Get all chunk hashes currently protected across active (unexpired) leases.
     pub fn get_active_pinned_chunks(&self, now_secs: i64) -> HashSet<String> {
-        let mut map = self.leases.write().unwrap();
-        map.retain(|_, lease| lease.expires_at_epoch_secs > now_secs);
         let mut pinned = HashSet::new();
-        for lease in map.values() {
-            pinned.extend(lease.pinned_chunks.iter().cloned());
+        {
+            let mut map = self.leases.write().unwrap();
+            map.retain(|_, lease| lease.expires_at_epoch_secs > now_secs);
+            for lease in map.values() {
+                pinned.extend(lease.pinned_chunks.iter().cloned());
+            }
+        }
+        if let Some(ref dir) = self.shared_dir {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) == Some("lease") {
+                        if let Ok(bytes) = std::fs::read(&path) {
+                            if let Ok(lease) = serde_json::from_slice::<InFlightUploadLease>(&bytes)
+                            {
+                                if lease.expires_at_epoch_secs > now_secs {
+                                    pinned.extend(lease.pinned_chunks);
+                                } else {
+                                    let _ = std::fs::remove_file(&path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         pinned
     }
 
     /// Check if a specific chunk is pinned in any active lease.
     pub fn is_chunk_pinned(&self, chunk_hash: &str, now_secs: i64) -> bool {
-        let mut map = self.leases.write().unwrap();
-        map.retain(|_, lease| lease.expires_at_epoch_secs > now_secs);
-        map.values()
-            .any(|lease| lease.pinned_chunks.contains(chunk_hash))
+        {
+            let mut map = self.leases.write().unwrap();
+            map.retain(|_, lease| lease.expires_at_epoch_secs > now_secs);
+            if map
+                .values()
+                .any(|lease| lease.pinned_chunks.contains(chunk_hash))
+            {
+                return true;
+            }
+        }
+        if let Some(ref dir) = self.shared_dir {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) == Some("lease") {
+                        if let Ok(bytes) = std::fs::read(&path) {
+                            if let Ok(lease) = serde_json::from_slice::<InFlightUploadLease>(&bytes)
+                            {
+                                if lease.expires_at_epoch_secs > now_secs
+                                    && lease.pinned_chunks.contains(chunk_hash)
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 }
 
@@ -617,5 +764,82 @@ mod tests {
         .unwrap();
         assert_eq!(report.in_flight_protected_chunks, 1);
         assert_eq!(report.candidate_chunks, 0);
+    }
+
+    #[test]
+    fn test_gc_in_flight_shared_durable_leases_protect_across_separate_workers() {
+        let tmp = TempDir::new().unwrap();
+        let store = LocalArtifactStore::new(tmp.path()).unwrap();
+        let lease_dir = store.in_flight_lease_dir();
+
+        // Worker 1 (Web replica 1 handling streaming upload)
+        let worker1_reg = InFlightUploadRegistry::with_shared_dir(lease_dir.clone());
+
+        // Worker 2 (Standalone background GC process with separate in-memory registry)
+        let worker2_gc_reg = InFlightUploadRegistry::with_shared_dir(lease_dir);
+
+        let lease_id = "upload_cross_worker_005";
+        worker1_reg.register_lease(lease_id, 60);
+
+        let chunk_bytes = b"shared durable chunk across worker processes";
+        let chunk_hash = blake3::hash(chunk_bytes).to_hex().to_string();
+        store.store_chunk(&chunk_hash, chunk_bytes).unwrap();
+        worker1_reg.pin_chunk(lease_id, &chunk_hash);
+
+        let all_chunks = vec![chunk_hash.clone()];
+
+        // Worker 2 runs GC with 0s grace period.
+        // Worker 2's registry has an EMPTY in-memory map, but reads the shared lease directory!
+        let rep1 = ArtifactGcCollector::collect_garbage_with_registry(
+            &store,
+            &[], // unmanifested
+            &all_chunks,
+            Some(&worker2_gc_reg),
+            0, // 0 grace
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            rep1.in_flight_protected_chunks, 1,
+            "Worker 2 must protect chunk pinned by Worker 1 via shared lease"
+        );
+        assert_eq!(rep1.candidate_chunks, 0);
+        assert_eq!(rep1.reclaimed_bytes, 0);
+
+        // Heartbeat from Worker 1
+        assert!(worker1_reg.heartbeat(lease_id, 120));
+
+        // Worker 1 completes the upload and commits manifest
+        let manifest = ArtifactManifest::new(
+            "art_shared".into(),
+            chunk_hash.clone(),
+            chunk_bytes.len() as u64,
+            chunk_bytes.len() as u32,
+            vec![ChunkEntry {
+                index: 0,
+                offset: 0,
+                length: chunk_bytes.len() as u32,
+                chunk_hash: chunk_hash.clone(),
+            }],
+            None,
+        )
+        .unwrap();
+        let m_id = store.store_manifest(&manifest).unwrap();
+        worker1_reg.complete_lease(lease_id);
+
+        // Worker 2 runs GC again: lease is gone from disk, but manifest now makes chunk reachable!
+        let rep2 = ArtifactGcCollector::collect_garbage_with_registry(
+            &store,
+            &[m_id],
+            &all_chunks,
+            Some(&worker2_gc_reg),
+            0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(rep2.reachable_chunks, 1);
+        assert_eq!(rep2.candidate_chunks, 0);
+        assert_eq!(rep2.in_flight_protected_chunks, 0);
     }
 }

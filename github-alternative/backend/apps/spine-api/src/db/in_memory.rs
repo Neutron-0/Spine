@@ -1951,6 +1951,20 @@ impl Database for InMemoryDatabase {
         Ok(None)
     }
 
+    async fn delete_lfs_object(&self, repository_id: &str, oid: &str) -> Result<bool, ForgeError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        let key = (repository_id.to_string(), oid.to_string());
+        if let Some(id) = state.lfs_objects_by_repo_oid.remove(&key) {
+            state.lfs_objects.remove(&id);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     async fn create_release(&self, release: Release) -> Result<Release, ForgeError> {
         let mut state = self
             .state

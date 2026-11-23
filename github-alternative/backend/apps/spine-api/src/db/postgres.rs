@@ -2923,6 +2923,17 @@ impl Database for PgDatabase {
         }))
     }
 
+    async fn delete_lfs_object(&self, repository_id: &str, oid: &str) -> Result<bool, ForgeError> {
+        let query = "DELETE FROM lfs_objects WHERE repository_id = $1 AND oid = $2";
+        let res = sqlx::query(query)
+            .bind(repository_id)
+            .bind(oid)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ForgeError::Internal(e.to_string()))?;
+        Ok(res.rows_affected() > 0)
+    }
+
     async fn create_release(&self, release: Release) -> Result<Release, ForgeError> {
         let query = r#"
             INSERT INTO releases (id, repo_id, tag_name, target_commit_id, title, body, is_draft, is_prerelease, author_id, created_at_nanos, published_at_nanos, updated_at_nanos)

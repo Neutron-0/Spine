@@ -79,6 +79,25 @@ enum Commands {
         migration_database_url_file: Option<PathBuf>,
     },
 
+    /// Read-only preflight and operator remediation for legacy LFS migrations
+    PreflightLfs {
+        /// Path to file containing PostgreSQL Database URL
+        #[arg(long)]
+        database_url_file: Option<PathBuf>,
+
+        /// Path to file containing operator-provided remediation mapping JSON
+        #[arg(long)]
+        remediate_file: Option<PathBuf>,
+
+        /// Perform dry-run without committing database modifications
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+
+        /// Output results in JSON format
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
     /// One-time bootstrap of the initial system administrator
     BootstrapAdmin {
         /// Administrator username
@@ -496,6 +515,91 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("Failed to execute schema migrations: {}", e))?;
             pool.close().await;
             println!("PostgreSQL schema migrations executed and verified successfully.");
+            Ok(())
+        }
+        Some(Commands::PreflightLfs {
+            database_url_file,
+            remediate_file,
+            dry_run,
+            json,
+        }) => {
+            let db_url = resolve_postgres_url(
+                None,
+                database_url_file.as_deref(),
+                &[
+                    "MIGRATION_DATABASE_URL",
+                    "SPINE_MIGRATION_DATABASE_URL",
+                    "DATABASE_URL",
+                    "SPINE_DATABASE_URL",
+                ],
+                Some("POSTGRES_MIGRATOR_USER"),
+                Some("POSTGRES_MIGRATOR_PASSWORD"),
+                Some("POSTGRES_MIGRATOR_PASSWORD_FILE"),
+            )?
+            .ok_or_else(|| anyhow::anyhow!("DATABASE_URL must be provided for preflight-lfs"))?;
+
+            let pool = sqlx::PgPool::connect(&db_url)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to connect to PostgreSQL: {}", e))?;
+
+            if let Some(ref rem_path) = remediate_file {
+                let content = std::fs::read_to_string(rem_path).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to read remediation file '{}': {}",
+                        rem_path.display(),
+                        e
+                    )
+                })?;
+                let mappings: Vec<spine_api::db::OperatorLfsMapping> =
+                    serde_json::from_str(&content).map_err(|e| {
+                        anyhow::anyhow!(
+                            "Invalid operator mapping JSON in '{}': {}",
+                            rem_path.display(),
+                            e
+                        )
+                    })?;
+
+                let res = spine_api::db::remediate_legacy_lfs_manifests(&pool, &mappings, dry_run)
+                    .await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                } else {
+                    println!("Operator Remediation Summary:");
+                    println!("  Dry-run: {}", res.is_dry_run);
+                    println!("  Mappings Validated: {}", res.mappings_validated);
+                    println!("  Manifests Remediated: {}", res.manifests_remediated);
+                    println!("  Already Correct: {}", res.already_correct);
+                }
+            } else {
+                let inv = spine_api::db::inventory_legacy_lfs_manifests(&pool).await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&inv)?);
+                } else {
+                    println!("Legacy LFS Preflight Inventory:");
+                    println!(
+                        "  Total Manifests Inspected: {}",
+                        inv.total_manifests_inspected
+                    );
+                    println!(
+                        "  Non-LFS Manifests Excluded: {}",
+                        inv.non_lfs_excluded_count
+                    );
+                    println!("  Already Mapped: {}", inv.already_mapped_count);
+                    println!("  Ready to Migrate: {}", inv.ready_to_migrate_count);
+                    println!("  Invalid OIDs: {}", inv.invalid_oids.len());
+                    println!("  Missing Repositories: {}", inv.missing_repositories.len());
+                    println!("  Ambiguous Ownership: {}", inv.ambiguous_ownership.len());
+                    println!("  Duplicate Collisions: {}", inv.duplicate_collisions.len());
+                    println!("  Safe to Migrate: {}", inv.is_safe_to_migrate);
+                }
+                if !inv.is_safe_to_migrate {
+                    pool.close().await;
+                    anyhow::bail!(
+                        "Preflight check FAILED: Database contains legacy manifests that will abort migration 0016. Operator remediation required."
+                    );
+                }
+            }
+            pool.close().await;
             Ok(())
         }
         Some(Commands::BootstrapAdmin {
