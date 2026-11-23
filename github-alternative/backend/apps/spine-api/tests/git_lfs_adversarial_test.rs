@@ -1206,3 +1206,360 @@ async fn test_lfs_upload_gc_reachability_and_preservation() {
         );
     }
 }
+
+#[tokio::test]
+async fn test_lfs_upload_in_flight_protected_from_concurrent_gc() {
+    let (_db, state, _router, _user, _pat_secret, _repo) = setup_test_env().await;
+
+    // Simulate an in-flight upload: chunk is written to CAS, but manifest/DB mapping not yet committed
+    let in_flight_bytes = b"IN_FLIGHT_STREAMING_UPLOAD_CHUNK_BYTES";
+    let in_flight_hash = blake3::hash(in_flight_bytes).to_hex().to_string();
+    state
+        .artifacts
+        .store()
+        .store_chunk(&in_flight_hash, in_flight_bytes)
+        .unwrap();
+
+    let all_scanned_chunks = vec![in_flight_hash.clone()];
+    let active_manifest_ids: Vec<String> = Vec::new(); // No active manifest yet!
+
+    // 1. Run concurrent GC with standard grace period (e.g. 300s)
+    let report_with_grace = ArtifactGcCollector::collect_garbage_with_grace(
+        state.artifacts.store(),
+        &active_manifest_ids,
+        &all_scanned_chunks,
+        300,  // 300 seconds grace period
+        true, // dry run
+    )
+    .unwrap();
+
+    assert_eq!(
+        report_with_grace.grace_protected_chunks, 1,
+        "In-flight recently modified chunk must be protected by grace period"
+    );
+    assert_eq!(
+        report_with_grace.candidate_chunks, 0,
+        "Protected in-flight chunk must NOT be a candidate for deletion"
+    );
+    assert_eq!(
+        report_with_grace.reclaimed_bytes, 0,
+        "Zero bytes must be reclaimed while chunk is in grace period"
+    );
+    assert!(
+        state.artifacts.store().has_chunk(&in_flight_hash),
+        "In-flight chunk must remain present in CAS store"
+    );
+
+    // 2. Without grace period (or once grace expires), orphaned unmanifested chunk becomes candidate
+    let report_expired = ArtifactGcCollector::collect_garbage_with_grace(
+        state.artifacts.store(),
+        &active_manifest_ids,
+        &all_scanned_chunks,
+        0, // Zero grace period (simulating expired grace)
+        true,
+    )
+    .unwrap();
+
+    assert_eq!(
+        report_expired.grace_protected_chunks, 0,
+        "Expired chunk is no longer grace-protected"
+    );
+    assert_eq!(
+        report_expired.candidate_chunks, 1,
+        "Expired unmanifested chunk must become candidate for collection"
+    );
+    assert_eq!(
+        report_expired.reclaimed_bytes,
+        in_flight_bytes.len() as u64,
+        "Reclaimed bytes must match orphaned chunk size"
+    );
+}
+
+#[tokio::test]
+async fn test_lfs_upload_crash_between_cas_and_manifest_orphans_cleaned_up() {
+    let (db, state, router, user, _pat_secret, repo) = setup_test_env().await;
+
+    let payload = b"CRASH_AFTER_CHUNK_WRITE_BEFORE_MANIFEST";
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    let oid = hex::encode(hasher.finalize());
+
+    // Write chunk directly to CAS to simulate crash right after chunk write
+    let chunk_hash = blake3::hash(payload).to_hex().to_string();
+    state
+        .artifacts
+        .store()
+        .store_chunk(&chunk_hash, payload)
+        .unwrap();
+
+    // 1. Verify object is NOT published
+    let found = db.get_lfs_object_by_repo_oid(&repo.id, &oid).await.unwrap();
+    assert!(
+        found.is_none(),
+        "Unfinished upload must never be published in lfs_objects"
+    );
+
+    let found_man = db
+        .get_artifact_manifest_by_repo_oid(&repo.id, &oid)
+        .await
+        .unwrap();
+    assert!(
+        found_man.is_none(),
+        "Unfinished upload must never resolve a manifest"
+    );
+
+    // 2. Client batch download returns 404
+    let batch_req = serde_json::json!({
+        "operation": "download",
+        "transfers": ["basic"],
+        "objects": [{ "oid": &oid, "size": payload.len() }]
+    });
+    let (token, _) = generate_scoped_token(&repo.id, &oid, "download", payload.len() as u64, 3600);
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/objects/batch",
+            user.username, repo.name
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {}", token))
+        .header(header::CONTENT_TYPE, LFS_MEDIA_TYPE)
+        .body(Body::from(serde_json::to_vec(&batch_req).unwrap()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let batch_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(
+        batch_json["objects"][0]["error"]["code"], 404,
+        "Unmanifested object must return 404 in batch download"
+    );
+
+    // 3. GC cleanly reclaims the orphaned chunk once grace expires
+    let active_manifests: Vec<String> = Vec::new();
+    let all_chunks = vec![chunk_hash.clone()];
+    let report = ArtifactGcCollector::collect_garbage_with_grace(
+        state.artifacts.store(),
+        &active_manifests,
+        &all_chunks,
+        0, // expired grace
+        true,
+    )
+    .unwrap();
+    assert_eq!(report.candidate_chunks, 1);
+    assert_eq!(report.reclaimed_bytes, payload.len() as u64);
+}
+
+#[tokio::test]
+async fn test_lfs_upload_crash_between_manifest_and_lfs_objects_leaves_object_unpublished() {
+    let (db, state, router, user, pat_secret, repo) = setup_test_env().await;
+
+    let payload = b"CRASH_AFTER_MANIFEST_BEFORE_LFS_OBJECT_MAPPING";
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    let oid = hex::encode(hasher.finalize());
+
+    // Ingest into CAS and save artifact manifest, but DO NOT create lfs_objects mapping (simulating crash)
+    let stored = state
+        .artifacts
+        .store_object_reader(
+            "user",
+            &user.id,
+            &oid,
+            Some("application/octet-stream".to_string()),
+            std::io::Cursor::new(payload),
+            Some(payload.len() as u64),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stored.artifact_id, oid);
+
+    // Invariant: lfs_objects mapping does not exist yet
+    let mapping = db.get_lfs_object_by_repo_oid(&repo.id, &oid).await.unwrap();
+    assert!(
+        mapping.is_none(),
+        "Object mapping must not exist prior to lfs_objects insert"
+    );
+
+    // 1. Direct download returns 404
+    let (dl_token, _) =
+        generate_scoped_token(&repo.id, &oid, "download", payload.len() as u64, 3600);
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/objects/{}",
+            user.username, repo.name, oid
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {}", dl_token))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "Direct download must return 404 when lfs_objects mapping is missing"
+    );
+
+    // 2. Batch upload offers upload action (no existence leak)
+    let basic_auth = format!(
+        "Basic {}",
+        encode_base64(format!("{}:{}", user.username, pat_secret).as_bytes())
+    );
+    let batch_req = serde_json::json!({
+        "operation": "upload",
+        "transfers": ["basic"],
+        "objects": [{ "oid": &oid, "size": payload.len() }]
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/objects/batch",
+            user.username, repo.name
+        ))
+        .header(header::AUTHORIZATION, &basic_auth)
+        .header(header::CONTENT_TYPE, LFS_MEDIA_TYPE)
+        .body(Body::from(serde_json::to_vec(&batch_req).unwrap()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let batch_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(
+        !batch_json["objects"][0]["actions"]["upload"].is_null(),
+        "Batch upload must offer upload action for unmapped object"
+    );
+
+    // 3. Client retries upload -> creates lfs_objects mapping
+    let upload_href = batch_json["objects"][0]["actions"]["upload"]["href"]
+        .as_str()
+        .unwrap();
+    let upload_path = url::Url::parse(upload_href).unwrap().path().to_string();
+    let upload_auth = batch_json["objects"][0]["actions"]["upload"]["header"]["Authorization"]
+        .as_str()
+        .unwrap();
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri(&upload_path)
+        .header(header::AUTHORIZATION, upload_auth)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(payload.to_vec()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Now object mapping exists and download succeeds!
+    let mapping_after = db.get_lfs_object_by_repo_oid(&repo.id, &oid).await.unwrap();
+    assert!(
+        mapping_after.is_some(),
+        "Object mapping must exist after retry"
+    );
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/objects/{}",
+            user.username, repo.name, oid
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {}", dl_token))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let downloaded = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&downloaded[..], payload);
+}
+
+#[tokio::test]
+async fn test_lfs_cross_repository_token_reuse_rejected_across_all_routes() {
+    let (db, state, router, alice, _alice_pat, _default_repo) = setup_test_env().await;
+
+    let repo_a = state
+        .repositories
+        .create_repository(&alice, "repo-token-a", None, true, None)
+        .await
+        .unwrap();
+
+    let (bob, _bob_pat) = create_test_user_and_pat(
+        &db,
+        "usr_bob_tok",
+        "bob_tok",
+        "bob_tok@spine.build",
+        "sp_pat_bob_tok_12345",
+    )
+    .await;
+
+    let repo_b = state
+        .repositories
+        .create_repository(&bob, "repo-token-b", None, true, None)
+        .await
+        .unwrap();
+
+    let payload = b"CROSS_REPOSITORY_TOKEN_REUSE_PAYLOAD";
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    let oid = hex::encode(hasher.finalize());
+
+    // Generate tokens specifically scoped to repo_a
+    let (upload_token_a, _) =
+        generate_scoped_token(&repo_a.id, &oid, "upload", payload.len() as u64, 3600);
+    let (download_token_a, _) =
+        generate_scoped_token(&repo_a.id, &oid, "download", payload.len() as u64, 3600);
+    let (verify_token_a, _) =
+        generate_scoped_token(&repo_a.id, &oid, "verify", payload.len() as u64, 3600);
+
+    // 1. Attempt upload on repo_b with repo_a's upload token -> 403 Forbidden
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/objects/{}",
+            bob.username, repo_b.name, oid
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {}", upload_token_a))
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(payload.to_vec()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "Upload with cross-repo token must be rejected with 403 Forbidden"
+    );
+
+    // 2. Attempt download on repo_b with repo_a's download token -> 403 Forbidden
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/objects/{}",
+            bob.username, repo_b.name, oid
+        ))
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", download_token_a),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "Download with cross-repo token must be rejected with 403 Forbidden"
+    );
+
+    // 3. Attempt verify on repo_b with repo_a's verify token -> 403 Forbidden
+    let verify_req = serde_json::json!({ "oid": &oid, "size": payload.len() });
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/{}/{}.git/info/lfs/verify",
+            bob.username, repo_b.name
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {}", verify_token_a))
+        .header(header::CONTENT_TYPE, LFS_MEDIA_TYPE)
+        .body(Body::from(serde_json::to_vec(&verify_req).unwrap()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "Verify with cross-repo token must be rejected with 403 Forbidden"
+    );
+}

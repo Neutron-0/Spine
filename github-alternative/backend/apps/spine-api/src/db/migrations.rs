@@ -62,6 +62,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0015_maintenance_lease_owner_token",
         include_str!("../../migrations/0015_maintenance_lease_owner_token.sql"),
     ),
+    (
+        "0016_lfs_objects_multitenant_mapping",
+        include_str!("../../migrations/0016_lfs_objects_multitenant_mapping.sql"),
+    ),
 ];
 
 // 64-bit advisory lock ID representing "SPINEMIG" (0x5350494E454D4947)
@@ -207,5 +211,49 @@ async fn run_migrations_with_pause_internal(
     })?;
 
     tracing::info!("All schema migrations applied and transaction committed.");
+    Ok(())
+}
+
+pub async fn run_migrations_up_to(pool: &PgPool, up_to_version: &str) -> Result<(), ForgeError> {
+    let mut tx = pool.begin().await.map_err(|e| {
+        ForgeError::Internal(format!("Failed to begin transaction for migrations: {}", e))
+    })?;
+
+    acquire_lock(&mut tx).await.map_err(|e| {
+        ForgeError::Internal(format!(
+            "Failed to acquire migration transaction advisory lock: {}",
+            e
+        ))
+    })?;
+
+    create_migrations_table(&mut tx).await.map_err(|e| {
+        ForgeError::Internal(format!("Failed to create _schema_migrations table: {}", e))
+    })?;
+
+    for (name, sql) in MIGRATIONS {
+        let exists = migration_exists(&mut tx, name).await.map_err(|e| {
+            ForgeError::Internal(format!(
+                "Failed to check migration status for {}: {}",
+                name, e
+            ))
+        })?;
+
+        if !exists {
+            tracing::info!("Applying migration {}...", name);
+            execute_migration(&mut tx, name, sql)
+                .await
+                .map_err(|e| ForgeError::Internal(format!("Migration {} failed: {}", name, e)))?;
+            tracing::info!("Migration {} applied successfully.", name);
+        }
+
+        if *name == up_to_version {
+            break;
+        }
+    }
+
+    tx.commit().await.map_err(|e| {
+        ForgeError::Internal(format!("Failed to commit migration transaction: {}", e))
+    })?;
+
     Ok(())
 }

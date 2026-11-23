@@ -15,6 +15,7 @@ pub struct ArtifactGcReport {
     pub total_chunks_scanned: usize,
     pub reachable_chunks: usize,
     pub candidate_chunks: usize,
+    pub grace_protected_chunks: usize,
     pub reclaimed_bytes: u64,
     pub dry_run: bool,
 }
@@ -47,11 +48,24 @@ impl ArtifactGcCollector {
         all_chunk_hashes: &[String],
         dry_run: bool,
     ) -> Result<ArtifactGcReport, GcError> {
+        Self::collect_garbage_with_grace(store, active_manifest_ids, all_chunk_hashes, 0, dry_run)
+    }
+
+    /// Generates a GC report with configurable grace period protection for in-flight/recent chunks.
+    pub fn collect_garbage_with_grace<S: ArtifactStore + ?Sized>(
+        store: &S,
+        active_manifest_ids: &[String],
+        all_chunk_hashes: &[String],
+        grace_secs: i64,
+        dry_run: bool,
+    ) -> Result<ArtifactGcReport, GcError> {
         let reachable = Self::trace_reachable_chunks(store, active_manifest_ids)?;
+        let now = chrono::Utc::now().timestamp();
         let mut report = ArtifactGcReport {
             total_chunks_scanned: all_chunk_hashes.len(),
             reachable_chunks: 0,
             candidate_chunks: 0,
+            grace_protected_chunks: 0,
             reclaimed_bytes: 0,
             dry_run,
         };
@@ -60,6 +74,16 @@ impl ArtifactGcCollector {
             if reachable.contains(chunk_hash) {
                 report.reachable_chunks += 1;
             } else {
+                // If chunk was modified within grace period, protect it from GC (e.g. concurrent in-flight upload)
+                if grace_secs > 0 {
+                    if let Ok(Some(mtime)) = store.get_chunk_mtime_secs(chunk_hash) {
+                        if now - mtime < grace_secs {
+                            report.grace_protected_chunks += 1;
+                            continue;
+                        }
+                    }
+                }
+
                 report.candidate_chunks += 1;
                 if let Ok(Some(bytes)) = store.get_chunk(chunk_hash) {
                     report.reclaimed_bytes += bytes.len() as u64;

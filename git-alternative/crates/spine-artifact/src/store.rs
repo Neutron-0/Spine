@@ -36,6 +36,10 @@ pub trait ArtifactStore: Send + Sync {
         manifest_id: &str,
         policy: DurabilityPolicy,
     ) -> Result<bool, StoreError>;
+
+    fn get_chunk_mtime_secs(&self, _chunk_hash: &str) -> Result<Option<i64>, StoreError> {
+        Ok(None)
+    }
 }
 
 impl<T: ?Sized + ArtifactStore> ArtifactStore for Arc<T> {
@@ -63,6 +67,9 @@ impl<T: ?Sized + ArtifactStore> ArtifactStore for Arc<T> {
         policy: DurabilityPolicy,
     ) -> Result<bool, StoreError> {
         (**self).verify_artifact_durability(manifest_id, policy)
+    }
+    fn get_chunk_mtime_secs(&self, chunk_hash: &str) -> Result<Option<i64>, StoreError> {
+        (**self).get_chunk_mtime_secs(chunk_hash)
     }
 }
 
@@ -206,6 +213,20 @@ impl ArtifactStore for LocalArtifactStore {
             }
         }
     }
+
+    fn get_chunk_mtime_secs(&self, chunk_hash: &str) -> Result<Option<i64>, StoreError> {
+        let p = self.chunk_path(chunk_hash);
+        if !p.exists() {
+            return Ok(None);
+        }
+        let meta = fs::metadata(&p)?;
+        let mtime = meta
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        Ok(Some(mtime))
+    }
 }
 
 /// Clustered artifact store wrapper combining local storage with replica storage dispatch.
@@ -313,5 +334,9 @@ impl ArtifactStore for DistributedArtifactStore {
         }
 
         Ok(valid_copies >= required)
+    }
+
+    fn get_chunk_mtime_secs(&self, chunk_hash: &str) -> Result<Option<i64>, StoreError> {
+        self.local.get_chunk_mtime_secs(chunk_hash)
     }
 }

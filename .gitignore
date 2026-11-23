@@ -33,6 +33,7 @@ tmp_backups/
 *.spnebak
 *.dump
 *.sql
+!github-alternative/backend/apps/spine-api/migrations/*.sql
 tmp_rehearsal/
 .docker-compose.rehearsal-*.yml
 __pycache__/

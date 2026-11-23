@@ -96,17 +96,3 @@ CREATE TABLE IF NOT EXISTS lfs_lock_audits (
 
 CREATE INDEX IF NOT EXISTS idx_lfs_audits_repo ON lfs_lock_audits (repository_id, created_at_nanos DESC);
 
-CREATE TABLE IF NOT EXISTS lfs_objects (
-    id TEXT PRIMARY KEY,
-    repository_id TEXT NOT NULL REFERENCES forge_repositories (id) ON DELETE CASCADE,
-    oid TEXT NOT NULL,
-    size_bytes BIGINT NOT NULL,
-    manifest_id TEXT NOT NULL REFERENCES artifact_manifests (id) ON DELETE RESTRICT,
-    created_at_nanos BIGINT NOT NULL,
-    CONSTRAINT uq_repo_lfs_oid UNIQUE (repository_id, oid)
-);
-
-CREATE INDEX IF NOT EXISTS idx_lfs_objects_repo_oid ON lfs_objects (repository_id, oid);
-CREATE INDEX IF NOT EXISTS idx_lfs_objects_manifest ON lfs_objects (manifest_id);
-CREATE INDEX IF NOT EXISTS idx_lfs_objects_oid ON lfs_objects (oid);
-
