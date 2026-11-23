@@ -80,7 +80,7 @@ async fn setup_test_env() -> (
     };
     db.create_user(user.clone()).await.unwrap();
 
-    let pat_secret = "sp_pat_alice_adv_token_1234567890abcdef1234".to_string();
+    let pat_secret = "sp_pat_test12345".to_string();
     let pat = PersonalAccessToken {
         id: "pat_alice_adv".to_string(),
         user_id: user.id.clone(),
