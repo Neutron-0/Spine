@@ -1776,7 +1776,7 @@ async fn test_multitenant_shared_cas_deduplication_and_gc_reachability() {
         "usr_bob_shared",
         "bob_shared",
         "bob_shared@spine.build",
-        "sp_pat_bob_shared_12345",
+        "test_pat_bob_shared",
     )
     .await;
 
@@ -1791,7 +1791,7 @@ async fn test_multitenant_shared_cas_deduplication_and_gc_reachability() {
         "usr_charlie_shared",
         "charlie_shared",
         "charlie_shared@spine.build",
-        "sp_pat_charlie_shared_12345",
+        "test_pat_charlie_shared",
     )
     .await;
 
