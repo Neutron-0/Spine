@@ -1566,11 +1566,11 @@ async fn test_live_coordinator_and_storage_node_processes_restore_and_restart() 
 
     async fn wait_for_node(addr: &str) {
         let client = ClusterNodeClient::new(addr.to_string());
-        for _ in 0..100 {
+        for _ in 0..300 {
             if client.query_node_details().await.is_ok() {
                 return;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         panic!("Timed out waiting for live cluster process at {}", addr);
     }

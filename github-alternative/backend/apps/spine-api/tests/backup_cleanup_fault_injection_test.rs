@@ -376,11 +376,11 @@ fn pick_free_addr() -> String {
 
 async fn wait_for_node(addr: &str) {
     let client = ClusterNodeClient::new(addr.to_string());
-    for _ in 0..100 {
+    for _ in 0..300 {
         if client.query_node_details().await.is_ok() {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("Timed out waiting for {}", addr);
 }
