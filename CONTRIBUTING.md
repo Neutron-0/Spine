@@ -111,4 +111,4 @@ When opening a pull request, please verify:
 
 ## 6. License
 
-By contributing to Spine, you agree that your contributions will be licensed under its dual MIT and Apache-2.0 licenses.
+By contributing to Spine, you agree that your contributions will be licensed under its [Proprietary Source-Available License](file:///d:/Vault/Spine/LICENSE).

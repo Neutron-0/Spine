@@ -1,10 +1,27 @@
-# Spine Licensing
+Proprietary Source-Available License
 
-Spine is distributed under the terms of both the MIT license and the Apache License (Version 2.0).
+Copyright (c) 2026 Neutron. All rights reserved.
 
-Users and contributors may choose to use Spine under either license:
+1. Grant of License
+Subject to the terms and conditions of this License, the copyright holder grants you a non-exclusive, non-transferable, royalty-free license to:
+  (a) View, inspect, clone, compile, and run the software locally solely for personal, educational, research, and non-commercial evaluation purposes; and
+  (b) Exercise rights expressly required by GitHub's Terms of Service for public repositories (such as viewing and creating public forks on GitHub for personal inspection and upstream contribution).
 
-- **MIT License**: See [LICENSE-MIT](file:///d:/Vault/Spine/LICENSE-MIT)
-- **Apache License, Version 2.0**: See [LICENSE-APACHE](file:///d:/Vault/Spine/LICENSE-APACHE)
+2. Restrictions
+Except as expressly permitted in Section 1, you may NOT:
+  (a) Sell, resell, license, sublicense, rent, lease, or commercially exploit the software, documentation, or any portion thereof;
+  (b) Embed, bundle, integrate, or redistribute the software (in source or binary form) into any commercial product, service, library, software-as-a-service (SaaS) platform, or distribution;
+  (c) Create, distribute, or publish derivative works, commercial forks, or modified copies of the software for external distribution without prior written authorization from the copyright holder;
+  (d) Remove, alter, or obscure any copyright, proprietary notices, or licensing notices contained in the software.
 
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual-licensed as above, without any additional terms or conditions.
+3. Reservation of Rights
+All rights not expressly granted in this License are reserved by the copyright holder. No trademark, patent, or service mark licenses are granted.
+
+4. Historical Versions
+Versions, tags, commits, or archives distributed prior to this licensing update under the MIT License or Apache License 2.0 remain subject to their respective licensing terms as distributed at that time. This License applies to this release and all subsequent versions and commits.
+
+5. Third-Party Dependencies
+This software links to or utilizes third-party open-source crates and libraries. Each third-party component remains governed by its respective open-source license. Nothing in this License alters or supersedes third-party license terms.
+
+6. Disclaimer of Warranties and Limitation of Liability
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

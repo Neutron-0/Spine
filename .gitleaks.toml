@@ -39,6 +39,7 @@ paths = [
     '''(^|/)references/''',
     '''(^|/)target/''',
     '''(^|/)dist/''',
+    '''(^|/)github-alternative/backend/apps/spine-api/tests/''',
 ]
 regexes = [
     '''4ac344ceb9efd42cf898aa55c5df05b22b07e05ec68661eb5271eb53dfbbef77''',
